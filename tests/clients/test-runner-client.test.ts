@@ -62,6 +62,311 @@ describe("test-runner-client", () => {
 		expect(result.failed).toBe(1);
 	});
 
+	// #1479: the agent-facing surface reads the same "was this measured"
+	// predicate the turn-end log reads, so the two cannot drift.
+	describe("formatResult duration suffix (#1479)", () => {
+		const format = (duration: number) =>
+			new TestRunnerClient(false).formatResult({
+				file: "/tmp/foo.test.ts",
+				sourceFile: "",
+				runner: "vitest",
+				passed: 2,
+				failed: 0,
+				skipped: 0,
+				failures: [],
+				duration,
+			});
+
+		it("prints the suffix for a measured run", () => {
+			expect(format(1230)).toContain(" (1.23s)");
+		});
+
+		it("omits the suffix for an unmeasured run", () => {
+			expect(format(0)).not.toContain("(");
+		});
+
+		it("omits the suffix for a non-finite duration rather than printing it", () => {
+			expect(format(Number.POSITIVE_INFINITY)).not.toContain("(");
+			expect(format(Number.NaN)).not.toContain("(");
+		});
+	});
+
+	// #1480: `parseGenericRunnerOutput` hardcoded duration 0 for every runner
+	// but go, so the turn-end log printed a constant that looked like a
+	// measurement. Durations are pinned to EXACT values here: a `> 0` assertion
+	// would accept the next plausible constant, which is how this defect class
+	// survived #1452's sweep in the first place.
+	describe("generic runner durations (#1480)", () => {
+		const parse = (output: string, runner: string, exitCode = 0) =>
+			(new TestRunnerClient(false) as any).parseGenericRunnerOutput(
+				output,
+				"",
+				exitCode,
+				`/tmp/test.${runner}`,
+				runner,
+			);
+
+		// Format from the libtest printer shipped with the local rustc 1.94.1
+		// (`formatters/pretty.rs` + `time.rs`), NOT a live `cargo test` — this
+		// box has no MSVC linker, so cargo cannot link a test binary.
+		it("parses the cargo test-result summary duration", () => {
+			const result = parse(
+				[
+					"running 3 tests",
+					"test tests::ok1 ... ok",
+					"test tests::ign ... ignored",
+					"",
+					"test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.25s",
+					"",
+				].join("\n"),
+				"cargo",
+			);
+
+			expect(result.passed).toBe(2);
+			expect(result.skipped).toBe(1);
+			expect(result.duration).toBe(250);
+		});
+
+		it("ignores a cargo panic message that mimics the summary suffix", () => {
+			// First-match hazard: the assertion diff below carries the same
+			// "; finished in ..." text the summary does. The pattern is anchored
+			// to the start of the `test result:` line so the diff cannot win.
+			const result = parse(
+				[
+					"thread 'tests::bad' panicked at src/lib.rs:9:",
+					'  left: "; finished in 99.9s"',
+					"",
+					"test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.50s",
+				].join("\n"),
+				"cargo",
+				101,
+			);
+
+			expect(result.duration).toBe(500);
+		});
+
+		it("leaves cargo unmeasured when the summary carries no elapsed time", () => {
+			// Older rustc omits the suffix entirely.
+			const result = parse(
+				"test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
+				"cargo",
+			);
+
+			expect(result.passed).toBe(2);
+			expect(result.duration).toBe(0);
+		});
+
+		// Format from the vstest.console.dll shipped with the local .NET SDK
+		// 8.0.423 (summary literal plus the " h"/" m"/" s"/" ms"/"< 1 ms" unit
+		// literals), NOT a live `dotnet test` — NuGet restore has no network.
+		it("parses the dotnet/vstest summary duration in ms", () => {
+			const result = parse(
+				"Failed!  - Failed:     1, Passed:     2, Skipped:     0, Total:     3, Duration: 250 ms - t.dll (net8.0)",
+				"dotnet",
+				1,
+			);
+
+			expect(result.failed).toBe(1);
+			expect(result.passed).toBe(2);
+			expect(result.duration).toBe(250);
+		});
+
+		it("sums the dotnet/vstest multi-unit duration token list", () => {
+			// vstest joins unit tokens with spaces rather than printing one
+			// number, so "1 m 30 s" is 90s and "2 s 345 ms" is 2345ms.
+			const minutes = parse(
+				"Passed!  - Failed:     0, Passed:     3, Skipped:     0, Total:     3, Duration: 1 m 30 s - t.dll (net8.0)",
+				"dotnet",
+			);
+			const seconds = parse(
+				"Passed!  - Failed:     0, Passed:     3, Skipped:     0, Total:     3, Duration: 2 s 345 ms - t.dll (net8.0)",
+				"dotnet",
+			);
+			const hours = parse(
+				"Passed!  - Failed:     0, Passed:     3, Skipped:     0, Total:     3, Duration: 1 h 2 m - t.dll (net8.0)",
+				"dotnet",
+			);
+
+			expect(minutes.duration).toBe(90_000);
+			expect(seconds.duration).toBe(2345);
+			expect(hours.duration).toBe(3_720_000);
+		});
+
+		it("leaves dotnet unmeasured when vstest reports sub-millisecond", () => {
+			// "< 1 ms" carries no number to report. Claiming 0 would be a
+			// measurement; leaving it unmeasured is the honest record.
+			const result = parse(
+				"Passed!  - Failed:     0, Passed:     1, Skipped:     0, Total:     1, Duration: < 1 ms - t.dll (net8.0)",
+				"dotnet",
+			);
+
+			expect(result.passed).toBe(1);
+			expect(result.duration).toBe(0);
+		});
+
+		// Surefire format from its console reporter, NOT a live maven run —
+		// there is no mvn on this box.
+		it("sums the maven/surefire per-class Time elapsed lines", () => {
+			const result = parse(
+				[
+					"[INFO] Running com.example.AppTest",
+					"[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.05 s -- in com.example.AppTest",
+					"[INFO] Running com.example.OtherTest",
+					"[INFO] Tests run: 2, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.125 s -- in com.example.OtherTest",
+					"[INFO] Results:",
+					"[ERROR] Tests run: 4, Failures: 1, Errors: 0, Skipped: 0",
+					"[INFO] Total time:  9.876 s",
+				].join("\n"),
+				"maven",
+				1,
+			);
+
+			// 50 + 125. NOT 9876: "[INFO] Total time" is whole-build wall clock
+			// including compile, and reporting it as test time would be a wrong
+			// number rather than an absent one.
+			expect(result.duration).toBe(175);
+			expect(result.failed).toBe(1);
+		});
+
+		it("scores a multi-class maven run by the aggregate, not the first class", () => {
+			// Adjacent first-match defect the duration fixture exposed: surefire
+			// prints a `Tests run:` line per class, so reading the FIRST one
+			// reported the second class's failure as a pass.
+			const result = parse(
+				[
+					"[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.05 s -- in com.example.AppTest",
+					"[INFO] Tests run: 2, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.125 s -- in com.example.OtherTest",
+					"[INFO] Results:",
+					"[ERROR] Tests run: 4, Failures: 1, Errors: 0, Skipped: 0",
+				].join("\n"),
+				"maven",
+				1,
+			);
+
+			expect(result.failed).toBe(1);
+			expect(result.passed).toBe(3);
+		});
+
+		it("accepts the surefire 2.x 'sec' spelling", () => {
+			const result = parse(
+				"Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.012 sec - in com.example.AppTest",
+				"maven",
+			);
+
+			expect(result.duration).toBe(12);
+		});
+
+		// REAL capture: rspec-core 3.13.6 on ruby 3.4.10.
+		it("parses the rspec Finished-in line", () => {
+			const result = parse(
+				[
+					".F",
+					"",
+					"Finished in 0.32394 seconds (files took 0.49427 seconds to load)",
+					"2 examples, 1 failure",
+				].join("\n"),
+				"rspec",
+				1,
+			);
+
+			expect(result.passed).toBe(1);
+			expect(result.failed).toBe(1);
+			// 323.94ms, NOT the 494.27ms file-load time that trails it on the
+			// same line.
+			expect(result.duration).toBe(324);
+		});
+
+		it("parses the rspec minutes form", () => {
+			// From RSpec::Core::Formatters::Helpers.format_duration in the
+			// installed gem: past 60s it prints "N minutes M.MM seconds".
+			const result = parse(
+				[
+					"Finished in 2 minutes 15.14 seconds (files took 0.5 seconds to load)",
+					"2 examples, 0 failures",
+				].join("\n"),
+				"rspec",
+			);
+
+			expect(result.duration).toBe(135_140);
+		});
+
+		it("ignores an rspec failure diff that mimics the Finished-in line", () => {
+			// First-match hazard: the quoted expectation below would win an
+			// unanchored /m match. The pattern requires the line to START with
+			// "Finished in", which rspec's own summary does and a diff does not.
+			const result = parse(
+				[
+					"Failures:",
+					"",
+					"  1) demo fails",
+					"     Failure/Error: expect(log).to eq 'Finished in 99 seconds'",
+					"",
+					"Finished in 0.32394 seconds (files took 0.49427 seconds to load)",
+					"2 examples, 1 failure",
+				].join("\n"),
+				"rspec",
+				1,
+			);
+
+			expect(result.duration).toBe(324);
+		});
+
+		// REAL capture: minitest 5.25.4 on ruby 3.4.10.
+		it("parses the minitest Finished-in line", () => {
+			const result = parse(
+				[
+					"Run options: --seed 63795",
+					"",
+					"F.",
+					"",
+					"Finished in 0.254594s, 7.8557 runs/s, 7.8557 assertions/s.",
+					"",
+					"2 runs, 2 assertions, 1 failures, 0 errors, 0 skips",
+				].join("\n"),
+				"minitest",
+				1,
+			);
+
+			expect(result.passed).toBe(1);
+			expect(result.failed).toBe(1);
+			expect(result.duration).toBe(255);
+		});
+
+		// Gradle's console summary carries no elapsed time and "BUILD
+		// SUCCESSFUL in 3s" is whole-build wall clock, so this stays unmeasured
+		// on purpose. #1479 makes that absence legible in the log.
+		it("leaves gradle unmeasured rather than borrowing the build time", () => {
+			const result = parse(
+				[
+					"> Task :test FAILED",
+					"4 tests completed, 1 failed",
+					"BUILD FAILED in 3s",
+				].join("\n"),
+				"gradle",
+				1,
+			);
+
+			expect(result.failed).toBe(1);
+			expect(result.passed).toBe(3);
+			expect(result.duration).toBe(0);
+		});
+
+		it("still parses the go package summary duration", () => {
+			const result = parse(
+				"ok  \texample.com/pkg\t0.253s\n",
+				"go",
+			);
+
+			expect(result.duration).toBe(253);
+		});
+
+		it("leaves an unrecognised runner summary unmeasured", () => {
+			const result = parse("everything is fine\n", "somethingelse");
+
+			expect(result.duration).toBe(0);
+		});
+	});
+
 	it("prefers failed-first target when failure cache exists", () => {
 		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-");
 		cleanups.push(cleanup);

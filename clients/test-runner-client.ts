@@ -17,6 +17,7 @@ import * as path from "node:path";
 import { minimatch } from "./deps/minimatch.js";
 import { detectFileRole } from "./file-role.js";
 import { findGlobalBinary } from "./package-manager.js";
+import { isMeasuredDuration, toMeasuredDurationMs } from "./run-duration.js";
 import { safeSpawn, safeSpawnAsync } from "./safe-spawn.js";
 
 // --- Types ---
@@ -1460,6 +1461,153 @@ export class TestRunnerClient {
 
 	// --- Generic text parser for non-JSON runners ---
 
+	/**
+	 * #1480: elapsed time for the runners `parseGenericRunnerOutput` handles.
+	 *
+	 * Before this, only go's `ok  pkg  0.25s` was read and every other runner
+	 * reported a hardcoded 0 — a constant that the turn-end log then printed as
+	 * a measurement. Each runner below prints its elapsed time in the same
+	 * summary block this parser already regexes for pass/fail counts.
+	 *
+	 * One parser serves all runners, so every pattern is anchored to the line
+	 * that carries the counts (`^test result:`, the `Failed:/Passed:` summary,
+	 * `^Finished in`). That matters for the same reason #1452's PHPUnit `Time:`
+	 * pattern is anchored: an unanchored /m alternation takes the FIRST match
+	 * over stdout+stderr, and a failure diff quoting "Finished in ..." would
+	 * beat the real summary. Probes run in a fixed order and the first measured
+	 * value wins, so one runner's output cannot be scored by another's pattern.
+	 *
+	 * Formats and how each was verified:
+	 *
+	 * - go — `ok  example.com/pkg  0.253s`. Pre-existing pattern, unchanged
+	 *   apart from the shared finite/positive guard.
+	 *
+	 * - cargo — `test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured;
+	 *   0 filtered out; finished in 0.253s`. NOT VERIFIED AGAINST A LIVE CARGO
+	 *   RUN — this box has no MSVC linker, so `cargo test` cannot link. Format
+	 *   read out of the libtest printer shipped with the local rustc 1.94.1:
+	 *   `library/test/src/formatters/pretty.rs` builds `"; finished in
+	 *   {exec_time}"` and `library/test/src/time.rs` renders `TestSuiteExecTime`
+	 *   as `{:.2}s`. Older rustc omits the suffix entirely; that degrades to
+	 *   unmeasured.
+	 *
+	 * - dotnet/vstest — `Failed: 1, Passed: 2, Skipped: 0, Total: 3, Duration:
+	 *   1 m 30 s - t.dll (net8.0)`. NOT VERIFIED AGAINST A LIVE `dotnet test` —
+	 *   NuGet restore has no network here. Format read out of the
+	 *   vstest.console.dll shipped with the local .NET SDK 8.0.423, which holds
+	 *   the literal `{0} - Failed: {1}, Passed: {2}, Skipped: {3}, Total: {4},
+	 *   Duration: {5}` next to the unit literals `" h"`, `" m"`, `" s"`,
+	 *   `" ms"`, `"< 1 ms"`. The duration is a space-joined token list, so it
+	 *   is summed rather than read as one number. `< 1 ms` carries no number
+	 *   and stays unmeasured.
+	 *
+	 * - maven/surefire — `Tests run: 4, Failures: 0, Errors: 0, Skipped: 0,
+	 *   Time elapsed: 0.05 s -- in com.example.AppTest`. NOT VERIFIED AGAINST A
+	 *   LIVE MAVEN — no mvn on this box. Summed across the per-class lines,
+	 *   because surefire prints `Time elapsed` per test class and its final
+	 *   `Results:` total carries no time. `[INFO] Total time: 3.4 s` is
+	 *   deliberately NOT used: that is whole-build wall clock including compile,
+	 *   which would report a wrong number rather than none. Surefire 2.x wrote
+	 *   `sec` where 3.x writes `s`; both are accepted.
+	 *
+	 * - rspec — `Finished in 0.32394 seconds (files took 0.49427 seconds to
+	 *   load)`. VERIFIED against a live rspec-core 3.13.6 run on ruby 3.4.10.
+	 *   The minutes form (`Finished in 2 minutes 15.14 seconds`) comes from
+	 *   `RSpec::Core::Formatters::Helpers.format_duration` in the same
+	 *   installed gem; rspec never prints hours. Load time trails the run time
+	 *   on the same line and must not be read instead of it.
+	 *
+	 * - minitest — `Finished in 0.254594s, 7.8557 runs/s, 7.8557 assertions/s.`
+	 *   VERIFIED against a live minitest 5.25.4 run on ruby 3.4.10. The format
+	 *   string is `"Finished in %.6fs, ..."` in minitest.rb, always seconds.
+	 *
+	 * - gradle — deliberately left unmeasured. Gradle's console summary
+	 *   (`4 tests completed, 1 failed`) carries no elapsed time, and `BUILD
+	 *   SUCCESSFUL in 3s` is whole-build wall clock including compile and
+	 *   dependency resolution. Reporting that as test time would be a wrong
+	 *   number; #1479 makes the absence legible in the log instead.
+	 */
+	private parseGenericRunnerDuration(output: string): number {
+		// go: "ok  	example.com/pkg	0.253s"
+		const goSummary = output.match(/ok\s+\S+\s+([\d.]+)s/m);
+		if (goSummary) {
+			const ms = toMeasuredDurationMs(Number.parseFloat(goSummary[1]) * 1000);
+			if (ms > 0) return ms;
+		}
+
+		// cargo: "...; 0 filtered out; finished in 0.25s"
+		const cargoTime = output.match(
+			/^test result:.*?;\s*finished in\s+([\d.]+)\s*s\b/im,
+		);
+		if (cargoTime) {
+			const ms = toMeasuredDurationMs(Number.parseFloat(cargoTime[1]) * 1000);
+			if (ms > 0) return ms;
+		}
+
+		// dotnet/vstest: "..., Total: 3, Duration: 1 m 30 s - t.dll (net8.0)".
+		// Anchored to the counts line, and the tail stops at the " - <dll>"
+		// separator so an assembly name can never be scanned for units.
+		const dotnetTime = output.match(
+			/Failed:\s*\d+,\s*Passed:\s*\d+,\s*Skipped:\s*\d+,\s*Total:\s*\d+,\s*Duration:\s*([^\r\n-]+)/i,
+		);
+		// `< 1 ms` is vstest's "too fast to name a number". Summing the tokens
+		// would report 1ms, a number it never claimed.
+		if (dotnetTime && !/^\s*</.test(dotnetTime[1])) {
+			let total = 0;
+			// "ms" before "m", or "250 ms" scores as 250 minutes.
+			const units: Record<string, number> = {
+				ms: 1,
+				s: 1000,
+				m: 60_000,
+				h: 3_600_000,
+			};
+			for (const token of dotnetTime[1].matchAll(
+				/([\d.]+)\s*(ms|h|m|s)\b/gi,
+			)) {
+				total += Number.parseFloat(token[1]) * units[token[2].toLowerCase()];
+			}
+			const ms = toMeasuredDurationMs(total);
+			if (ms > 0) return ms;
+		}
+
+		// maven/surefire: summed across per-class "Time elapsed" lines.
+		let surefireTotal = 0;
+		for (const line of output.matchAll(
+			/^.*Tests run:\s*\d+,.*?Time elapsed:\s*([\d.]+)\s*(?:s|sec|secs|seconds)\b.*$/gim,
+		)) {
+			const seconds = Number.parseFloat(line[1]);
+			if (Number.isFinite(seconds) && seconds > 0) surefireTotal += seconds;
+		}
+		if (surefireTotal > 0) {
+			const ms = toMeasuredDurationMs(surefireTotal * 1000);
+			if (ms > 0) return ms;
+		}
+
+		// rspec: "Finished in 2 minutes 15.14 seconds (files took 0.5 ...)"
+		const rspecTime = output.match(
+			/^Finished in\s+(?:([\d.]+)\s+minutes?\s+)?([\d.]+)\s+seconds?/im,
+		);
+		if (rspecTime) {
+			const minutes = rspecTime[1] ? Number.parseFloat(rspecTime[1]) : 0;
+			const ms = toMeasuredDurationMs(
+				minutes * 60_000 + Number.parseFloat(rspecTime[2]) * 1000,
+			);
+			if (ms > 0) return ms;
+		}
+
+		// minitest: "Finished in 0.254594s, 7.8557 runs/s, ..."
+		const minitestTime = output.match(/^Finished in\s+([\d.]+)s\s*,/im);
+		if (minitestTime) {
+			const ms = toMeasuredDurationMs(
+				Number.parseFloat(minitestTime[1]) * 1000,
+			);
+			if (ms > 0) return ms;
+		}
+
+		// gradle and anything unrecognised: unmeasured, not zero-as-measurement.
+		return 0;
+	}
+
 	private parseGenericRunnerOutput(
 		stdout: string,
 		stderr: string,
@@ -1473,12 +1621,7 @@ export class TestRunnerClient {
 		let passed = 0;
 		let failed = exitCode === 0 ? 0 : 1;
 		let skipped = 0;
-		let duration = 0;
-
-		const goSummary = output.match(/ok\s+\S+\s+([\d.]+)s/m);
-		if (goSummary) {
-			duration = Number.parseFloat(goSummary[1]) * 1000;
-		}
+		const duration = this.parseGenericRunnerDuration(output);
 
 		const cargoSummary = output.match(
 			/test result:\s+\w+\.\s+(\d+)\s+passed;\s+(\d+)\s+failed;\s+(\d+)\s+ignored;/i,
@@ -1498,9 +1641,17 @@ export class TestRunnerClient {
 			skipped = Number.parseInt(dotnetSummary[3], 10);
 		}
 
-		const mavenSummary = output.match(
-			/Tests run:\s*(\d+),\s*Failures:\s*(\d+),\s*Errors:\s*(\d+),\s*Skipped:\s*(\d+)/i,
-		);
+		// #1480 (adjacent): surefire prints one `Tests run:` line PER TEST CLASS
+		// and then the aggregate under `Results:`. Taking the first match scored
+		// a multi-class run by its first class alone — a two-class run with a
+		// failure in the second class reported 0 failures. The aggregate is
+		// last, and for a single-class run first and last are the same line.
+		const mavenMatches = [
+			...output.matchAll(
+				/Tests run:\s*(\d+),\s*Failures:\s*(\d+),\s*Errors:\s*(\d+),\s*Skipped:\s*(\d+)/gi,
+			),
+		];
+		const mavenSummary = mavenMatches[mavenMatches.length - 1];
 		if (mavenSummary) {
 			const total = Number.parseInt(mavenSummary[1], 10);
 			const failures = Number.parseInt(mavenSummary[2], 10);
@@ -1594,8 +1745,11 @@ export class TestRunnerClient {
 			return ""; // No tests to report
 		}
 
-		const durationStr =
-			result.duration > 0 ? ` (${(result.duration / 1000).toFixed(2)}s)` : "";
+		// #1479: same "was this measured at all" question the turn-end log asks,
+		// answered from the same predicate so the two surfaces cannot drift.
+		const durationStr = isMeasuredDuration(result.duration)
+			? ` (${(result.duration / 1000).toFixed(2)}s)`
+			: "";
 
 		if (result.failed === 0) {
 			return `[Tests] ✓ ${result.passed}/${total} passed${durationStr} — ${result.runner}`;
