@@ -1787,6 +1787,92 @@ describe("turn_end test runner — stale results are cached, not discarded", () 
 	});
 });
 
+// ── #1479: the turn-end log separates "measured 0" from "unmeasured" ─────────
+
+describe("turn_end test runner — duration reporting (#1479)", () => {
+	async function runAndCaptureTurnEndLog(duration: number, failed: number) {
+		const env = setupTestEnvironment("pi-lens-test-duration-");
+		try {
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId: "duration-session" });
+			const cacheManager = new CacheManager(false);
+
+			const srcFile = path.join(env.tmpDir, "src/foo.ts");
+			const testFile = path.join(env.tmpDir, "src/foo.test.ts");
+			fs.mkdirSync(path.dirname(srcFile), { recursive: true });
+			fs.writeFileSync(srcFile, "export const x = 1;\n");
+			fs.writeFileSync(testFile, "test('x', () => {});\n");
+			cacheManager.addModifiedRange(
+				srcFile,
+				{ start: 1, end: 1 },
+				false,
+				env.tmpDir,
+				"duration-session",
+			);
+
+			const dbg = vi.fn();
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, {
+					ctxCwd: env.tmpDir,
+					dbg,
+					testRunnerClient: {
+						getTestRunTarget: () => ({
+							testFile,
+							runner: "cargo",
+							config: {} as any,
+							strategy: "related" as const,
+						}),
+						runTestFileAsync: async () => ({
+							file: testFile,
+							sourceFile: srcFile,
+							runner: "cargo",
+							passed: 1,
+							failed,
+							skipped: 0,
+							failures: [],
+							duration,
+						}),
+						formatResult: () => "[Tests] ✗ — cargo",
+					},
+				}),
+			);
+			await new Promise((r) => setImmediate(r));
+
+			return (dbg.mock.calls as string[][])
+				.map((c) => c[0])
+				.filter((line) => line.startsWith("turn_end: test "));
+		} finally {
+			env.cleanup();
+		}
+	}
+
+	it("prints (unmeasured), not (0ms), when the run was never timed", async () => {
+		const lines = await runAndCaptureTurnEndLog(0, 0);
+
+		// The whole point: a reader must not be able to mistake an absent
+		// measurement for a run that took under a millisecond.
+		expect(lines).toEqual([
+			"turn_end: test cargo foo.test.ts → PASS 1p/0f (unmeasured)",
+		]);
+	});
+
+	it("prints the exact measured duration when the run was timed", async () => {
+		const lines = await runAndCaptureTurnEndLog(253, 1);
+
+		expect(lines).toEqual([
+			"turn_end: test cargo foo.test.ts → FAIL 1p/1f (253ms)",
+		]);
+	});
+
+	it("treats a garbled negative duration as unmeasured, not as a number", async () => {
+		const lines = await runAndCaptureTurnEndLog(-7, 0);
+
+		expect(lines).toEqual([
+			"turn_end: test cargo foo.test.ts → PASS 1p/0f (unmeasured)",
+		]);
+	});
+});
+
 // ── #628: cascade-neighbor test companions are also fired ─────────────────────
 
 describe("turn_end test runner — cascade neighbors get their own test companion run", () => {

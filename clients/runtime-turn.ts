@@ -63,6 +63,7 @@ import { RUNTIME_CONFIG } from "./runtime-config.js";
 import { isSubagentSession } from "./subagent-mode.js";
 import type { RuntimeCoordinator } from "./runtime-coordinator.js";
 import type { TurnStateOwner } from "./cache-manager.js";
+import { formatRunDurationMs } from "./run-duration.js";
 import type { TestResult, TestRunnerClient } from "./test-runner-client.js";
 import {
 	MAX_ADVISORY_AFFECTED_FILES,
@@ -1110,7 +1111,10 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 						const summary =
 							error && passed === 0 && failed === 0
 								? `error: ${error}`
-								: `${failed > 0 ? "FAIL" : "PASS"} ${passed}p/${failed}f (${duration}ms)`;
+								// #1479: `(0ms)` read as a measurement of zero for a run
+								// that was never timed. `formatRunDurationMs` prints
+								// `(unmeasured)` for the absent case instead.
+								: `${failed > 0 ? "FAIL" : "PASS"} ${passed}p/${failed}f (${formatRunDurationMs(duration)})`;
 						dbg(
 							`turn_end: ${stale ? "[stale] " : ""}test ${runner} ${shortFile} → ${summary}`,
 						);
