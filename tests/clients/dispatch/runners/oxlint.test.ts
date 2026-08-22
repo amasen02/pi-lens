@@ -14,6 +14,60 @@ const safeSpawnAsync = vi.fn();
 const ensureTool = vi.fn(async (_toolId?: string) => "oxlint");
 const logLatency = vi.hoisted(() => vi.fn());
 
+const OXLINT_NO_FILES_BANNER =
+	"No files found to lint. Please check your paths and ignore patterns.";
+const CANONICAL_NO_FILES_REPORT = {
+	diagnostics: [],
+	number_of_files: 0,
+	number_of_rules: 96,
+	threads_count: 16,
+	start_time: 0.009533,
+};
+const CAPTURED_NO_FILES_STDOUT =
+	`${OXLINT_NO_FILES_BANNER}\n` +
+	'{ "diagnostics": [],\n' +
+	'              "number_of_files": 0,\n' +
+	'              "number_of_rules": 96,\n' +
+	'              "threads_count": 16,\n' +
+	'              "start_time": 0.009533\n' +
+	"            }\n" +
+	"            ";
+
+function noFilesEnvelope(
+	report: Record<string, unknown> | string = CANONICAL_NO_FILES_REPORT,
+	banner = OXLINT_NO_FILES_BANNER,
+): string {
+	return `${banner}\n${typeof report === "string" ? report : JSON.stringify(report)}`;
+}
+
+const MATRIX_UNCONFIRMED_REASONS: Record<string, string> = {
+	"spawn failure with exact envelope": "process-spawn",
+	"timeout with exact envelope": "process-timeout",
+	"killed process with exact envelope": "process-killed",
+	"signal termination with exact envelope": "process-signal",
+	"truncated exact envelope": "process-truncated",
+	"status zero with exact envelope": "status-zero",
+	"other nonzero status with exact envelope": "status-other",
+	"null status with exact envelope": "status-null",
+	"nonempty stderr with exact envelope": "stderr-nonempty",
+	"near banner": "banner-near",
+	"missing banner": "banner-missing",
+	"unknown JSON key": "json-unknown-key",
+	"missing captured JSON key": "json-missing-key",
+	"diagnostics has the wrong type": "json-known-field-invalid",
+	"number_of_files has the wrong type": "json-known-field-invalid",
+	"number_of_files is out of range": "json-known-field-invalid",
+	"number_of_rules has the wrong type": "json-known-field-invalid",
+	"number_of_rules is out of range": "json-known-field-invalid",
+	"threads_count is out of range": "json-known-field-invalid",
+	"threads_count has the wrong type": "json-known-field-invalid",
+	"start_time has the wrong type": "json-known-field-invalid",
+	"start_time is out of range": "json-known-field-invalid",
+	"malformed JSON after exact banner": "json-malformed",
+	"nonempty diagnostics with zero files": "diagnostics-nonempty",
+	"nonzero file count after exact banner": "files-nonzero",
+};
+
 vi.mock("../../../../clients/safe-spawn.js", () => ({
 	safeSpawn,
 	safeSpawnAsync,
@@ -73,6 +127,417 @@ describe("oxlint runner", () => {
 		};
 		expect(invalid.skipReason).toBe("ignored because someone felt like it");
 	});
+
+	it.each([
+		{
+			name: "exact captured envelope",
+			result: {
+				error: null,
+				status: 1,
+				stdout: CAPTURED_NO_FILES_STDOUT,
+				stderr: "",
+			},
+			expectedStatus: "skipped",
+			expectedSkipReason: "no-files-matched",
+		},
+		{
+			name: "spawn failure with exact envelope",
+			result: {
+				error: new Error("spawn failed"),
+				failure: "spawn",
+				status: null,
+				stdout: CAPTURED_NO_FILES_STDOUT,
+				stderr: "",
+			},
+			expectedStatus: "skipped",
+			expectedDegradation: "runner-empty-result",
+		},
+		{
+			name: "timeout with exact envelope",
+			result: {
+				error: new Error("Process timed out after 30000ms"),
+				failure: "timeout",
+				status: null,
+				stdout: CAPTURED_NO_FILES_STDOUT,
+				stderr: "",
+			},
+			expectedStatus: "skipped",
+			expectedDegradation: "runner-empty-result",
+		},
+		{
+			name: "killed process with exact envelope",
+			result: {
+				error: new Error("Spawn aborted"),
+				failure: "aborted",
+				status: null,
+				stdout: CAPTURED_NO_FILES_STDOUT,
+				stderr: "",
+			},
+			expectedStatus: "skipped",
+			expectedDegradation: "runner-empty-result",
+		},
+		{
+			name: "signal termination with exact envelope",
+			result: {
+				error: new Error("Process killed by signal: SIGTERM"),
+				failure: "signal",
+				signal: "SIGTERM" as NodeJS.Signals,
+				status: null,
+				stdout: CAPTURED_NO_FILES_STDOUT,
+				stderr: "",
+			},
+			expectedStatus: "skipped",
+			expectedDegradation: "runner-empty-result",
+		},
+		{
+			name: "truncated exact envelope",
+			result: {
+				error: null,
+				status: 1,
+				stdout: CAPTURED_NO_FILES_STDOUT,
+				stderr: "",
+				outputTruncated: true,
+			},
+			expectedStatus: "failed",
+			expectedDegradation: "runner-parsed-nothing",
+		},
+		{
+			name: "status zero with exact envelope",
+			result: {
+				error: null,
+				status: 0,
+				stdout: CAPTURED_NO_FILES_STDOUT,
+				stderr: "",
+			},
+			expectedStatus: "failed",
+			expectedFailureKind: "unconfirmed_output",
+		},
+		{
+			name: "other nonzero status with exact envelope",
+			result: {
+				error: null,
+				status: 2,
+				stdout: CAPTURED_NO_FILES_STDOUT,
+				stderr: "",
+			},
+			expectedStatus: "failed",
+			expectedDegradation: "runner-parsed-nothing",
+		},
+		{
+			name: "null status with exact envelope",
+			result: {
+				error: null,
+				status: null,
+				stdout: CAPTURED_NO_FILES_STDOUT,
+				stderr: "",
+			},
+			expectedStatus: "skipped",
+			expectedDegradation: "runner-empty-result",
+		},
+		{
+			name: "nonempty stderr with exact envelope",
+			result: {
+				error: null,
+				status: 1,
+				stdout: CAPTURED_NO_FILES_STDOUT,
+				stderr: "Error: invalid configuration\n",
+			},
+			expectedStatus: "failed",
+			expectedDegradation: "runner-parsed-nothing",
+		},
+		{
+			name: "near banner",
+			result: {
+				error: null,
+				status: 1,
+				stdout: noFilesEnvelope(
+					CANONICAL_NO_FILES_REPORT,
+					"No files found to lint. Check paths and ignores.",
+				),
+				stderr: "",
+			},
+			expectedStatus: "failed",
+			expectedDegradation: "runner-parsed-nothing",
+		},
+		{
+			name: "missing banner",
+			result: {
+				error: null,
+				status: 1,
+				stdout: JSON.stringify(CANONICAL_NO_FILES_REPORT),
+				stderr: "",
+			},
+			expectedStatus: "failed",
+			expectedDegradation: "runner-parsed-nothing",
+		},
+		{
+			name: "unknown JSON key",
+			result: {
+				error: null,
+				status: 1,
+				stdout: noFilesEnvelope({
+					...CANONICAL_NO_FILES_REPORT,
+					error: "invalid config",
+				}),
+				stderr: "",
+			},
+			expectedStatus: "failed",
+			expectedDegradation: "runner-parsed-nothing",
+		},
+		{
+			name: "missing captured JSON key",
+			result: {
+				error: null,
+				status: 1,
+				stdout: noFilesEnvelope({
+					diagnostics: [],
+					number_of_files: 0,
+					number_of_rules: 96,
+					threads_count: 16,
+				}),
+				stderr: "",
+			},
+			expectedStatus: "failed",
+			expectedDegradation: "runner-parsed-nothing",
+		},
+		{
+			name: "diagnostics has the wrong type",
+			result: {
+				error: null,
+				status: 1,
+				stdout: noFilesEnvelope({
+					...CANONICAL_NO_FILES_REPORT,
+					diagnostics: {},
+				}),
+				stderr: "",
+			},
+			expectedStatus: "failed",
+			expectedDegradation: "runner-parsed-nothing",
+		},
+		{
+			name: "number_of_files has the wrong type",
+			result: {
+				error: null,
+				status: 1,
+				stdout: noFilesEnvelope({
+					...CANONICAL_NO_FILES_REPORT,
+					number_of_files: "0",
+				}),
+				stderr: "",
+			},
+			expectedStatus: "failed",
+			expectedDegradation: "runner-parsed-nothing",
+		},
+		{
+			name: "number_of_files is out of range",
+			result: {
+				error: null,
+				status: 1,
+				stdout: noFilesEnvelope({
+					...CANONICAL_NO_FILES_REPORT,
+					number_of_files: -1,
+				}),
+				stderr: "",
+			},
+			expectedStatus: "failed",
+			expectedDegradation: "runner-parsed-nothing",
+		},
+		{
+			name: "number_of_rules has the wrong type",
+			result: {
+				error: null,
+				status: 1,
+				stdout: noFilesEnvelope({
+					...CANONICAL_NO_FILES_REPORT,
+					number_of_rules: "96",
+				}),
+				stderr: "",
+			},
+			expectedStatus: "failed",
+			expectedDegradation: "runner-parsed-nothing",
+		},
+		{
+			name: "number_of_rules is out of range",
+			result: {
+				error: null,
+				status: 1,
+				stdout: noFilesEnvelope({
+					...CANONICAL_NO_FILES_REPORT,
+					number_of_rules: -1,
+				}),
+				stderr: "",
+			},
+			expectedStatus: "failed",
+			expectedDegradation: "runner-parsed-nothing",
+		},
+		{
+			name: "threads_count is out of range",
+			result: {
+				error: null,
+				status: 1,
+				stdout: noFilesEnvelope({
+					...CANONICAL_NO_FILES_REPORT,
+					threads_count: 0,
+				}),
+				stderr: "",
+			},
+			expectedStatus: "failed",
+			expectedDegradation: "runner-parsed-nothing",
+		},
+		{
+			name: "threads_count has the wrong type",
+			result: {
+				error: null,
+				status: 1,
+				stdout: noFilesEnvelope({
+					...CANONICAL_NO_FILES_REPORT,
+					threads_count: "16",
+				}),
+				stderr: "",
+			},
+			expectedStatus: "failed",
+			expectedDegradation: "runner-parsed-nothing",
+		},
+		{
+			name: "start_time has the wrong type",
+			result: {
+				error: null,
+				status: 1,
+				stdout: noFilesEnvelope({
+					...CANONICAL_NO_FILES_REPORT,
+					start_time: "0.009533",
+				}),
+				stderr: "",
+			},
+			expectedStatus: "failed",
+			expectedDegradation: "runner-parsed-nothing",
+		},
+		{
+			name: "start_time is out of range",
+			result: {
+				error: null,
+				status: 1,
+				stdout: noFilesEnvelope({
+					...CANONICAL_NO_FILES_REPORT,
+					start_time: -0.1,
+				}),
+				stderr: "",
+			},
+			expectedStatus: "failed",
+			expectedDegradation: "runner-parsed-nothing",
+		},
+		{
+			name: "malformed JSON after exact banner",
+			result: {
+				error: null,
+				status: 1,
+				stdout: noFilesEnvelope('{ "diagnostics": [], "number_of_files": 0'),
+				stderr: "",
+			},
+			expectedStatus: "failed",
+			expectedDegradation: "runner-parsed-nothing",
+		},
+		{
+			name: "nonempty diagnostics with zero files",
+			result: {
+				error: null,
+				status: 1,
+				stdout: noFilesEnvelope({
+					...CANONICAL_NO_FILES_REPORT,
+					diagnostics: [{ message: "invalid config" }],
+				}),
+				stderr: "",
+			},
+			expectedStatus: "failed",
+			expectedDegradation: "runner-parsed-nothing",
+		},
+		{
+			name: "nonzero file count after exact banner",
+			result: {
+				error: null,
+				status: 1,
+				stdout: noFilesEnvelope({
+					...CANONICAL_NO_FILES_REPORT,
+					number_of_files: 1,
+				}),
+				stderr: "",
+			},
+			expectedStatus: "failed",
+			expectedDegradation: "runner-parsed-nothing",
+		},
+		{
+			name: "ordinary matched clean report",
+			result: {
+				error: null,
+				status: 0,
+				stdout: JSON.stringify({ diagnostics: [], number_of_files: 1 }),
+				stderr: "",
+			},
+			expectedStatus: "succeeded",
+		},
+	])(
+		"classifies the no-files state matrix: $name",
+		async ({
+			name,
+			result: spawnResult,
+			expectedStatus,
+			expectedSkipReason,
+			expectedDegradation,
+			expectedFailureKind,
+		}) => {
+			const env = setupTestEnvironment(
+				`pi-lens-oxlint-matrix-${name.replace(/[^a-z0-9]+/gi, "-")}-`,
+			);
+			try {
+				const filePath = path.join(env.tmpDir, "sample.ts");
+				fs.writeFileSync(filePath, "const value = 1;\n");
+				safeSpawnAsync.mockResolvedValueOnce(spawnResult);
+				const runnerModule =
+					await import("../../../../clients/dispatch/runners/oxlint.js");
+				const decision = runnerModule.decideOxlintNoFiles(
+					spawnResult,
+					spawnResult.stdout,
+					spawnResult.stderr,
+				);
+				const expectedDecision = expectedSkipReason
+					? { kind: "expected-no-files" }
+					: expectedStatus === "succeeded"
+						? { kind: "ordinary-report" }
+						: {
+								kind: "unconfirmed-no-files",
+								reason: MATRIX_UNCONFIRMED_REASONS[name],
+							};
+				if (!expectedSkipReason && expectedStatus !== "succeeded") {
+					expect(MATRIX_UNCONFIRMED_REASONS[name]).toBeDefined();
+				}
+				expect(decision).toEqual(expectedDecision);
+
+				const runner = runnerModule.default;
+				const outcome = await runner.run({
+					...createCtx(filePath, env.tmpDir),
+					hasTool: async () => false,
+				} as never);
+
+				expect(outcome.status).toBe(expectedStatus);
+				expect(outcome.skipReason).toBe(expectedSkipReason);
+				expect(outcome.failureKind).toBe(expectedFailureKind);
+				const degradationKinds = logLatency.mock.calls
+					.map(
+						([entry]) =>
+							entry as { phase?: string; metadata?: { kind?: string } },
+					)
+					.filter((entry) => entry.phase === "degradation_ledger")
+					.map((entry) => entry.metadata?.kind);
+				if (expectedDegradation) {
+					expect(degradationKinds).toContain(expectedDegradation);
+				} else {
+					expect(degradationKinds).toEqual([]);
+				}
+			} finally {
+				env.cleanup();
+			}
+		},
+	);
 
 	it("does not skip test files (#576) — real correctness findings matter there too", async () => {
 		const { default: oxlintRunner } =
@@ -582,16 +1047,6 @@ describe("oxlint runner", () => {
 			const filePath = path.join(env.tmpDir, "sample.ts");
 			fs.writeFileSync(filePath, "const unused = 1;\n");
 
-			const CAPTURED_NO_FILES_STDOUT =
-				"No files found to lint. Please check your paths and ignore patterns.\n" +
-				'{ "diagnostics": [],\n' +
-				'              "number_of_files": 0,\n' +
-				'              "number_of_rules": 96,\n' +
-				'              "threads_count": 16,\n' +
-				'              "start_time": 0.009533\n' +
-				"            }\n" +
-				"            ";
-
 			safeSpawnAsync.mockResolvedValueOnce({
 				error: null,
 				status: 1,
@@ -630,8 +1085,7 @@ describe("oxlint runner", () => {
 				error: new Error("Process timed out after 30000ms"),
 				failure: "timeout",
 				status: null,
-				stdout:
-					'No files found to lint.\n{ "diagnostics": [], "number_of_files": 0 }',
+				stdout: CAPTURED_NO_FILES_STDOUT,
 				stderr: "",
 			});
 
@@ -670,9 +1124,7 @@ describe("oxlint runner", () => {
 			safeSpawnAsync.mockResolvedValueOnce({
 				error: null,
 				status: 1,
-				stdout:
-					"No files found to lint. Please check your paths and ignore patterns.\n" +
-					'{ "diagnostics": [], "number_of_files": 0 }',
+				stdout: CAPTURED_NO_FILES_STDOUT,
 				stderr: "",
 			});
 

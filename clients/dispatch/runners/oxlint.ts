@@ -29,6 +29,7 @@ import {
 import { finishParsedRun, parseToolRun } from "./utils/tool-failure.js";
 
 const OXLINT_NO_FILES = Symbol("oxlint-no-files");
+const OXLINT_NO_FILES_UNCONFIRMED = Symbol("oxlint-no-files-unconfirmed");
 const OXLINT_NO_FILES_BANNER =
 	"No files found to lint. Please check your paths and ignore patterns.";
 const OXLINT_NO_FILES_REPORT_KEYS = new Set([
@@ -38,6 +39,33 @@ const OXLINT_NO_FILES_REPORT_KEYS = new Set([
 	"threads_count",
 	"start_time",
 ]);
+
+type OxlintProcessState =
+	| "normal"
+	| "spawn"
+	| "timeout"
+	| "killed"
+	| "signal"
+	| "truncated";
+type OxlintNoFilesUnconfirmedReason =
+	| `process-${Exclude<OxlintProcessState, "normal">}`
+	| "status-zero"
+	| "status-null"
+	| "status-other"
+	| "stderr-nonempty"
+	| "banner-near"
+	| "banner-missing"
+	| "json-malformed"
+	| "json-unknown-key"
+	| "json-missing-key"
+	| "json-known-field-invalid"
+	| "diagnostics-nonempty"
+	| "files-nonzero";
+
+export type OxlintNoFilesDecision =
+	| { kind: "expected-no-files" }
+	| { kind: "ordinary-report" }
+	| { kind: "unconfirmed-no-files"; reason: OxlintNoFilesUnconfirmedReason };
 
 function resolveLocalVp(cwd: string): string | null {
 	const isWin = process.platform === "win32";
@@ -119,24 +147,32 @@ const oxlintRunner: RunnerDefinition = {
 		const stdout = result.stdout ?? "";
 		const stderr = result.stderr ?? "";
 		const parsedOutput = stdout + stderr;
+		const noFilesDecision = decideOxlintNoFiles(result, stdout, stderr);
 		// #1994's shared gate classifies invocation and parsed-output failures.
-		// The private marker lets its parser recognize oxlint's one legitimate
-		// nonzero/zero-diagnostic shape without recording a parsed-nothing
-		// degradation. It never escapes this runner. Because parseToolRun checks
-		// the process outcome before invoking the parser, a timed-out or killed
-		// process retaining partial no-files stdout still follows the failure path.
-		const parsedRun = parseToolRun<Diagnostic | typeof OXLINT_NO_FILES>(
+		// The private markers preserve one legitimate nonzero/empty shape and
+		// force a status-0 lookalike away from clean. Neither escapes this runner.
+		// parseToolRun checks process failures before invoking this parser, so
+		// spawn/timeout/killed/signal precedence remains owned by #1994.
+		const parsedRun = parseToolRun<
+			Diagnostic | typeof OXLINT_NO_FILES | typeof OXLINT_NO_FILES_UNCONFIRMED
+		>(
 			"oxlint",
 			{ result, output: parsedOutput },
 			() => {
+				if (noFilesDecision.kind === "expected-no-files") {
+					return [OXLINT_NO_FILES];
+				}
+				if (
+					noFilesDecision.kind === "unconfirmed-no-files" &&
+					result.status === 0
+				) {
+					return [OXLINT_NO_FILES_UNCONFIRMED];
+				}
 				let parsed = parseOxlintJson(stdout, ctx.filePath);
 				if (parsed.length === 0 && stdout.length > 0) {
 					parsed = parseOxlintUnix(parsedOutput, ctx.filePath);
 				}
-				return parsed.length === 0 &&
-					isExpectedOxlintNoFiles(result.status, stdout, stderr)
-					? [OXLINT_NO_FILES]
-					: parsed;
+				return parsed;
 			},
 			{ parseOutput: parsedOutput },
 		);
@@ -159,8 +195,34 @@ const oxlintRunner: RunnerDefinition = {
 				skipReason: "no-files-matched",
 			};
 		}
+		if (parsedRun.diagnostics.includes(OXLINT_NO_FILES_UNCONFIRMED)) {
+			const reason =
+				noFilesDecision.kind === "unconfirmed-no-files"
+					? noFilesDecision.reason
+					: "status-zero";
+			return {
+				status: "failed",
+				diagnostics: [
+					{
+						id: `oxlint:no-files-unconfirmed:${reason}`,
+						message: `oxlint no-files report was not canonical (${reason})`,
+						filePath: ctx.filePath,
+						line: 1,
+						column: 1,
+						severity: "warning",
+						semantic: "warning",
+						tool: "oxlint",
+					},
+				],
+				semantic: "warning",
+				failureKind: "unconfirmed_output",
+				failureMessage: `no-files-${reason}`,
+			};
+		}
 		const diagnostics = parsedRun.diagnostics.filter(
-			(diagnostic): diagnostic is Diagnostic => diagnostic !== OXLINT_NO_FILES,
+			(diagnostic): diagnostic is Diagnostic =>
+				diagnostic !== OXLINT_NO_FILES &&
+				diagnostic !== OXLINT_NO_FILES_UNCONFIRMED,
 		);
 
 		// A warning-only result on exit 0 is oxlint's normal outcome, not a
@@ -209,52 +271,156 @@ interface OxlintJsonReport {
 	number_of_files?: number;
 }
 
+interface OxlintProcessEvidence {
+	status?: number | null;
+	error?: Error | null;
+	failure?: string;
+	signal?: NodeJS.Signals | null;
+	outputTruncated?: boolean;
+	spawnFailure?: { kind?: string };
+}
+
+function oxlintProcessState(result: OxlintProcessEvidence): OxlintProcessState {
+	const failureKind = result.spawnFailure?.kind;
+	if (result.signal || result.failure === "signal") return "signal";
+	if (result.failure === "timeout" || failureKind === "timeout")
+		return "timeout";
+	if (result.failure === "aborted" || failureKind === "killed") return "killed";
+	if (result.failure === "spawn" || result.error) return "spawn";
+	if (result.outputTruncated) return "truncated";
+	return "normal";
+}
+
+function isNonnegativeInteger(value: unknown): value is number {
+	return Number.isInteger(value) && (value as number) >= 0;
+}
+
+function isPositiveInteger(value: unknown): value is number {
+	return Number.isInteger(value) && (value as number) >= 1;
+}
+
+function isNonnegativeFinite(value: unknown): value is number {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
 /**
- * Recognize only oxlint's captured expected no-files envelope. The numeric
- * field alone is not a verdict: config errors can also serialize
- * `number_of_files: 0`, and stderr accompanying an otherwise familiar stdout
- * means the invocation did not produce the clean expected-policy outcome.
+ * One decision seam for every oxlint no-files axis (#1998).
  *
- * Real oxlint 1.79.0 prints "No files found to lint. Please check your paths
- * and ignore patterns." to stdout before a JSON summary, exits 1, emits an
- * empty diagnostics array, and leaves stderr empty. Unknown JSON fields fail
- * closed so an error/message payload cannot borrow the expected skip merely
- * by also setting the file count to zero. Rejected lookalikes continue through
- * `parseToolRun`, preserving #1994 parsed-nothing telemetry.
+ * Real oxlint 1.79.0 establishes the only expected shape: a normal completed
+ * process, exit 1, empty stderr, the exact no-files banner, and a JSON object
+ * containing exactly the five captured summary fields with canonical types
+ * and ranges. Diagnostics must be empty and `number_of_files` must be zero.
+ *
+ * Any process-control evidence wins before report bytes. Any no-files
+ * lookalike that differs on status, stderr, banner, JSON syntax/schema,
+ * diagnostics, or file count is unconfirmed rather than clean. A report with
+ * no no-files evidence remains an ordinary oxlint report for the normal parser.
  */
-function isExpectedOxlintNoFiles(
-	status: number | null | undefined,
+export function decideOxlintNoFiles(
+	result: OxlintProcessEvidence,
 	stdout: string,
 	stderr: string,
-): boolean {
-	if (status !== 1 || stderr.trim().length > 0) return false;
-	const jsonStart = stdout.indexOf("{");
-	if (jsonStart === -1) return false;
-	if (stdout.slice(0, jsonStart).trim() !== OXLINT_NO_FILES_BANNER)
-		return false;
-	try {
-		const parsed = JSON.parse(stdout.slice(jsonStart)) as unknown;
-		if (
-			typeof parsed !== "object" ||
-			parsed === null ||
-			Array.isArray(parsed)
-		) {
-			return false;
-		}
-		const report = parsed as Record<string, unknown>;
-		if (
-			Object.keys(report).some((key) => !OXLINT_NO_FILES_REPORT_KEYS.has(key))
-		) {
-			return false;
-		}
-		return (
-			report.number_of_files === 0 &&
-			Array.isArray(report.diagnostics) &&
-			report.diagnostics.length === 0
-		);
-	} catch {
-		return false;
+): OxlintNoFilesDecision {
+	const processState = oxlintProcessState(result);
+	if (processState !== "normal") {
+		return {
+			kind: "unconfirmed-no-files",
+			reason: `process-${processState}`,
+		};
 	}
+
+	const jsonStart = stdout.indexOf("{");
+	const bannerText = (
+		jsonStart === -1 ? stdout : stdout.slice(0, jsonStart)
+	).trim();
+	const banner =
+		bannerText === OXLINT_NO_FILES_BANNER
+			? "exact"
+			: /no files found.+lint/i.test(bannerText)
+				? "near"
+				: "missing";
+
+	let report: Record<string, unknown> | undefined;
+	let jsonMalformed = jsonStart === -1;
+	if (jsonStart !== -1) {
+		try {
+			const parsed = JSON.parse(stdout.slice(jsonStart)) as unknown;
+			if (
+				typeof parsed === "object" &&
+				parsed !== null &&
+				!Array.isArray(parsed)
+			) {
+				report = parsed as Record<string, unknown>;
+			} else {
+				jsonMalformed = true;
+			}
+		} catch {
+			jsonMalformed = true;
+		}
+	}
+
+	const hasFileCount =
+		report !== undefined &&
+		Object.prototype.hasOwnProperty.call(report, "number_of_files");
+	const fileCount = report?.number_of_files;
+	const hasNoFilesEvidence =
+		banner !== "missing" ||
+		(hasFileCount && (fileCount === 0 || !isNonnegativeInteger(fileCount)));
+	if (!hasNoFilesEvidence) return { kind: "ordinary-report" };
+
+	if (result.status == null) {
+		return { kind: "unconfirmed-no-files", reason: "status-null" };
+	}
+	if (result.status === 0) {
+		return { kind: "unconfirmed-no-files", reason: "status-zero" };
+	}
+	if (result.status !== 1) {
+		return { kind: "unconfirmed-no-files", reason: "status-other" };
+	}
+	if (stderr.trim().length > 0) {
+		return { kind: "unconfirmed-no-files", reason: "stderr-nonempty" };
+	}
+	if (banner === "near") {
+		return { kind: "unconfirmed-no-files", reason: "banner-near" };
+	}
+	if (banner === "missing") {
+		return { kind: "unconfirmed-no-files", reason: "banner-missing" };
+	}
+	if (jsonMalformed || !report) {
+		return { kind: "unconfirmed-no-files", reason: "json-malformed" };
+	}
+
+	const keys = Object.keys(report);
+	if (keys.some((key) => !OXLINT_NO_FILES_REPORT_KEYS.has(key))) {
+		return { kind: "unconfirmed-no-files", reason: "json-unknown-key" };
+	}
+	if (
+		OXLINT_NO_FILES_REPORT_KEYS.size !== keys.length ||
+		[...OXLINT_NO_FILES_REPORT_KEYS].some(
+			(key) => !Object.prototype.hasOwnProperty.call(report, key),
+		)
+	) {
+		return { kind: "unconfirmed-no-files", reason: "json-missing-key" };
+	}
+	if (
+		!Array.isArray(report.diagnostics) ||
+		!isNonnegativeInteger(report.number_of_files) ||
+		!isNonnegativeInteger(report.number_of_rules) ||
+		!isPositiveInteger(report.threads_count) ||
+		!isNonnegativeFinite(report.start_time)
+	) {
+		return {
+			kind: "unconfirmed-no-files",
+			reason: "json-known-field-invalid",
+		};
+	}
+	if (report.diagnostics.length > 0) {
+		return { kind: "unconfirmed-no-files", reason: "diagnostics-nonempty" };
+	}
+	if (report.number_of_files !== 0) {
+		return { kind: "unconfirmed-no-files", reason: "files-nonzero" };
+	}
+	return { kind: "expected-no-files" };
 }
 
 // Oxlint codes look like "eslint(no-debugger)" or "oxc(approx-constant)".
@@ -279,8 +445,9 @@ function parseOxlintJson(raw: string, filePath: string): Diagnostic[] {
 	} catch {
 		return [];
 	}
+	if (!Array.isArray(parsed.diagnostics)) return [];
 	const diagnostics: Diagnostic[] = [];
-	for (const d of parsed.diagnostics ?? []) {
+	for (const d of parsed.diagnostics) {
 		const rule = extractOxlintRule(d.code);
 		const label = d.labels?.[0]?.span;
 		const lineNum = label?.line ?? 1;

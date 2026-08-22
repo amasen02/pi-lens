@@ -1596,10 +1596,17 @@ an expected policy skip; reserve failure classification and degradation records
 for a tool that did not run or did not produce a usable result. Extend the
 closed `RUNNER_SKIP_REASONS` taxonomy when adding a new expected-skip reason;
 the dispatcher rejects unknown runtime values from latency metadata. Oxlint's
-`no-files-matched` reason requires its captured exit-1 banner plus an empty,
-known-field JSON summary and empty stderr; `number_of_files: 0` alone is not
-evidence of an expected skip, and rejected lookalikes retain shared
-parsed-nothing failure telemetry.
+no-files classification is one fail-closed state machine: process-control
+evidence wins first (spawn/timeout/killed/signal use #1994's runner-empty lane;
+truncation is unconfirmed), and only a normal exit 1 with empty stderr, the
+exact captured banner, and exactly the captured JSON fields may produce
+`no-files-matched`. Every field is schema-checked (`diagnostics` array;
+nonnegative integer file/rule counts; positive integer threads; finite
+nonnegative start time), diagnostics must be empty, and the file count must be
+zero. A no-files lookalike on any other status/banner/stderr/JSON/schema/count
+combination is never clean: nonzero runs retain shared parsed-nothing telemetry,
+while status 0 becomes an explicit `unconfirmed_output` failure. Reports with no
+no-files evidence continue through the ordinary parser.
 
 - **Use `safeSpawnAsync()` for all subprocess work** in hook/dispatch/install paths. The sync `safeSpawn()` is deprecated, blocks the Node event loop, and is now reachable only from the cached `TestRunnerClient.detectRunner` `which pytest` probe. Don't add new sync `safeSpawn` callers.
 - **The hot per-edit path is the dispatch runners** (`clients/dispatch/runners/*`), not the legacy per-tool client classes (`biome-client`, `ruff-client`, `rust-client`, `ast-grep-client`, …). Those classes historically carried a *parallel sync surface* (`checkFile`/`fixFile`/`isAvailable`/`findCargoPath`/…) that the async runners superseded; #197 found almost all of it **dead** and deleted ~1600 lines. **Lesson: when you find a sync client method, grep its real callers before "converting" it — the answer is usually "delete," and the live path already has an `*Async` twin** (`fixFileAsync`, `ensureAvailable`, `runTestFileAsync`, `tempScanAsync`, `findGoPathAsync`).
