@@ -1254,6 +1254,19 @@ a *second host adapter* alongside `index.ts`. Design rationale + progress: `mcp.
   generation is still current. `flushReviewGraphPersist` remains synchronous
   for the CLI/exit hook and invalidates any in-flight generation before its
   own gzip write, so a late worker can never overwrite the forced snapshot.
+- **Project-snapshot dedupe earns identity off-thread (#1997).** Never hash or
+  recursively walk the snapshot on the caller thread. Keep one active persist
+  and only the latest queued candidate per normalized root. Equal project
+  sequences share one gate generation, so a duplicate does not invalidate the
+  active publication; a changed sequence does. Refresh the queued candidate's
+  tiny durable baseline only when it dispatches. The worker hashes
+  its existing serialized JSON with only top-level `generatedAt` excluded, and
+  skips gzip and staging when it matches the current durable or last local
+  success. Same-sequence semantic changes still publish. Only successful
+  publication updates the bounded fingerprint cache; failures remain retryable,
+  and missing bodies always force repair. Preserve the current same-sequence
+  sidecar until the worker decides, so a stale local replay cannot erase a
+  newer sibling-process fingerprint.
 - **Out-of-band graph builds** use `npx pi-lens build-graph [--cwd <dir>]`.
   The CLI reuses `buildOrUpdateGraph` plus the builder's queued atomic persist
   payload, force-flushes it before exit, and treats every build/persist skip or

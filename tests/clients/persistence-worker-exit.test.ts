@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { gunzipSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
 
 const REPO_ROOT = fileURLToPath(new URL("../..", import.meta.url));
@@ -72,6 +73,29 @@ async function runPersistenceChild(kind: PersistenceKind): Promise<string> {
 					),
 				);
 				return;
+			}
+			if (kind === "project-snapshot") {
+				const pathLine = stdout
+					.split(/\r?\n/)
+					.find((line) => line.startsWith("snapshot-path:"));
+				const snapshotPath = pathLine?.slice("snapshot-path:".length);
+				try {
+					if (!snapshotPath) throw new Error("child omitted snapshot path");
+					const body = JSON.parse(
+						gunzipSync(fs.readFileSync(snapshotPath)).toString("utf8"),
+					) as { cachedExports?: unknown };
+					if (
+						!Array.isArray(body.cachedExports) ||
+						body.cachedExports[0]?.[0] !== "latest"
+					) {
+						throw new Error(
+							"exit flush did not persist latest queued snapshot",
+						);
+					}
+				} catch (error) {
+					finish(error instanceof Error ? error : new Error(String(error)));
+					return;
+				}
 			}
 			finish();
 		});

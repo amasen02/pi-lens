@@ -22,8 +22,9 @@ process.env.NODE_ENV = "test";
 
 if (kind === "project-snapshot") {
 	delete process.env.PI_LENS_SNAPSHOT_PERSIST_SYNC;
+	process.env.PI_LENS_TEST_SNAPSHOT_PERSIST_WORKER_DELAY_MS = "1000";
 	const snapshot = await import("../../clients/project-snapshot.js");
-	snapshot.saveProjectSnapshot(projectRoot, {
+	const base = {
 		version: snapshot.PROJECT_SNAPSHOT_VERSION,
 		projectRoot,
 		generatedAt: new Date().toISOString(),
@@ -32,11 +33,16 @@ if (kind === "project-snapshot") {
 		symbols: {},
 		reverseDeps: {},
 		cachedExports: [],
+	};
+	snapshot.saveProjectSnapshot(projectRoot, base);
+	snapshot.saveProjectSnapshot(projectRoot, {
+		...base,
+		generatedAt: new Date(Date.now() + 1000).toISOString(),
+		cachedExports: [["latest", path.join(projectRoot, "latest.ts")]],
 	});
-	await snapshot.waitForProjectSnapshotPersistsForTests();
-	if (!fs.existsSync(snapshot.getProjectSnapshotPath(projectRoot))) {
-		throw new Error("project snapshot did not persist");
-	}
+	process.stdout.write(
+		`snapshot-path:${snapshot.getProjectSnapshotPath(projectRoot)}\n`,
+	);
 } else {
 	process.env.PI_LENS_GRAPH_PERSIST_DEBOUNCE_MS = "0";
 	const sourcePath = path.join(projectRoot, "source.ts");

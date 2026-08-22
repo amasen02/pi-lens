@@ -788,7 +788,7 @@ export const EXEMPT_SESSION_STATE_FILES: Readonly<Record<string, string>> = {
 		"MCP turn-end delivery chain, drained per turn; its session context is replaced, not accumulated",
 	"project-report.ts": "project-report build guard, per build",
 	"project-snapshot.ts":
-		"snapshot parse caches keyed by content, invalidated by the snapshot generation they were built from",
+		"snapshot parse caches and the bounded per-root persist coordinator are process-lifetime state keyed by content/generation; a session reset must not abandon an in-flight durable publication",
 	"review-graph/shared-extraction-ir.ts":
 		"extraction IR keyed by cwd and file, invalidated by the graph build that produced it",
 	"lsp/client.ts":
@@ -881,9 +881,9 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"project-lens-config.ts": 3,
 	"project-report.ts": 1,
 	"project-scale.ts": 0,
-	// #1785: 5 -> 6 for _lastNarrowParseDigestForTests, the bounded digest hook
-	// (see clients/project-snapshot.ts:605-609's own comment anticipating this).
-	"project-snapshot.ts": 6,
+	// #1785: 5 -> 6 for _lastNarrowParseDigestForTests. #1997: 6 -> 10 for
+	// bounded successful/failed and active/latest-queued persist state.
+	"project-snapshot.ts": 10,
 	"project-trust.ts": 1,
 	"quiet-window-config.ts": 0,
 	"quiet-window.ts": 0,

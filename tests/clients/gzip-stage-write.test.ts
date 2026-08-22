@@ -65,6 +65,43 @@ describe("writeGzipStageFile", () => {
 		]);
 	});
 
+	it("returns before gzip and staging when a semantic fingerprint matches", async () => {
+		const stagePath = path.join(dir, "snapshot.json.gz.stage-1-0");
+		const fingerprint = vi.fn(() => "same-body");
+		const metrics = await writeGzipStageFile(
+			{ generatedAt: "volatile", value: 1 },
+			stagePath,
+			undefined,
+			{
+				semanticFingerprint: fingerprint,
+				skipIfFingerprints: ["older-local", "same-body"],
+			},
+		);
+
+		expect(fingerprint).toHaveBeenCalledOnce();
+		expect(metrics).toMatchObject({
+			semanticFingerprint: "same-body",
+			skippedUnchanged: true,
+			gzBytes: 0,
+			writeMs: 0,
+		});
+		expect(fs.existsSync(stagePath)).toBe(false);
+		expect(tmpLeftovers()).toEqual([]);
+	});
+
+	it("writes when the semantic fingerprint is new", async () => {
+		const stagePath = path.join(dir, "snapshot.json.gz.stage-1-0");
+		const data = { generatedAt: "volatile", value: 2 };
+		const metrics = await writeGzipStageFile(data, stagePath, undefined, {
+			semanticFingerprint: () => "new-body",
+			skipIfFingerprints: ["old-body"],
+		});
+
+		expect(metrics.skippedUnchanged).toBeUndefined();
+		expect(metrics.semanticFingerprint).toBe("new-body");
+		expect(readStage(stagePath)).toEqual(data);
+	});
+
 	it("removes the partial staging file and rethrows when the write fails", async () => {
 		// A stage path whose parent cannot be created (an existing FILE sits where
 		// the directory would go) fails inside the pipeline, on every platform.

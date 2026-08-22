@@ -8,6 +8,7 @@ import { getProjectDataDir } from "./file-utils.js";
 import { readJsonCache } from "./json-cache-read.js";
 import { logLatency } from "./latency-logger.js";
 import { normalizeMapKey } from "./path-utils.js";
+import { fingerprintProjectSnapshotJson } from "./project-snapshot-fingerprint.js";
 import type {
 	ProjectSnapshotPersistWorkerRequest,
 	ProjectSnapshotPersistWorkerResult,
@@ -170,6 +171,8 @@ export interface ProjectSnapshotMeta {
 	timestamp: string;
 	version: number;
 	seq: number;
+	/** SHA-256 of the snapshot body with volatile `generatedAt` omitted (#1997). */
+	fingerprint?: string;
 	/**
 	 * The derived sequence index as of `seq` (#1019), MIRRORED here from the
 	 * snapshot body so session-start can bound the change-log replay WITHOUT
@@ -188,6 +191,11 @@ function parseSnapshotMeta(value: unknown): ProjectSnapshotMeta | null {
 		timestamp: typeof meta.timestamp === "string" ? meta.timestamp : "",
 		version: meta.version,
 		seq: meta.seq,
+		fingerprint:
+			typeof meta.fingerprint === "string" &&
+			/^[a-f0-9]{64}$/.test(meta.fingerprint)
+				? meta.fingerprint
+				: undefined,
 		sequenceIndex: parseSequenceIndex(meta.sequenceIndex),
 	};
 }
@@ -868,8 +876,37 @@ interface PendingSnapshotBody {
 	stagePath: string;
 	snapshot: ProjectSnapshot;
 	generation: number;
+	durablePersist?: SnapshotPersistRecord;
+	dedupeFingerprints: string[];
 }
-const _snapshotGenerations = new Map<string, number>();
+
+interface SnapshotPersistRecord {
+	seq: number;
+	fingerprint: string;
+	generatedAt: string;
+	generation: number;
+	rawBytes?: number;
+	gzBytes?: number;
+}
+
+interface SnapshotPersistStats {
+	rawBytes: number;
+	gzBytes: number;
+	serializeMs: number;
+	writeMs: number;
+	offloaded: boolean;
+}
+const _snapshotGenerationStates = new Map<
+	string,
+	{ generation: number; seq: number }
+>();
+const _successfulSnapshotPersists = new Map<string, SnapshotPersistRecord>();
+const _failedSnapshotPersists = new Map<
+	string,
+	{ seq: number; generation: number }
+>();
+const _activeSnapshotPersists = new Map<string, PendingSnapshotBody>();
+const _queuedSnapshotPersists = new Map<string, PendingSnapshotBody>();
 const _snapshotWorkerRequests = new Map<number, PendingSnapshotBody>();
 let _snapshotPersistWorker: Worker | undefined;
 let _snapshotWorkerRequestId = 0;
@@ -877,6 +914,8 @@ let _snapshotWorkerDisabled = false;
 let _snapshotGenerationGateEnabledForTests = true;
 let _snapshotPromotionSeamForTests: (() => Promise<void>) | undefined;
 let _lastSnapshotPersistErrorForTests: string | undefined;
+let _snapshotExiting = false;
+let _snapshotWorkerBodyWritesForTests = 0;
 
 function snapshotWorkerEnabled(): boolean {
 	// The synchronous fallback writer is a legitimate degraded mode (hosts that
@@ -886,20 +925,109 @@ function snapshotWorkerEnabled(): boolean {
 	return !(raw === "1" || raw === "true");
 }
 
-function recordSnapshotPersistFailure(cwd: string, error: string): void {
+function pendingSnapshotIsCurrent(pending: PendingSnapshotBody): boolean {
+	return (
+		!_snapshotGenerationGateEnabledForTests ||
+		_snapshotGenerationStates.get(pending.key)?.generation ===
+			pending.generation
+	);
+}
+
+function rememberSuccessfulSnapshotPersist(
+	key: string,
+	record: SnapshotPersistRecord,
+): void {
+	_successfulSnapshotPersists.delete(key);
+	_successfulSnapshotPersists.set(key, record);
+	while (_successfulSnapshotPersists.size > PROJECT_SNAPSHOT_MAX_WARM_ROOTS) {
+		const oldest = _successfulSnapshotPersists.keys().next().value;
+		if (oldest === undefined) break;
+		_successfulSnapshotPersists.delete(oldest);
+	}
+}
+
+function snapshotPersistBaselinesFor(
+	cwd: string,
+	key: string,
+): { durable?: SnapshotPersistRecord; fingerprints: string[] } {
+	const local = _successfulSnapshotPersists.get(key);
+	const meta = readProjectSnapshotMeta(cwd);
+	const body = resolveSnapshotBodyPath(cwd);
+	// No body means no dedupe evidence. This keeps same-seq deletion repair live.
+	if (!meta?.fingerprint || !body) {
+		if (!body) _successfulSnapshotPersists.delete(key);
+		return { fingerprints: [] };
+	}
+	const durable: SnapshotPersistRecord = {
+		seq: meta.seq,
+		fingerprint: meta.fingerprint,
+		generatedAt: meta.timestamp,
+		generation: _snapshotGenerationStates.get(key)?.generation ?? 0,
+		gzBytes: body.gz ? body.size : undefined,
+	};
+	if (!local) rememberSuccessfulSnapshotPersist(key, durable);
+	const fingerprints = [durable.fingerprint];
+	// A sibling process may have advanced durable state from local A to B. An
+	// unchanged replay of A is stale work and must not overwrite B. A third
+	// semantic state C matches neither fingerprint and still publishes.
+	if (local && local.fingerprint !== durable.fingerprint) {
+		fingerprints.push(local.fingerprint);
+	}
+	return { durable, fingerprints };
+}
+
+function writeProjectSnapshotMeta(
+	metaPath: string,
+	snapshot: ProjectSnapshot,
+	bodyRecord?: Pick<SnapshotPersistRecord, "fingerprint" | "generatedAt">,
+): void {
+	writeFileAtomic(
+		metaPath,
+		JSON.stringify({
+			timestamp: bodyRecord?.generatedAt ?? snapshot.generatedAt,
+			version: snapshot.version,
+			seq: snapshot.seq,
+			...(bodyRecord ? { fingerprint: bodyRecord.fingerprint } : {}),
+			...(snapshot.sequenceIndex
+				? { sequenceIndex: snapshot.sequenceIndex }
+				: {}),
+		}),
+		{ bestEffort: false },
+	);
+}
+
+function recordSnapshotPersistFailure(
+	pending: PendingSnapshotBody,
+	error: string,
+	bodyPersisted = false,
+): void {
 	// Honesty (#533): a failed async body write must be surfaced, never left to
 	// masquerade as a saved snapshot. The meta gate is already self-healing (an
 	// old body under a newer-seq meta is rejected on the body's own embedded
 	// seq), and dropping the authoritative entry means the next load reflects
 	// what is ACTUALLY on disk rather than the object we failed to persist.
 	_lastSnapshotPersistErrorForTests = error;
-	deleteAuthoritativeSnapshot(normalizeMapKey(cwd));
+	_failedSnapshotPersists.set(pending.key, {
+		seq: pending.snapshot.seq,
+		generation: pending.generation,
+	});
+	while (_failedSnapshotPersists.size > PROJECT_SNAPSHOT_MAX_WARM_ROOTS) {
+		const oldest = _failedSnapshotPersists.keys().next().value;
+		if (oldest === undefined) break;
+		_failedSnapshotPersists.delete(oldest);
+	}
+	deleteAuthoritativeSnapshot(pending.key);
 	logLatency({
 		type: "phase",
 		phase: "project_snapshot_persist_failed",
-		filePath: getProjectSnapshotPath(cwd),
+		filePath: pending.gzPath,
 		durationMs: 0,
-		metadata: { error },
+		metadata: {
+			error,
+			seq: pending.snapshot.seq,
+			outcome: bodyPersisted ? "metadata_repair_required" : "failed",
+			...(bodyPersisted ? { bodyPersisted: true } : {}),
+		},
 	});
 	// #1333: the logLatency call above already carries this failure to
 	// latency.log — the console.error was a duplicate RAW write into pi's frame.
@@ -907,20 +1035,53 @@ function recordSnapshotPersistFailure(cwd: string, error: string): void {
 
 function logSnapshotPersistSuccess(
 	pending: PendingSnapshotBody,
-	stats: {
-		rawBytes: number;
-		gzBytes: number;
-		serializeMs: number;
-		writeMs: number;
-		offloaded: boolean;
-	},
+	fingerprint: string,
+	stats: SnapshotPersistStats,
 ): void {
+	rememberSuccessfulSnapshotPersist(pending.key, {
+		seq: pending.snapshot.seq,
+		fingerprint,
+		generatedAt: pending.snapshot.generatedAt,
+		generation: pending.generation,
+		rawBytes: stats.rawBytes,
+		gzBytes: stats.gzBytes,
+	});
+	_failedSnapshotPersists.delete(pending.key);
 	logLatency({
 		type: "phase",
 		phase: "project_snapshot_persist",
 		filePath: pending.gzPath,
 		durationMs: stats.serializeMs + stats.writeMs,
-		metadata: { seq: pending.snapshot.seq, ...stats },
+		metadata: { seq: pending.snapshot.seq, outcome: "executed", ...stats },
+	});
+}
+
+function logSnapshotPersistDecision(args: {
+	cwd: string;
+	seq: number;
+	fingerprint?: string;
+	decision: "requested" | "coalesced" | "skipped_unchanged" | "retry";
+	avoidedRawBytes?: number;
+	avoidedGzipBytes?: number;
+}): void {
+	logLatency({
+		type: "phase",
+		phase: "project_snapshot_persist_decision",
+		filePath: getProjectSnapshotPath(args.cwd),
+		durationMs: 0,
+		metadata: {
+			seq: args.seq,
+			decision: args.decision,
+			...(args.fingerprint
+				? { fingerprint: args.fingerprint.slice(0, 12) }
+				: {}),
+			...(args.avoidedRawBytes === undefined
+				? {}
+				: { avoidedRawBytes: args.avoidedRawBytes }),
+			...(args.avoidedGzipBytes === undefined
+				? {}
+				: { avoidedGzipBytes: args.avoidedGzipBytes }),
+		},
 	});
 }
 
@@ -985,10 +1146,45 @@ function reconcileAuthoritativeAfterWrite(
 	}
 }
 
+function finalizeProjectSnapshotMeta(
+	pending: PendingSnapshotBody,
+	record: Pick<SnapshotPersistRecord, "fingerprint" | "generatedAt">,
+): boolean {
+	try {
+		writeProjectSnapshotMeta(
+			getProjectSnapshotMetaPath(pending.cwd),
+			pending.snapshot,
+			record,
+		);
+		return true;
+	} catch (err) {
+		recordSnapshotPersistFailure(
+			pending,
+			err instanceof Error ? err.message : String(err),
+			true,
+		);
+		return false;
+	}
+}
+
+function completeSnapshotPersist(pending: PendingSnapshotBody): void {
+	if (_activeSnapshotPersists.get(pending.key) !== pending) return;
+	_activeSnapshotPersists.delete(pending.key);
+	if (_snapshotExiting) return;
+	const queued = _queuedSnapshotPersists.get(pending.key);
+	if (!queued) return;
+	_queuedSnapshotPersists.delete(pending.key);
+	dispatchSnapshotPersist(queued);
+}
+
 function writeSnapshotBodyOnMainThread(
 	pending: PendingSnapshotBody,
 	reason?: string,
 ): void {
+	if (!pendingSnapshotIsCurrent(pending)) {
+		completeSnapshotPersist(pending);
+		return;
+	}
 	if (reason) {
 		// We took the synchronous main-thread gzip path (the +656MB-risk path,
 		// #950) instead of the worker. Surface it rather than burying it in an
@@ -1013,13 +1209,41 @@ function writeSnapshotBodyOnMainThread(
 		const json = JSON.stringify(pending.snapshot);
 		const serializeMs = performance.now() - serializeStarted;
 		const rawBytes = Buffer.byteLength(json);
+		const fingerprint = fingerprintProjectSnapshotJson(
+			json,
+			pending.snapshot.generatedAt,
+		);
+		if (pending.dedupeFingerprints.includes(fingerprint)) {
+			const prior =
+				snapshotPersistBaselinesFor(pending.cwd, pending.key).durable ??
+				pending.durablePersist;
+			if (
+				authoritativeSnapshots.get(pending.key)?.snapshot === pending.snapshot
+			) {
+				deleteAuthoritativeSnapshot(pending.key);
+			}
+			logSnapshotPersistDecision({
+				cwd: pending.cwd,
+				seq: pending.snapshot.seq,
+				fingerprint,
+				decision: "skipped_unchanged",
+				avoidedRawBytes: rawBytes,
+				avoidedGzipBytes: prior?.gzBytes,
+			});
+			return;
+		}
 		const writeStarted = performance.now();
 		const gzip = gzipSync(json);
 		fs.mkdirSync(path.dirname(pending.gzPath), { recursive: true });
 		writeFileAtomic(pending.gzPath, gzip, { bestEffort: false });
 		fs.rmSync(pending.legacyPath, { force: true });
+		const metadataFinalized = finalizeProjectSnapshotMeta(pending, {
+			fingerprint,
+			generatedAt: pending.snapshot.generatedAt,
+		});
+		if (!metadataFinalized) return;
 		reconcileAuthoritativeAfterWrite(pending, rawBytes);
-		logSnapshotPersistSuccess(pending, {
+		logSnapshotPersistSuccess(pending, fingerprint, {
 			rawBytes,
 			gzBytes: gzip.byteLength,
 			serializeMs,
@@ -1029,9 +1253,11 @@ function writeSnapshotBodyOnMainThread(
 		if (reason) _lastSnapshotPersistErrorForTests = reason;
 	} catch (err) {
 		recordSnapshotPersistFailure(
-			pending.cwd,
+			pending,
 			err instanceof Error ? err.message : String(err),
 		);
+	} finally {
+		completeSnapshotPersist(pending);
 	}
 }
 
@@ -1059,7 +1285,7 @@ function handleSnapshotWorkerResult(
 ): void {
 	const pending = _snapshotWorkerRequests.get(result.id);
 	if (!pending) {
-		fs.rm(result.stagePath, { force: true }, () => {});
+		fs.rmSync(result.stagePath, { force: true });
 		return;
 	}
 	_snapshotWorkerRequests.delete(result.id);
@@ -1068,9 +1294,10 @@ function handleSnapshotWorkerResult(
 		result.rawBytes === undefined ||
 		result.gzBytes === undefined ||
 		result.serializeMs === undefined ||
-		result.writeMs === undefined
+		result.writeMs === undefined ||
+		result.semanticFingerprint === undefined
 	) {
-		fs.rm(result.stagePath, { force: true }, () => {});
+		fs.rmSync(result.stagePath, { force: true });
 		dispatchMainThreadWriteThroughSeam(
 			pending,
 			result.error ?? "invalid worker result",
@@ -1079,28 +1306,104 @@ function handleSnapshotWorkerResult(
 	}
 	// Generation gate: a newer save already superseded this one — discard the
 	// stale stage file rather than promote it over the fresher body.
+	if (!result.skippedUnchanged) _snapshotWorkerBodyWritesForTests++;
 	if (
 		_snapshotGenerationGateEnabledForTests &&
-		_snapshotGenerations.get(pending.key) !== result.generation
+		_snapshotGenerationStates.get(pending.key)?.generation !== result.generation
 	) {
 		// The stale stage is part of the promotion transaction: remove it before
 		// returning so a superseded save cannot leave an orphan behind.
-		fs.rm(result.stagePath, { force: true }, () => {});
+		fs.rmSync(result.stagePath, { force: true });
+		completeSnapshotPersist(pending);
+		return;
+	}
+	if (result.skippedUnchanged) {
+		// Re-read the tiny durable sidecar at the decision seam. A sibling process
+		// may have advanced B after this request captured A. A stale replay of A
+		// must preserve B's body metadata, not restore the captured A sidecar.
+		const prior =
+			snapshotPersistBaselinesFor(pending.cwd, pending.key).durable ??
+			pending.durablePersist;
+		if (
+			authoritativeSnapshots.get(pending.key)?.snapshot === pending.snapshot
+		) {
+			deleteAuthoritativeSnapshot(pending.key);
+		}
+		logSnapshotPersistDecision({
+			cwd: pending.cwd,
+			seq: pending.snapshot.seq,
+			fingerprint: result.semanticFingerprint,
+			decision: "skipped_unchanged",
+			avoidedRawBytes: result.rawBytes,
+			avoidedGzipBytes: prior?.gzBytes,
+		});
+		completeSnapshotPersist(pending);
 		return;
 	}
 	try {
 		fs.renameSync(result.stagePath, pending.gzPath);
 		fs.rmSync(pending.legacyPath, { force: true });
+		const metadataFinalized = finalizeProjectSnapshotMeta(pending, {
+			fingerprint: result.semanticFingerprint,
+			generatedAt: pending.snapshot.generatedAt,
+		});
+		if (!metadataFinalized) {
+			completeSnapshotPersist(pending);
+			return;
+		}
 		reconcileAuthoritativeAfterWrite(pending, result.rawBytes);
-		logSnapshotPersistSuccess(pending, {
+		logSnapshotPersistSuccess(pending, result.semanticFingerprint, {
 			rawBytes: result.rawBytes,
 			gzBytes: result.gzBytes,
 			serializeMs: result.serializeMs,
 			writeMs: result.writeMs,
 			offloaded: true,
 		});
+		completeSnapshotPersist(pending);
 	} catch (err) {
 		fs.rm(result.stagePath, { force: true }, () => {});
+		dispatchMainThreadWriteThroughSeam(
+			pending,
+			err instanceof Error ? err.message : String(err),
+		);
+	}
+}
+
+function dispatchSnapshotPersist(pending: PendingSnapshotBody): void {
+	// A queued request may have waited behind the publication that created its
+	// best dedupe evidence. Refresh only the tiny sidecar/body stat here; never
+	// retain the stale admission-time baseline through dispatch.
+	const baselines = snapshotPersistBaselinesFor(pending.cwd, pending.key);
+	pending.durablePersist = baselines.durable;
+	pending.dedupeFingerprints = baselines.fingerprints;
+	_activeSnapshotPersists.set(pending.key, pending);
+	if (!snapshotWorkerEnabled()) {
+		dispatchMainThreadWriteThroughSeam(pending, undefined);
+		return;
+	}
+	const worker = getSnapshotPersistWorker();
+	if (!worker) {
+		dispatchMainThreadWriteThroughSeam(pending, "persist worker unavailable");
+		return;
+	}
+	const id = ++_snapshotWorkerRequestId;
+	_snapshotWorkerRequests.set(id, pending);
+	const request: ProjectSnapshotPersistWorkerRequest = {
+		id,
+		generation: pending.generation,
+		stagePath: pending.stagePath,
+		data: pending.snapshot,
+		priorFingerprints: pending.dedupeFingerprints,
+		testDelayMs:
+			process.env.NODE_ENV === "test"
+				? Number(process.env.PI_LENS_TEST_SNAPSHOT_PERSIST_WORKER_DELAY_MS) ||
+					undefined
+				: undefined,
+	};
+	try {
+		worker.postMessage(request);
+	} catch (err) {
+		_snapshotWorkerRequests.delete(id);
 		dispatchMainThreadWriteThroughSeam(
 			pending,
 			err instanceof Error ? err.message : String(err),
@@ -1224,12 +1527,29 @@ function ensureSnapshotPersistExitHook(): void {
 	if (_snapshotExitHookInstalled) return;
 	_snapshotExitHookInstalled = true;
 	process.once("exit", () => {
-		const requests = [..._snapshotWorkerRequests.values()];
+		_snapshotExiting = true;
+		const latestByKey = new Map<string, PendingSnapshotBody>();
+		for (const pending of _snapshotWorkerRequests.values()) {
+			latestByKey.set(pending.key, pending);
+		}
+		for (const pending of _queuedSnapshotPersists.values()) {
+			const prior = latestByKey.get(pending.key);
+			// Queued work is later admission order. Equal-seq requests deliberately
+			// share a gate generation, so a tie must still select the queued payload.
+			if (!prior || prior.generation <= pending.generation) {
+				latestByKey.set(pending.key, pending);
+			}
+		}
 		_snapshotWorkerRequests.clear();
-		for (const pending of requests) {
+		_queuedSnapshotPersists.clear();
+		_activeSnapshotPersists.clear();
+		for (const pending of latestByKey.values()) {
 			// Only the newest generation per key still matters; older ones are
 			// superseded and their stage files are swept on next launch.
-			if (_snapshotGenerations.get(pending.key) !== pending.generation)
+			if (
+				_snapshotGenerationStates.get(pending.key)?.generation !==
+				pending.generation
+			)
 				continue;
 			writeSnapshotBodyOnMainThread(pending, "exit_hook");
 		}
@@ -1247,9 +1567,19 @@ export function saveProjectSnapshot(
 	const cacheDir = path.dirname(gzPath);
 	const key = normalizeMapKey(cwd);
 	fs.mkdirSync(cacheDir, { recursive: true });
+	const baselines = snapshotPersistBaselinesFor(cwd, key);
+	const priorPersist = baselines.durable;
+	logSnapshotPersistDecision({
+		cwd,
+		seq: snapshot.seq,
+		decision: "requested",
+	});
+	if (_failedSnapshotPersists.delete(key)) {
+		logSnapshotPersistDecision({ cwd, seq: snapshot.seq, decision: "retry" });
+	}
 
-	// #958: meta is written FIRST, body SECOND — the reverse of the original
-	// order. A crash/failure between the two writes can now only produce
+	// #958: for a new seq, meta is written FIRST and body SECOND. A crash or
+	// failure between the two writes can now only produce
 	// "meta already claims the new seq, body hasn't caught up yet" (the meta
 	// races ahead). The meta-first gate (isProjectSnapshotMetaStale) reads
 	// that as *fresh* and falls through to parsing the body, whose own
@@ -1261,28 +1591,14 @@ export function saveProjectSnapshot(
 	// away a genuinely fresh snapshot. That direction is not recoverable
 	// until the next save, so it's the one this reorder eliminates.
 	//
-	// The meta write is still SYNCHRONOUS (it is tiny) and uses
-	// `bestEffort: false`: if it fails, the body persist below is skipped
-	// entirely — the save is simply lost this round (fail-open, caught by
-	// `saveRuntimeProjectSnapshot`'s own try/catch) rather than leaving a
-	// stale meta in place while the body writer stampedes ahead.
-	writeFileAtomic(
-		metaPath,
-		JSON.stringify({
-			timestamp: snapshot.generatedAt,
-			version: snapshot.version,
-			seq: snapshot.seq,
-			// #1019: mirror the derived sequence index (kept consistent with `seq`
-			// because both are stamped from the same runtime moment) so the
-			// interactive path can hydrate it from the tiny sidecar. Omitted when
-			// absent so a non-runtime side-write (word-index/reverse-deps) that
-			// carried no index doesn't stamp an empty one.
-			...(snapshot.sequenceIndex
-				? { sequenceIndex: snapshot.sequenceIndex }
-				: {}),
-		}),
-		{ bestEffort: false },
-	);
+	// The new-seq meta write stays synchronous and throwing. Same-seq work does
+	// not need to advance the freshness gate, so it leaves the current sidecar
+	// untouched until the worker has a semantic verdict. This prevents a stale
+	// local request from replacing a
+	// newer sibling process's same-seq fingerprint before it can coalesce.
+	if (priorPersist?.seq !== snapshot.seq) {
+		writeProjectSnapshotMeta(metaPath, snapshot);
+	}
 
 	// Record the authoritative in-process write BEFORE handing the body off, so
 	// a merge-read between now and the worker's promotion sees our own object
@@ -1309,8 +1625,12 @@ export function saveProjectSnapshot(
 	// authoritative write once the latter is dropped (oversized bodies).
 	snapshotParseCache.delete(gzPath);
 
-	const generation = (_snapshotGenerations.get(key) ?? 0) + 1;
-	_snapshotGenerations.set(key, generation);
+	const generationState = _snapshotGenerationStates.get(key);
+	const generation =
+		generationState?.seq === snapshot.seq
+			? generationState.generation
+			: (generationState?.generation ?? 0) + 1;
+	_snapshotGenerationStates.set(key, { generation, seq: snapshot.seq });
 	const stagePath = `${gzPath}.stage-${process.pid}-${generation}`;
 	const pending: PendingSnapshotBody = {
 		key,
@@ -1320,33 +1640,22 @@ export function saveProjectSnapshot(
 		stagePath,
 		snapshot,
 		generation,
+		durablePersist: priorPersist,
+		dedupeFingerprints: baselines.fingerprints,
 	};
 	sweepStaleSnapshotStageFiles(cacheDir);
 	ensureSnapshotPersistExitHook();
 
-	if (!snapshotWorkerEnabled()) {
-		dispatchMainThreadWriteThroughSeam(pending, undefined);
+	if (_activeSnapshotPersists.has(key)) {
+		_queuedSnapshotPersists.set(key, pending);
+		logSnapshotPersistDecision({
+			cwd,
+			seq: snapshot.seq,
+			decision: "coalesced",
+		});
 		return;
 	}
-	const worker = getSnapshotPersistWorker();
-	if (!worker) {
-		dispatchMainThreadWriteThroughSeam(pending, "persist worker unavailable");
-		return;
-	}
-	const id = ++_snapshotWorkerRequestId;
-	_snapshotWorkerRequests.set(id, pending);
-	const request: ProjectSnapshotPersistWorkerRequest = {
-		id,
-		generation,
-		stagePath,
-		data: snapshot,
-		testDelayMs:
-			process.env.NODE_ENV === "test"
-				? Number(process.env.PI_LENS_TEST_SNAPSHOT_PERSIST_WORKER_DELAY_MS) ||
-					undefined
-				: undefined,
-	};
-	worker.postMessage(request);
+	dispatchSnapshotPersist(pending);
 }
 
 // --- Test hooks for the worker persist path ---------------------------------
@@ -1355,7 +1664,10 @@ export function saveProjectSnapshot(
 export async function waitForProjectSnapshotPersistsForTests(): Promise<void> {
 	for (
 		let attempts = 0;
-		attempts < 200 && _snapshotWorkerRequests.size > 0;
+		attempts < 200 &&
+		(_snapshotWorkerRequests.size > 0 ||
+			_activeSnapshotPersists.size > 0 ||
+			_queuedSnapshotPersists.size > 0);
 		attempts++
 	) {
 		await new Promise((resolve) => setTimeout(resolve, 10));
@@ -1367,7 +1679,6 @@ export function flushProjectSnapshotPersistsForTests(): void {
 	const requests = [..._snapshotWorkerRequests.values()];
 	_snapshotWorkerRequests.clear();
 	for (const pending of requests) {
-		if (_snapshotGenerations.get(pending.key) !== pending.generation) continue;
 		dispatchMainThreadWriteThroughSeam(pending, undefined);
 	}
 }
@@ -1385,8 +1696,30 @@ export function resetProjectSnapshotPersistWorkerForTests(): void {
 	_snapshotPromotionSeamForTests = undefined;
 	_snapshotPersistWorker = undefined;
 	_snapshotWorkerRequests.clear();
-	_snapshotGenerations.clear();
+	_snapshotGenerationStates.clear();
+	_successfulSnapshotPersists.clear();
+	_failedSnapshotPersists.clear();
+	_activeSnapshotPersists.clear();
+	_queuedSnapshotPersists.clear();
+	_snapshotExiting = false;
+	_snapshotWorkerBodyWritesForTests = 0;
 	_lastSnapshotPersistErrorForTests = undefined;
+}
+
+/** Test-only: expose bounded queue state without retaining snapshot bodies. */
+export function getProjectSnapshotPersistStateForTests(cwd: string): {
+	active: boolean;
+	queued: boolean;
+	successfulFingerprint?: string;
+	workerBodyWrites: number;
+} {
+	const key = normalizeMapKey(cwd);
+	return {
+		active: _activeSnapshotPersists.has(key),
+		queued: _queuedSnapshotPersists.has(key),
+		successfulFingerprint: _successfulSnapshotPersists.get(key)?.fingerprint,
+		workerBodyWrites: _snapshotWorkerBodyWritesForTests,
+	};
 }
 
 /** Test-only mutation switch for proving the supersession invariant. */

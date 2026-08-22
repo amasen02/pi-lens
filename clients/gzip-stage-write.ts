@@ -13,6 +13,17 @@ export interface GzipStageWriteMetrics {
 	gzBytes: number;
 	serializeMs: number;
 	writeMs: number;
+	/** Optional semantic digest derived from the serialized JSON. */
+	semanticFingerprint?: string;
+	/** True when the digest matched and no gzip or stage write ran. */
+	skippedUnchanged?: boolean;
+}
+
+export interface GzipStageWriteOptions {
+	/** Runs on the worker thread after JSON serialization, never on the caller. */
+	semanticFingerprint?: (json: string) => string;
+	/** Return before gzip/write when the derived digest equals one of these. */
+	skipIfFingerprints?: readonly string[];
 }
 
 /** Common request envelope every gzip-stage persist worker receives. Concrete
@@ -35,6 +46,8 @@ export interface GzipStageWorkerResult {
 	gzBytes?: number;
 	serializeMs?: number;
 	writeMs?: number;
+	semanticFingerprint?: string;
+	skippedUnchanged?: boolean;
 	error?: string;
 }
 
@@ -75,6 +88,7 @@ export async function writeGzipStageFile(
 	data: unknown,
 	stagePath: string,
 	testDelayMs?: number,
+	options?: GzipStageWriteOptions,
 ): Promise<GzipStageWriteMetrics> {
 	const tmpPath = stagePathFor(stagePath);
 	try {
@@ -85,6 +99,20 @@ export async function writeGzipStageFile(
 		const json = JSON.stringify(data);
 		const serializeMs = performance.now() - serializeStarted;
 		const rawBytes = Buffer.byteLength(json);
+		const semanticFingerprint = options?.semanticFingerprint?.(json);
+		if (
+			semanticFingerprint !== undefined &&
+			options?.skipIfFingerprints?.includes(semanticFingerprint)
+		) {
+			return {
+				rawBytes,
+				gzBytes: 0,
+				serializeMs,
+				writeMs: 0,
+				semanticFingerprint,
+				skippedUnchanged: true,
+			};
+		}
 
 		const writeStarted = performance.now();
 		await fs.promises.mkdir(path.dirname(stagePath), { recursive: true });
@@ -102,7 +130,13 @@ export async function writeGzipStageFile(
 		await fs.promises.rename(tmpPath, stagePath);
 		const writeMs = performance.now() - writeStarted;
 		const gzBytes = (await fs.promises.stat(stagePath)).size;
-		return { rawBytes, gzBytes, serializeMs, writeMs };
+		return {
+			rawBytes,
+			gzBytes,
+			serializeMs,
+			writeMs,
+			semanticFingerprint,
+		};
 	} catch (err) {
 		await fs.promises.rm(tmpPath, { force: true }).catch(() => {});
 		throw err;
@@ -121,7 +155,13 @@ export async function writeGzipStageFile(
 export function serveGzipStageWorker<
 	Req extends GzipStageWorkerRequest,
 	Base extends { id: number; generation: number; stagePath: string },
->(buildBaseResult: (request: Req) => Base): void {
+>(
+	buildBaseResult: (request: Req) => Base,
+	options?: {
+		semanticFingerprint?: (request: Req, json: string) => string;
+		skipIfFingerprints?: (request: Req) => readonly string[] | undefined;
+	},
+): void {
 	const port = parentPort;
 	if (!port) {
 		throw new Error("gzip stage persist worker requires a parent port");
@@ -132,15 +172,24 @@ export function serveGzipStageWorker<
 				...buildBaseResult(request),
 			};
 			try {
+				const fingerprint = options?.semanticFingerprint;
 				const metrics = await writeGzipStageFile(
 					request.data,
 					request.stagePath,
 					request.testDelayMs,
+					{
+						semanticFingerprint: fingerprint
+							? (json) => fingerprint(request, json)
+							: undefined,
+						skipIfFingerprints: options?.skipIfFingerprints?.(request),
+					},
 				);
 				result.rawBytes = metrics.rawBytes;
 				result.gzBytes = metrics.gzBytes;
 				result.serializeMs = metrics.serializeMs;
 				result.writeMs = metrics.writeMs;
+				result.semanticFingerprint = metrics.semanticFingerprint;
+				result.skippedUnchanged = metrics.skippedUnchanged;
 			} catch (err) {
 				result.error = err instanceof Error ? err.message : String(err);
 			}
