@@ -34,6 +34,10 @@
  * `cache_context` record splits a mixed injection payload by contributing
  * source. #1996 makes every unexplained miss name the absent/conflicting
  * evidence and emits one fixed-key `cache_usage_summary` at session shutdown.
+ * Heuristic causes require complete request hashing and full provider/model
+ * identity evidence. Identity comparison uses SHA-256 over the full normalized
+ * value while logs retain only a bounded display prefix; malformed numeric
+ * usage is sanitized before it reaches JSON metadata.
  * The per-turn records still ride events that already fire once per turn, and
  * all attribution derives from bounded in-process state — nothing reads
  * latency.log back or serializes transcript content.
@@ -46,24 +50,6 @@
 import { createHash } from "node:crypto";
 import { lazyEnvNumber } from "./env-utils.js";
 import { logLatency } from "./latency-logger.js";
-
-/** Shape we defensively read off an assistant `AgentMessage` (see pi-ai types). */
-interface AssistantUsageLike {
-	input?: number;
-	output?: number;
-	cacheRead?: number;
-	cacheWrite?: number;
-	cacheWrite1h?: number;
-	reasoning?: number;
-	totalTokens?: number;
-	cost?: {
-		input?: number;
-		output?: number;
-		cacheRead?: number;
-		cacheWrite?: number;
-		total?: number;
-	};
-}
 
 interface AssistantMessageLike {
 	role?: unknown;
@@ -106,7 +92,9 @@ export type CacheMissCause =
 export type CacheMissUnknownReason =
 	| "no-prior-sample"
 	| "cache-read-unavailable"
+	| "malformed-provider-usage"
 	| "request-correlation-unavailable"
+	| "request-evidence-incomplete"
 	| "sequence-hash-truncated"
 	| "model-provider-unavailable"
 	| "provider-reported-zero-stable-prefix"
@@ -252,6 +240,8 @@ interface SessionAttributionState {
 	prefixStableSinceLastUsage: boolean;
 	/** A bounded context sequence hash lost content or message coverage. */
 	sequenceHashTruncatedSinceLastUsage: boolean;
+	/** Request hashing encountered cycles, throwing getters, or unreadable data. */
+	requestEvidenceIncompleteSinceLastUsage: boolean;
 	/** Characters pi-lens injected since the previous usage record. */
 	injectedCharsSinceLastUsage: number;
 	/** Characters of transcript growth observed since the previous usage record. */
@@ -260,9 +250,9 @@ interface SessionAttributionState {
 	attributionCharsCapped: boolean;
 	/** Transcript length at the previous `context` observation. */
 	lastObservedMessageCount?: number;
-	/** Provider/model identity from the previous usage record. */
-	lastProvider?: string;
-	lastModel?: string;
+	/** Full-identity SHA-256 evidence from the previous usage record. */
+	lastProviderIdentityHash?: string;
+	lastModelIdentityHash?: string;
 	/** Bounded process-local session summary, emitted at session shutdown. */
 	summary: CacheUsageSessionSummary;
 }
@@ -281,7 +271,9 @@ function emptyUnknownEvidenceReasons(): Record<CacheMissUnknownReason, number> {
 	return {
 		"no-prior-sample": 0,
 		"cache-read-unavailable": 0,
+		"malformed-provider-usage": 0,
 		"request-correlation-unavailable": 0,
+		"request-evidence-incomplete": 0,
 		"sequence-hash-truncated": 0,
 		"model-provider-unavailable": 0,
 		"provider-reported-zero-stable-prefix": 0,
@@ -307,6 +299,7 @@ function newAttributionState(): SessionAttributionState {
 		prefixBrokeSinceLastUsage: false,
 		prefixStableSinceLastUsage: false,
 		sequenceHashTruncatedSinceLastUsage: false,
+		requestEvidenceIncompleteSinceLastUsage: false,
 		injectedCharsSinceLastUsage: 0,
 		newTranscriptCharsSinceLastUsage: 0,
 		attributionCharsCapped: false,
@@ -432,10 +425,53 @@ function readableTokenCount(value: unknown): number | undefined {
 		: undefined;
 }
 
-function boundedIdentity(value: unknown): string | undefined {
-	if (typeof value !== "string") return undefined;
+type NumericEvidenceStatus = "available" | "absent" | "malformed";
+
+interface NumericEvidence {
+	value?: number;
+	status: NumericEvidenceStatus;
+}
+
+function readNumericEvidence(
+	record: Record<string, unknown>,
+	key: string,
+): NumericEvidence {
+	let raw: unknown;
+	try {
+		raw = record[key];
+	} catch {
+		return { status: "malformed" };
+	}
+	if (raw === undefined) return { status: "absent" };
+	const value = readableTokenCount(raw);
+	return value === undefined
+		? { status: "malformed" }
+		: { status: "available", value };
+}
+
+const MAX_LOGGED_IDENTITY_CHARS = 200;
+
+interface IdentityEvidence {
+	display?: string;
+	hash?: string;
+	status: "complete" | "truncated" | "unavailable";
+}
+
+/**
+ * Keep the human-readable identity bounded while comparing a SHA-256 digest of
+ * the FULL normalized value. Comparing the display prefix would make two long
+ * provider/model ids that differ after the cap collide (#1996 review).
+ */
+function identityEvidence(value: unknown): IdentityEvidence {
+	if (typeof value !== "string") return { status: "unavailable" };
 	const normalized = value.trim();
-	return normalized ? normalized.slice(0, 200) : undefined;
+	if (!normalized) return { status: "unavailable" };
+	const truncated = normalized.length > MAX_LOGGED_IDENTITY_CHARS;
+	return {
+		display: normalized.slice(0, MAX_LOGGED_IDENTITY_CHARS),
+		hash: createHash("sha256").update(normalized).digest("hex"),
+		status: truncated ? "truncated" : "complete",
+	};
 }
 
 interface CacheMissVerdict {
@@ -462,7 +498,8 @@ interface CacheMissVerdict {
  *   2. `model-provider-changed` — both adjacent identities were present and
  *      differ. This is direct local evidence and outranks timing heuristics.
  *   3. Evidence gates — heuristic causes require a REQUEST-time observation,
- *      a complete bounded sequence hash, and adjacent provider/model identity.
+ *      a complete bounded sequence hash, adjacent full provider/model identity,
+ *      and well-formed provider usage numbers.
  *      Missing evidence returns a specific unknown reason; it never lets a
  *      plausible but unproved heuristic win.
  *   4. `ttl-expired` — a REQUEST-time gap reached the configured provider TTL.
@@ -487,9 +524,11 @@ function classifyCacheMiss(args: {
 	prefixBroke: boolean;
 	prefixStable: boolean;
 	sequenceHashTruncated: boolean;
+	requestEvidenceIncomplete: boolean;
 	stableSessionIdentity: boolean;
 	modelProviderChanged: boolean;
 	modelProviderEvidenceAvailable: boolean;
+	providerUsageMalformed: boolean;
 	estimatedNewTokens: number;
 	attributionCharsCapped: boolean;
 }): CacheMissVerdict | null {
@@ -541,11 +580,25 @@ function classifyCacheMiss(args: {
 	// bounded request observation is complete and both adjacent usage records
 	// identify the same provider/model. Otherwise an unseen prompt or identity
 	// change remains a competing explanation, so classification must fail closed.
+	if (args.requestEvidenceIncomplete) {
+		return {
+			kind,
+			cause: "unknown",
+			unknownReason: "request-evidence-incomplete",
+		};
+	}
 	if (args.sequenceHashTruncated) {
 		return {
 			kind,
 			cause: "unknown",
 			unknownReason: "sequence-hash-truncated",
+		};
+	}
+	if (args.providerUsageMalformed) {
+		return {
+			kind,
+			cause: "unknown",
+			unknownReason: "malformed-provider-usage",
 		};
 	}
 	if (!args.modelProviderEvidenceAvailable) {
@@ -595,14 +648,23 @@ function recordCacheUsageSummary(args: {
 }): void {
 	const summary = args.state.summary;
 	summary.usageRecords += 1;
+	let unknownReasonRecorded = false;
+	if (args.unknownReason === "malformed-provider-usage") {
+		summary.unknownEvidenceReasons["malformed-provider-usage"] += 1;
+		unknownReasonRecorded = true;
+	}
 	if (args.cacheRead === undefined) {
-		summary.unknownEvidenceReasons["cache-read-unavailable"] += 1;
+		if (!unknownReasonRecorded) {
+			summary.unknownEvidenceReasons["cache-read-unavailable"] += 1;
+		}
 		return;
 	}
 	if (args.priorCacheRead === undefined) {
 		if (args.cacheRead === 0) {
 			summary.missObservations += 1;
-			summary.unknownEvidenceReasons["no-prior-sample"] += 1;
+			if (!unknownReasonRecorded) {
+				summary.unknownEvidenceReasons["no-prior-sample"] += 1;
+			}
 		} else {
 			summary.cacheHits += 1;
 		}
@@ -614,13 +676,18 @@ function recordCacheUsageSummary(args: {
 	}
 	summary.missObservations += 1;
 	summary.cacheMissCauses[args.verdict.cause] += 1;
-	if (args.verdict.cause === "unknown" && args.unknownReason) {
+	if (
+		args.verdict.cause === "unknown" &&
+		args.unknownReason &&
+		!unknownReasonRecorded
+	) {
 		summary.unknownEvidenceReasons[args.unknownReason] += 1;
 	}
 }
 
 interface BoundedHashState {
 	contentTruncated: boolean;
+	incomplete: boolean;
 }
 
 function boundedHashScalar(value: unknown, state: BoundedHashState): string {
@@ -679,15 +746,18 @@ function boundedHashValue(
 	seen = new Set<object>(),
 	state?: BoundedHashState,
 ): string {
-	const hashState = state ?? { contentTruncated: false };
+	const hashState = state ?? { contentTruncated: false, incomplete: false };
 	if (value === null || typeof value !== "object") {
 		return boundedHashScalar(value, hashState);
 	}
 	if (depth >= 3) {
 		hashState.contentTruncated = true;
-		return Object.prototype.toString.call(value);
+		return "[depth-limit]";
 	}
-	if (seen.has(value)) return "[cycle]";
+	if (seen.has(value)) {
+		hashState.incomplete = true;
+		return "[cycle]";
+	}
 	seen.add(value);
 	try {
 		if (Array.isArray(value)) {
@@ -700,6 +770,7 @@ function boundedHashValue(
 			hashState,
 		);
 	} catch {
+		hashState.incomplete = true;
 		return "[unreadable]";
 	} finally {
 		seen.delete(value);
@@ -710,24 +781,55 @@ function hashMessageSequence(messages: ReadonlyArray<ContextMessageLike>): {
 	hash: string;
 	truncated: boolean;
 	contentTruncated: boolean;
+	incomplete: boolean;
 } {
 	const hash = createHash("sha256");
-	const state: BoundedHashState = { contentTruncated: false };
-	hash.update(`message-count:${messages.length};`);
-	const sampled = Math.min(messages.length, MAX_HASHED_MESSAGES);
+	const state: BoundedHashState = {
+		contentTruncated: false,
+		incomplete: false,
+	};
+	let messageCount: number;
+	try {
+		messageCount = messages.length;
+		if (!Number.isSafeInteger(messageCount) || messageCount < 0) {
+			throw new Error("invalid message count");
+		}
+	} catch {
+		state.incomplete = true;
+		hash.update("message-count:[unreadable];");
+		return {
+			hash: hash.digest("hex"),
+			truncated: false,
+			contentTruncated: false,
+			incomplete: true,
+		};
+	}
+	hash.update(`message-count:${messageCount};`);
+	const sampled = Math.min(messageCount, MAX_HASHED_MESSAGES);
 	for (let i = 0; i < sampled; i++) {
-		const message = messages[i];
 		const seen = new Set<object>();
+		let role: unknown;
+		let content: unknown;
+		try {
+			const message = messages[i];
+			role = message?.role;
+			content = message?.content;
+		} catch {
+			state.incomplete = true;
+			role = "[unreadable]";
+			content = "[unreadable]";
+		}
 		hash.update(
-			`${i}|role:${boundedHashValue(message?.role, 0, seen, state)}|content:${boundedHashValue(message?.content, 0, seen, state)};`,
+			`${i}|role:${boundedHashValue(role, 0, seen, state)}|content:${boundedHashValue(content, 0, seen, state)};`,
 		);
 	}
-	const truncated = messages.length > sampled;
+	const truncated = messageCount > sampled;
 	if (truncated) hash.update(`truncated-after:${sampled};`);
 	return {
 		hash: hash.digest("hex"),
 		truncated,
 		contentTruncated: state.contentTruncated,
+		incomplete: state.incomplete,
 	};
 }
 
@@ -763,7 +865,10 @@ function messageTextSize(
 			),
 		};
 	}
-	const bounded = boundedHashValue(content);
+	const bounded = boundedHashValue(content, 0, new Set<object>(), {
+		contentTruncated: false,
+		incomplete: false,
+	});
 	return {
 		chars: Math.min(bounded.length, limits.maxChars),
 		bytes: Math.min(
@@ -911,6 +1016,8 @@ export function observeCacheContext(args: {
 			beforeSequence.contentTruncated ||
 			afterSequence.truncated ||
 			afterSequence.contentTruncated;
+		state.requestEvidenceIncompleteSinceLastUsage ||=
+			beforeSequence.incomplete || afterSequence.incomplete;
 
 		logLatency({
 			type: "phase",
@@ -962,9 +1069,23 @@ export function observeCacheContext(args: {
 					beforeSequence.truncated || afterSequence.truncated,
 				sequenceContentHashTruncated:
 					beforeSequence.contentTruncated || afterSequence.contentTruncated,
+				sequenceHashIncomplete:
+					beforeSequence.incomplete || afterSequence.incomplete,
 			},
 		});
 	} catch (err) {
+		// The context event still occurred at request time. Preserve that clock but
+		// fail the evidence closed so a later usage row cannot infer TTL/eviction
+		// from an observation whose hashing/measurement never completed.
+		try {
+			const state = attributionFor(
+				attributionKey(args.sessionId, args.sessionRole),
+			);
+			state.lastContextAtMs = Date.now();
+			state.requestEvidenceIncompleteSinceLastUsage = true;
+		} catch {
+			// The outer contract is no-throw; there is no safe attribution key left.
+		}
 		args.dbg?.(`cache-context: failed to log context observation: ${err}`);
 	}
 }
@@ -990,7 +1111,7 @@ export function logCacheUsage(
 		if (msg.role !== "assistant") return;
 		const usage = msg.usage;
 		if (!usage || typeof usage !== "object") return;
-		const u = usage as AssistantUsageLike;
+		const usageRecord = usage as unknown as Record<string, unknown>;
 		// #1071: attribute the shortfall in-process, from state this module already
 		// keeps, so nothing re-reads latency.log.
 		const stateKey = attributionKey(context?.sessionId, context?.sessionRole);
@@ -999,18 +1120,61 @@ export function logCacheUsage(
 		const gap = resolveInterTurnGap(state, nowMs);
 		const interTurnGapMs = gap.gapMs;
 		const ttlMs = getProviderCacheTtlMs();
-		const cacheRead = readableTokenCount(u.cacheRead);
+		const inputEvidence = readNumericEvidence(usageRecord, "input");
+		const outputEvidence = readNumericEvidence(usageRecord, "output");
+		const cacheReadEvidence = readNumericEvidence(usageRecord, "cacheRead");
+		const cacheWriteEvidence = readNumericEvidence(usageRecord, "cacheWrite");
+		let costEvidence: NumericEvidence;
+		try {
+			const cost = usageRecord.cost;
+			costEvidence =
+				cost === undefined
+					? { status: "absent" }
+					: cost && typeof cost === "object"
+						? readNumericEvidence(cost as Record<string, unknown>, "total")
+						: { status: "malformed" };
+		} catch {
+			costEvidence = { status: "malformed" };
+		}
+		const usageEvidenceFields: ReadonlyArray<
+			readonly [string, NumericEvidence]
+		> = [
+			["input", inputEvidence],
+			["output", outputEvidence],
+			["cacheRead", cacheReadEvidence],
+			["cacheWrite", cacheWriteEvidence],
+			["cost.total", costEvidence],
+		];
+		const malformedProviderUsageFields = usageEvidenceFields
+			.filter(([, evidence]) => evidence.status === "malformed")
+			.map(([field]) => field);
+		const providerUsageMalformed = malformedProviderUsageFields.length > 0;
+		const cacheRead = cacheReadEvidence.value;
 		const priorCacheReadValue = readableTokenCount(state.lastCacheRead);
-		const currentProvider = boundedIdentity(msg.provider);
+		const messageRecord = msg as unknown as Record<string, unknown>;
+		const safeMessageField = (key: string): unknown => {
+			try {
+				return messageRecord[key];
+			} catch {
+				return undefined;
+			}
+		};
+		const currentProvider = identityEvidence(safeMessageField("provider"));
+		const responseModel = identityEvidence(safeMessageField("responseModel"));
 		const currentModel =
-			boundedIdentity(msg.responseModel) ?? boundedIdentity(msg.model);
+			responseModel.hash !== undefined
+				? responseModel
+				: identityEvidence(safeMessageField("model"));
 		const modelProviderEvidenceAvailable = Boolean(
-			currentProvider && currentModel && state.lastProvider && state.lastModel,
+			currentProvider.hash &&
+			currentModel.hash &&
+			state.lastProviderIdentityHash &&
+			state.lastModelIdentityHash,
 		);
 		const modelProviderChanged = Boolean(
 			modelProviderEvidenceAvailable &&
-			(currentProvider !== state.lastProvider ||
-				currentModel !== state.lastModel),
+			(currentProvider.hash !== state.lastProviderIdentityHash ||
+				currentModel.hash !== state.lastModelIdentityHash),
 		);
 		const estimatedNewTokens = estimateTokens(
 			state.injectedCharsSinceLastUsage +
@@ -1018,10 +1182,9 @@ export function logCacheUsage(
 		);
 		const verdict = classifyCacheMiss({
 			cacheRead,
-			// Malformed/non-finite provider usage cannot prove fresh-input pressure.
-			// Normalize it to the conservative zero used by the existing missing-input
-			// path so it can never manufacture `partial-eviction`.
-			input: readableTokenCount(u.input) ?? 0,
+			// Missing/malformed input cannot prove fresh-input pressure. The explicit
+			// malformed gate below also keeps every heuristic fail-closed.
+			input: inputEvidence.value ?? 0,
 			priorCacheRead: priorCacheReadValue,
 			interTurnGapMs,
 			gapBasis: gap.basis,
@@ -1029,18 +1192,22 @@ export function logCacheUsage(
 			prefixBroke: state.prefixBrokeSinceLastUsage,
 			prefixStable: state.prefixStableSinceLastUsage,
 			sequenceHashTruncated: state.sequenceHashTruncatedSinceLastUsage,
+			requestEvidenceIncomplete: state.requestEvidenceIncompleteSinceLastUsage,
 			stableSessionIdentity: sessionKey(context?.sessionId) !== NO_SESSION_KEY,
 			modelProviderChanged,
 			modelProviderEvidenceAvailable,
+			providerUsageMalformed,
 			estimatedNewTokens,
 			attributionCharsCapped: state.attributionCharsCapped,
 		});
 		const unknownReason: CacheMissUnknownReason | undefined =
-			cacheRead === undefined
-				? "cache-read-unavailable"
-				: priorCacheReadValue === undefined && cacheRead === 0
-					? "no-prior-sample"
-					: verdict?.unknownReason;
+			providerUsageMalformed
+				? "malformed-provider-usage"
+				: cacheRead === undefined
+					? "cache-read-unavailable"
+					: priorCacheReadValue === undefined && cacheRead === 0
+						? "no-prior-sample"
+						: verdict?.unknownReason;
 		recordCacheUsageSummary({
 			state,
 			cacheRead,
@@ -1061,11 +1228,12 @@ export function logCacheUsage(
 		// one turn long while its baseline was two turns old, and a verdict built
 		// on that mismatch is worse than no verdict (#1071 review round 1, F4).
 		state.lastCacheRead = cacheRead;
-		state.lastProvider = currentProvider;
-		state.lastModel = currentModel;
+		state.lastProviderIdentityHash = currentProvider.hash;
+		state.lastModelIdentityHash = currentModel.hash;
 		state.prefixBrokeSinceLastUsage = false;
 		state.prefixStableSinceLastUsage = false;
 		state.sequenceHashTruncatedSinceLastUsage = false;
+		state.requestEvidenceIncompleteSinceLastUsage = false;
 		state.injectedCharsSinceLastUsage = 0;
 		state.newTranscriptCharsSinceLastUsage = 0;
 		state.attributionCharsCapped = false;
@@ -1079,14 +1247,21 @@ export function logCacheUsage(
 			phase: "cache_usage",
 			durationMs: 0,
 			metadata: {
-				provider: currentProvider,
-				model: currentModel,
-				cacheRead: u.cacheRead,
-				cacheWrite: u.cacheWrite,
-				input: u.input,
-				output: u.output,
+				provider: currentProvider.display,
+				model: currentModel.display,
+				providerIdentityHash: currentProvider.hash,
+				modelIdentityHash: currentModel.hash,
+				providerIdentityStatus: currentProvider.status,
+				modelIdentityStatus: currentModel.status,
+				providerIdentityTruncated: currentProvider.status === "truncated",
+				modelIdentityTruncated: currentModel.status === "truncated",
+				cacheRead: cacheReadEvidence.value ?? null,
+				cacheWrite: cacheWriteEvidence.value ?? null,
+				input: inputEvidence.value ?? null,
+				output: outputEvidence.value ?? null,
 				// `Usage.cost` is a breakdown object; the total is the headline number.
-				cost: u.cost?.total,
+				cost: costEvidence.value ?? null,
+				providerUsageMalformedFields: malformedProviderUsageFields,
 				// Idle milliseconds before this turn's request, or null for the first
 				// record in the session. This is the field the 2026-08-21
 				// investigation had to reconstruct by hand-joining timestamps.

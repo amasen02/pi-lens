@@ -56,9 +56,9 @@ const UNWRAPPED_HANDLER_REASONS: Readonly<Record<string, string>> = {
 	tool_call:
 		"Delegates straight to handleToolCall, which already owns a total guard recording `tool-call-handler-throw` (clients/runtime-tool-call.ts); the registration body itself reads no ctx property.",
 	session_shutdown:
-		"Every ctx read is already inside a try/catch or behind noteSessionShutdown's probe, and skipping teardown on an inconclusive probe would leak the LSP fleet.",
+		"The stable-id read is inside a try/catch; activation-owned role decides every post-start shutdown, and the pre-start fallback remains behind noteSessionShutdown's probe. A known secondary returns before shared teardown, while an inconclusive pre-start fallback still tears down to avoid leaking the LSP fleet.",
 	message_end:
-		"The handler body is a total try/catch, and its only ctx readers are getStableSessionId (its own try/catch, index.ts:328) and classifyCurrentSessionEmission (probe-based, reads no ctx property). Nothing throws and nothing is skipped: a stale ctx degrades the cache_usage row to an unattributed sessionId instead. Wrapping it would DROP a row whose `message` payload is still valid, so the fix is a bounded attribution record, not a skip. Tracked in #1956.",
+		"The handler body is a total try/catch, and its only ctx reader is getStableSessionId (its own try/catch); activation-owned role classification reads closure state and its pre-session fallback is probe-based. Nothing throws and nothing is skipped: a stale ctx degrades the cache_usage row to an unattributed sessionId instead. Wrapping it would DROP a row whose `message` payload is still valid, so the fix is a bounded attribution record, not a skip. Tracked in #1956/#1996.",
 };
 
 /** One `pi.on("<event>", ...)` registration found in index.ts. */

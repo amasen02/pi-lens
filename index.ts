@@ -595,6 +595,26 @@ function activateExtension(hostPi: ExtensionAPI) {
 	// The process-global latest ctx remains only a boot-window fallback.
 	// biome-ignore lint/suspicious/noExplicitAny: heterogeneous pi event ctx shapes
 	let ownEventCtx: any;
+	// #1996 review: role belongs to THIS extension activation. A secondary can
+	// be positively identified at session_start even when its stable id is
+	// unavailable later; recomputing from process-global primary state would then
+	// misclassify its context/message_end/shutdown as primary. Closure ownership
+	// avoids a shared mutable "last session" race between sibling activations.
+	let ownedSessionRole: "primary" | "concurrent-secondary" | undefined;
+	const classifyOwnedSessionEmission = (
+		ctx: unknown,
+		sessionId: string | undefined,
+	): "primary" | "concurrent-secondary" =>
+		ownedSessionRole ?? classifyCurrentSessionEmission(ctx, sessionId);
+	const classifyOwnedSessionShutdown = (
+		ctx: unknown,
+		sessionId: string | undefined,
+	): "primary" | "secondary" =>
+		ownedSessionRole === "concurrent-secondary"
+			? "secondary"
+			: ownedSessionRole === "primary"
+				? "primary"
+				: noteSessionShutdown(ctx, sessionId);
 	// biome-ignore lint/suspicious/noExplicitAny: heterogeneous pi event ctx shapes
 	const rememberOwnEventCtx = (ctx: any): void => {
 		if (!ctx) return;
@@ -1750,6 +1770,9 @@ function activateExtension(hostPi: ExtensionAPI) {
 					// -live parent) or updateRuntimeIdentityFromCtx (which would
 					// overwrite the parent's telemetry identity).
 					const sessionStartDecision = decideSessionStart(ctx, stableSessionId);
+					ownedSessionRole = sessionStartDecision.runFullSessionStart
+						? "primary"
+						: "concurrent-secondary";
 					if (!sessionStartDecision.runFullSessionStart) {
 						dbg(
 							`session_start: concurrent secondary detected (count=${sessionStartDecision.secondaryCount}) — skipping handleSessionStart`,
@@ -2345,7 +2368,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 		// relying only on the per-record ownership filter inside
 		// handleAgentEnd. Fail-safe: any inconclusive signal classifies
 		// "primary" and runs as before.
-		const emission = classifyCurrentSessionEmission(ctx, currentSessionId);
+		const emission = classifyOwnedSessionEmission(ctx, currentSessionId);
 		if (emission === "concurrent-secondary") {
 			dbg(
 				`deferred_mutation_drain: concurrent secondary session detected — skipping (sessionId=${currentSessionId})`,
@@ -2872,7 +2895,10 @@ function activateExtension(hostPi: ExtensionAPI) {
 				return undefined;
 			}
 		})();
-		const shutdownClassification = noteSessionShutdown(ctx, stableSessionId);
+		const shutdownClassification = classifyOwnedSessionShutdown(
+			ctx,
+			stableSessionId,
+		);
 		if (shutdownClassification === "secondary") {
 			emitCacheUsageSummaryAtSessionEnd(
 				stableSessionId,
@@ -2942,7 +2968,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 				const sessionId = getStableSessionId(ctx);
 				logCacheUsage((event as { message?: unknown })?.message, dbg, {
 					sessionId,
-					sessionRole: classifyCurrentSessionEmission(ctx, sessionId),
+					sessionRole: classifyOwnedSessionEmission(ctx, sessionId),
 					turnIndex: runtime.turnIndex,
 				});
 			} catch (err) {
@@ -3014,10 +3040,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 					(event as { messages?: Array<{ role: string; content: unknown }> })
 						?.messages ?? [];
 				const prefixSessionId = getStableSessionId(ctx);
-				const sessionRole = classifyCurrentSessionEmission(
-					ctx,
-					prefixSessionId,
-				);
+				const sessionRole = classifyOwnedSessionEmission(ctx, prefixSessionId);
 				// #1938: `observeCachePrefix` still owns the unbounded, always-accurate
 				// `cache_prefix_break` signal below. Its return value used to be threaded
 				// into `observeCacheContext` as `prefixObservation`, but that field was

@@ -2,4 +2,4 @@
 section: Fixed
 ---
 
-- **Cache-miss attribution stays useful in long sessions (closes #1996)** — classify model/provider switches and split unexplained cache misses by bounded evidence reason, with fail-closed heuristic attribution and a per-session cause summary that preserves request-time and primary/secondary isolation.
+- **Cache-miss attribution stays useful in long sessions (closes #1996)** — classify full model/provider identities and split unexplained or malformed cache evidence by bounded reason, with fail-closed request hashing, activation-owned primary/secondary isolation, sanitized numeric metadata, and a per-session cause summary.

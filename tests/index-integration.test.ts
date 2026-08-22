@@ -2222,8 +2222,17 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 	it(
 		"session shutdown summarizes and clears each cache-observability role locally (#1996)",
 		async () => {
-			const emitCacheUsageSummaryAtSessionEnd = vi.fn();
-			const clearCachePrefixSession = vi.fn();
+			const order: string[] = [];
+			const emitCacheUsageSummaryAtSessionEnd = vi.fn(
+				(sessionId: string, role: string) => {
+					order.push(`summary:${sessionId}:${role}`);
+				},
+			);
+			const clearCachePrefixSession = vi.fn(
+				(sessionId: string, role: string) => {
+					order.push(`clear:${sessionId}:${role}`);
+				},
+			);
 			vi.doMock("../clients/cache-observability.js", async (importActual) => ({
 				...(await importActual<
 					typeof import("../clients/cache-observability.js")
@@ -2261,6 +2270,10 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 				"secondary-cache",
 				"concurrent-secondary",
 			);
+			expect(order).toEqual([
+				"summary:secondary-cache:concurrent-secondary",
+				"clear:secondary-cache:concurrent-secondary",
+			]);
 
 			await primary.trigger(
 				"session_shutdown",
@@ -2275,6 +2288,100 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 				"primary-cache",
 				"primary",
 			);
+			expect(order).toEqual([
+				"summary:secondary-cache:concurrent-secondary",
+				"clear:secondary-cache:concurrent-secondary",
+				"summary:primary-cache:primary",
+				"clear:primary-cache:primary",
+			]);
+		},
+		INTEGRATION_TIMEOUT_MS,
+	);
+
+	it(
+		"a missing-id secondary keeps its activation-owned role through context, usage, and shutdown (#1996 review)",
+		async () => {
+			const observeCacheContext = vi.fn();
+			const observeCachePrefix = vi.fn();
+			const logCacheUsage = vi.fn();
+			const emitCacheUsageSummaryAtSessionEnd = vi.fn();
+			const clearCachePrefixSession = vi.fn();
+			vi.doMock("../clients/cache-observability.js", async (importActual) => ({
+				...(await importActual<
+					typeof import("../clients/cache-observability.js")
+				>()),
+				observeCacheContext,
+				observeCachePrefix,
+				logCacheUsage,
+				emitCacheUsageSummaryAtSessionEnd,
+				clearCachePrefixSession,
+			}));
+			const resetLSPService = vi.fn();
+			vi.doMock("../clients/lsp/index.js", () => ({
+				getLSPService: () => ({
+					touchFile: vi.fn(),
+					getAliveClientCount: () => 0,
+					getAliveServerIds: () => [],
+				}),
+				resetLSPService,
+			}));
+
+			const { default: registerExtension } = await import("../index.js");
+			const primary = createMockPi();
+			registerExtension(primary.pi as any);
+			await primary.trigger(
+				"session_start",
+				{},
+				makeCtx({ cwd: tmpDir, sessionId: "primary-cache" }),
+			);
+
+			const secondary = createMockPi();
+			registerExtension(secondary.pi as any);
+			const secondaryCtx = makeCtx({ cwd: tmpDir, sessionId: undefined });
+			await secondary.trigger("session_start", {}, secondaryCtx);
+			resetLSPService.mockClear();
+			await secondary.trigger(
+				"context",
+				{ messages: [{ role: "user", content: "prompt" }] },
+				secondaryCtx,
+			);
+			await secondary.trigger(
+				"message_end",
+				{
+					message: {
+						role: "assistant",
+						provider: "provider",
+						model: "model",
+						usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+					},
+				},
+				secondaryCtx,
+			);
+			await secondary.trigger("session_shutdown", {}, secondaryCtx);
+
+			expect(observeCacheContext).toHaveBeenCalledWith(
+				expect.objectContaining({
+					sessionId: undefined,
+					sessionRole: "concurrent-secondary",
+				}),
+			);
+			expect(logCacheUsage).toHaveBeenCalledWith(
+				expect.anything(),
+				expect.any(Function),
+				expect.objectContaining({
+					sessionId: undefined,
+					sessionRole: "concurrent-secondary",
+				}),
+			);
+			expect(emitCacheUsageSummaryAtSessionEnd).toHaveBeenCalledWith(
+				undefined,
+				"concurrent-secondary",
+			);
+			expect(clearCachePrefixSession).toHaveBeenCalledWith(
+				undefined,
+				"concurrent-secondary",
+			);
+			expect(resetLSPService).not.toHaveBeenCalled();
 		},
 		INTEGRATION_TIMEOUT_MS,
 	);

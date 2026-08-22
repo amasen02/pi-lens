@@ -62,11 +62,18 @@ describe("cache-observability — response-side usage (#1018)", () => {
 				metadata: {
 					provider: "anthropic",
 					model: "claude-opus-4",
+					providerIdentityHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+					modelIdentityHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+					providerIdentityStatus: "complete",
+					modelIdentityStatus: "complete",
+					providerIdentityTruncated: false,
+					modelIdentityTruncated: false,
 					cacheRead: 8000,
 					cacheWrite: 512,
 					input: 1200,
 					output: 340,
 					cost: 0.037,
+					providerUsageMalformedFields: [],
 					interTurnGapMs: null,
 					gapBasis: "no-prior-turn",
 					cacheMissCause: null,
@@ -968,8 +975,71 @@ describe("cache-observability — miss attribution (#1071)", () => {
 		expect(lastUsageMetadata()).toMatchObject({
 			cacheMissCause: "unknown",
 			cacheMissKind: "low-read",
-			cacheMissUnknownReason: "no-local-explanation",
+			cacheMissUnknownReason: "malformed-provider-usage",
+			input: null,
+			providerUsageMalformedFields: ["input"],
 		});
+	});
+
+	it("distinguishes malformed cacheRead from an absent provider field", () => {
+		logCacheUsage(
+			assistantMessage({
+				usage: {
+					input: 100,
+					output: 10,
+					cacheRead: Number.NaN,
+					cacheWrite: 0,
+				},
+			}),
+			undefined,
+			{ sessionId: "attr", turnIndex: 0 },
+		);
+		expect(lastUsageMetadata()).toMatchObject({
+			cacheRead: null,
+			cacheMissCause: null,
+			cacheMissUnknownReason: "malformed-provider-usage",
+			providerUsageMalformedFields: ["cacheRead"],
+		});
+		emitCacheUsageSummaryAtSessionEnd("attr", "primary");
+		const summary = latencyEntries.find(
+			(entry) => entry.phase === "cache_usage_summary",
+		)?.metadata as Record<string, unknown>;
+		expect(summary.unknownEvidenceReasons).toMatchObject({
+			"malformed-provider-usage": 1,
+		});
+	});
+
+	it("sanitizes every logged malformed numeric field with a fixed bounded field list", () => {
+		logCacheUsage(
+			assistantMessage({
+				usage: {
+					input: Number.POSITIVE_INFINITY,
+					output: Number.NaN,
+					cacheRead: -1,
+					cacheWrite: Number.NEGATIVE_INFINITY,
+					cost: { total: Number.NaN },
+				},
+			}),
+			undefined,
+			{ sessionId: "attr", turnIndex: 0 },
+		);
+		const metadata = lastUsageMetadata();
+		expect(metadata).toMatchObject({
+			input: null,
+			output: null,
+			cacheRead: null,
+			cacheWrite: null,
+			cost: null,
+			cacheMissUnknownReason: "malformed-provider-usage",
+			providerUsageMalformedFields: [
+				"input",
+				"output",
+				"cacheRead",
+				"cacheWrite",
+				"cost.total",
+			],
+		});
+		expect(JSON.stringify(metadata)).not.toMatch(/Infinity|NaN/);
 	});
 
 	it("distinguishes a provider-reported miss despite a stable local prefix", () => {
@@ -1041,6 +1111,125 @@ describe("cache-observability — miss attribution (#1071)", () => {
 			cacheMissUnknownReason: "sequence-hash-truncated",
 		});
 	});
+
+	const incompleteContextCases = [
+		[
+			"cyclic content",
+			() => {
+				const value: Record<string, unknown> = {};
+				value.self = value;
+				return value;
+			},
+		],
+		[
+			"a throwing enumerable getter",
+			() => {
+				const value: Record<string, unknown> = {};
+				Object.defineProperty(value, "secret", {
+					enumerable: true,
+					get: () => {
+						throw new Error("unreadable");
+					},
+				});
+				return value;
+			},
+		],
+		[
+			"an unreadable proxy",
+			() =>
+				new Proxy(
+					{},
+					{
+						ownKeys: () => {
+							throw new Error("unreadable");
+						},
+					},
+				),
+		],
+	] as const;
+
+	it.each(incompleteContextCases)(
+		"fails ttl closed when context hashing sees %s",
+		(_label, make) => {
+			logUsage(8_000, 100);
+			vi.setSystemTime(BASE_MS + DEFAULT_PROVIDER_CACHE_TTL_MS);
+			observeCacheContext({
+				sessionId: "attr",
+				turnIndex: 1,
+				injectionEnabled: false,
+				existingMessages: [{ role: "user", content: make() }],
+			});
+			const contextMetadata = [...latencyEntries]
+				.reverse()
+				.find((entry) => entry.phase === "cache_context")?.metadata;
+			expect(contextMetadata?.sequenceHashIncomplete).toBe(true);
+			logUsage(0, 9_000);
+			expect(lastUsageMetadata()).toMatchObject({
+				cacheMissCause: "unknown",
+				cacheMissUnknownReason: "request-evidence-incomplete",
+			});
+		},
+	);
+
+	it.each(incompleteContextCases)(
+		"fails partial eviction closed when context hashing sees %s",
+		(_label, make) => {
+			logUsage(8_000, 100);
+			observeCacheContext({
+				sessionId: "attr",
+				turnIndex: 1,
+				injectionEnabled: false,
+				existingMessages: [{ role: "user", content: make() }],
+			});
+			const contextMetadata = [...latencyEntries]
+				.reverse()
+				.find((entry) => entry.phase === "cache_context")?.metadata;
+			expect(contextMetadata?.sequenceHashIncomplete).toBe(true);
+			logUsage(3_000, 20_000);
+			expect(lastUsageMetadata()).toMatchObject({
+				cacheMissCause: "unknown",
+				cacheMissUnknownReason: "request-evidence-incomplete",
+			});
+		},
+	);
+
+	it.each(["provider", "model"] as const)(
+		"compares the full %s identity when values differ only after the log cap",
+		(field) => {
+			const shared = "x".repeat(200);
+			const firstIdentity = `${shared}PRIVATE_SUFFIX_A`;
+			const secondIdentity = `${shared}PRIVATE_SUFFIX_B`;
+			logCacheUsage(
+				assistantMessage({
+					[field]: firstIdentity,
+					usage: { input: 100, output: 10, cacheRead: 8_000, cacheWrite: 0 },
+				}),
+				undefined,
+				{ sessionId: "attr", turnIndex: 0 },
+			);
+			const first = lastUsageMetadata();
+			observeRequest();
+			logCacheUsage(
+				assistantMessage({
+					[field]: secondIdentity,
+					usage: { input: 9_000, output: 10, cacheRead: 0, cacheWrite: 0 },
+				}),
+				undefined,
+				{ sessionId: "attr", turnIndex: 1 },
+			);
+			const second = lastUsageMetadata();
+			expect(second).toMatchObject({
+				cacheMissCause: "model-provider-changed",
+				[`${field}IdentityTruncated`]: true,
+			});
+			expect(second[field]).toBe(shared);
+			expect(second[`${field}IdentityHash`]).toMatch(/^[a-f0-9]{64}$/);
+			expect(second[`${field}IdentityHash`]).not.toBe(
+				first[`${field}IdentityHash`],
+			);
+			expect(JSON.stringify(second)).not.toContain("PRIVATE_SUFFIX_B");
+		},
+	);
 
 	it("separates missing-id primary and secondary buckets and fails correlation closed", () => {
 		logCacheUsage(usageMessage(8_000, 100), undefined, {
@@ -1265,7 +1454,9 @@ describe("cache-observability — miss attribution (#1071)", () => {
 			unknownEvidenceReasons: {
 				"no-prior-sample": 0,
 				"cache-read-unavailable": 0,
+				"malformed-provider-usage": 0,
 				"request-correlation-unavailable": 0,
+				"request-evidence-incomplete": 0,
 				"sequence-hash-truncated": 0,
 				"model-provider-unavailable": 0,
 				"provider-reported-zero-stable-prefix": 1,
