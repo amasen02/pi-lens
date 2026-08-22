@@ -212,6 +212,7 @@ import {
 import {
 	type CacheContextInjectionSlice,
 	clearCachePrefixSession,
+	emitCacheUsageSummaryAtSessionEnd,
 	logCacheUsage,
 	observeCacheContext,
 	observeCachePrefix,
@@ -2859,10 +2860,9 @@ function activateExtension(hostPi: ExtensionAPI) {
 		// #473: a concurrently-live in-process subagent session shutting down
 		// (its sibling primary — the real parent — still active) must NOT run
 		// the shared-infra teardown below: no LSP fleet shutdown, no idle-timer
-		// cancel that the parent still relies on. Only cheap/idempotent work
-		// (none here) would be safe to keep; everything in this handler today
-		// is destructive shared-infra teardown, so a secondary skips the whole
-		// body.
+		// cancel that the parent still relies on. Role-local cache observability
+		// summary/cleanup is safe before the return; all shared-infra teardown
+		// remains below and is skipped by a secondary.
 		const stableSessionId = (() => {
 			try {
 				return (
@@ -2874,6 +2874,11 @@ function activateExtension(hostPi: ExtensionAPI) {
 		})();
 		const shutdownClassification = noteSessionShutdown(ctx, stableSessionId);
 		if (shutdownClassification === "secondary") {
+			emitCacheUsageSummaryAtSessionEnd(
+				stableSessionId,
+				"concurrent-secondary",
+			);
+			clearCachePrefixSession(stableSessionId, "concurrent-secondary");
 			decrementSecondarySessionCount();
 			dbg(
 				"session_shutdown: concurrent secondary — skipping shared-infra teardown",
@@ -2886,11 +2891,11 @@ function activateExtension(hostPi: ExtensionAPI) {
 		// session_shutdown-based safety net was deliberately dropped rather
 		// than kept.
 
-		// #1018: drop this (primary) session's prefix baseline now it has ended,
-		// so its entry is reclaimed promptly instead of lingering until the LRU
-		// evicts it. Respects the #473 guard above (a concurrent-secondary
-		// shutdown returned already, so its entry is left for the LRU backstop).
-		clearCachePrefixSession(stableSessionId);
+		// #1018/#1996: emit the bounded primary cache summary, then drop this
+		// session's prefix/attribution state. The secondary path did the same for
+		// its role-local bucket before returning above.
+		emitCacheUsageSummaryAtSessionEnd(stableSessionId, "primary");
+		clearCachePrefixSession(stableSessionId, "primary");
 
 		cancelLSPIdleReset();
 		// #449 slice 1: SYNC-only deregistration (no child spawns — see the

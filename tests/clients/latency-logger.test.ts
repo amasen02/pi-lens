@@ -158,6 +158,22 @@ describe("getLastLoggedPhase (loop_block attribution, #1122/#1123)", () => {
 		});
 		expect(getLastLoggedPhase()?.phase).toBe("word_index_build");
 	});
+
+	it("does not let the cache usage session summary own stall attribution (#1996)", () => {
+		logLatency({
+			type: "phase",
+			phase: "provider_request",
+			filePath: "<pi-lens>",
+			durationMs: 5,
+		});
+		logLatency({
+			type: "phase",
+			phase: "cache_usage_summary",
+			filePath: "<pi-lens>",
+			durationMs: 0,
+		});
+		expect(getLastLoggedPhase()?.phase).toBe("provider_request");
+	});
 });
 
 describe("getRecentLoggedPhases (#1723: bounded attribution ring)", () => {

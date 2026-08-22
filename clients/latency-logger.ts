@@ -113,6 +113,10 @@ let recentPhases: Array<{ phase: string; ts: string }> = [];
  * their own work. `lsp_scanner_coverage_gap` reports the touch's elapsed time for
  * joinability. Letting any of them win `lastPhase` would attribute a `loop_block`
  * to the record instead of to the touch that is actually stalled.
+ *
+ * #1996: `cache_usage_summary` is a zero-duration session rollup over earlier
+ * usage records. It reports no new work and therefore cannot own last-phase
+ * stall attribution.
  */
 const LAST_PHASE_EXCLUDED = new Set([
 	"loop_block",
@@ -122,6 +126,7 @@ const LAST_PHASE_EXCLUDED = new Set([
 	"agent_end_deferred_mutation_drain",
 	"agent_end_deferred_mutation_requeue",
 	"session_end_bus_rollup",
+	"cache_usage_summary",
 	"lsp_aux_wait_outcome",
 	"tool_set_mutation",
 	"availability_decision",

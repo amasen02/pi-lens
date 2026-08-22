@@ -2218,4 +2218,64 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 		},
 		INTEGRATION_TIMEOUT_MS,
 	);
+
+	it(
+		"session shutdown summarizes and clears each cache-observability role locally (#1996)",
+		async () => {
+			const emitCacheUsageSummaryAtSessionEnd = vi.fn();
+			const clearCachePrefixSession = vi.fn();
+			vi.doMock("../clients/cache-observability.js", async (importActual) => ({
+				...(await importActual<
+					typeof import("../clients/cache-observability.js")
+				>()),
+				emitCacheUsageSummaryAtSessionEnd,
+				clearCachePrefixSession,
+			}));
+
+			const { default: registerExtension } = await import("../index.js");
+			const primary = createMockPi();
+			registerExtension(primary.pi as any);
+			await primary.trigger(
+				"session_start",
+				{},
+				makeCtx({ cwd: tmpDir, sessionId: "primary-cache" }),
+			);
+
+			const secondary = createMockPi();
+			registerExtension(secondary.pi as any);
+			await secondary.trigger(
+				"session_start",
+				{},
+				makeCtx({ cwd: tmpDir, sessionId: "secondary-cache" }),
+			);
+			await secondary.trigger(
+				"session_shutdown",
+				{},
+				makeCtx({ cwd: tmpDir, sessionId: "secondary-cache" }),
+			);
+			expect(emitCacheUsageSummaryAtSessionEnd).toHaveBeenCalledWith(
+				"secondary-cache",
+				"concurrent-secondary",
+			);
+			expect(clearCachePrefixSession).toHaveBeenCalledWith(
+				"secondary-cache",
+				"concurrent-secondary",
+			);
+
+			await primary.trigger(
+				"session_shutdown",
+				{},
+				makeCtx({ cwd: tmpDir, sessionId: "primary-cache" }),
+			);
+			expect(emitCacheUsageSummaryAtSessionEnd).toHaveBeenCalledWith(
+				"primary-cache",
+				"primary",
+			);
+			expect(clearCachePrefixSession).toHaveBeenCalledWith(
+				"primary-cache",
+				"primary",
+			);
+		},
+		INTEGRATION_TIMEOUT_MS,
+	);
 });

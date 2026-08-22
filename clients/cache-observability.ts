@@ -29,12 +29,14 @@
  *      flags that something (pi-lens or otherwise) broke the cache prefix. This
  *      remains a local observation, never a provider cache-miss claim.
  *
- * #1071 adds miss ATTRIBUTION on top of those three, without a new phase. Each
- * `cache_usage` record carries the inter-turn gap and a `cacheMissCause`
- * verdict, and each `cache_context` record splits a mixed injection payload by
- * contributing source. Both ride records that already fire once per turn, and
- * both derive from state this module already keeps in process — nothing reads
- * latency.log back.
+ * #1071 adds miss ATTRIBUTION on top of those three. Each `cache_usage` record
+ * carries the inter-turn gap and a `cacheMissCause` verdict, and each
+ * `cache_context` record splits a mixed injection payload by contributing
+ * source. #1996 makes every unexplained miss name the absent/conflicting
+ * evidence and emits one fixed-key `cache_usage_summary` at session shutdown.
+ * The per-turn records still ride events that already fire once per turn, and
+ * all attribution derives from bounded in-process state — nothing reads
+ * latency.log back or serializes transcript content.
  *
  * All paths are defensive: `usage` (and its fields) may be absent on older
  * hosts or non-assistant messages, so every access is guarded and the handlers
@@ -97,7 +99,19 @@ export type CacheMissCause =
 	| "ttl-expired"
 	| "prefix-broke"
 	| "partial-eviction"
+	| "model-provider-changed"
 	| "unknown";
+
+/** Why a miss could not be assigned a local cause (#1996). */
+export type CacheMissUnknownReason =
+	| "no-prior-sample"
+	| "cache-read-unavailable"
+	| "request-correlation-unavailable"
+	| "sequence-hash-truncated"
+	| "model-provider-unavailable"
+	| "provider-reported-zero-stable-prefix"
+	| "provider-reported-low-read-stable-prefix"
+	| "no-local-explanation";
 
 /** Which shape of shortfall triggered the verdict. */
 export type CacheMissKind = "zero-read" | "low-read";
@@ -114,6 +128,14 @@ interface CacheUsageContext {
 	sessionId?: string;
 	sessionRole?: "primary" | "concurrent-secondary";
 	turnIndex?: number;
+}
+
+export interface CacheUsageSessionSummary {
+	usageRecords: number;
+	cacheHits: number;
+	missObservations: number;
+	cacheMissCauses: Record<CacheMissCause, number>;
+	unknownEvidenceReasons: Record<CacheMissUnknownReason, number>;
 }
 
 /** RuntimeCoordinator's counter is process-global when sessions share a host. */
@@ -226,6 +248,10 @@ interface SessionAttributionState {
 	lastCacheRead?: number;
 	/** A `cache_prefix_break` CHANGE fired since the previous usage record. */
 	prefixBrokeSinceLastUsage: boolean;
+	/** A prefix baseline or unchanged observation was seen since the usage record. */
+	prefixStableSinceLastUsage: boolean;
+	/** A bounded context sequence hash lost content or message coverage. */
+	sequenceHashTruncatedSinceLastUsage: boolean;
 	/** Characters pi-lens injected since the previous usage record. */
 	injectedCharsSinceLastUsage: number;
 	/** Characters of transcript growth observed since the previous usage record. */
@@ -234,6 +260,44 @@ interface SessionAttributionState {
 	attributionCharsCapped: boolean;
 	/** Transcript length at the previous `context` observation. */
 	lastObservedMessageCount?: number;
+	/** Provider/model identity from the previous usage record. */
+	lastProvider?: string;
+	lastModel?: string;
+	/** Bounded process-local session summary, emitted at session shutdown. */
+	summary: CacheUsageSessionSummary;
+}
+
+function emptyCacheMissCauses(): Record<CacheMissCause, number> {
+	return {
+		"ttl-expired": 0,
+		"prefix-broke": 0,
+		"partial-eviction": 0,
+		"model-provider-changed": 0,
+		unknown: 0,
+	};
+}
+
+function emptyUnknownEvidenceReasons(): Record<CacheMissUnknownReason, number> {
+	return {
+		"no-prior-sample": 0,
+		"cache-read-unavailable": 0,
+		"request-correlation-unavailable": 0,
+		"sequence-hash-truncated": 0,
+		"model-provider-unavailable": 0,
+		"provider-reported-zero-stable-prefix": 0,
+		"provider-reported-low-read-stable-prefix": 0,
+		"no-local-explanation": 0,
+	};
+}
+
+function newCacheUsageSummary(): CacheUsageSessionSummary {
+	return {
+		usageRecords: 0,
+		cacheHits: 0,
+		missObservations: 0,
+		cacheMissCauses: emptyCacheMissCauses(),
+		unknownEvidenceReasons: emptyUnknownEvidenceReasons(),
+	};
 }
 
 const attributionBySession = new Map<string, SessionAttributionState>();
@@ -241,9 +305,12 @@ const attributionBySession = new Map<string, SessionAttributionState>();
 function newAttributionState(): SessionAttributionState {
 	return {
 		prefixBrokeSinceLastUsage: false,
+		prefixStableSinceLastUsage: false,
+		sequenceHashTruncatedSinceLastUsage: false,
 		injectedCharsSinceLastUsage: 0,
 		newTranscriptCharsSinceLastUsage: 0,
 		attributionCharsCapped: false,
+		summary: newCacheUsageSummary(),
 	};
 }
 
@@ -359,10 +426,29 @@ function estimateTokens(chars: number): number {
 	return Math.ceil(chars / CHARS_PER_ESTIMATED_TOKEN);
 }
 
+function readableTokenCount(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0
+		? value
+		: undefined;
+}
+
+function boundedIdentity(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const normalized = value.trim();
+	return normalized ? normalized.slice(0, 200) : undefined;
+}
+
+interface CacheMissVerdict {
+	kind: CacheMissKind;
+	cause: CacheMissCause;
+	unknownReason?: CacheMissUnknownReason;
+}
+
 /**
- * Classify a turn's prompt-cache shortfall. Returns `null` when there is
- * nothing to explain: no prior usage record in this session (the first turn
- * legitimately reads nothing), an unreadable `cacheRead`, or a healthy read.
+ * Classify a turn's prompt-cache shortfall. Returns `null` when no comparable
+ * miss exists: no prior readable usage record or a healthy read. The caller
+ * separately records why an unreadable/first zero sample could not be
+ * classified, so those evidence gaps remain visible in the session summary.
  *
  * Rules, in the order they are applied, each stated with the evidence behind
  * it (2026-08-21 investigation, 63 sessions, 2,288 turns, 94.2% overall hit
@@ -373,33 +459,46 @@ function estimateTokens(chars: number): number {
  *      the cause, so it outranks the timing heuristics below. The window was
  *      byte-stable throughout, so this verdict should stay rare; if it does
  *      not, #1016's fix has regressed.
- *   2. `ttl-expired` — the gap since the previous usage record reached the
- *      provider TTL threshold. The 34 zero-read turns had a median gap of 166s
- *      against 9s elsewhere, and carried 35.1% of all fresh input.
- *   3. `partial-eviction` — a non-zero but low read, where fresh input runs far
+ *   2. `model-provider-changed` — both adjacent identities were present and
+ *      differ. This is direct local evidence and outranks timing heuristics.
+ *   3. Evidence gates — heuristic causes require a REQUEST-time observation,
+ *      a complete bounded sequence hash, and adjacent provider/model identity.
+ *      Missing evidence returns a specific unknown reason; it never lets a
+ *      plausible but unproved heuristic win.
+ *   4. `ttl-expired` — a REQUEST-time gap reached the configured provider TTL.
+ *      A message-end fallback includes generation time and cannot prove this.
+ *   5. `partial-eviction` — a non-zero but low read, where fresh input runs far
  *      above the new content we measured. pi-lens injections average ~2.7
  *      estimated tokens per turn, so they cannot account for a multiple of the
  *      measured content; the remainder is provider-side eviction, typically at
  *      a context limit. Suppressed when the character accumulators were capped,
  *      because a floor estimate would manufacture the verdict.
- *   4. `unknown` — a real shortfall with no local explanation. Reported, never
- *      guessed at.
+ *   6. `unknown` — a real shortfall with no local explanation. A bounded
+ *      `cacheMissUnknownReason` names the missing or conflicting evidence;
+ *      provider behavior is never guessed.
  */
 function classifyCacheMiss(args: {
 	cacheRead: number | undefined;
 	input: number;
 	priorCacheRead: number | undefined;
 	interTurnGapMs: number | null;
+	gapBasis: CacheGapBasis;
 	ttlMs: number;
 	prefixBroke: boolean;
+	prefixStable: boolean;
+	sequenceHashTruncated: boolean;
+	stableSessionIdentity: boolean;
+	modelProviderChanged: boolean;
+	modelProviderEvidenceAvailable: boolean;
 	estimatedNewTokens: number;
 	attributionCharsCapped: boolean;
-}): { kind: CacheMissKind; cause: CacheMissCause } | null {
-	const { cacheRead, priorCacheRead } = args;
-	if (typeof cacheRead !== "number" || !Number.isFinite(cacheRead)) return null;
+}): CacheMissVerdict | null {
+	const cacheRead = readableTokenCount(args.cacheRead);
+	if (cacheRead === undefined) return null;
 	// No baseline turn in this session: a first turn reads zero because nothing
 	// is cached yet, not because anything went wrong.
-	if (typeof priorCacheRead !== "number" || !Number.isFinite(priorCacheRead)) {
+	const priorCacheRead = readableTokenCount(args.priorCacheRead);
+	if (priorCacheRead === undefined) {
 		return null;
 	}
 	let kind: CacheMissKind;
@@ -414,7 +513,48 @@ function classifyCacheMiss(args: {
 		return null;
 	}
 
+	// A missing stable session id makes every cross-event baseline ambiguous. Do
+	// not let the shared fallback bucket turn another session's evidence into a
+	// cause claim (#1996 concurrent primary/secondary invariant).
+	if (!args.stableSessionIdentity) {
+		return {
+			kind,
+			cause: "unknown",
+			unknownReason: "request-correlation-unavailable",
+		};
+	}
 	if (args.prefixBroke) return { kind, cause: "prefix-broke" };
+	if (args.modelProviderChanged) {
+		return { kind, cause: "model-provider-changed" };
+	}
+	// TTL and transcript-growth claims need the request-side context observation.
+	// A response-time fallback includes generation and can only explain why the
+	// verdict stayed unknown; it cannot establish cache expiry.
+	if (args.gapBasis !== "request-time") {
+		return {
+			kind,
+			cause: "unknown",
+			unknownReason: "request-correlation-unavailable",
+		};
+	}
+	// TTL and eviction are heuristics. They are only evidence-backed if the
+	// bounded request observation is complete and both adjacent usage records
+	// identify the same provider/model. Otherwise an unseen prompt or identity
+	// change remains a competing explanation, so classification must fail closed.
+	if (args.sequenceHashTruncated) {
+		return {
+			kind,
+			cause: "unknown",
+			unknownReason: "sequence-hash-truncated",
+		};
+	}
+	if (!args.modelProviderEvidenceAvailable) {
+		return {
+			kind,
+			cause: "unknown",
+			unknownReason: "model-provider-unavailable",
+		};
+	}
 	if (args.interTurnGapMs !== null && args.interTurnGapMs >= args.ttlMs) {
 		return { kind, cause: "ttl-expired" };
 	}
@@ -429,7 +569,54 @@ function classifyCacheMiss(args: {
 	) {
 		return { kind, cause: "partial-eviction" };
 	}
-	return { kind, cause: "unknown" };
+	if (args.prefixStable) {
+		return {
+			kind,
+			cause: "unknown",
+			unknownReason:
+				kind === "zero-read"
+					? "provider-reported-zero-stable-prefix"
+					: "provider-reported-low-read-stable-prefix",
+		};
+	}
+	return {
+		kind,
+		cause: "unknown",
+		unknownReason: "no-local-explanation",
+	};
+}
+
+function recordCacheUsageSummary(args: {
+	state: SessionAttributionState;
+	cacheRead: number | undefined;
+	priorCacheRead: number | undefined;
+	verdict: CacheMissVerdict | null;
+	unknownReason?: CacheMissUnknownReason;
+}): void {
+	const summary = args.state.summary;
+	summary.usageRecords += 1;
+	if (args.cacheRead === undefined) {
+		summary.unknownEvidenceReasons["cache-read-unavailable"] += 1;
+		return;
+	}
+	if (args.priorCacheRead === undefined) {
+		if (args.cacheRead === 0) {
+			summary.missObservations += 1;
+			summary.unknownEvidenceReasons["no-prior-sample"] += 1;
+		} else {
+			summary.cacheHits += 1;
+		}
+		return;
+	}
+	if (!args.verdict) {
+		summary.cacheHits += 1;
+		return;
+	}
+	summary.missObservations += 1;
+	summary.cacheMissCauses[args.verdict.cause] += 1;
+	if (args.verdict.cause === "unknown" && args.unknownReason) {
+		summary.unknownEvidenceReasons[args.unknownReason] += 1;
+	}
 }
 
 interface BoundedHashState {
@@ -639,6 +826,21 @@ function sessionKey(sessionId?: string): string {
 }
 
 /**
+ * A stable host session id is the only safe cross-event identity. When it is
+ * absent, keep primary and concurrent-secondary observations in separate
+ * buckets and let classification fail closed instead of allowing a secondary
+ * to overwrite the primary's baseline.
+ */
+function attributionKey(
+	sessionId?: string,
+	sessionRole?: "primary" | "concurrent-secondary",
+): string {
+	const key = sessionKey(sessionId);
+	if (key !== NO_SESSION_KEY) return key;
+	return `${sessionRole ?? "unknown"}:${key}`;
+}
+
+/**
  * Log one bounded request-side observation for every `context` call. This is
  * deliberately a separate phase from `cache_prefix_break`: it describes the
  * messages pi-lens saw and returned from its own context handler, not the final
@@ -697,10 +899,18 @@ export function observeCacheContext(args: {
 			existingMessages.length > MAX_REPORTED_MESSAGES ||
 			resultMessages.length > MAX_REPORTED_MESSAGES;
 		recordContextAttribution(
-			sessionKey(args.sessionId),
+			attributionKey(args.sessionId, args.sessionRole),
 			existingMessages,
 			sizes,
 		);
+		const state = attributionFor(
+			attributionKey(args.sessionId, args.sessionRole),
+		);
+		state.sequenceHashTruncatedSinceLastUsage ||=
+			beforeSequence.truncated ||
+			beforeSequence.contentTruncated ||
+			afterSequence.truncated ||
+			afterSequence.contentTruncated;
 
 		logLatency({
 			type: "phase",
@@ -783,28 +993,62 @@ export function logCacheUsage(
 		const u = usage as AssistantUsageLike;
 		// #1071: attribute the shortfall in-process, from state this module already
 		// keeps, so nothing re-reads latency.log.
-		const attributionKey = sessionKey(context?.sessionId);
-		const state = attributionFor(attributionKey);
+		const stateKey = attributionKey(context?.sessionId, context?.sessionRole);
+		const state = attributionFor(stateKey);
 		const nowMs = Date.now();
 		const gap = resolveInterTurnGap(state, nowMs);
 		const interTurnGapMs = gap.gapMs;
 		const ttlMs = getProviderCacheTtlMs();
+		const cacheRead = readableTokenCount(u.cacheRead);
+		const priorCacheReadValue = readableTokenCount(state.lastCacheRead);
+		const currentProvider = boundedIdentity(msg.provider);
+		const currentModel =
+			boundedIdentity(msg.responseModel) ?? boundedIdentity(msg.model);
+		const modelProviderEvidenceAvailable = Boolean(
+			currentProvider && currentModel && state.lastProvider && state.lastModel,
+		);
+		const modelProviderChanged = Boolean(
+			modelProviderEvidenceAvailable &&
+			(currentProvider !== state.lastProvider ||
+				currentModel !== state.lastModel),
+		);
 		const estimatedNewTokens = estimateTokens(
 			state.injectedCharsSinceLastUsage +
 				state.newTranscriptCharsSinceLastUsage,
 		);
 		const verdict = classifyCacheMiss({
-			cacheRead: u.cacheRead,
-			input: typeof u.input === "number" ? u.input : 0,
-			priorCacheRead: state.lastCacheRead,
+			cacheRead,
+			// Malformed/non-finite provider usage cannot prove fresh-input pressure.
+			// Normalize it to the conservative zero used by the existing missing-input
+			// path so it can never manufacture `partial-eviction`.
+			input: readableTokenCount(u.input) ?? 0,
+			priorCacheRead: priorCacheReadValue,
 			interTurnGapMs,
+			gapBasis: gap.basis,
 			ttlMs,
 			prefixBroke: state.prefixBrokeSinceLastUsage,
+			prefixStable: state.prefixStableSinceLastUsage,
+			sequenceHashTruncated: state.sequenceHashTruncatedSinceLastUsage,
+			stableSessionIdentity: sessionKey(context?.sessionId) !== NO_SESSION_KEY,
+			modelProviderChanged,
+			modelProviderEvidenceAvailable,
 			estimatedNewTokens,
 			attributionCharsCapped: state.attributionCharsCapped,
 		});
-		const priorCacheRead =
-			typeof state.lastCacheRead === "number" ? state.lastCacheRead : null;
+		const unknownReason: CacheMissUnknownReason | undefined =
+			cacheRead === undefined
+				? "cache-read-unavailable"
+				: priorCacheReadValue === undefined && cacheRead === 0
+					? "no-prior-sample"
+					: verdict?.unknownReason;
+		recordCacheUsageSummary({
+			state,
+			cacheRead,
+			priorCacheRead: priorCacheReadValue,
+			verdict,
+			unknownReason,
+		});
+		const priorCacheRead = priorCacheReadValue ?? null;
 		const injectedCharsSinceLastTurn = state.injectedCharsSinceLastUsage;
 		const newTranscriptCharsSinceLastTurn =
 			state.newTranscriptCharsSinceLastUsage;
@@ -816,11 +1060,12 @@ export function logCacheUsage(
 		// Clear the stored one rather than keeping it: the next turn's gap would be
 		// one turn long while its baseline was two turns old, and a verdict built
 		// on that mismatch is worse than no verdict (#1071 review round 1, F4).
-		state.lastCacheRead =
-			typeof u.cacheRead === "number" && Number.isFinite(u.cacheRead)
-				? u.cacheRead
-				: undefined;
+		state.lastCacheRead = cacheRead;
+		state.lastProvider = currentProvider;
+		state.lastModel = currentModel;
 		state.prefixBrokeSinceLastUsage = false;
+		state.prefixStableSinceLastUsage = false;
+		state.sequenceHashTruncatedSinceLastUsage = false;
 		state.injectedCharsSinceLastUsage = 0;
 		state.newTranscriptCharsSinceLastUsage = 0;
 		state.attributionCharsCapped = false;
@@ -834,8 +1079,8 @@ export function logCacheUsage(
 			phase: "cache_usage",
 			durationMs: 0,
 			metadata: {
-				provider: typeof msg.provider === "string" ? msg.provider : undefined,
-				model: typeof msg.model === "string" ? msg.model : undefined,
+				provider: currentProvider,
+				model: currentModel,
 				cacheRead: u.cacheRead,
 				cacheWrite: u.cacheWrite,
 				input: u.input,
@@ -851,6 +1096,8 @@ export function logCacheUsage(
 				// the explicit no-local-explanation verdict.
 				cacheMissCause: verdict?.cause ?? null,
 				cacheMissKind: verdict?.kind ?? null,
+				cacheMissUnknownReason: unknownReason ?? null,
+				modelProviderChanged,
 				cacheTtlThresholdMs: ttlMs,
 				priorCacheRead,
 				injectedCharsSinceLastTurn,
@@ -927,9 +1174,10 @@ const MAX_TRACKED_SESSIONS = 32;
 const prefixHashBySession = new Map<string, string>();
 
 /**
- * Bucket key used when no session id is available (undefined/empty). Degrades
- * gracefully to the old single-var semantics — one shared baseline — rather than
- * throwing or dropping the signal.
+ * Reported key used when no session id is available (undefined/empty). Internal
+ * attribution additionally separates primary and concurrent-secondary roles;
+ * neither role may overwrite the other's baseline when stable identity is
+ * absent.
  */
 const NO_SESSION_KEY = "<no-session>";
 
@@ -962,10 +1210,10 @@ function recordSessionHash(key: string, hash: string): void {
  * baseline. (`runtime.telemetrySessionId` cannot be used here: per the #473
  * guard a concurrent secondary skips `updateRuntimeIdentityFromEvent`, so that
  * process-global singleton stays pinned to the PARENT — it would collapse
- * parent and subagent onto one baseline.) Residual limitation: if the host ever
- * does NOT supply a stable id, all such sessions collapse onto `NO_SESSION_KEY`
- * and behave like the old single-var (a concurrent subagent could then still
- * cross-contaminate) — accepted as graceful degradation, not silently perfect.
+ * parent and subagent onto one baseline.) If the host does NOT supply a stable
+ * id, primary and secondary roles still use separate fallback buckets, but
+ * multiple same-role sessions cannot be correlated. Miss attribution therefore
+ * fails closed with `request-correlation-unavailable`.
  *
  * Does nothing on an empty transcript (nothing to anchor a prefix to yet).
  */
@@ -980,13 +1228,16 @@ export function observeCachePrefix(
 		if (!messages || messages.length === 0) return "empty";
 		const first = messages[0];
 		if (!first || typeof first !== "object") return "empty";
-		const key = sessionKey(sessionId);
+		const key = attributionKey(sessionId, sessionRole);
+		const reportedSessionId = sessionKey(sessionId);
 		const currentHash = hashFirstMessage(first);
 		const previousHash = prefixHashBySession.get(key);
+		const state = attributionFor(key);
 		if (previousHash === undefined) {
 			// Baseline: record this session's starting prefix so a later break has a
 			// reference point in the log. `previousHash: null` marks the baseline.
 			recordSessionHash(key, currentHash);
+			state.prefixStableSinceLastUsage = true;
 			logLatency({
 				type: "phase",
 				filePath: "<pi-lens>",
@@ -999,7 +1250,7 @@ export function observeCachePrefix(
 					previousHash: null,
 					currentHash,
 					baseline: true,
-					sessionId: key,
+					sessionId: reportedSessionId,
 					sessionRole,
 				},
 			});
@@ -1008,7 +1259,8 @@ export function observeCachePrefix(
 		if (currentHash !== previousHash) {
 			// #1071: arm the direct-cause flag the next `cache_usage` verdict reads.
 			// A locally observed prefix change outranks the timing heuristics.
-			attributionFor(key).prefixBrokeSinceLastUsage = true;
+			state.prefixBrokeSinceLastUsage = true;
+			state.prefixStableSinceLastUsage = false;
 			logLatency({
 				type: "phase",
 				filePath: "<pi-lens>",
@@ -1020,10 +1272,13 @@ export function observeCachePrefix(
 						: { turnIndex, turnScope: PROCESS_TURN_SCOPE }),
 					previousHash,
 					currentHash,
-					sessionId: key,
+					sessionId: reportedSessionId,
 					sessionRole,
 				},
 			});
+		}
+		if (currentHash === previousHash) {
+			state.prefixStableSinceLastUsage = true;
 		}
 		// Refresh recency (and update the stored hash after a break) so an active
 		// session stays warm in the LRU and isn't evicted while still in use.
@@ -1036,18 +1291,53 @@ export function observeCachePrefix(
 }
 
 /**
- * Drop a single session's prefix baseline. Called from the `session_shutdown`
- * handler (primary path only — the concurrent-secondary guard there returns
- * first, and the LRU cap backstops any secondary entry left behind) so an ended
- * conversation's entry is reclaimed promptly rather than only when the LRU
- * evicts it. Idempotent and never throws.
+ * Drop a single session's prefix baseline and attribution state. Called from
+ * both role-specific `session_shutdown` paths so an ended conversation is
+ * reclaimed promptly rather than only when the LRU evicts it. Idempotent and
+ * never throws.
  */
-export function clearCachePrefixSession(sessionId?: string): void {
-	const key = sessionKey(sessionId);
+export function clearCachePrefixSession(
+	sessionId?: string,
+	sessionRole?: "primary" | "concurrent-secondary",
+): void {
+	const key = attributionKey(sessionId, sessionRole);
 	prefixHashBySession.delete(key);
 	// The miss-attribution state has the same lifetime and the same reason to be
 	// reclaimed at session end; leaving it would let a reused session id inherit
 	// a stale gap baseline and a stale prefix-break flag.
+	attributionBySession.delete(key);
+}
+
+/**
+ * Emit one bounded session summary and retire its attribution state. The
+ * summary contains fixed-key counters only; it never serializes transcript or
+ * context content. A session with no usage records emits nothing.
+ */
+export function emitCacheUsageSummaryAtSessionEnd(
+	sessionId?: string,
+	sessionRole?: "primary" | "concurrent-secondary",
+): void {
+	const key = attributionKey(sessionId, sessionRole);
+	const state = attributionBySession.get(key);
+	if (!state || state.summary.usageRecords === 0) return;
+	logLatency({
+		type: "phase",
+		filePath: "<pi-lens>",
+		phase: "cache_usage_summary",
+		durationMs: 0,
+		metadata: {
+			version: 1,
+			sessionId: sessionKey(sessionId),
+			sessionRole,
+			usageRecords: state.summary.usageRecords,
+			cacheHits: state.summary.cacheHits,
+			missObservations: state.summary.missObservations,
+			cacheMissCauses: { ...state.summary.cacheMissCauses },
+			unknownEvidenceReasons: {
+				...state.summary.unknownEvidenceReasons,
+			},
+		},
+	});
 	attributionBySession.delete(key);
 }
 

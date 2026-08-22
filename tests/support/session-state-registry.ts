@@ -768,7 +768,7 @@ export const EXEMPT_SESSION_STATE_FILES: Readonly<Record<string, string>> = {
 	"dispatch/lazy.ts": "the lazy dispatch-integration import cell",
 	"extension-log.ts": "console-method guard installation",
 	"cache-observability.ts":
-		"cache-prefix observation and, since #1071, per-session miss-attribution state; both are keyed by session id, bounded by the same LRU cap, and cleared per session by their own caller (clearCachePrefixSession)",
+		"cache-prefix observation and per-session miss-attribution/summary state; both maps are role-separated when session identity is absent, bounded by the same LRU cap, summarized then cleared on each role-specific shutdown",
 
 	// --- Turn- or call-scoped working state: shorter-lived than a session, so
 	// a session_start reset would be redundant, not missing. ---
