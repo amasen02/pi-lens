@@ -1589,6 +1589,18 @@ non-light behavior in a detected subagent child, either vocabulary),
 
 ## Runner process model
 
+Expected runner skips must stay distinct from clean success and runner failure.
+Return a bounded machine-readable `skipReason` on `RunnerResult` and carry it
+through the existing runner latency record. Do not emit an extension error for
+an expected policy skip; reserve failure classification and degradation records
+for a tool that did not run or did not produce a usable result. Extend the
+closed `RUNNER_SKIP_REASONS` taxonomy when adding a new expected-skip reason;
+the dispatcher rejects unknown runtime values from latency metadata. Oxlint's
+`no-files-matched` reason requires its captured exit-1 banner plus an empty,
+known-field JSON summary and empty stderr; `number_of_files: 0` alone is not
+evidence of an expected skip, and rejected lookalikes retain shared
+parsed-nothing failure telemetry.
+
 - **Use `safeSpawnAsync()` for all subprocess work** in hook/dispatch/install paths. The sync `safeSpawn()` is deprecated, blocks the Node event loop, and is now reachable only from the cached `TestRunnerClient.detectRunner` `which pytest` probe. Don't add new sync `safeSpawn` callers.
 - **The hot per-edit path is the dispatch runners** (`clients/dispatch/runners/*`), not the legacy per-tool client classes (`biome-client`, `ruff-client`, `rust-client`, `ast-grep-client`, …). Those classes historically carried a *parallel sync surface* (`checkFile`/`fixFile`/`isAvailable`/`findCargoPath`/…) that the async runners superseded; #197 found almost all of it **dead** and deleted ~1600 lines. **Lesson: when you find a sync client method, grep its real callers before "converting" it — the answer is usually "delete," and the live path already has an `*Async` twin** (`fixFileAsync`, `ensureAvailable`, `runTestFileAsync`, `tempScanAsync`, `findGoPathAsync`).
 - **Ambient turn abort signal (#197):** `safeSpawnAsync` defaults its `AbortSignal` to a module-level ambient signal (`setAmbientAbortSignal` in `clients/safe-spawn.ts`). The lifecycle handlers (`tool_result`, `agent_end`, `turn_end`) publish pi's `ctx.signal` at entry and clear it in `finally`, so an Esc/interrupt kills in-flight linter/format/type-check children (process-tree kill on Windows) without threading a signal through every call site. The signal is captured at spawn time, so clearing it only affects future spawns. Pass `ignoreAmbientSignal: true` for **installs** (gem/go/dotnet/rustup) so they run to completion even if the turn is interrupted — matching the old uncancellable sync behaviour; an explicit `options.signal` always wins.

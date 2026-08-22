@@ -44,6 +44,7 @@ import { getToolPlan } from "./plan.js";
 import { resolveRunnerPath } from "./runner-context.js";
 import { applyRulePolicy, rulePolicyMapFromConfig } from "./rule-policy.js";
 import { getToolProfile } from "./tool-profile.js";
+import { isRunnerSkipReason } from "./types.js";
 import type {
 	Diagnostic,
 	DispatchContext,
@@ -54,6 +55,7 @@ import type {
 	RunnerGroup,
 	RunnerRegistry as RunnerRegistryContract,
 	RunnerResult,
+	RunnerSkipReason,
 } from "./types.js";
 import { formatDiagnostics } from "./utils/format-utils.js";
 
@@ -493,6 +495,7 @@ export interface RunnerLatency {
 	status: "succeeded" | "failed" | "skipped" | "when_skipped";
 	diagnosticCount: number;
 	semantic: string;
+	skipReason?: RunnerSkipReason;
 	unconfirmedServerIds?: readonly string[];
 }
 
@@ -777,6 +780,13 @@ async function runGroup(
 		onRunnerResult?.(runnerId, result);
 		const runnerEnd = Date.now();
 		const duration = runnerEnd - runnerStart;
+		// Runner definitions are a typed API, but embedders/plugins can still
+		// return untyped objects at runtime. Admit only the closed taxonomy and
+		// only on actual skips so free text cannot enter durable latency metadata.
+		const skipReason =
+			result.status === "skipped" && isRunnerSkipReason(result.skipReason)
+				? result.skipReason
+				: undefined;
 
 		latencies.push({
 			runnerId,
@@ -786,6 +796,9 @@ async function runGroup(
 			status: result.status,
 			diagnosticCount: result.diagnostics.length,
 			semantic: result.semantic ?? semantic,
+			...(skipReason !== undefined && {
+				skipReason,
+			}),
 			...(result.unconfirmedServerIds !== undefined && {
 				unconfirmedServerIds: result.unconfirmedServerIds,
 			}),
@@ -814,7 +827,9 @@ async function runGroup(
 							failureKind: result.failureKind,
 							failureMessage: result.failureMessage,
 						}
-					: undefined,
+					: skipReason
+						? { skipReason }
+						: undefined,
 		});
 		recordRunner(
 			ctx.filePath,

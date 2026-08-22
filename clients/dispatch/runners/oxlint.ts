@@ -26,7 +26,18 @@ import {
 	resolveToolCommand,
 	resolveToolCommandWithInstallFallback,
 } from "./utils/runner-helpers.js";
-import { finishParsedRun } from "./utils/tool-failure.js";
+import { finishParsedRun, parseToolRun } from "./utils/tool-failure.js";
+
+const OXLINT_NO_FILES = Symbol("oxlint-no-files");
+const OXLINT_NO_FILES_BANNER =
+	"No files found to lint. Please check your paths and ignore patterns.";
+const OXLINT_NO_FILES_REPORT_KEYS = new Set([
+	"diagnostics",
+	"number_of_files",
+	"number_of_rules",
+	"threads_count",
+	"start_time",
+]);
 
 function resolveLocalVp(cwd: string): string | null {
 	const isWin = process.platform === "win32";
@@ -107,13 +118,32 @@ const oxlintRunner: RunnerDefinition = {
 		// unavailable.
 		const stdout = result.stdout ?? "";
 		const stderr = result.stderr ?? "";
-		let diagnostics = parseOxlintJson(stdout, ctx.filePath);
-		if (diagnostics.length === 0 && stdout.length > 0) {
-			diagnostics = parseOxlintUnix(stdout + stderr, ctx.filePath);
-		}
+		const parsedOutput = stdout + stderr;
+		// #1994's shared gate classifies invocation and parsed-output failures.
+		// The private marker lets its parser recognize oxlint's one legitimate
+		// nonzero/zero-diagnostic shape without recording a parsed-nothing
+		// degradation. It never escapes this runner. Because parseToolRun checks
+		// the process outcome before invoking the parser, a timed-out or killed
+		// process retaining partial no-files stdout still follows the failure path.
+		const parsedRun = parseToolRun<Diagnostic | typeof OXLINT_NO_FILES>(
+			"oxlint",
+			{ result, output: parsedOutput },
+			() => {
+				let parsed = parseOxlintJson(stdout, ctx.filePath);
+				if (parsed.length === 0 && stdout.length > 0) {
+					parsed = parseOxlintUnix(parsedOutput, ctx.filePath);
+				}
+				return parsed.length === 0 &&
+					isExpectedOxlintNoFiles(result.status, stdout, stderr)
+					? [OXLINT_NO_FILES]
+					: parsed;
+			},
+			{ parseOutput: parsedOutput },
+		);
+		if (parsedRun.skipped) return parsedRun.skipped;
 
-		if (diagnostics.length === 0) {
-			// Read BEFORE anything else — real captured bytes show oxlint exits
+		if (parsedRun.diagnostics.includes(OXLINT_NO_FILES)) {
+			// Real captured bytes show oxlint exits
 			// 1 with "No files found" + number_of_files: 0 when a config excludes
 			// the target, so "nonzero exit" alone cannot mean "unreadable report
 			// of problems" until the no-files shape is ruled out.
@@ -122,27 +152,16 @@ const oxlintRunner: RunnerDefinition = {
 			// file reports the same empty diagnostics array a clean file does.
 			// "succeeded"/"none" would say "we checked, it's clean"; this file
 			// was never checked at all.
-			if (parseOxlintFileCount(stdout) === 0) {
-				ctx.log(
-					"oxlint: 0 files matched (ignorePatterns/nested config excluded this file) — skipping, not reporting clean",
-				);
-				return { status: "skipped", diagnostics: [], semantic: "none" };
-			}
-			// Nonzero exit WITH output that parsed to nothing (and files WERE
-			// matched) is an unreadable report of problems, never clean (#1839).
-			if (
-				(result.status ?? 0) !== 0 &&
-				(stdout.length > 0 || stderr.length > 0)
-			) {
-				return finishParsedRun({
-					tool: "oxlint",
-					ctx,
-					result,
-					diagnostics,
-				});
-			}
-			return { status: "succeeded", diagnostics: [], semantic: "none" };
+			return {
+				status: "skipped",
+				diagnostics: [],
+				semantic: "none",
+				skipReason: "no-files-matched",
+			};
 		}
+		const diagnostics = parsedRun.diagnostics.filter(
+			(diagnostic): diagnostic is Diagnostic => diagnostic !== OXLINT_NO_FILES,
+		);
 
 		// A warning-only result on exit 0 is oxlint's normal outcome, not a
 		// failure: exit 0 means nothing hit ERROR severity. `status: "failed"`
@@ -191,34 +210,50 @@ interface OxlintJsonReport {
 }
 
 /**
- * `number_of_files: 0` is oxlint's own signal that its config (nested
- * discovery walks up from `ctx.filePath` and stops at the NEAREST
- * `.oxlintrc.json`/`ignorePatterns`, not necessarily the repo root's) excluded
- * this file entirely — "No files found to lint." That report has the SAME
- * empty `diagnostics` array a genuinely clean file produces, so without
- * reading this field, config-excluded and clean are indistinguishable (the
- * AGENTS.md empty-result invariant). Returns `undefined` when the field is
- * absent or the JSON did not parse — callers must not treat that as zero.
+ * Recognize only oxlint's captured expected no-files envelope. The numeric
+ * field alone is not a verdict: config errors can also serialize
+ * `number_of_files: 0`, and stderr accompanying an otherwise familiar stdout
+ * means the invocation did not produce the clean expected-policy outcome.
  *
  * Real oxlint 1.79.0 prints "No files found to lint. Please check your paths
- * and ignore patterns." to STDOUT BEFORE the JSON report in this exact case —
- * confirmed against a real capture (#1985 review round 2), not assumed. An
- * earlier version of this function trusted `stdout.trim().startsWith("{")`
- * and bailed on that banner line every time, so the guard this function
- * exists for never actually fired in production. Finding the first `{` and
- * parsing from there survives the banner; a raw string with no `{` at all
- * (a crash, a wholly different error format) still returns `undefined`.
+ * and ignore patterns." to stdout before a JSON summary, exits 1, emits an
+ * empty diagnostics array, and leaves stderr empty. Unknown JSON fields fail
+ * closed so an error/message payload cannot borrow the expected skip merely
+ * by also setting the file count to zero. Rejected lookalikes continue through
+ * `parseToolRun`, preserving #1994 parsed-nothing telemetry.
  */
-function parseOxlintFileCount(raw: string): number | undefined {
-	const jsonStart = raw.indexOf("{");
-	if (jsonStart === -1) return undefined;
+function isExpectedOxlintNoFiles(
+	status: number | null | undefined,
+	stdout: string,
+	stderr: string,
+): boolean {
+	if (status !== 1 || stderr.trim().length > 0) return false;
+	const jsonStart = stdout.indexOf("{");
+	if (jsonStart === -1) return false;
+	if (stdout.slice(0, jsonStart).trim() !== OXLINT_NO_FILES_BANNER)
+		return false;
 	try {
-		const parsed = JSON.parse(raw.slice(jsonStart)) as OxlintJsonReport;
-		return typeof parsed.number_of_files === "number"
-			? parsed.number_of_files
-			: undefined;
+		const parsed = JSON.parse(stdout.slice(jsonStart)) as unknown;
+		if (
+			typeof parsed !== "object" ||
+			parsed === null ||
+			Array.isArray(parsed)
+		) {
+			return false;
+		}
+		const report = parsed as Record<string, unknown>;
+		if (
+			Object.keys(report).some((key) => !OXLINT_NO_FILES_REPORT_KEYS.has(key))
+		) {
+			return false;
+		}
+		return (
+			report.number_of_files === 0 &&
+			Array.isArray(report.diagnostics) &&
+			report.diagnostics.length === 0
+		);
 	} catch {
-		return undefined;
+		return false;
 	}
 }
 

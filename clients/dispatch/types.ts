@@ -141,6 +141,15 @@ export interface RunnerDefinition {
 	run(ctx: DispatchContext): Promise<RunnerResult>;
 }
 
+/** Closed telemetry taxonomy for expected runner skips. */
+export const RUNNER_SKIP_REASONS = ["no-files-matched"] as const;
+export type RunnerSkipReason = (typeof RUNNER_SKIP_REASONS)[number];
+
+/** Runtime guard for untyped/plugin-provided runner results. */
+export function isRunnerSkipReason(value: unknown): value is RunnerSkipReason {
+	return RUNNER_SKIP_REASONS.some((reason) => reason === value);
+}
+
 export interface RunnerResult {
 	status: "succeeded" | "failed" | "skipped";
 	/** Diagnostics found */
@@ -160,6 +169,8 @@ export interface RunnerResult {
 	failureKind?: string;
 	/** Optional short human-readable detail for the failure (truncated). */
 	failureMessage?: string;
+	/** Bounded machine-readable reason when status is an expected skip. */
+	skipReason?: RunnerSkipReason;
 	/** Correlated scanner ids whose findings are absent from this result. */
 	unconfirmedServerIds?: readonly string[];
 }
