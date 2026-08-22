@@ -1111,6 +1111,9 @@ export function logCacheUsage(
 		if (msg.role !== "assistant") return;
 		const usage = msg.usage;
 		if (!usage || typeof usage !== "object") return;
+		// SAFETY: `usage` is verified non-null object above; widening to an
+		// indexable record is only so the numeric-evidence readers can probe
+		// each field defensively. Every read re-validates its own type.
 		const usageRecord = usage as unknown as Record<string, unknown>;
 		// #1071: attribute the shortfall in-process, from state this module already
 		// keeps, so nothing re-reads latency.log.
@@ -1151,20 +1154,23 @@ export function logCacheUsage(
 		const providerUsageMalformed = malformedProviderUsageFields.length > 0;
 		const cacheRead = cacheReadEvidence.value;
 		const priorCacheReadValue = readableTokenCount(state.lastCacheRead);
+		// SAFETY: `msg` passed the AssistantMessageLike role check above; the
+		// record view backs only the guarded identity-field probes below, each
+		// re-validated by `identityEvidence` at its own boundary.
 		const messageRecord = msg as unknown as Record<string, unknown>;
-		const safeMessageField = (key: string): unknown => {
+		const safeMessageField = (key: string): IdentityEvidence => {
 			try {
-				return messageRecord[key];
+				return identityEvidence(messageRecord[key]);
 			} catch {
-				return undefined;
+				return { status: "unavailable" };
 			}
 		};
-		const currentProvider = identityEvidence(safeMessageField("provider"));
-		const responseModel = identityEvidence(safeMessageField("responseModel"));
+		const currentProvider = safeMessageField("provider");
+		const responseModel = safeMessageField("responseModel");
 		const currentModel =
 			responseModel.hash !== undefined
 				? responseModel
-				: identityEvidence(safeMessageField("model"));
+				: safeMessageField("model");
 		const modelProviderEvidenceAvailable = Boolean(
 			currentProvider.hash &&
 			currentModel.hash &&
