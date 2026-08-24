@@ -40,6 +40,7 @@ type MockRenameClient = {
 	closeDocument: ReturnType<typeof vi.fn>;
 	notify: { open: ReturnType<typeof vi.fn> };
 	willRenameFiles: ReturnType<typeof vi.fn>;
+	getOperationSupport: ReturnType<typeof vi.fn>;
 	didRenameFiles: ReturnType<typeof vi.fn>;
 };
 
@@ -52,6 +53,7 @@ function makeClient(root: string): MockRenameClient {
 		closeDocument: vi.fn(async () => undefined),
 		notify: { open: vi.fn(async () => undefined) },
 		willRenameFiles: vi.fn(async () => null),
+		getOperationSupport: vi.fn(() => ({ willRenameFiles: true })),
 		didRenameFiles: vi.fn(async () => undefined),
 	};
 }

@@ -78,6 +78,8 @@ describe("LSP Client Integration", () => {
 		expect(support.documentSymbol).toBe(true);
 		expect(support.workspaceSymbol).toBe(true);
 		expect(support.codeAction).toBe(true);
+		expect(support.codeActionResolve).toBe(true);
+		expect(support.willRenameFiles).toBe(false);
 		expect(support.callHierarchy).toBe(false);
 	});
 
@@ -212,6 +214,122 @@ describe("LSP Client Integration", () => {
 		await client!.shutdown();
 		expect(client!.isAlive()).toBe(false);
 	});
+});
+
+describe("LSP Client Integration — nested capability gates (#1971)", () => {
+	const capabilityCases = [
+		{ name: "absent", env: {}, supported: false },
+		{ name: "false", env: { FAKE_LSP_WILL_RENAME: "false" }, supported: false },
+		{
+			name: "malformed",
+			env: { FAKE_LSP_WILL_RENAME: "malformed" },
+			supported: false,
+		},
+		{ name: "present", env: { FAKE_LSP_WILL_RENAME: "true" }, supported: true },
+	] as const;
+
+	it.each(capabilityCases)(
+		"sends workspace/willRenameFiles only when nested capability is $name",
+		async ({ env, supported }) => {
+			const proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+				cwd: process.cwd(),
+				env: {
+					...process.env,
+					...env,
+					FAKE_LSP_ECHO_REQUEST_METHODS: "1",
+				},
+			});
+			const client = await createLSPClient({
+				serverId: "fake-rename-capability",
+				process: proc,
+				root: process.cwd(),
+			});
+			const received: string[] = [];
+			client.connection.onNotification(
+				"$/test/requestReceived",
+				(params: { method: string }) => {
+					received.push(params.method);
+				},
+			);
+			try {
+				const result = await client.willRenameFiles(
+					path.join(process.cwd(), "old.ts"),
+					path.join(process.cwd(), "new.ts"),
+				);
+				await new Promise((resolve) => setImmediate(resolve));
+				expect(client.getOperationSupport().willRenameFiles).toBe(supported);
+				expect(result).toBeNull();
+				expect(received).toEqual(
+					supported ? ["workspace/willRenameFiles"] : [],
+				);
+			} finally {
+				await client.shutdown();
+				await stopLSP(proc);
+			}
+		},
+	);
+
+	const resolveCases = [
+		{
+			name: "absent",
+			env: { FAKE_LSP_NO_CODE_ACTION_RESOLVE: "1" },
+			supported: false,
+		},
+		{
+			name: "false",
+			env: { FAKE_LSP_CODE_ACTION_PROVIDER: "false" },
+			supported: false,
+		},
+		{
+			name: "malformed",
+			env: { FAKE_LSP_CODE_ACTION_PROVIDER: "malformed" },
+			supported: false,
+		},
+		{ name: "present", env: {}, supported: true },
+	] as const;
+
+	it.each(resolveCases)(
+		"sends codeAction/resolve only when resolveProvider is $name",
+		async ({ env, supported }) => {
+			const proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+				cwd: process.cwd(),
+				env: {
+					...process.env,
+					...env,
+					FAKE_LSP_ECHO_REQUEST_METHODS: "1",
+				},
+			});
+			const client = await createLSPClient({
+				serverId: "fake-code-action-capability",
+				process: proc,
+				root: process.cwd(),
+			});
+			const received: string[] = [];
+			client.connection.onNotification(
+				"$/test/requestReceived",
+				(params: { method: string }) => {
+					received.push(params.method);
+				},
+			);
+			try {
+				const filePath = path.join(process.cwd(), "resolve.ts");
+				await client.notify.open(filePath, "greet();", "typescript");
+				const actions = await client.codeAction(filePath, 0, 0, 0, 5);
+				await new Promise((resolve) => setImmediate(resolve));
+				expect(client.getOperationSupport().codeActionResolve).toBe(supported);
+				if (supported) expect(actions[0]?.edit).toBeDefined();
+				else expect(actions[0]?.edit).toBeUndefined();
+				expect(received).toEqual(
+					supported
+						? ["textDocument/codeAction", "codeAction/resolve"]
+						: ["textDocument/codeAction"],
+				);
+			} finally {
+				await client.shutdown();
+				await stopLSP(proc);
+			}
+		},
+	);
 });
 
 describe("LSP Client Integration — cold start", () => {

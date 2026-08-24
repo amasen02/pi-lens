@@ -26,7 +26,9 @@ const NO_SUPPORT: LSPOperationSupport = {
 	documentSymbol: false,
 	workspaceSymbol: false,
 	codeAction: false,
+	codeActionResolve: false,
 	rename: false,
+	willRenameFiles: false,
 	implementation: false,
 	callHierarchy: false,
 };

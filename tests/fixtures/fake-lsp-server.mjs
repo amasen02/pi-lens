@@ -121,6 +121,22 @@ function handle(raw) {
 	// timeout kill + 2s SIGKILL-backstop path (#1114).
 	if (data.method === "initialize") {
 		if (process.env.FAKE_LSP_IGNORE_INITIALIZE === "1") return;
+		const codeActionProvider =
+			process.env.FAKE_LSP_CODE_ACTION_PROVIDER === "false"
+				? { resolveProvider: false }
+				: process.env.FAKE_LSP_CODE_ACTION_PROVIDER === "malformed"
+					? { resolveProvider: "yes" }
+					: process.env.FAKE_LSP_NO_CODE_ACTION_RESOLVE === "1"
+						? {}
+						: { resolveProvider: true };
+		const workspaceFileOperations =
+			process.env.FAKE_LSP_WILL_RENAME === "true"
+				? { willRename: true }
+				: process.env.FAKE_LSP_WILL_RENAME === "false"
+					? { willRename: false }
+					: process.env.FAKE_LSP_WILL_RENAME === "malformed"
+						? { willRename: "yes" }
+						: undefined;
 		send({
 			jsonrpc: "2.0",
 			id: data.id,
@@ -156,7 +172,10 @@ function handle(raw) {
 					...(process.env.FAKE_LSP_NO_WORKSPACE_SYMBOL === "1"
 						? {}
 						: { workspaceSymbolProvider: true }),
-					codeActionProvider: { resolveProvider: true },
+					codeActionProvider,
+					...(workspaceFileOperations
+						? { workspace: { fileOperations: workspaceFileOperations } }
+						: {}),
 					executeCommandProvider: {
 						commands: ["fake.doThing", "fake.applyEdit"],
 					},
@@ -168,6 +187,17 @@ function handle(raw) {
 			},
 		});
 		return;
+	}
+
+	if (
+		process.env.FAKE_LSP_ECHO_REQUEST_METHODS === "1" &&
+		data.id !== undefined
+	) {
+		send({
+			jsonrpc: "2.0",
+			method: "$/test/requestReceived",
+			params: { method: data.method },
+		});
 	}
 
 	// Ignore notifications without id
@@ -411,6 +441,11 @@ function handle(raw) {
 					],
 			},
 		});
+		return;
+	}
+
+	if (data.method === "workspace/willRenameFiles") {
+		send({ jsonrpc: "2.0", id: data.id, result: null });
 		return;
 	}
 

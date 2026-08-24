@@ -15,7 +15,10 @@ import * as os from "node:os";
 import { pathToFileURL } from "node:url";
 import { emitBounded } from "../bounded-telemetry.js";
 import { withTimeout } from "../deadline-utils.js";
-import { incrementDegradationCount } from "../degradation-ledger.js";
+import {
+	incrementDegradationCount,
+	recordDegradationOnce,
+} from "../degradation-ledger.js";
 import type { MessageConnection } from "../deps/vscode-jsonrpc.js";
 // vscode-jsonrpc v9 ships an `exports` map exposing the Node entry as the
 // `./node` subpath (no `.js`); the old `/node.js` file path no longer resolves.
@@ -213,7 +216,11 @@ export interface LSPOperationSupport {
 	documentSymbol: boolean;
 	workspaceSymbol: boolean;
 	codeAction: boolean;
+	/** `codeActionProvider.resolveProvider === true` at initialize. */
+	codeActionResolve: boolean;
 	rename: boolean;
+	/** `workspace.fileOperations.willRename === true` at initialize. */
+	willRenameFiles: boolean;
 	implementation: boolean;
 	callHierarchy: boolean;
 }
@@ -4445,6 +4452,14 @@ async function resolveCodeActionBestEffort(
 			),
 		};
 	}
+	if (!state.operationSupport.codeActionResolve) {
+		recordDegradationOnce({
+			kind: "lsp-capability-skip",
+			subject: `${state.serverId}:codeAction/resolve`,
+			reason: "server did not advertise codeActionProvider.resolveProvider",
+		});
+		return action;
+	}
 	let resolved: LSPCodeAction | null | undefined;
 	try {
 		resolved = await withTimeout(
@@ -5165,6 +5180,16 @@ export async function createLSPClient(options: {
 		closeDocument: (filePath) => closeDocument(state, filePath),
 
 		async willRenameFiles(oldFilePath, newFilePath) {
+			if (!isClientAlive(state)) return null;
+			if (!state.operationSupport.willRenameFiles) {
+				recordDegradationOnce({
+					kind: "lsp-capability-skip",
+					subject: `${state.serverId}:workspace/willRenameFiles`,
+					reason:
+						"server did not advertise workspace.fileOperations.willRename",
+				});
+				return null;
+			}
 			const result = await navRequest<LSPWorkspaceEdit>(
 				state,
 				"workspace/willRenameFiles",
@@ -5467,8 +5492,13 @@ function detectOperationSupport(initResult: unknown): LSPOperationSupport {
 		const value = capabilities?.[key];
 		if (value === undefined || value === null) return false;
 		if (typeof value === "boolean") return value;
-		return true;
+		return isCapabilityRecord(value);
 	};
+	const codeActionProvider = capabilities?.codeActionProvider;
+	const workspace = capabilities?.workspace;
+	const fileOperations = isCapabilityRecord(workspace)
+		? workspace.fileOperations
+		: undefined;
 
 	return {
 		definition: hasProvider("definitionProvider"),
@@ -5480,8 +5510,17 @@ function detectOperationSupport(initResult: unknown): LSPOperationSupport {
 		documentSymbol: hasProvider("documentSymbolProvider"),
 		workspaceSymbol: hasProvider("workspaceSymbolProvider"),
 		codeAction: hasProvider("codeActionProvider"),
+		codeActionResolve:
+			isCapabilityRecord(codeActionProvider) &&
+			codeActionProvider.resolveProvider === true,
 		rename: hasProvider("renameProvider"),
+		willRenameFiles:
+			isCapabilityRecord(fileOperations) && fileOperations.willRename === true,
 		implementation: hasProvider("implementationProvider"),
 		callHierarchy: hasProvider("callHierarchyProvider"),
 	};
+}
+
+function isCapabilityRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
 }

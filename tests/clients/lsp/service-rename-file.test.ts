@@ -15,6 +15,7 @@ type MockRenameClient = {
 	closeDocument: ReturnType<typeof vi.fn>;
 	notify: { open: ReturnType<typeof vi.fn> };
 	willRenameFiles: ReturnType<typeof vi.fn>;
+	getOperationSupport: ReturnType<typeof vi.fn>;
 	didRenameFiles: ReturnType<typeof vi.fn>;
 };
 
@@ -27,6 +28,7 @@ function makeClient(root: string, edit: unknown): MockRenameClient {
 		closeDocument: vi.fn(async () => undefined),
 		notify: { open: vi.fn(async () => undefined) },
 		willRenameFiles: vi.fn(async () => edit),
+		getOperationSupport: vi.fn(() => ({ willRenameFiles: true })),
 		didRenameFiles: vi.fn(async () => undefined),
 	};
 }
@@ -105,6 +107,52 @@ describe("LSPService.renameFile", () => {
 			expect(secondary.willRenameFiles).toHaveBeenCalledWith(oldPath, newPath);
 			expect(primary.didRenameFiles).toHaveBeenCalledWith(oldPath, newPath);
 			expect(secondary.didRenameFiles).toHaveBeenCalledWith(oldPath, newPath);
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
+	});
+
+	it("skips unsupported willRenameFiles clients while retaining supporting edits", async () => {
+		const tmpDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-rename-file-"),
+		);
+		const oldPath = path.join(tmpDir, "old.ts");
+		const newPath = path.join(tmpDir, "new.ts");
+		const importPath = path.join(tmpDir, "import.ts");
+		fs.writeFileSync(oldPath, "export const value = 1;\n", "utf-8");
+		fs.writeFileSync(importPath, "import { value } from './old';\n", "utf-8");
+		const supporting = makeClient(tmpDir, {
+			changes: {
+				[pathToFileURL(importPath).href]: [
+					{
+						range: {
+							start: { line: 0, character: 25 },
+							end: { line: 0, character: 28 },
+						},
+						newText: "new",
+					},
+				],
+			},
+		});
+		const unsupported = makeClient(tmpDir, {
+			changes: { [pathToFileURL(importPath).href]: [] },
+		});
+		unsupported.getOperationSupport.mockReturnValue({ willRenameFiles: false });
+		const service = new LSPService();
+		addClient(service, "typescript", tmpDir, supporting);
+		addClient(service, "eslint", tmpDir, unsupported);
+
+		try {
+			const result = await service.renameFile(oldPath, newPath, {
+				cwd: tmpDir,
+				apply: true,
+			});
+			expect(result.applied).toBe(true);
+			expect(supporting.willRenameFiles).toHaveBeenCalledWith(oldPath, newPath);
+			expect(unsupported.willRenameFiles).not.toHaveBeenCalled();
+			expect(fs.readFileSync(importPath, "utf-8")).toBe(
+				"import { value } from './new';\n",
+			);
 		} finally {
 			removeTempDirSync(tmpDir);
 		}
