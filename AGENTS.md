@@ -2288,3 +2288,11 @@ once, then use `normalizeEphemeralMapKey` because their keys are already
 canonical and process-local. `detectRunner` hoists the outer availability-map
 lookup before the runner loop and uses the nested plain `Map`; glob-cache
 lookups use one `get`, not `has` plus `get`. (#2048)
+
+**Word-index persistence serializes in the snapshot worker (#2068).** The
+per-edit writer passes the live index as `wordIndexForWorker`; it must not call
+`serializeWordIndex` before `saveProjectSnapshot`. The worker's structured
+clone is the capture boundary, so edits after scheduling cannot affect the
+captured wire form. Keep the posting-entry shape and #2082 serializer bridge
+composable; the parent-thread serialize counter is a regression guard, not
+production telemetry.

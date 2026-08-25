@@ -25,6 +25,7 @@ import type { StartupScanContext } from "./startup-scan.js";
 import {
 	deserializeWordIndex,
 	serializeWordIndex,
+	type WordIndex,
 	type SerializedWordIndex,
 } from "./word-index.js";
 
@@ -893,6 +894,7 @@ interface PendingSnapshotBody {
 	generation: number;
 	durablePersist?: SnapshotPersistRecord;
 	dedupeFingerprints: string[];
+	wordIndexForWorker?: WordIndex;
 }
 
 interface SnapshotPersistRecord {
@@ -1263,7 +1265,7 @@ function reconcileAuthoritativeAfterWrite(
 	// shared reference is unsafe: ProjectSnapshot stores serialized arrays while
 	// WordIndex owns mutable Map/PathKeyedMap state. Drop the authoritative copy
 	// after publication; later merge-writers rehydrate the canonical disk body.
-	if (pending.snapshot.wordIndex) {
+	if (pending.snapshot.wordIndex || pending.wordIndexForWorker) {
 		try {
 			const stat = fs.statSync(pending.gzPath);
 			cacheParsedSnapshot(pending.gzPath, {
@@ -1368,7 +1370,13 @@ function writeSnapshotBodyOnMainThread(
 	}
 	try {
 		const serializeStarted = performance.now();
-		const json = JSON.stringify(pending.snapshot);
+		const snapshotForWrite = pending.wordIndexForWorker
+			? {
+					...pending.snapshot,
+					wordIndex: serializeWordIndex(pending.wordIndexForWorker),
+				}
+			: pending.snapshot;
+		const json = JSON.stringify(snapshotForWrite);
 		const serializeMs = performance.now() - serializeStarted;
 		const rawBytes = Buffer.byteLength(json);
 		const fingerprint = fingerprintProjectSnapshotJson(
@@ -1593,6 +1601,7 @@ function dispatchSnapshotPersist(pending: PendingSnapshotBody): void {
 		stagePath: pending.stagePath,
 		data: pending.snapshot,
 		priorFingerprints: pending.dedupeFingerprints,
+		wordIndexForWorker: pending.wordIndexForWorker,
 		testDelayMs:
 			process.env.NODE_ENV === "test"
 				? Number(process.env.PI_LENS_TEST_SNAPSHOT_PERSIST_WORKER_DELAY_MS) ||
@@ -1759,6 +1768,7 @@ function ensureSnapshotPersistExitHook(): void {
 export function saveProjectSnapshot(
 	cwd: string,
 	snapshot: ProjectSnapshot,
+	options?: { wordIndexForWorker?: WordIndex },
 ): void {
 	const gzPath = getProjectSnapshotPath(cwd);
 	const legacyPath = getProjectSnapshotLegacyPath(cwd);
@@ -1841,6 +1851,7 @@ export function saveProjectSnapshot(
 		generation,
 		durablePersist: priorPersist,
 		dedupeFingerprints: baselines.fingerprints,
+		wordIndexForWorker: options?.wordIndexForWorker,
 	};
 	sweepStaleSnapshotStageFiles(cacheDir);
 	ensureSnapshotPersistExitHook();

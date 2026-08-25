@@ -4,6 +4,7 @@ import {
 	serveGzipStageWorker,
 } from "./gzip-stage-write.js";
 import { fingerprintProjectSnapshotJson } from "./project-snapshot-fingerprint.js";
+import { serializeWordIndex, type WordIndex } from "./word-index.js";
 
 /**
  * Worker-thread persist for the project snapshot BODY (#958 item 2). The parent
@@ -19,6 +20,8 @@ import { fingerprintProjectSnapshotJson } from "./project-snapshot-fingerprint.j
 export interface ProjectSnapshotPersistWorkerRequest extends GzipStageWorkerRequest {
 	/** Last body digest known to have reached canonical storage. */
 	priorFingerprints?: string[];
+	/** Live index captured by postMessage; serialized only inside this worker. */
+	wordIndexForWorker?: WordIndex;
 }
 
 export type ProjectSnapshotPersistWorkerResult = GzipStageWorkerResult;
@@ -50,6 +53,15 @@ serveGzipStageWorker<
 		stagePath: request.stagePath,
 	}),
 	{
+		prepareData: (request) => {
+			const snapshotRequest = request as ProjectSnapshotPersistWorkerRequest;
+			return snapshotRequest.wordIndexForWorker
+				? {
+						...(snapshotRequest.data as Record<string, unknown>),
+						wordIndex: serializeWordIndex(snapshotRequest.wordIndexForWorker),
+					}
+				: snapshotRequest.data;
+		},
 		semanticFingerprint: semanticSnapshotFingerprint,
 		skipIfFingerprints: (request) => request.priorFingerprints,
 	},

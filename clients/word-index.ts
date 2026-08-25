@@ -1464,8 +1464,41 @@ export interface SerializedWordIndex {
 /** Persisted word-index serialization format version. Bump on breaking format changes. */
 export const WORD_INDEX_FORMAT_VERSION = 2;
 
+let serializeWordIndexCallCount = 0;
+
+type PathMapLike<V> = {
+	keys?: () => IterableIterator<string>;
+	get?: (key: string) => V | undefined;
+};
+
+function pathMapEntries<V>(map: PathMapLike<V>): Array<[string, V]> {
+	const cloned = map as PathMapLike<V> & {
+		store?: Map<string, { displayPath: string; value: V }>;
+	};
+	if (cloned.store instanceof Map)
+		return [...cloned.store.values()].map((entry) => [
+			entry.displayPath,
+			entry.value,
+		]);
+	if (!map.keys || !map.get) return [];
+	return [...map.keys()].map((key) => [key, map.get!(key)!]);
+}
+
+function pathMapGet<V>(map: PathMapLike<V>, key: string): V | undefined {
+	const cloned = map as PathMapLike<V> & {
+		store?: Map<string, { displayPath: string; value: V }>;
+	};
+	if (cloned.store instanceof Map) {
+		for (const entry of cloned.store.values())
+			if (entry.displayPath === key) return entry.value;
+		return undefined;
+	}
+	return map.get?.(key);
+}
+
 export function serializeWordIndex(index: WordIndex): SerializedWordIndex {
-	const files = [...index.docLengths.keys()];
+	serializeWordIndexCallCount++;
+	const files = pathMapEntries(index.docLengths).map(([file]) => file);
 	const fileIndex = new Map<string, number>();
 	files.forEach((file, i) => fileIndex.set(file, i));
 
@@ -1484,7 +1517,7 @@ export function serializeWordIndex(index: WordIndex): SerializedWordIndex {
 		index.forward
 			? files.map((file, i) => [
 					i,
-					[...(index.forward!.get(file) ?? new Map()).entries()],
+					[...(pathMapGet(index.forward!, file) ?? new Map()).entries()],
 				])
 			: undefined;
 
@@ -1499,6 +1532,36 @@ export function serializeWordIndex(index: WordIndex): SerializedWordIndex {
 		fileMtimes: files.map((file) => index.fileMtimes.get(file) ?? 0),
 		fileSizes: files.map((file) => index.fileSizes.get(file) ?? 0),
 		forward,
+	};
+}
+
+export function getWordIndexSerializeCountForTests(): number {
+	return serializeWordIndexCallCount;
+}
+
+export function resetWordIndexSerializeCountForTests(): void {
+	serializeWordIndexCallCount = 0;
+}
+
+/**
+ * Make the small path-index structures cloneable for the snapshot worker.
+ * `postings` is intentionally left as its native Map so worker_threads clones
+ * its entries without a JavaScript posting walk on the caller thread.
+ */
+export function prepareWordIndexForWorker(index: WordIndex): WordIndex {
+	return {
+		...index,
+		docLengths: new Map(index.docLengths) as unknown as WordIndex["docLengths"],
+		fileMtimes: new Map(index.fileMtimes) as unknown as WordIndex["fileMtimes"],
+		fileSizes: new Map(index.fileSizes) as unknown as WordIndex["fileSizes"],
+		forward: index.forward
+			? (new Map(
+					[...index.forward.entries()].map(([file, counts]) => [
+						file,
+						new Map(counts),
+					]),
+				) as unknown as WordIndex["forward"])
+			: undefined,
 	};
 }
 
@@ -1774,8 +1837,9 @@ async function writeWordIndexSnapshot(
 			cachedExports: [],
 		};
 		snapshot.generatedAt = new Date().toISOString();
-		snapshot.wordIndex = serializeWordIndex(index);
-		saveProjectSnapshot(cwd, snapshot);
+		saveProjectSnapshot(cwd, snapshot, {
+			wordIndexForWorker: prepareWordIndexForWorker(index),
+		});
 		dbg?.(
 			`word-index persist: ${index.docCount} files, ${index.postings.size} tokens`,
 		);

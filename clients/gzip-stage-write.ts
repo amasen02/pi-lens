@@ -158,6 +158,7 @@ export function serveGzipStageWorker<
 >(
 	buildBaseResult: (request: Req) => Base,
 	options?: {
+		prepareData?: (request: Req) => unknown;
 		semanticFingerprint?: (request: Req, json: string) => string;
 		skipIfFingerprints?: (request: Req) => readonly string[] | undefined;
 	},
@@ -174,7 +175,7 @@ export function serveGzipStageWorker<
 			try {
 				const fingerprint = options?.semanticFingerprint;
 				const metrics = await writeGzipStageFile(
-					request.data,
+					options?.prepareData?.(request) ?? request.data,
 					request.stagePath,
 					request.testDelayMs,
 					{
