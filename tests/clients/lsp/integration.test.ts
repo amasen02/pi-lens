@@ -225,6 +225,11 @@ describe("LSP Client Integration — nested capability gates (#1971)", () => {
 			env: { FAKE_LSP_WILL_RENAME: "malformed" },
 			supported: false,
 		},
+		{
+			name: "object without filters",
+			env: { FAKE_LSP_WILL_RENAME: "empty-object" },
+			supported: false,
+		},
 		{ name: "present", env: { FAKE_LSP_WILL_RENAME: "true" }, supported: true },
 	] as const;
 

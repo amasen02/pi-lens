@@ -103,6 +103,15 @@ describe("CLIENT_CAPABILITIES (#278 regression)", () => {
 				}
 			).versionSupport,
 		).toBe(true);
+		expect(CLIENT_CAPABILITIES.workspace.fileOperations).toMatchObject({
+			dynamicRegistration: false,
+			willRename: true,
+			didRename: true,
+		});
+		expect(CLIENT_CAPABILITIES.textDocument.codeAction).toMatchObject({
+			dataSupport: true,
+			resolveSupport: { properties: ["edit", "command"] },
+		});
 	});
 });
 

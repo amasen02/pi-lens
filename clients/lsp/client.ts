@@ -219,7 +219,7 @@ export interface LSPOperationSupport {
 	/** `codeActionProvider.resolveProvider === true` at initialize. */
 	codeActionResolve: boolean;
 	rename: boolean;
-	/** `workspace.fileOperations.willRename === true` at initialize. */
+	/** `workspace.fileOperations.willRename` registration options at initialize. */
 	willRenameFiles: boolean;
 	implementation: boolean;
 	callHierarchy: boolean;
@@ -567,6 +567,11 @@ export const CLIENT_CAPABILITIES = {
 		workspaceFolders: true,
 		configuration: true,
 		didChangeWatchedFiles: { dynamicRegistration: true },
+		fileOperations: {
+			dynamicRegistration: false,
+			willRename: true,
+			didRename: true,
+		},
 	},
 	textDocument: {
 		synchronization: {
@@ -586,7 +591,11 @@ export const CLIENT_CAPABILITIES = {
 		implementation: { dynamicRegistration: false },
 		references: { dynamicRegistration: false },
 		documentSymbol: { dynamicRegistration: false },
-		codeAction: { dynamicRegistration: false },
+		codeAction: {
+			dynamicRegistration: false,
+			dataSupport: true,
+			resolveSupport: { properties: ["edit", "command"] },
+		},
 		rename: { dynamicRegistration: false },
 		publishDiagnostics: {
 			relatedInformation: true,
@@ -5515,7 +5524,8 @@ function detectOperationSupport(initResult: unknown): LSPOperationSupport {
 			codeActionProvider.resolveProvider === true,
 		rename: hasProvider("renameProvider"),
 		willRenameFiles:
-			isCapabilityRecord(fileOperations) && fileOperations.willRename === true,
+			isCapabilityRecord(fileOperations) &&
+			isFileOperationRegistrationOptions(fileOperations.willRename),
 		implementation: hasProvider("implementationProvider"),
 		callHierarchy: hasProvider("callHierarchyProvider"),
 	};
@@ -5523,4 +5533,8 @@ function detectOperationSupport(initResult: unknown): LSPOperationSupport {
 
 function isCapabilityRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isFileOperationRegistrationOptions(value: unknown): boolean {
+	return isCapabilityRecord(value) && Array.isArray(value.filters);
 }

@@ -604,7 +604,9 @@ type CapabilitySnapshot = {
 		documentSymbol: boolean;
 		workspaceSymbol: boolean;
 		codeAction: boolean;
+		codeActionResolve: boolean;
 		rename: boolean;
+		willRenameFiles: boolean;
 		implementation: boolean;
 		callHierarchy: boolean;
 	};
@@ -632,6 +634,8 @@ function formatCapabilities(
 		["hover", (s) => !!s.operationSupport.hover],
 		["rename", (s) => !!s.operationSupport.rename],
 		["codeAction", (s) => !!s.operationSupport.codeAction],
+		["codeAction/resolve", (s) => !!s.operationSupport.codeActionResolve],
+		["workspace/willRenameFiles", (s) => !!s.operationSupport.willRenameFiles],
 		["workspaceSymbol", (s) => !!s.operationSupport.workspaceSymbol],
 		["implementation", (s) => !!s.operationSupport.implementation],
 		["signatureHelp", (s) => !!s.operationSupport.signatureHelp],
@@ -645,7 +649,7 @@ function formatCapabilities(
 		[
 			"rename_file",
 			() => true,
-			"willRenameFiles/didRenameFiles helper available",
+			"filesystem rename; preflight support shown above",
 		],
 	];
 

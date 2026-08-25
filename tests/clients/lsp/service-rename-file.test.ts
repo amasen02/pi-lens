@@ -158,6 +158,41 @@ describe("LSPService.renameFile", () => {
 		}
 	});
 
+	it("applies and notifies when every active client skips willRenameFiles", async () => {
+		const tmpDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-rename-file-"),
+		);
+		const oldPath = path.join(tmpDir, "old.ts");
+		const newPath = path.join(tmpDir, "new.ts");
+		fs.writeFileSync(oldPath, "export const value = 1;\n", "utf-8");
+		const first = makeClient(tmpDir, null);
+		const second = makeClient(tmpDir, null);
+		first.getOperationSupport.mockReturnValue({ willRenameFiles: false });
+		second.getOperationSupport.mockReturnValue({ willRenameFiles: false });
+		const service = new LSPService();
+		addClient(service, "typescript", tmpDir, first);
+		addClient(service, "eslint", tmpDir, second);
+
+		try {
+			const result = await service.renameFile(oldPath, newPath, {
+				cwd: tmpDir,
+				apply: true,
+			});
+			expect(result.applied).toBe(true);
+			expect(result.serverIds).toEqual(["typescript", "eslint"]);
+			expect(first.willRenameFiles).not.toHaveBeenCalled();
+			expect(second.willRenameFiles).not.toHaveBeenCalled();
+			expect(first.didRenameFiles).toHaveBeenCalledWith(oldPath, newPath);
+			expect(second.didRenameFiles).toHaveBeenCalledWith(oldPath, newPath);
+			expect(fs.existsSync(oldPath)).toBe(false);
+			expect(fs.readFileSync(newPath, "utf-8")).toBe(
+				"export const value = 1;\n",
+			);
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
+	});
+
 	it("previews with no active clients without touching the filesystem", async () => {
 		const tmpDir = fs.mkdtempSync(
 			path.join(os.tmpdir(), "pi-lens-lsp-rename-file-"),

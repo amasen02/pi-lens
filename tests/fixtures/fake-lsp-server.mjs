@@ -121,22 +121,44 @@ function handle(raw) {
 	// timeout kill + 2s SIGKILL-backstop path (#1114).
 	if (data.method === "initialize") {
 		if (process.env.FAKE_LSP_IGNORE_INITIALIZE === "1") return;
+		const clientCapabilities = data.params?.capabilities;
+		const clientCodeAction = clientCapabilities?.textDocument?.codeAction;
+		const clientSupportsCodeActionResolve =
+			clientCodeAction?.dataSupport === true &&
+			Array.isArray(clientCodeAction?.resolveSupport?.properties) &&
+			clientCodeAction.resolveSupport.properties.includes("edit");
+		const clientSupportsWillRename =
+			clientCapabilities?.workspace?.fileOperations?.willRename === true;
 		const codeActionProvider =
 			process.env.FAKE_LSP_CODE_ACTION_PROVIDER === "false"
 				? { resolveProvider: false }
 				: process.env.FAKE_LSP_CODE_ACTION_PROVIDER === "malformed"
 					? { resolveProvider: "yes" }
-					: process.env.FAKE_LSP_NO_CODE_ACTION_RESOLVE === "1"
+					: process.env.FAKE_LSP_NO_CODE_ACTION_RESOLVE === "1" ||
+						  !clientSupportsCodeActionResolve
 						? {}
 						: { resolveProvider: true };
 		const workspaceFileOperations =
 			process.env.FAKE_LSP_WILL_RENAME === "true"
-				? { willRename: true }
+				? {
+						willRename: clientSupportsWillRename
+							? {
+									filters: [
+										{
+											scheme: "file",
+											pattern: { glob: "**/*" },
+										},
+									],
+								}
+							: undefined,
+					}
 				: process.env.FAKE_LSP_WILL_RENAME === "false"
 					? { willRename: false }
-					: process.env.FAKE_LSP_WILL_RENAME === "malformed"
-						? { willRename: "yes" }
-						: undefined;
+					: process.env.FAKE_LSP_WILL_RENAME === "empty-object"
+						? { willRename: {} }
+						: process.env.FAKE_LSP_WILL_RENAME === "malformed"
+							? { willRename: "yes" }
+							: undefined;
 		send({
 			jsonrpc: "2.0",
 			id: data.id,
