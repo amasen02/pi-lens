@@ -34,6 +34,7 @@ function makeFakeClient(supportsWorkspaceSymbol: boolean, alive = true) {
 			codeActionResolve: false,
 			rename: false,
 			willRenameFiles: false,
+			didRenameFiles: false,
 			implementation: false,
 			callHierarchy: false,
 		}),

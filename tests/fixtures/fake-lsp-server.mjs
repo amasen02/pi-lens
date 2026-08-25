@@ -114,6 +114,25 @@ function handle(raw) {
 	} catch {
 		return;
 	}
+	if (process.env.FAKE_LSP_TRACE_FILE) {
+		const trace = (what) => {
+			import("node:fs")
+				.then((fs) =>
+					fs.appendFileSync(
+						process.env.FAKE_LSP_TRACE_FILE,
+						`${what}\n`,
+					),
+				)
+				.catch(() => {});
+		};
+		trace(`recv ${data.method ?? "<response>"}`);
+		if (
+			process.env.FAKE_LSP_ECHO_NOTIFY_METHODS === "1" &&
+			data.id === undefined
+		) {
+			trace(`echo-eligible ${data.method}`);
+		}
+	}
 
 	// Initialize handshake. FAKE_LSP_IGNORE_INITIALIZE simulates a hung server
 	// that never completes the handshake, so createLSPClient's
@@ -129,6 +148,14 @@ function handle(raw) {
 			clientCodeAction.resolveSupport.properties.includes("edit");
 		const clientSupportsWillRename =
 			clientCapabilities?.workspace?.fileOperations?.willRename === true;
+		const clientSupportsDidRename =
+			clientCapabilities?.workspace?.fileOperations?.didRename === true;
+		const renameFilter = (globEnv, globDefault) => ({
+			scheme: "file",
+			pattern: {
+				glob: process.env[globEnv] ?? globDefault,
+			},
+		});
 		const codeActionProvider =
 			process.env.FAKE_LSP_CODE_ACTION_PROVIDER === "false"
 				? { resolveProvider: false }
@@ -144,14 +171,27 @@ function handle(raw) {
 						willRename: clientSupportsWillRename
 							? {
 									filters: [
-										{
-											scheme: "file",
-											pattern: { glob: "**/*" },
-										},
+										renameFilter(
+											"FAKE_LSP_WILL_RENAME_GLOB",
+											"**/*",
+										),
 									],
 								}
 							: undefined,
-					}
+						...(process.env.FAKE_LSP_DID_RENAME === "true" &&
+						clientSupportsDidRename
+							? {
+									didRename: {
+										filters: [
+											renameFilter(
+												"FAKE_LSP_DID_RENAME_GLOB",
+												"**/*",
+											),
+										],
+									},
+								  }
+							: {}),
+				  }
 				: process.env.FAKE_LSP_WILL_RENAME === "false"
 					? { willRename: false }
 					: process.env.FAKE_LSP_WILL_RENAME === "empty-object"
@@ -218,6 +258,20 @@ function handle(raw) {
 		send({
 			jsonrpc: "2.0",
 			method: "$/test/requestReceived",
+			params: { method: data.method },
+		});
+	}
+
+	// #1971: notification twin of the request echo above, so tests can assert
+	// WHETHER a notification (e.g. workspace/didRenameFiles) was sent at all.
+	if (
+		process.env.FAKE_LSP_ECHO_NOTIFY_METHODS === "1" &&
+		data.id === undefined &&
+		typeof data.method === "string"
+	) {
+		send({
+			jsonrpc: "2.0",
+			method: "$/test/notifyReceived",
 			params: { method: data.method },
 		});
 	}

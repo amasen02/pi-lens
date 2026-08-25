@@ -53,7 +53,10 @@ function makeClient(root: string): MockRenameClient {
 		closeDocument: vi.fn(async () => undefined),
 		notify: { open: vi.fn(async () => undefined) },
 		willRenameFiles: vi.fn(async () => null),
-		getOperationSupport: vi.fn(() => ({ willRenameFiles: true })),
+		getOperationSupport: vi.fn(() => ({
+			willRenameFiles: true,
+			didRenameFiles: true,
+		})),
 		didRenameFiles: vi.fn(async () => undefined),
 	};
 }

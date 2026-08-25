@@ -274,6 +274,150 @@ describe("LSP Client Integration — nested capability gates (#1971)", () => {
 		},
 	);
 
+	it("sends didRenameFiles only when didRename is registered and filters match", async () => {
+		const cases: Array<{
+			name: string;
+			env: Record<string, string>;
+			sent: boolean;
+		}> = [
+			{
+				name: "not registered",
+				env: {},
+				sent: false,
+			},
+			{
+				name: "registered with matching glob",
+				env: { FAKE_LSP_DID_RENAME: "true" },
+				sent: true,
+			},
+			{
+				name: "registered but glob excludes the paths",
+				env: {
+					FAKE_LSP_DID_RENAME: "true",
+					FAKE_LSP_DID_RENAME_GLOB: "**/*.go",
+				},
+				sent: false,
+			},
+		];
+
+		for (const { name, env, sent } of cases) {
+			const proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+				cwd: process.cwd(),
+				env: {
+					...process.env,
+					...env,
+					FAKE_LSP_WILL_RENAME: "true",
+					FAKE_LSP_ECHO_NOTIFY_METHODS: "1",
+				},
+			});
+			const client = await createLSPClient({
+				serverId: "fake-did-rename-capability",
+				process: proc,
+				root: process.cwd(),
+			});
+			const notified: string[] = [];
+			client.connection.onNotification(
+				"$/test/notifyReceived",
+				(params: { method: string }) => {
+					notified.push(params.method);
+				},
+			);
+			try {
+				await client.notify.open(
+					path.join(process.cwd(), "doc.ts"),
+					"greet();",
+					"typescript",
+				);
+				notified.length = 0;
+				await client.didRenameFiles(
+					path.join(process.cwd(), "old.ts"),
+					path.join(process.cwd(), "new.ts"),
+				);
+				// A notification has no awaitable reply, so the echo's stdio
+				// round-trip needs several event-loop turns — a single
+				// setImmediate yield cannot cover it. Poll until the echo
+				// arrives; for the negative cases, give the pipe a bounded
+				// grace window before asserting nothing was sent.
+				const graceMs = sent ? 5000 : 500;
+				for (
+					let i = 0;
+					i < graceMs / 25 && !notified.includes("workspace/didRenameFiles");
+					i++
+				) {
+					await new Promise((r) => setTimeout(r, 25));
+				}
+				// Support reflects REGISTRATION at initialize time (a static
+				// capability fact); the per-path FILTER decision happens at
+				// send time, so the glob case suppresses the send without
+				// un-advertising support.
+				expect(client.getOperationSupport().didRenameFiles, name).toBe(
+					env.FAKE_LSP_DID_RENAME === "true",
+				);
+				expect(notified.includes("workspace/didRenameFiles"), name).toBe(sent);
+			} finally {
+				await client.shutdown();
+				await stopLSP(proc);
+			}
+		}
+	}, 20_000); // so a regression fails on an ASSERTION, not this timeout. // Three real server launches plus a bounded echo round-trip; generous
+
+	it("applies willRename filter matching before sending the preflight request", async () => {
+		const cases = [
+			{ glob: undefined as string | undefined, sent: true },
+			{ glob: "**/*.ts", sent: true },
+			{ glob: "**/*.go", sent: false },
+		] as const;
+
+		for (const { glob, sent } of cases) {
+			const proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+				cwd: process.cwd(),
+				env: {
+					...process.env,
+					FAKE_LSP_WILL_RENAME: "true",
+					...(glob ? { FAKE_LSP_WILL_RENAME_GLOB: glob } : {}),
+					FAKE_LSP_ECHO_REQUEST_METHODS: "1",
+				},
+			});
+			const client = await createLSPClient({
+				serverId: "fake-will-rename-filter",
+				process: proc,
+				root: process.cwd(),
+			});
+			const received: string[] = [];
+			client.connection.onNotification(
+				"$/test/requestReceived",
+				(params: { method: string }) => {
+					received.push(params.method);
+				},
+			);
+			try {
+				const result = await client.willRenameFiles(
+					path.join(process.cwd(), "old.ts"),
+					path.join(process.cwd(), "new.ts"),
+				);
+				// Same bounded-poll rationale as the didRename matrix above: the
+				// echo notification rides the stdio round-trip and can land after
+				// one event-loop turn under load.
+				const graceMs = sent ? 5000 : 500;
+				for (
+					let i = 0;
+					i < graceMs / 25 && !received.includes("workspace/willRenameFiles");
+					i++
+				) {
+					await new Promise((r) => setTimeout(r, 25));
+				}
+				expect(result, `glob=${glob ?? "default"}`).toBeNull();
+				expect(
+					received.includes("workspace/willRenameFiles"),
+					`glob=${glob ?? "default"}`,
+				).toBe(sent);
+			} finally {
+				await client.shutdown();
+				await stopLSP(proc);
+			}
+		}
+	});
+
 	const resolveCases = [
 		{
 			name: "absent",

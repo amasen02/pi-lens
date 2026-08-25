@@ -113,6 +113,7 @@ export function createMockState(
 			codeActionResolve: false,
 			rename: false,
 			willRenameFiles: false,
+			didRenameFiles: false,
 			implementation: false,
 			callHierarchy: false,
 		},

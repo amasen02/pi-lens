@@ -111,6 +111,14 @@ describe("CLIENT_CAPABILITIES (#278 regression)", () => {
 		expect(CLIENT_CAPABILITIES.textDocument.codeAction).toMatchObject({
 			dataSupport: true,
 			resolveSupport: { properties: ["edit", "command"] },
+			// #1971: LSP 3.17 restricts codeAction responses to Command[] unless
+			// literal support is advertised; resolve-of-edit is protocol-invalid
+			// without it.
+			codeActionLiteralSupport: {
+				codeActionKind: {
+					valueSet: expect.arrayContaining(["quickfix"]),
+				},
+			},
 		});
 	});
 });
@@ -2687,6 +2695,7 @@ describe("applyDynamicCapabilities", () => {
 				codeActionResolve: false,
 				rename: false,
 				willRenameFiles: false,
+				didRenameFiles: false,
 				implementation: false,
 				callHierarchy: false,
 			},

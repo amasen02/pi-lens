@@ -113,6 +113,7 @@ describe("lsp_navigation tool", () => {
 					codeActionResolve: false,
 					rename: true,
 					willRenameFiles: false,
+					didRenameFiles: false,
 					implementation: false,
 					callHierarchy: true,
 				},
@@ -634,6 +635,7 @@ describe("lsp_navigation tool", () => {
 				codeActionResolve: false,
 				rename: false,
 				willRenameFiles: false,
+				didRenameFiles: false,
 				implementation: false,
 				callHierarchy: false,
 			});
@@ -690,6 +692,7 @@ describe("lsp_navigation tool", () => {
 				codeActionResolve: false,
 				rename: false,
 				willRenameFiles: false,
+				didRenameFiles: false,
 				implementation: false,
 				callHierarchy: true,
 			});

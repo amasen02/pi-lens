@@ -6726,6 +6726,18 @@ export class LSPService {
 
 		await Promise.all(
 			activeClients.map(async ({ serverId, client }) => {
+				// #1971 review: didRename has its own registration. A server that
+				// never asked for didRenameFiles notifications must not receive
+				// them — same chokepoint discipline as the willRename preflight.
+				if (client.getOperationSupport().didRenameFiles !== true) {
+					recordDegradationOnce({
+						kind: "lsp-capability-skip",
+						subject: `${serverId}:workspace/didRenameFiles`,
+						reason:
+							"server did not advertise workspace.fileOperations.didRename",
+					});
+					return;
+				}
 				const opened = openDocuments.find(
 					(entry) => entry.serverId === serverId,
 				);

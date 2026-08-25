@@ -28,7 +28,10 @@ function makeClient(root: string, edit: unknown): MockRenameClient {
 		closeDocument: vi.fn(async () => undefined),
 		notify: { open: vi.fn(async () => undefined) },
 		willRenameFiles: vi.fn(async () => edit),
-		getOperationSupport: vi.fn(() => ({ willRenameFiles: true })),
+		getOperationSupport: vi.fn(() => ({
+			willRenameFiles: true,
+			didRenameFiles: true,
+		})),
 		didRenameFiles: vi.fn(async () => undefined),
 	};
 }
@@ -137,7 +140,10 @@ describe("LSPService.renameFile", () => {
 		const unsupported = makeClient(tmpDir, {
 			changes: { [pathToFileURL(importPath).href]: [] },
 		});
-		unsupported.getOperationSupport.mockReturnValue({ willRenameFiles: false });
+		unsupported.getOperationSupport.mockReturnValue({
+			willRenameFiles: false,
+			didRenameFiles: true,
+		});
 		const service = new LSPService();
 		addClient(service, "typescript", tmpDir, supporting);
 		addClient(service, "eslint", tmpDir, unsupported);
@@ -167,8 +173,14 @@ describe("LSPService.renameFile", () => {
 		fs.writeFileSync(oldPath, "export const value = 1;\n", "utf-8");
 		const first = makeClient(tmpDir, null);
 		const second = makeClient(tmpDir, null);
-		first.getOperationSupport.mockReturnValue({ willRenameFiles: false });
-		second.getOperationSupport.mockReturnValue({ willRenameFiles: false });
+		first.getOperationSupport.mockReturnValue({
+			willRenameFiles: false,
+			didRenameFiles: true,
+		});
+		second.getOperationSupport.mockReturnValue({
+			willRenameFiles: false,
+			didRenameFiles: true,
+		});
 		const service = new LSPService();
 		addClient(service, "typescript", tmpDir, first);
 		addClient(service, "eslint", tmpDir, second);
