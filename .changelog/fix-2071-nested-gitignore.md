@@ -1,4 +1,6 @@
-### Fixed
+---
+section: Fixed
+---
 
 - **Nested `.gitignore` edits now refresh ignore verdicts (closes #2071)** —
   agent writes invalidate the affected matcher subtree, so its per-path memo
