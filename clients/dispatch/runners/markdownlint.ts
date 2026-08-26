@@ -22,7 +22,10 @@ import {
 } from "../../spawn-timeout-cooldown.js";
 import { finishParsedRun } from "./utils/tool-failure.js";
 
-const markdownlint = createAvailabilityChecker("markdownlint-cli2", ".cmd");
+const markdownlint = createAvailabilityChecker("markdownlint-cli2", ".cmd", [
+	"--no-globs",
+	"-",
+]);
 
 // markdownlint-cli2 exit codes (its README's "Exit Codes" section): 0 = no
 // findings, 1 = lint findings, 2 = unexpected error (unreadable config, bad

@@ -248,6 +248,40 @@ describe("runner-helpers availability checker", () => {
 		expect(probedArgs).toEqual(["version"]);
 	});
 
+	it("forwards custom verification args to managed-shim verification", async () => {
+		const env = setupTestEnvironment("pi-lens-managed-check-args-");
+		try {
+			const managedHome = path.join(env.tmpDir, "managed-home");
+			vi.stubEnv("PI_LENS_HOME", managedHome);
+			fs.mkdirSync(path.join(managedHome, "tools", "node_modules", ".bin"), {
+				recursive: true,
+			});
+			const managedBinary = path.join(
+				managedHome,
+				"tools",
+				"node_modules",
+				".bin",
+				"markdownlint-cli2",
+			);
+			fs.writeFileSync(managedBinary, "#!/bin/sh\nexit 0\n");
+			const installerMod =
+				await import("../../../../clients/installer/index.js");
+			await createVenvFinder("markdownlint-cli2", ".cmd", ["--no-globs", "-"])(
+				env.tmpDir,
+			);
+			expect(installerMod.verifyToolBinary).toHaveBeenCalledWith(
+				managedBinary,
+				undefined,
+				expect.any(Function),
+				expect.any(Number),
+				["--no-globs", "-"],
+			);
+		} finally {
+			vi.unstubAllEnvs();
+			env.cleanup();
+		}
+	});
+
 	it("does not let an old in-flight probe delete a newer generation", async () => {
 		const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
 		let releaseOld!: (value: unknown) => void;

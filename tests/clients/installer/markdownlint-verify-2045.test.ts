@@ -67,7 +67,7 @@ describe("managed markdownlint verification (#2045)", () => {
 		},
 	);
 
-	it("does not let output truncation hide a typed timeout", async () => {
+	it("keeps typed timeout telemetry ahead of output truncation", async () => {
 		sessionLog.mockClear();
 		safeSpawnAsync.mockResolvedValueOnce(
 			result({
@@ -223,7 +223,8 @@ function resolveMarkdownlintBinary(): string | undefined {
 			: "markdownlint-cli2";
 	const candidates = [
 		path.join(
-			process.env.PI_LENS_HOME ?? os.homedir(),
+			os.homedir(),
+			".pi-lens",
 			"tools",
 			"node_modules",
 			".bin",

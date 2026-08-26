@@ -651,7 +651,9 @@ in about 370ms when stdin was closed, while `--no-globs -` linted one stdin
 file and returned in about 370ms; with production-shaped open stdin the latter
 waited for the full 10s budget. The bound is therefore supplied by the spawner,
 not by the CLI. Verification failure logs include the effective check arguments
-and prefer `spawnFailure.kind` over generic `error` text (#2045).
+and prefer `spawnFailure.kind` over generic `error` text. Markdownlint's
+availability checker and install fallback use the registry's bounded
+`["--no-globs", "-"]` command through the managed-shim path as well (#2045).
 
 **One-shot process-table collection distinguishes exit failure from empty.**
 `spawnCollectStdoutResult` reports `exit-error` with code/signal and discards

@@ -1137,7 +1137,7 @@ const TOOL_COMMAND_SPECS = new Map<string, ToolCommandSpec>([
 		{
 			command: "markdownlint-cli2",
 			windowsExt: ".cmd",
-			versionArgs: ["--version"],
+			versionArgs: ["--no-globs", "-"],
 			managedToolId: "markdownlint",
 		},
 	],
