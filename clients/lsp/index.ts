@@ -2694,15 +2694,23 @@ export class LSPService {
 	 * `isServerAliveForFile`, this NEVER creates or warms a client — it only
 	 * resolves each requested server's root and reads the already-connected
 	 * client's cached diagnostics for `filePath`. Servers with no live client
-	 * are simply absent from the returned map (the caller drops those pairs
-	 * silently); a present server maps to its cache contents, possibly empty
-	 * (still scanning).
+	 * are simply absent from the returned map. A live client is present only
+	 * when its per-file cache entry exists; its timestamp distinguishes a
+	 * published clean result from no publication.
 	 */
 	async readCachedDiagnosticsForServers(
 		filePath: string,
 		serverIds: ReadonlySet<string>,
-	): Promise<Map<string, import("./client.js").LSPDiagnostic[]>> {
-		const out = new Map<string, import("./client.js").LSPDiagnostic[]>();
+	): Promise<
+		Map<
+			string,
+			{ diags: import("./client.js").LSPDiagnostic[]; publishedAt?: number }
+		>
+	> {
+		const out = new Map<
+			string,
+			{ diags: import("./client.js").LSPDiagnostic[]; publishedAt?: number }
+		>();
 		if (this.checkDestroyed() || serverIds.size === 0) return out;
 		for (const server of getServersForFileWithConfig(filePath)) {
 			if (!serverIds.has(server.id) || out.has(server.id)) continue;
@@ -2711,7 +2719,11 @@ export class LSPService {
 			const key = `${server.id}:${normalizeMapKey(root)}`;
 			const client = this.state.clients.get(key);
 			if (!client?.isAlive()) continue;
-			out.set(server.id, client.getDiagnostics(filePath));
+			const entry = client.getAllDiagnostics().get(normalizeMapKey(filePath));
+			out.set(server.id, {
+				diags: entry?.diags ?? [],
+				publishedAt: entry?.ts,
+			});
 		}
 		return out;
 	}

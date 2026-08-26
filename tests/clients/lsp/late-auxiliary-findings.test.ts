@@ -39,6 +39,7 @@ import { handleTurnEnd } from "../../../clients/runtime-turn.js";
 import {
 	drainPendingAuxiliaryCoverage,
 	markPendingAuxiliaryCoverage,
+	MAX_LATE_AUX_REARMS,
 	readLateAuxRearmTtlMs,
 	resetPendingAuxiliaryCoverage,
 } from "../../../clients/lsp/pending-aux-coverage.js";
@@ -155,9 +156,15 @@ describe("turn-end late-auxiliary findings (#2001/#2002)", () => {
 			// By turn end the scanner has published into its client cache.
 			readCachedDiagnosticsForServers.mockImplementation(
 				async (_filePath: string, serverIds: ReadonlySet<string>) => {
-					const out = new Map<string, LSPDiagnostic[]>();
+					const out = new Map<
+						string,
+						{ diags: LSPDiagnostic[]; publishedAt: number }
+					>();
 					if (serverIds.has("opengrep"))
-						out.set("opengrep", [diag(4, "late finding body")]);
+						out.set("opengrep", {
+							diags: [diag(4, "late finding body")],
+							publishedAt: Date.now(),
+						});
 					return out;
 				},
 			);
@@ -201,7 +208,16 @@ describe("turn-end late-auxiliary findings (#2001/#2002)", () => {
 			// mtime (now-10s) > mark (now-60s) + tolerance → stale → drop.
 			markPendingAuxiliaryCoverage(file, ["opengrep"], Date.now() - 60_000);
 			readCachedDiagnosticsForServers.mockImplementation(
-				async () => new Map([["opengrep", [diag(0, "should not appear")]]]),
+				async () =>
+					new Map([
+						[
+							"opengrep",
+							{
+								diags: [diag(0, "should not appear")],
+								publishedAt: Date.now(),
+							},
+						],
+					]),
 			);
 
 			await handleTurnEnd(makeDeps(runtime, cacheManager, env.tmpDir));
@@ -214,6 +230,184 @@ describe("turn-end late-auxiliary findings (#2001/#2002)", () => {
 			expect(record).toBeDefined();
 			expect(record.metadata).toMatchObject({ pending: 1, delivered: 0 });
 			expect(record.metadata.stale).toBeGreaterThan(0);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("retires a newer empty publication as cleanConfirmed", async () => {
+		const env = setupTestEnvironment("pi-lens-late-aux-clean-") as any;
+		try {
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId: "late-aux-clean" });
+			runtime.beginTurn();
+			const cacheManager = new CacheManager(false);
+			const file = path.join(env.tmpDir, "src", "clean.ts");
+			registerEdit(env, "late-aux-clean", cacheManager, file);
+			markPendingAuxiliaryCoverage(file, ["opengrep"], Date.now() - 2_000);
+			const clean: {
+				diags: LSPDiagnostic[];
+				publishedAt: number;
+			} = { diags: [], publishedAt: Date.now() };
+			readCachedDiagnosticsForServers.mockResolvedValue(
+				new Map([["opengrep", clean]]),
+			);
+			await handleTurnEnd(makeDeps(runtime, cacheManager, env.tmpDir));
+			expect(drainPendingAuxiliaryCoverage()).toHaveLength(0);
+			expect(lateAuxRecord()?.metadata).toMatchObject({
+				pending: 1,
+				cleanConfirmed: 1,
+				rearmed: 0,
+			});
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("retires a never-published pair at the re-arm ceiling", async () => {
+		const env = setupTestEnvironment("pi-lens-late-aux-ceiling-") as any;
+		try {
+			process.env.PI_LENS_LATE_AUX_REARM_TTL_MS = "600000";
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId: "late-aux-ceiling" });
+			runtime.beginTurn();
+			const cacheManager = new CacheManager(false);
+			const file = path.join(env.tmpDir, "src", "ceiling.ts");
+			registerEdit(env, "late-aux-ceiling", cacheManager, file);
+			markPendingAuxiliaryCoverage(file, ["opengrep"], Date.now() - 1000);
+			readCachedDiagnosticsForServers.mockResolvedValue(
+				new Map([["opengrep", { diags: [], publishedAt: undefined }]]),
+			);
+
+			for (let turn = 0; turn <= MAX_LATE_AUX_REARMS; turn += 1) {
+				registerEdit(env, "late-aux-ceiling", cacheManager, file);
+				await handleTurnEnd(makeDeps(runtime, cacheManager, env.tmpDir));
+			}
+
+			const ceilingRemaining = drainPendingAuxiliaryCoverage();
+			expect(ceilingRemaining).toHaveLength(0);
+			const records = logLatency.mock.calls
+				.map((call) => call[0])
+				.filter((entry: any) => entry?.phase === "late_auxiliary_findings");
+			expect(records.at(-1)?.metadata).toMatchObject({
+				pairCreated: 1,
+				ceilingExhausted: 1,
+				pendingAfter: 0,
+			});
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("reconciles pair units across clean, stale, absent, and eviction paths", async () => {
+		const env = setupTestEnvironment("pi-lens-late-aux-pair-reconcile-") as any;
+		try {
+			process.env.PI_LENS_LATE_AUX_REARM_TTL_MS = "5000";
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId: "late-aux-pair-reconcile" });
+			runtime.beginTurn();
+			const cacheManager = new CacheManager(false);
+			const clean = path.join(env.tmpDir, "src", "clean.ts");
+			const stale = path.join(env.tmpDir, "src", "stale.ts");
+			registerEdit(env, "late-aux-pair-reconcile", cacheManager, stale);
+			registerEdit(env, "late-aux-pair-reconcile", cacheManager, clean);
+			markPendingAuxiliaryCoverage(
+				path.join(env.tmpDir, "src", "evicted.ts"),
+				["opengrep"],
+				Date.now() - 1000,
+			);
+			markPendingAuxiliaryCoverage(clean, ["opengrep"], Date.now() - 1000);
+			markPendingAuxiliaryCoverage(
+				stale,
+				["opengrep"],
+				Date.now() - 60_000,
+				Date.now() - 1000,
+			);
+			const absent = path.join(env.tmpDir, "src", "absent.ts");
+			markPendingAuxiliaryCoverage(absent, ["opengrep"], Date.now() - 1000);
+			const expired = path.join(env.tmpDir, "src", "expired.ts");
+			markPendingAuxiliaryCoverage(expired, ["opengrep"], Date.now() - 10_000);
+			for (let index = 0; index < 47; index += 1) {
+				markPendingAuxiliaryCoverage(
+					path.join(env.tmpDir, "src", `clean-${index}.ts`),
+					["opengrep"],
+					Date.now() - 1000,
+				);
+			}
+			readCachedDiagnosticsForServers.mockImplementation(
+				async (filePath: string) => {
+					if (filePath === absent) return new Map();
+					if (filePath === stale)
+						return new Map([
+							[
+								"opengrep",
+								{ diags: [diag(0, "old")], publishedAt: Date.now() },
+							],
+						]);
+					if (filePath === expired)
+						return new Map([
+							["opengrep", { diags: [], publishedAt: Date.now() - 20_000 }],
+						]);
+					return new Map([
+						["opengrep", { diags: [], publishedAt: Date.now() }],
+					]);
+				},
+			);
+
+			await handleTurnEnd(makeDeps(runtime, cacheManager, env.tmpDir));
+
+			const metadata = lateAuxRecord()?.metadata;
+			expect(metadata).toMatchObject({
+				pairCreated: 50,
+				cleanConfirmed: 47,
+				clientGone: 1,
+				expired: 1,
+				rearmed: 1,
+				pendingAfter: 1,
+			});
+			expect(
+				metadata.cleanConfirmed +
+					metadata.clientGone +
+					metadata.expired +
+					metadata.pendingAfter,
+			).toBe(metadata.pairCreated);
+			expect(metadata.stale).toBe(1);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("reconciles expired and conversion-empty retirements", async () => {
+		const env = setupTestEnvironment("pi-lens-late-aux-reconcile-") as any;
+		try {
+			process.env.PI_LENS_LATE_AUX_REARM_TTL_MS = "5000";
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId: "late-aux-reconcile" });
+			runtime.beginTurn();
+			const cacheManager = new CacheManager(false);
+			const expired = path.join(env.tmpDir, "src", "expired.ts");
+			const empty = path.join(env.tmpDir, "src", "empty.ts");
+			registerEdit(env, "late-aux-reconcile", cacheManager, expired);
+			registerEdit(env, "late-aux-reconcile", cacheManager, empty);
+			markPendingAuxiliaryCoverage(expired, ["opengrep"], Date.now() - 10_000);
+			markPendingAuxiliaryCoverage(empty, ["opengrep"], Date.now() - 2_000);
+			readCachedDiagnosticsForServers.mockImplementation(
+				async (filePath: string) =>
+					filePath === expired
+						? new Map([
+								["opengrep", { diags: [], publishedAt: Date.now() - 20_000 }],
+							])
+						: new Map([
+								[
+									"opengrep",
+									{ diags: [{ message: "bad" }], publishedAt: Date.now() },
+								],
+							]),
+			);
+			await handleTurnEnd(makeDeps(runtime, cacheManager, env.tmpDir));
+			const metadata = lateAuxRecord()?.metadata;
+			expect(metadata).toMatchObject({ pending: 2, expired: 1, missing: 1 });
+			expect(metadata.expired + metadata.missing).toBe(metadata.pending);
 		} finally {
 			env.cleanup();
 		}
@@ -233,7 +427,15 @@ describe("turn-end late-auxiliary findings (#2001/#2002)", () => {
 			markPendingAuxiliaryCoverage(deleted, ["opengrep"], Date.now() - 2000);
 			readCachedDiagnosticsForServers.mockImplementation(
 				async () =>
-					new Map([["opengrep", [diag(0, "finding for deleted file")]]]),
+					new Map([
+						[
+							"opengrep",
+							{
+								diags: [diag(0, "finding for deleted file")],
+								publishedAt: Date.now(),
+							},
+						],
+					]),
 			);
 
 			await handleTurnEnd(makeDeps(runtime, cacheManager, env.tmpDir));
@@ -262,7 +464,7 @@ describe("turn-end late-auxiliary findings (#2001/#2002)", () => {
 			markPendingAuxiliaryCoverage(file, ["opengrep"], markedAt);
 			// Client alive (present in the map) but the scan has not landed yet.
 			readCachedDiagnosticsForServers.mockImplementation(
-				async () => new Map([["opengrep", []]]),
+				async () => new Map([["opengrep", { diags: [] }]]),
 			);
 
 			await handleTurnEnd(makeDeps(runtime, cacheManager, env.tmpDir));
@@ -318,7 +520,7 @@ describe("turn-end late-auxiliary findings (#2001/#2002)", () => {
 				Date.now() - 1_000,
 			);
 			readCachedDiagnosticsForServers.mockImplementation(
-				async () => new Map([["opengrep", []]]),
+				async () => new Map([["opengrep", { diags: [] }]]),
 			);
 
 			await handleTurnEnd(makeDeps(runtime, cacheManager, env.tmpDir));
@@ -350,7 +552,7 @@ describe("turn-end late-auxiliary findings (#2001/#2002)", () => {
 
 			markPendingAuxiliaryCoverage(file, ["opengrep"], Date.now() - 10_000);
 			readCachedDiagnosticsForServers.mockImplementation(
-				async () => new Map([["opengrep", []]]),
+				async () => new Map([["opengrep", { diags: [] }]]),
 			);
 
 			await handleTurnEnd(makeDeps(runtime, cacheManager, env.tmpDir));
