@@ -277,6 +277,12 @@ group (see the placement rules in "Maintaining this file").
 
 ### LSP: acquisition, touches, waits, and diagnostics
 
+Document sync keeps a per-client raw-spelling-to-canonical-path memo for the
+repeated `didChange` path. Close and teardown clear the memo, including every
+equivalent spelling, so Windows realpath savings do not become stale path-key
+state. New document-sync call sites must use this seam rather than calling
+`normalizeMapKey` inside the edit loop. (#2016)
+
 The live LSP service, generation handoff, workspace-sweep hold state, and
 classic TypeScript repair latch use separate versioned families in
 `getProcessSingleton`. The service's incompatible-cell teardown uses

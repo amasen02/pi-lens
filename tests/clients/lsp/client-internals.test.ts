@@ -58,6 +58,7 @@ import {
 	type LSPDiagnostic,
 } from "../../../clients/lsp/client.js";
 import { normalizeMapKey } from "../../../clients/path-utils.js";
+import * as pathUtils from "../../../clients/path-utils.js";
 import { hashDiagnosticContent } from "../../../clients/lsp/diagnostic-binding.js";
 import { applyWorkspaceEdit } from "../../../clients/lsp/edits.js";
 // #1667: the LSPClientState fixture moved to a shared module so the
@@ -1064,6 +1065,29 @@ describe("handleNotifyExternalChange (#1668)", () => {
 });
 
 describe("handleNotifyChange", () => {
+	it("memoizes the canonical key across edits and clears it on close (#2016)", async () => {
+		const state = createMockState();
+		state.openDocuments.add(TEST_KEY);
+		state.documentVersions.set(TEST_KEY, 0);
+		const normalizeSpy = vi.spyOn(pathUtils, "normalizeMapKey");
+
+		try {
+			await handleNotifyChange(state, TEST_FILE, "const y = 2;");
+			await handleNotifyChange(state, TEST_FILE, "const y = 3;");
+
+			// The production path performs one canonicalization for this stable
+			// spelling, then reuses that key for both didChange notifications.
+			expect(normalizeSpy).toHaveBeenCalledTimes(1);
+			expect(state.normalizedDocumentPaths.get(TEST_FILE)).toBe(TEST_KEY);
+			expect(state.normalizedDocumentPaths.size).toBe(1);
+
+			await closeDocument(state, TEST_FILE);
+			expect(state.normalizedDocumentPaths.size).toBe(0);
+		} finally {
+			normalizeSpy.mockRestore();
+		}
+	});
+
 	it("sends didChange when document is open", async () => {
 		const state = createMockState();
 		state.openDocuments.add(TEST_KEY);
