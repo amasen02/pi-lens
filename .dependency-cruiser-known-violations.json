@@ -1,4 +1,4 @@
-// Follow-up reduction tracked in issue #2125; 29 entries, seven traverse a dynamic-import edge.
+// Follow-up reduction tracked in issue #2125; 30 entries, seven traverse a dynamic-import edge. Entry 30 (instance-registry-lock -> degradation-ledger, #2173): the machine-global lock records its own timeout telemetry; the ledger sits upstream of the reaper/registry chain, so the edge closes a baseline-class cycle rather than introducing new coupling.
 [
   {
     "type": "cycle",
@@ -1290,6 +1290,85 @@
       },
       {
         "name": "clients/workspace-topology.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "clients/instance-registry-lock.js",
+    "to": "clients/degradation-ledger.js",
+    "unresolvedTo": "./degradation-ledger.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-client-cycles"
+    },
+    "cycle": [
+      {
+        "name": "clients/degradation-ledger.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/extension-log.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/file-utils.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/git-tracked-ignore.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/safe-spawn.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/resource-sampler.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/instance-reaper.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/instance-registry.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/instance-registry-lock.js",
         "dependencyTypes": [
           "local",
           "import"

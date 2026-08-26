@@ -2,23 +2,17 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	withInstanceRegistryLock,
 	withInstanceRegistryLockSync,
 } from "../../clients/instance-registry-lock.js";
+import { getDegradationSummary } from "../../clients/degradation-ledger.js";
 import { removeTempDirSync } from "./test-utils.js";
 
 const dirs: string[] = [];
-const require = createRequire(import.meta.url);
-const getDegradationSummary = () =>
-	(
-		require("../../clients/degradation-ledger.js") as {
-			getDegradationSummary: () => unknown[];
-		}
-	).getDegradationSummary();
+
 const testTimeoutScale = (() => {
 	const parsed = Number(process.env.PI_LENS_TEST_TIMEOUT_SCALE ?? "1");
 	return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;

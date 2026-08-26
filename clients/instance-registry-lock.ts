@@ -2,21 +2,9 @@
 
 import * as fs from "node:fs";
 import { randomInt } from "node:crypto";
-import { createRequire } from "node:module";
 import * as path from "node:path";
 
-const require = createRequire(import.meta.url);
-type IncrementDegradationCount =
-	typeof import("./degradation-ledger.js").incrementDegradationCount;
-let incrementDegradationCount: IncrementDegradationCount | undefined;
-
-function getIncrementDegradationCount(): IncrementDegradationCount {
-	return (incrementDegradationCount ??= (
-		require("./degradation-ledger.js") as {
-			incrementDegradationCount: IncrementDegradationCount;
-		}
-	).incrementDegradationCount);
-}
+import { incrementDegradationCount } from "./degradation-ledger.js";
 
 const LOCK_STALE_MS = 5_000;
 const LOCK_WAIT_MS = 500;
@@ -58,7 +46,7 @@ function staleLock(lock: string): boolean {
 }
 
 function recordLockTimeout(target: string): void {
-	getIncrementDegradationCount()({
+	incrementDegradationCount({
 		kind: "instance-registry-lock-timeout",
 		subject: path.resolve(target),
 		reason: `lock acquisition exhausted for ${path.basename(target)}`,
