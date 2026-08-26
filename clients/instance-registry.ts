@@ -13,12 +13,9 @@
  * treated as `{ instances: [] }` — this module must never throw on a read.
  *
  * Concurrency: every write is read-modify-write-whole-file with an atomic
- * tmp+rename (same pattern as clients/review-graph/builder.ts). Two
- * processes racing a write is a KNOWN, ACCEPTED race for slice 1
- * (last-writer-wins) — a lost update here only means a stale/missing
- * observability entry, never data corruption (the tmp+rename guarantees the
- * file itself is always valid JSON). A future slice can add file locking or
- * per-pid shard files if this proves too lossy in practice.
+ * tmp+rename (same pattern as clients/review-graph/builder.ts). File locking
+ * remains deferred, but writers re-read after publication and retry when their
+ * own mutation is absent, which bounds the cross-process lost-update window.
  */
 
 import * as fs from "node:fs";
@@ -219,6 +216,18 @@ async function writeRegistryAsync(file: RegistryFile): Promise<void> {
 	await writeFileAtomicAsync(target, JSON.stringify(file));
 }
 
+const REGISTRY_WRITE_RETRIES = 3;
+
+async function writeRegistryWithRetry(
+	mutate: (file: RegistryFile) => RegistryFile,
+	isCommitted: (file: RegistryFile) => boolean,
+): Promise<void> {
+	for (let attempt = 0; attempt < REGISTRY_WRITE_RETRIES; attempt++) {
+		await writeRegistryAsync(mutate(await readRegistryAsync()));
+		if (isCommitted(await readRegistryAsync())) return;
+	}
+}
+
 function writeRegistrySync(file: RegistryFile): void {
 	const dir = getGlobalPiLensDir();
 	const target = registryPath();
@@ -304,14 +313,7 @@ async function registerInstanceNow(projectRoot: string): Promise<void> {
 	if (!isInstanceRegistryEnabled()) return;
 	const pid = process.pid;
 	const normalizedRoot = normalizeFilePath(projectRoot);
-	const file = await readRegistryAsync();
 	const now = new Date().toISOString();
-	const others = file.instances.filter((entry) => entry.pid !== pid);
-	const existing = file.instances.find((entry) => entry.pid === pid);
-	const roots = mergeInstanceRoots(
-		existing ? getInstanceRoots(existing) : [],
-		normalizedRoot,
-	);
 	const identity = isSubagentSession() ? getSubagentIdentity() : undefined;
 	const subagent = identity
 		? {
@@ -321,19 +323,29 @@ async function registerInstanceNow(projectRoot: string): Promise<void> {
 				runId: identity.runId,
 			}
 		: undefined;
-	others.push({
-		pid,
-		startedAt: existing?.startedAt ?? now,
-		// Pinned: `roots[0]` is the first root this process ever registered.
-		projectRoot: roots[0] ?? normalizedRoot,
-		projectRoots: roots,
-		lspChildren: existing?.lspChildren ?? [],
-		lspChildCount: existing?.lspChildren?.length ?? 0,
-		rssBytes: process.memoryUsage().rss,
-		heartbeatAt: now,
-		...(subagent ? { subagent } : {}),
-	});
-	await writeRegistryAsync({ instances: others });
+	await writeRegistryWithRetry(
+		(file) => {
+			const others = file.instances.filter((entry) => entry.pid !== pid);
+			const existing = file.instances.find((entry) => entry.pid === pid);
+			const roots = mergeInstanceRoots(
+				existing ? getInstanceRoots(existing) : [],
+				normalizedRoot,
+			);
+			others.push({
+				pid,
+				startedAt: existing?.startedAt ?? now,
+				projectRoot: roots[0] ?? normalizedRoot,
+				projectRoots: roots,
+				lspChildren: existing?.lspChildren ?? [],
+				lspChildCount: existing?.lspChildren?.length ?? 0,
+				rssBytes: process.memoryUsage().rss,
+				heartbeatAt: now,
+				...(subagent ? { subagent } : {}),
+			});
+			return { instances: others };
+		},
+		(file) => file.instances.some((entry) => entry.pid === pid),
+	);
 }
 
 /**
@@ -453,6 +465,8 @@ export interface RecordLspChildInput {
 	serverId: string;
 	command: string;
 	marker?: string;
+	/** Session identity used if this child arrives before host registration. */
+	sessionIdentity?: { projectRoot: string; startedAt: string };
 }
 
 // Every mutation routed through this tail (`registerInstance`,
@@ -523,8 +537,6 @@ export function recordLspChild(entry: RecordLspChildInput): Promise<void> {
 async function recordLspChildNow(entry: RecordLspChildInput): Promise<void> {
 	if (!isInstanceRegistryEnabled()) return;
 	const pid = process.pid;
-	const file = await readRegistryAsync();
-	const idx = file.instances.findIndex((inst) => inst.pid === pid);
 	const now = new Date().toISOString();
 	const childEntry: LspChildEntry = {
 		pid: entry.pid,
@@ -533,32 +545,65 @@ async function recordLspChildNow(entry: RecordLspChildInput): Promise<void> {
 		marker: entry.marker,
 		spawnedAt: now,
 	};
-	if (idx === -1) {
-		// registerInstance hasn't run yet in this process (or was reaped) —
-		// synthesize a minimal entry so the child is still tracked.
-		file.instances.push({
-			pid,
-			startedAt: now,
-			projectRoot: normalizeFilePath(process.cwd()),
-			projectRoots: [normalizeFilePath(process.cwd())],
-			lspChildren: [childEntry],
-			lspChildCount: 1,
-			rssBytes: process.memoryUsage().rss,
-			heartbeatAt: now,
-		});
-	} else {
-		const current = file.instances[idx];
-		const filtered = current.lspChildren.filter(
-			(child) => child.pid !== entry.pid,
-		);
-		filtered.push(childEntry);
-		file.instances[idx] = {
-			...current,
-			lspChildren: filtered,
-			lspChildCount: filtered.length,
-		};
-	}
-	await writeRegistryAsync(file);
+	await writeRegistryWithRetry(
+		(file) => {
+			const idx = file.instances.findIndex((inst) => inst.pid === pid);
+			if (idx === -1) {
+				// registerInstance hasn't run yet in this process (or was reaped) —
+				// synthesize a minimal entry so the child is still tracked.
+				recordDegradationOnce({
+					kind: "instance-registry-registration-missing",
+					subject: String(pid),
+					reason: "synthesizing host entry while recording an LSP child",
+				});
+				const identity = entry.sessionIdentity;
+				const projectRoot = normalizeFilePath(
+					identity?.projectRoot ?? process.cwd(),
+				);
+				file.instances.push({
+					pid,
+					startedAt: identity?.startedAt ?? now,
+					projectRoot,
+					projectRoots: [projectRoot],
+					lspChildren: [childEntry],
+					lspChildCount: 1,
+					rssBytes: process.memoryUsage().rss,
+					heartbeatAt: now,
+					...(getSubagentIdentity()
+						? {
+								subagent: (() => {
+									const identity = getSubagentIdentity();
+									return {
+										marker: identity?.marker,
+										agentType: identity?.agentName,
+										parentPid: identity?.parentPid,
+										runId: identity?.runId,
+									};
+								})(),
+							}
+						: {}),
+				});
+			} else {
+				const current = file.instances[idx];
+				const filtered = current.lspChildren.filter(
+					(child) => child.pid !== entry.pid,
+				);
+				filtered.push(childEntry);
+				file.instances[idx] = {
+					...current,
+					lspChildren: filtered,
+					lspChildCount: filtered.length,
+				};
+			}
+			return file;
+		},
+		(file) =>
+			file.instances.some(
+				(instance) =>
+					instance.pid === pid &&
+					instance.lspChildren.some((child) => child.pid === entry.pid),
+			),
+	);
 }
 
 /**

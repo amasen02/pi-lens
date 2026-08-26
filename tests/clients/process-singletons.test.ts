@@ -219,6 +219,80 @@ describe("#2146 — the registry mutation tail is one per process", () => {
 			"late",
 		);
 	});
+
+	it("re-reads and merges registrations when independent writers lose an update", async () => {
+		let releaseFirstWrite: () => void = () => {};
+		let firstWriteStarted!: () => void;
+		const firstWriteReady = new Promise<void>((resolve) => {
+			firstWriteStarted = resolve;
+		});
+		const gate = new Promise<void>((resolve) => {
+			releaseFirstWrite = resolve;
+		});
+		let writes = 0;
+		vi.doMock("../../clients/atomic-write.js", async (importOriginal) => {
+			const actual =
+				await importOriginal<typeof import("../../clients/atomic-write.js")>();
+			return {
+				...actual,
+				writeFileAtomicAsync: async (
+					...args: Parameters<typeof actual.writeFileAtomicAsync>
+				) => {
+					writes++;
+					if (writes === 1) {
+						firstWriteStarted();
+						await gate;
+					}
+					return actual.writeFileAtomicAsync(...args);
+				},
+			};
+		});
+		const first = await freshEvaluation<InstanceRegistryModule>(
+			"../../clients/instance-registry.js",
+		);
+		// Deliberately model two independent processes: each has its own
+		// in-process tail, while both point at the same registry file.
+		const singletons = await import("../../clients/process-singletons.js");
+		singletons._resetProcessSingletonsForTests();
+		const second = await freshEvaluation<InstanceRegistryModule>(
+			"../../clients/instance-registry.js",
+		);
+		fs.mkdirSync(path.join(dir, "root-a"), { recursive: true });
+		fs.mkdirSync(path.join(dir, "root-b"), { recursive: true });
+		const originalPid = process.pid;
+		const pidDescriptor = Object.getOwnPropertyDescriptor(process, "pid");
+		try {
+			Object.defineProperty(process, "pid", { value: 21731 });
+			const firstRegistration = first.registerInstance(
+				path.join(dir, "root-a"),
+			);
+			await firstWriteReady;
+			Object.defineProperty(process, "pid", { value: 21732 });
+			const secondRegistration = second.registerInstance(
+				path.join(dir, "root-b"),
+			);
+			releaseFirstWrite();
+			await Promise.all([firstRegistration, secondRegistration]);
+
+			const entries = JSON.parse(
+				fs.readFileSync(path.join(dir, "instances.json"), "utf8"),
+			).instances as Array<{ pid: number; projectRoot: string }>;
+			expect(entries.map((entry) => entry.pid)).toEqual(
+				expect.arrayContaining([21731, 21732]),
+			);
+			expect(
+				entries.find((entry) => entry.pid === 21731)?.projectRoot,
+			).toContain("root-a");
+			expect(
+				entries.find((entry) => entry.pid === 21732)?.projectRoot,
+			).toContain("root-b");
+		} finally {
+			releaseFirstWrite();
+			vi.doUnmock("../../clients/atomic-write.js");
+			if (pidDescriptor) Object.defineProperty(process, "pid", pidDescriptor);
+			else Object.defineProperty(process, "pid", { value: originalPid });
+		}
+	});
 });
 
 describe("#2146 — host_boot carries the module-evaluation ordinal", () => {

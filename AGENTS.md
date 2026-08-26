@@ -818,6 +818,13 @@ Tier-2 cache bounds (#1389) use the Tier-1 idle-timer/LRU shape where entries ar
 
 ### Session lifecycle, telemetry, and observability
 
+The machine-global instance registry keeps a lost-update recovery bounded
+without file locking: registration writers re-read after atomic publication
+and retry when their own pid is absent. Child-first synthesis receives the
+session's real root and start time from the LSP client, preserves subagent
+identity, and records `instance-registry-registration-missing` once when the
+host registration is absent. (#2173)
+
 Tool metadata is normalized at the final `pi.registerTool` boundary in
 `clients/tool-definition.ts`. Keep this seam around the complete active/lazy/
 activation-tool registration list: child sessions and wrapped/lazy factories

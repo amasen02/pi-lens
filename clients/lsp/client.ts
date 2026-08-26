@@ -31,6 +31,7 @@ import {
 } from "../deps/vscode-jsonrpc.js";
 import { logExtension } from "../extension-log.js";
 import { recordLspChild, removeLspChild } from "../instance-registry.js";
+import { workspaceDiagnosticsCacheSessionStart } from "./workspace-diagnostics-session.js";
 import { logLatency } from "../latency-logger.js";
 import {
 	type LspMutationContext,
@@ -4840,6 +4841,12 @@ export async function createLSPClient(options: {
 		serverId,
 		command: lspProcess.command,
 		marker: extractSpawnMarker(lspProcess.args),
+		sessionIdentity: {
+			projectRoot: root,
+			startedAt: new Date(
+				workspaceDiagnosticsCacheSessionStart(),
+			).toISOString(),
+		},
 	}).catch((err) => {
 		// best-effort observability — never fail LSP startup over this
 		logLatency({
