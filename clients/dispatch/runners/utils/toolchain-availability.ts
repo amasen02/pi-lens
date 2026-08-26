@@ -46,9 +46,10 @@ export interface ToolchainAvailability {
 	isAvailable: () => Promise<boolean>;
 }
 
-const toolchainProbeFlights = createAvailabilityProbeFlight<
-	Awaited<ReturnType<typeof probeAvailabilityCandidates>>
->();
+const toolchainProbeFlights =
+	createAvailabilityProbeFlight<
+		Awaited<ReturnType<typeof probeAvailabilityCandidates>>
+	>();
 
 /**
  * Own one toolchain's availability: sweep the platform candidate list, memoize

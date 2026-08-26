@@ -606,8 +606,11 @@ is appended after primary diagnostics so both remain visible.
 
 Availability probes for package managers, dispatch, Go and Cargo toolchains,
 security scans, checkers, and cwd probes use owner-local keyed flights created
-by `createAvailabilityProbeFlight`. Each owner reset clears only its own
-registry; dispatch-owned flights also use the dispatch generation guard, and
+by `createAvailabilityProbeFlight`. An owner with a reset seam clears only its
+own registry (dispatch clears checker and cwd flights; package-manager clears
+its own); the toolchain and security registries have no reset and rely on
+flight-settle semantics plus stable keys. Dispatch-owned flights also use the
+dispatch generation guard, and
 joined records retain `classifiedBy: "joined"`. Release-managed binaries under
 `~/.pi-lens/bin` resolve before PATH probing, and the resolved path reaches
 security scans. Overrun records use the cache key as their second subject
