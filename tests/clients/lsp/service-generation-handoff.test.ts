@@ -166,4 +166,41 @@ describe("LSP singleton generation handoff (#850)", () => {
 
 		resetLSPService({ fast: true });
 	});
+
+	it("passes service cwd through child-first client identity synthesis", async () => {
+		const { getLSPService, resetLSPService } =
+			await import("../../../clients/lsp/index.js");
+		const spawn = vi.fn(async () => ({
+			process: {
+				process: { killed: false, kill: vi.fn() },
+				stdin: {} as any,
+				stdout: {} as any,
+				stderr: {} as any,
+				pid: 870,
+			},
+		}));
+		let synthesizedRootSource: string | undefined;
+		createLSPClient.mockImplementation(
+			async (options: { sessionCwd?: string }) => {
+				synthesizedRootSource = options.sessionCwd
+					? "service-cwd"
+					: "lsp-fallback";
+				return { isAlive: () => true, shutdown: vi.fn(), serverId: "python" };
+			},
+		);
+		getServersForFileWithConfig.mockReturnValue([
+			{
+				id: "python",
+				name: "Python",
+				extensions: [".py"],
+				root: async () => "C:/repo",
+				spawn,
+			},
+		]);
+
+		await getLSPService().getClientForFile("C:/repo/main.py");
+
+		expect(synthesizedRootSource).toBe("service-cwd");
+		resetLSPService({ fast: true });
+	});
 });

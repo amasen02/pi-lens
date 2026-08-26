@@ -943,15 +943,19 @@ export async function getResourceFootprint(
  *  module docstring). Mirrors clients/instance-reaper.ts's
  *  `pruneDeadInstances` in the reaper delegates here so this module owns the
  *  registry lock seam without creating a dependency on the reaper. */
-export async function pruneDeadInstances(deadPids: Set<number>): Promise<void> {
-	await withInstanceRegistryLock(registryPath(), async () => {
+export async function pruneDeadInstances(
+	deadPids: Set<number>,
+): Promise<"pruned" | "no-match" | "could-not-acquire"> {
+	const result = await withInstanceRegistryLock(registryPath(), async () => {
 		const file = await readRegistryAsync();
 		const remaining = file.instances.filter(
 			(entry) => !deadPids.has(entry.pid),
 		);
-		if (remaining.length === file.instances.length) return;
+		if (remaining.length === file.instances.length) return "no-match" as const;
 		await writeRegistryAsync({ instances: remaining });
+		return "pruned" as const;
 	});
+	return result ?? "could-not-acquire";
 }
 
 async function prunePids(deadPids: Set<number>): Promise<void> {

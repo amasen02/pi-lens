@@ -1153,6 +1153,7 @@ async function collectWorkspaceDiagnosticFiles(
 // --- Service ---
 
 export class LSPService {
+	private readonly sessionCwd: string | undefined;
 	private state: LSPState;
 	private readonly workspaceProbeLogged = new Set<string>();
 	/** Per-service immutable root-boundary verdicts; root detectors cache hits too. */
@@ -1365,8 +1366,9 @@ export class LSPService {
 	 */
 	private generationHandoff: Promise<void> | undefined;
 
-	constructor(generationHandoff?: Promise<void>) {
+	constructor(generationHandoff?: Promise<void>, sessionCwd?: string) {
 		this.generationHandoff = generationHandoff;
+		this.sessionCwd = sessionCwd;
 		this.state = {
 			clients: new Map(),
 			servers: new Map(),
@@ -3513,6 +3515,7 @@ export class LSPService {
 				serverId: server.id,
 				process: spawned.process,
 				root,
+				sessionCwd: this.sessionCwd,
 				initialization: mergedInit,
 				initializeTimeoutMs: server.initializeTimeoutMs,
 				launchVariant: spawned.launchVariant,
@@ -8825,7 +8828,8 @@ function lspProcessState(): LSPProcessState {
 
 function processService(): LSPService {
 	const state = lspProcessState();
-	if (!state.service) state.service = new LSPService(state.generationHandoff);
+	if (!state.service)
+		state.service = new LSPService(state.generationHandoff, process.cwd());
 	return state.service;
 }
 /**
