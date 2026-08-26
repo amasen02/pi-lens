@@ -137,6 +137,75 @@ describe("verifyToolBinary (#2015)", () => {
 		).resolves.toBe(true);
 	}, 15_000);
 
+	it("waits for a late rescue at the deterministic 2000ms cliff", async () => {
+		const writer = path.join(binDir, "late-rescue-cliff.cjs");
+		fs.writeFileSync(
+			writer,
+			"for (let i = 0; i < 24; i++) process.stderr.write('x'.repeat(4096));" +
+				"setTimeout(() => process.stderr.write('Connection input stream is not set\\n'), 2000);",
+			"utf8",
+		);
+		const result = await safeSpawnAsync(process.execPath, [writer], {
+			timeout: 10_000,
+			maxOutputBytes: 64 * 1024,
+			matchWhileStreaming: /Connection input stream is not set/,
+		});
+		expect(result.streamingMatch).toBe(true);
+		expect(result.outputTruncated).toBe(true);
+	}, 15_000);
+
+	it("does not invent a kill classification when an unmatched child exits", async () => {
+		const writer = path.join(binDir, "natural-exit-after-cap.cjs");
+		fs.writeFileSync(
+			writer,
+			"for (let i = 0; i < 24; i++) process.stderr.write('x'.repeat(4096));",
+			"utf8",
+		);
+		const result = await safeSpawnAsync(process.execPath, [writer], {
+			timeout: 10_000,
+			maxOutputBytes: 64 * 1024,
+			matchWhileStreaming: /never-matches/,
+		});
+		expect(result.status).toBe(0);
+		expect(result.signal).toBeUndefined();
+		expect(result.error).toBeUndefined();
+		expect(result.streamingMatch).toBeUndefined();
+		expect(result.outputTruncated).toBe(true);
+	}, 15_000);
+
+	it("matches a rescue split across output chunks", async () => {
+		const writer = path.join(binDir, "split-rescue.cjs");
+		fs.writeFileSync(
+			writer,
+			"process.stderr.write('x'.repeat(70 * 1024));" +
+				"process.stderr.write('create');" +
+				"setTimeout(() => process.stderr.write('Connection\\n'), 50);",
+			"utf8",
+		);
+		const result = await safeSpawnAsync(process.execPath, [writer], {
+			timeout: 10_000,
+			maxOutputBytes: 64 * 1024,
+			matchWhileStreaming: /createConnection/,
+		});
+		expect(result.streamingMatch).toBe(true);
+	}, 15_000);
+
+	it("uses the latch when head and tail retention cannot see the rescue", async () => {
+		const writer = path.join(binDir, "evicted-rescue.cjs");
+		fs.writeFileSync(
+			writer,
+			"for (let i = 0; i < 24; i++) process.stderr.write('x'.repeat(4096));" +
+				"setTimeout(() => {" +
+				"process.stderr.write('Connection input stream is not set\\n' + 'y'.repeat(100 * 1024));" +
+				"}, 2000);",
+			"utf8",
+		);
+		const bin = writeShim("evicted-rescue", `node "${writer}"`);
+		await expect(
+			verifyToolBinary(bin, undefined, undefined, 10_000, ["--version"]),
+		).resolves.toBe(true);
+	}, 15_000);
+
 	it("latches a matching chunk before retained output can discard it", async () => {
 		const writer = path.join(binDir, "streaming-latch.cjs");
 		fs.writeFileSync(

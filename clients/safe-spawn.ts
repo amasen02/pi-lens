@@ -1226,6 +1226,14 @@ export async function safeSpawnAsync(
 		let retainedTailBytes = 0;
 		let retainedTailLimit = 0;
 		let truncationStream: OutputStream = "stderr";
+		const streamingMatcher = options?.matchWhileStreaming;
+		const streamingCarryBytes = streamingMatcher
+			? Math.max(0, streamingMatcher.source.length - 1)
+			: 0;
+		const streamingCarry: Record<OutputStream, string> = {
+			stdout: "",
+			stderr: "",
+		};
 		const bytePrefix = (text: string, bytes: number): string =>
 			Buffer.from(text).subarray(0, bytes).toString();
 		const byteSuffix = (text: string, bytes: number): string => {
@@ -1316,6 +1324,20 @@ export async function safeSpawnAsync(
 			}
 			retainedTailBytes = tailBytes - tailRemaining;
 			return renderOutput(stream);
+		};
+		const matchStreamingChunk = (
+			stream: OutputStream,
+			chunk: string | Buffer,
+		): void => {
+			if (streamingMatch || !streamingMatcher) return;
+			const text = typeof chunk === "string" ? chunk : chunk.toString();
+			streamingMatcher.lastIndex = 0;
+			streamingMatch = streamingMatcher.test(streamingCarry[stream] + text);
+			if (streamingCarryBytes > 0) {
+				streamingCarry[stream] = Buffer.from(streamingCarry[stream] + text)
+					.subarray(-streamingCarryBytes)
+					.toString();
+			}
 		};
 
 		// Spawn the process (non-blocking). Keeping Node's `shell` option false
@@ -1578,11 +1600,19 @@ export async function safeSpawnAsync(
 		abortSignal?.addEventListener("abort", onAbort, { once: true });
 
 		// Output-cap kills are awaited by finalize() below, just like
-		// timeout/abort kills. This keeps a noisy CLI from continuing in the
-		// background after its retained output has been bounded.
+		// timeout/abort kills. An armed, unmatched streaming matcher is the one
+		// exception: retention remains bounded, but the caller's timeout is the
+		// bound while the child gets a chance to emit its rescue line.
 		let killPromise: Promise<void> | undefined;
 		const stopForOutputLimit = (): void => {
-			if (outputTruncated && !killed && !child.killed) {
+			const waitingForStreamingMatch =
+				streamingMatcher !== undefined && !streamingMatch;
+			if (
+				outputTruncated &&
+				!waitingForStreamingMatch &&
+				!killed &&
+				!child.killed
+			) {
 				killed = true;
 				killPromise = killTree();
 			}
@@ -1592,26 +1622,14 @@ export async function safeSpawnAsync(
 		child.stdout?.setEncoding("utf-8");
 		child.stderr?.setEncoding("utf-8");
 		child.stdout?.on("data", (data) => {
-			if (!streamingMatch && options?.matchWhileStreaming) {
-				const matcher = options.matchWhileStreaming;
-				matcher.lastIndex = 0;
-				streamingMatch = matcher.test(
-					typeof data === "string" ? data : data.toString(),
-				);
-			}
+			matchStreamingChunk("stdout", data);
 			stdout = appendOutput("stdout", stdout, data);
 			if (outputTruncated) refreshRetainedOutputs();
 			stopForOutputLimit();
 			rearmIdleGrace?.();
 		});
 		child.stderr?.on("data", (data) => {
-			if (!streamingMatch && options?.matchWhileStreaming) {
-				const matcher = options.matchWhileStreaming;
-				matcher.lastIndex = 0;
-				streamingMatch = matcher.test(
-					typeof data === "string" ? data : data.toString(),
-				);
-			}
+			matchStreamingChunk("stderr", data);
 			stderr = appendOutput("stderr", stderr, data);
 			if (outputTruncated) refreshRetainedOutputs();
 			stopForOutputLimit();
@@ -1951,6 +1969,7 @@ export async function safeSpawnAsync(
 					failure,
 					spawnFailure,
 					...(outputTruncated ? { outputTruncated: true } : {}),
+					...(streamingMatch ? { streamingMatch: true } : {}),
 					resourceUsage,
 				});
 			if (controlFailure) finish(controlFailure);

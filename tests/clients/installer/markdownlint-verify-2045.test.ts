@@ -48,6 +48,20 @@ describe("managed markdownlint verification (#2045)", () => {
 		expect(fixture).toContain("Summary: 0 issues in 0 files");
 	});
 
+	it("accepts a transport rescue visible only through the streaming latch", async () => {
+		safeSpawnAsync.mockResolvedValueOnce(
+			result({
+				stderr: "x".repeat(64 * 1024),
+				outputTruncated: true,
+				streamingMatch: true,
+			}),
+		);
+
+		await expect(
+			verifyToolBinary("latch-only-tool", undefined, undefined, 10),
+		).resolves.toBe(true);
+	});
+
 	it.each([
 		"tool-not-found",
 		"cwd-unresolvable",

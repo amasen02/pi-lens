@@ -159,6 +159,25 @@ describe("safeSpawnAsync decides from the close-event SHAPE, not event timing (#
 		expect(result.spawnFailure).toBeUndefined();
 	});
 
+	it("preserves a streaming match on the error resolve path", async () => {
+		const child = makeFakeChild();
+		spawnMock.mockImplementation(() => {
+			queueMicrotask(() => {
+				child.stderr?.emit("data", "crea");
+				child.stderr?.emit("data", "teConnection");
+				child.emit("error", new Error("stream failed"));
+			});
+			return child;
+		});
+
+		const result = await safeSpawnAsync(REAL_ABSOLUTE_COMMAND, [], {
+			matchWhileStreaming: /createConnection/,
+		});
+
+		expect(result.streamingMatch).toBe(true);
+		expect(result.error?.message).toBe("stream failed");
+	});
+
 	it("never downgrades a healthy exit(0) run when 'close' never fires and a late, unrelated 'error' follows (#1673 review round 4, F1)", async () => {
 		const child = makeFakeChild();
 		spawnMock.mockImplementation(() => {
