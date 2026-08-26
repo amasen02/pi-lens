@@ -90,6 +90,32 @@ can still recombine into a bug when master moved the seam you built on), and
 update the PR body with an honest review-round section. Report what changed per
 finding with its red-run evidence.
 
+## Hard-won mechanics (2026-08-26 harvest — each cost a fix round)
+
+- **CI: read once, report conclusions, end your turn.** After pushing, read
+  the check runs on your exact head SHA one time. Report each job id with its
+  actual state — `queued`, `in_progress`, or a CONCLUSION. Never poll in a
+  loop (stall watchdogs kill the turn), never report "started" as green, and
+  never quote a previous head's job ids. If no `ci.yml` run registers within
+  ~2 minutes, push one empty commit and read once more; if still absent,
+  report that plainly — the orchestrator owns the next lever.
+- **PowerShell mangles multiline text through arguments.** Any multiline
+  content — PR bodies, commit messages, issue comments — goes through a file:
+  `gh pr edit --body-file`, `gh issue comment --body-file`, `git commit -F`.
+  After any body write, re-read it (`gh pr view --json body`) and verify the
+  newlines survived; literal `\n` or `` `n `` in the stored text means it did
+  not. A flattened commit body loses its trailers.
+- **Test doubles must be production-faithful on the axis under test.** A
+  double that ignores an argument the production seam honors (a timeout, a
+  budget, a generation) can turn an inert fix green. When your fix changes
+  what a collaborator receives, the double must consume that input the way
+  production does — and your red-first run proves the double notices.
+- **Settlement claims must match pushed state.** Every claim in your final
+  report — body sections written, tables added, issues commented — must
+  correspond to state the reviewer can fetch. Re-read what you wrote before
+  claiming it; reviewers diff reports against reality and a false claim costs
+  a full extra round.
+
 ## Report format
 
 Outcome first: branch, PR URL, then root cause in two sentences, red-run

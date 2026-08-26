@@ -49,6 +49,7 @@ const sharedGlobalSetup = [
 	"./tests/support/prewarm-grammars.ts",
 	// After check-build-freshness: the seed analyze runs the in-place build.
 	"./tests/support/prewarm-tool-home.ts",
+	"./tests/support/git-config-guard-setup.ts",
 ];
 
 const sharedSetupFiles = ["./tests/support/vitest-setup.ts"];

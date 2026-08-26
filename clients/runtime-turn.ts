@@ -98,6 +98,7 @@ import { sweepInlineBlockerPastEof } from "./blocker-past-eof.js";
 // #2001/#2002: collect-later delivery for slow auxiliary LSP servers.
 import { getLSPService } from "./lsp/index.js";
 import {
+	drainPendingAuxCapEvictedCount,
 	drainPendingAuxiliaryCoverage,
 	isPendingAuxiliaryPastRearmTtl,
 	rearmPendingAuxiliaryCoverage,
@@ -2378,6 +2379,10 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	// client drops silently.
 	const lateAuxStart = Date.now();
 	const drainedPairs = drainPendingAuxiliaryCoverage();
+	// #2168: cap evictions retire a pair before any drain can observe it — read
+	// and reset that count here so it folds into this turn's reconciliation
+	// sum instead of the pair vanishing uncounted.
+	const lateAuxCapEvicted = drainPendingAuxCapEvictedCount();
 	let lateAuxDelivered = 0;
 	let lateAuxStale = 0;
 	let lateAuxMissing = 0;
@@ -2409,8 +2414,28 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 						new Set(pairs.map((p) => p.serverId)),
 					);
 				} catch {
-					// #2027 round-1 P3-2: count dropped pairs — never silent.
+					// #2027 round-1 P3-2 / #2167 R2-2: a transient probe rejection
+					// tells us nothing about the pair's content, so treat it like the
+					// "still scanning" branch below — re-arm under the SAME
+					// ceiling/TTL bound rather than dropping the coverage outright.
+					// `probeFailed` stays an honest per-turn failure count; it is
+					// informational (like `stale`/`missing`), not a terminal bucket,
+					// since the pair itself still resolves through rearmed/
+					// ceilingExhausted/expired below.
 					lateAuxProbeFailed += pairs.length;
+					for (const pair of pairs) {
+						if (
+							!isPendingAuxiliaryPastRearmTtl(pair) &&
+							(pair.rearmCount ?? 0) < MAX_LATE_AUX_REARMS
+						) {
+							rearmPendingAuxiliaryCoverage(pair);
+							lateAuxRearmed += 1;
+						} else if (isPendingAuxiliaryPastRearmTtl(pair)) {
+							lateAuxExpired += 1;
+						} else {
+							lateAuxCeilingExhausted += 1;
+						}
+					}
 					continue;
 				}
 				const displayLateAuxPath = toRunnerDisplayPath(cwd, lateAuxPath);
@@ -2525,7 +2550,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			durationMs: Date.now() - lateAuxStart,
 			metadata: {
 				pending: drainedPairs.length,
-				pairCreated: drainedPairs.length,
+				pairCreated: drainedPairs.length + lateAuxCapEvicted,
 				pendingAfter: pendingAuxiliaryCoverageSize(),
 				delivered: lateAuxDelivered,
 				stale: lateAuxStale,
@@ -2537,6 +2562,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				expired: lateAuxExpired,
 				ceilingExhausted: lateAuxCeilingExhausted,
 				answered: lateAuxAnswered,
+				capEvicted: lateAuxCapEvicted,
 				stuckPairs: lateAuxStuckPairs,
 			},
 		});

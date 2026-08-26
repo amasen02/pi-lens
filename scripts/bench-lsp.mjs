@@ -20,6 +20,7 @@
  * servers are measured (others report "unavailable").
  */
 import { execFileSync } from "node:child_process";
+import { gitExecFileSync } from "./lib/git-fixture-env.mjs";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -89,7 +90,7 @@ for (const fx of fixtures) {
 	const absFile = path.join(ws, fx.file);
 	if (fx.gitInit) {
 		try {
-			execFileSync("git", ["init", "-q"], { cwd: ws, stdio: "ignore" });
+			gitExecFileSync(["init", "-q"], { cwd: ws, stdio: "ignore" });
 		} catch {}
 	}
 

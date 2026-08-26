@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterAll, expect } from "vitest";
+import { installGitFixtureEnv } from "./git-fixture-env.js";
 
 // The review-graph persist is debounced in production (#260 circuit-breaker) so
 // a burst of edits collapses to one write. In tests that would race disk-snapshot
@@ -48,6 +49,7 @@ process.env.PI_LENS_CONFIG_PATH = "/nonexistent-pi-lens-tests/config.json";
 process.env.PI_LENS_HOME = fs.mkdtempSync(
 	path.join(os.tmpdir(), "pi-lens-test-home-"),
 );
+installGitFixtureEnv(process.env.PI_LENS_HOME);
 
 // Hand this worker the suite-wide tool template's probe cache (built once by
 // prewarm-tool-home.ts globalSetup). ensureTool's probe-cache fast path then

@@ -7,7 +7,7 @@
  * These are real-git-repo tests (execFileSync git init/add/commit), following
  * the same fixture shape as `git-tracked-ignore.test.ts` (#701).
  */
-import { execFileSync } from "node:child_process";
+import { execFileSync } from "../support/git-fixture-env.js";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {

@@ -1,6 +1,6 @@
 /**
  * #2095 — `getCurrentCommit()` in `clients/metrics-history.ts` ran
- * `execSync("git rev-parse --short HEAD")` without an explicit `stdio`
+ * Git commit lookup without an explicit `stdio`
  * override. Node's `execSync`/`execFileSync` inherit the child's stderr to
  * the PARENT process by default (only stdout is piped into the return
  * value), so a failing `git rev-parse` prints its raw "fatal: ..." line
@@ -17,25 +17,21 @@
  * arguments.
  */
 
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import {
+	gitExecFileSync,
+	gitFixtureEnv,
+	hasGit,
+} from "../support/git-fixture-env.js";
 
 const METRICS_HISTORY_JS = path.resolve(
 	__dirname,
 	"../../clients/metrics-history.js",
 );
-
-function hasGit(): boolean {
-	try {
-		execFileSync("git", ["--version"], { stdio: "ignore" });
-		return true;
-	} catch {
-		return false;
-	}
-}
 
 describe("metrics-history getCurrentCommit stderr suppression (#2095)", () => {
 	it.skipIf(!hasGit())(
@@ -44,11 +40,7 @@ describe("metrics-history getCurrentCommit stderr suppression (#2095)", () => {
 			const tmp = fs.mkdtempSync(
 				path.join(os.tmpdir(), "pi-lens-metrics-history-"),
 			);
-			const fixtureEnv: Record<string, string> = Object.fromEntries(
-				Object.entries(process.env).filter(
-					(entry): entry is [string, string] => entry[1] !== undefined,
-				),
-			);
+			const fixtureEnv = gitFixtureEnv(tmp);
 			fixtureEnv.GIT_CONFIG_GLOBAL = path.join(tmp, "gitconfig");
 			fixtureEnv.GIT_CONFIG_NOSYSTEM = "1";
 			try {
@@ -57,7 +49,7 @@ describe("metrics-history getCurrentCommit stderr suppression (#2095)", () => {
 				// revision or path not in the working tree." on real stderr.
 				// `stdio: "ignore"` here is the exact guard this PR is about —
 				// this setup call must not itself leak `git init`'s stderr.
-				execFileSync("git", ["init", "-q"], {
+				gitExecFileSync("git", ["init", "-q"], {
 					cwd: tmp,
 					stdio: "ignore",
 					env: fixtureEnv,
@@ -120,27 +112,12 @@ describe("metrics-history per-file commit resolution (#2099)", () => {
 			const tmp = fs.mkdtempSync(
 				path.join(os.tmpdir(), "pi-lens-metrics-history-repos-"),
 			);
-			const fixtureEnv: Record<string, string> = Object.fromEntries(
-				Object.entries(process.env).filter(
-					(entry): entry is [string, string] => entry[1] !== undefined,
-				),
-			);
+			const fixtureEnv = gitFixtureEnv(tmp);
 			fixtureEnv.PI_LENS_SKIP_HOOKS = "1";
-			for (const variable of [
-				"GIT_DIR",
-				"GIT_WORK_TREE",
-				"GIT_INDEX_FILE",
-				"GIT_OBJECT_DIRECTORY",
-				"GIT_ALTERNATE_OBJECT_DIRECTORIES",
-				"GIT_COMMON_DIR",
-				"GIT_PREFIX",
-			]) {
-				delete fixtureEnv[variable];
-			}
 			fixtureEnv.GIT_CONFIG_GLOBAL = path.join(tmp, "gitconfig");
 			fixtureEnv.GIT_CONFIG_NOSYSTEM = "1";
 			const runGit = (cwd: string, args: string[]) =>
-				execFileSync("git", args, {
+				gitExecFileSync("git", args, {
 					cwd,
 					stdio: "ignore",
 					env: fixtureEnv,
@@ -167,17 +144,17 @@ describe("metrics-history per-file commit resolution (#2099)", () => {
 				runGit(repoB, ["add", "b.ts"]);
 				runGit(repoB, ["commit", "-qm", "service-b"]);
 
-				const expectedA = execFileSync(
+				const expectedA = gitExecFileSync(
 					"git",
 					["rev-parse", "--short", "HEAD"],
 					{ cwd: repoA, encoding: "utf-8", env: fixtureEnv },
 				).trim();
-				const expectedB = execFileSync(
+				const expectedB = gitExecFileSync(
 					"git",
 					["rev-parse", "--short", "HEAD"],
 					{ cwd: repoB, encoding: "utf-8", env: fixtureEnv },
 				).trim();
-				const umbrellaHead = execFileSync(
+				const umbrellaHead = gitExecFileSync(
 					"git",
 					["rev-parse", "--short", "HEAD"],
 					{ cwd: umbrella, encoding: "utf-8", env: fixtureEnv },
@@ -220,29 +197,14 @@ describe("metrics-history repository guard (#2099)", () => {
 			const tmp = fs.mkdtempSync(
 				path.join(os.tmpdir(), "pi-lens-metrics-history-nonrepo-"),
 			);
-			const fixtureEnv: Record<string, string> = Object.fromEntries(
-				Object.entries(process.env).filter(
-					(entry): entry is [string, string] => entry[1] !== undefined,
-				),
-			);
+			const fixtureEnv = gitFixtureEnv(tmp);
 			fixtureEnv.PI_LENS_SKIP_HOOKS = "1";
-			for (const variable of [
-				"GIT_DIR",
-				"GIT_WORK_TREE",
-				"GIT_INDEX_FILE",
-				"GIT_OBJECT_DIRECTORY",
-				"GIT_ALTERNATE_OBJECT_DIRECTORIES",
-				"GIT_COMMON_DIR",
-				"GIT_PREFIX",
-			]) {
-				delete fixtureEnv[variable];
-			}
 			fixtureEnv.GIT_CONFIG_GLOBAL = path.join(tmp, "gitconfig");
 			fixtureEnv.GIT_CONFIG_NOSYSTEM = "1";
 			const repo = path.join(tmp, "nested-repo");
 			const filePath = path.join(repo, "nested.ts");
 			const runGit = (args: string[]) =>
-				execFileSync("git", args, {
+				gitExecFileSync("git", args, {
 					cwd: repo,
 					stdio: "ignore",
 					env: fixtureEnv,
@@ -255,11 +217,15 @@ describe("metrics-history repository guard (#2099)", () => {
 				fs.writeFileSync(filePath, "const nested = 1;\n");
 				runGit(["add", "nested.ts"]);
 				runGit(["commit", "-qm", "nested-repo"]);
-				const expected = execFileSync("git", ["rev-parse", "--short", "HEAD"], {
-					cwd: repo,
-					encoding: "utf-8",
-					env: fixtureEnv,
-				}).trim();
+				const expected = gitExecFileSync(
+					"git",
+					["rev-parse", "--short", "HEAD"],
+					{
+						cwd: repo,
+						encoding: "utf-8",
+						env: fixtureEnv,
+					},
+				).trim();
 				const dataDir = path.join(tmp, ".pilens-data");
 				const script = [
 					`process.chdir(${JSON.stringify(tmp)});`,
@@ -296,27 +262,12 @@ describe("metrics-history missing target directory (#2099)", () => {
 			const tmp = fs.mkdtempSync(
 				path.join(os.tmpdir(), "pi-lens-metrics-history-missing-"),
 			);
-			const fixtureEnv: Record<string, string> = Object.fromEntries(
-				Object.entries(process.env).filter(
-					(entry): entry is [string, string] => entry[1] !== undefined,
-				),
-			);
+			const fixtureEnv = gitFixtureEnv(tmp);
 			fixtureEnv.PI_LENS_SKIP_HOOKS = "1";
-			for (const variable of [
-				"GIT_DIR",
-				"GIT_WORK_TREE",
-				"GIT_INDEX_FILE",
-				"GIT_OBJECT_DIRECTORY",
-				"GIT_ALTERNATE_OBJECT_DIRECTORIES",
-				"GIT_COMMON_DIR",
-				"GIT_PREFIX",
-			]) {
-				delete fixtureEnv[variable];
-			}
 			fixtureEnv.GIT_CONFIG_GLOBAL = path.join(tmp, "gitconfig");
 			fixtureEnv.GIT_CONFIG_NOSYSTEM = "1";
 			const runGit = (args: string[]) =>
-				execFileSync("git", args, {
+				gitExecFileSync("git", args, {
 					cwd: tmp,
 					stdio: "ignore",
 					env: fixtureEnv,
@@ -328,11 +279,15 @@ describe("metrics-history missing target directory (#2099)", () => {
 				fs.writeFileSync(path.join(tmp, "README.md"), "umbrella\n");
 				runGit(["add", "README.md"]);
 				runGit(["commit", "-qm", "fixture"]);
-				const expected = execFileSync("git", ["rev-parse", "--short", "HEAD"], {
-					cwd: tmp,
-					encoding: "utf-8",
-					env: fixtureEnv,
-				}).trim();
+				const expected = gitExecFileSync(
+					"git",
+					["rev-parse", "--short", "HEAD"],
+					{
+						cwd: tmp,
+						encoding: "utf-8",
+						env: fixtureEnv,
+					},
+				).trim();
 				const filePath = path.join(tmp, "sub", "gone.ts");
 				const dataDir = path.join(tmp, ".pilens-data");
 				const script = [

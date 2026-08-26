@@ -41,6 +41,7 @@
  * already-installed servers unless --install is passed.
  */
 import { execFileSync } from "node:child_process";
+import { gitExecFileSync } from "./lib/git-fixture-env.mjs";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -231,7 +232,7 @@ async function probeFixture(fx, dst, row) {
 	const absFile = path.join(dst, fx.file);
 	if (fx.gitInit) {
 		try {
-			execFileSync("git", ["init", "-q"], { cwd: dst, stdio: "ignore" });
+			gitExecFileSync(["init", "-q"], { cwd: dst, stdio: "ignore" });
 		} catch {}
 	}
 	if (fx.disableServers) {

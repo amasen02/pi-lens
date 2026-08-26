@@ -8,7 +8,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { execFileSync, execSync } from "node:child_process";
+import { execFileSync, execSync } from "../support/git-fixture-env.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // The synthetic-write dispatch runs the full per-edit pipeline; point it at

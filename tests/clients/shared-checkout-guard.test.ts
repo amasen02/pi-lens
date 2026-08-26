@@ -53,7 +53,7 @@ import {
 } from "../../clients/shared-checkout-guard.js";
 import { resolveGitToplevel } from "../../clients/opaque-mutation-scan.js";
 import { normalizeFilePath } from "../../clients/path-utils.js";
-import { safeSpawnAsync } from "../../clients/safe-spawn.js";
+import { gitFixtureSpawnAsync } from "../support/git-fixture-env.js";
 
 const ROOT = path.resolve("/shared/checkout");
 
@@ -769,7 +769,7 @@ describe("probeWorkingTreeState against the real git binary (#2007)", () => {
 		const main = path.join(tmpRoot, "main-repo");
 		fs.mkdirSync(main, { recursive: true });
 		const run = async (args: string[], cwd: string) =>
-			safeSpawnAsync("git", args, { cwd, timeout: 20000 });
+			gitFixtureSpawnAsync(cwd, args, { cwd, timeout: 20000 });
 		const init = await run(["init", "-q", "-b", "master"], main);
 		if (init.error || init.status !== 0) {
 			throw new Error(`git init unavailable: ${init.error ?? init.status}`);
@@ -813,7 +813,7 @@ describe("probeWorkingTreeState against the real git binary (#2007)", () => {
 	it("reports clean, then dirty, then unknown outside a repo", async () => {
 		const repo = path.join(tmpRoot, "repo");
 		fs.mkdirSync(repo, { recursive: true });
-		const init = await safeSpawnAsync("git", ["init", "-q"], {
+		const init = await gitFixtureSpawnAsync(repo, ["init", "-q"], {
 			cwd: repo,
 			timeout: 20000,
 		});

@@ -109,6 +109,15 @@ export function isPendingAuxiliaryPastRearmTtl(
 
 const pending = new Map<string, PendingAuxCoverageEntry>();
 
+/**
+ * #2168: pairs evicted at the cap have no other retirement record — the
+ * drain-time reconciliation in `runtime-turn.ts` never sees them because
+ * they are gone before a drain can observe them. Counted here so the
+ * consumer can fold them into its per-turn `pairCreated`/retirement sum
+ * instead of the pair vanishing uncounted.
+ */
+let capEvictedCount = 0;
+
 function pairKey(filePath: string, serverId: string): string {
 	return `${normalizeEphemeralMapKey(filePath)}\u0000${serverId}`;
 }
@@ -173,6 +182,7 @@ export function markPendingAuxiliaryCoverage(
 			const oldest = pending.keys().next().value;
 			if (oldest === undefined) break;
 			pending.delete(oldest);
+			capEvictedCount += 1;
 		}
 	}
 }
@@ -226,9 +236,23 @@ export const pendingAuxiliaryCoverageSizeForTests =
 	pendingAuxiliaryCoverageSize;
 
 /**
+ * Drain (read and reset) the cap-eviction count accumulated since the last
+ * drain. Mirrors {@link drainPendingAuxiliaryCoverage}'s consume-once shape
+ * so the turn-end consumer can fold evictions that happened between two
+ * turn ends into its reconciliation sum exactly once, never accumulating
+ * across turns.
+ */
+export function drainPendingAuxCapEvictedCount(): number {
+	const count = capEvictedCount;
+	capEvictedCount = 0;
+	return count;
+}
+
+/**
  * Session-boundary clear (#1635): pending baselines are unreachable after
  * reset (the generation-stamped keys no longer match any active session).
  */
 export function resetPendingAuxiliaryCoverage(): void {
 	pending.clear();
+	capEvictedCount = 0;
 }

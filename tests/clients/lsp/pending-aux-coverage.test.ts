@@ -14,6 +14,7 @@ import {
 	DEFAULT_LATE_AUX_REARM_TTL_MS,
 	MAX_PENDING_AUX_ENTRIES,
 	clearPendingAuxiliaryCoverage,
+	drainPendingAuxCapEvictedCount,
 	drainPendingAuxiliaryCoverage,
 	isPendingAuxiliaryPastRearmTtl,
 	markPendingAuxiliaryCoverage,
@@ -96,6 +97,46 @@ describe("pending auxiliary coverage store (#2001/#2002)", () => {
 				(e) => e.filePath === `/w/file${MAX_PENDING_AUX_ENTRIES + 4}.ts`,
 			),
 		).toBe(true);
+	});
+
+	it("counts a cap eviction (#2168) and drains it exactly once", () => {
+		// Mark 51 pairs against the 50-pair cap: the 51st mark evicts the
+		// single oldest pair, which retires with no other telemetry — the
+		// dedicated counter is the only record of it.
+		for (let i = 0; i < MAX_PENDING_AUX_ENTRIES + 1; i++) {
+			markPendingAuxiliaryCoverage(`/w/file${i}.ts`, ["opengrep"], i);
+		}
+		expect(pendingAuxiliaryCoverageSizeForTests()).toBe(
+			MAX_PENDING_AUX_ENTRIES,
+		);
+		expect(drainPendingAuxCapEvictedCount()).toBe(1);
+		// Draining resets the count so a later drain never double-counts it.
+		expect(drainPendingAuxCapEvictedCount()).toBe(0);
+	});
+
+	it("counts one eviction per pair beyond the cap in a single mark call", () => {
+		for (let i = 0; i < MAX_PENDING_AUX_ENTRIES; i++) {
+			markPendingAuxiliaryCoverage(`/w/file${i}.ts`, ["opengrep"], i);
+		}
+		// One call marking three NEW server ids for one file pushes the store
+		// three pairs over the cap in one shot.
+		markPendingAuxiliaryCoverage(
+			"/w/overflow.ts",
+			["opengrep", "typos", "biome"],
+			10_000,
+		);
+		expect(pendingAuxiliaryCoverageSizeForTests()).toBe(
+			MAX_PENDING_AUX_ENTRIES,
+		);
+		expect(drainPendingAuxCapEvictedCount()).toBe(3);
+	});
+
+	it("resetPendingAuxiliaryCoverage also clears the cap-eviction count", () => {
+		for (let i = 0; i < MAX_PENDING_AUX_ENTRIES + 1; i++) {
+			markPendingAuxiliaryCoverage(`/w/file${i}.ts`, ["opengrep"], i);
+		}
+		resetPendingAuxiliaryCoverage();
+		expect(drainPendingAuxCapEvictedCount()).toBe(0);
 	});
 
 	it("re-arming a pair refreshes eviction recency without moving the baseline", () => {
