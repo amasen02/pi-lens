@@ -1,13 +1,122 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, afterEach, vi } from "vitest";
 import {
+	detectFlattenedBody,
+	lintPullRequestEvent,
 	lintLivePrBody,
 	lintPrBody,
+	repairFlattenedBody,
 	resolveLivePrBody,
 	resolveTouchesTests,
 } from "../../scripts/check-pr-body.mjs";
 
 const body = `Summary\nOpening context.\n\n## Tests\nTargeted tests pass.\n\n## Blast radius\nNo runtime module touched.\n\n## Class sweep\nWhole-tree grep completed.\n\n## Observability\nThe advisory check run is the record.`;
+const flattenedBody =
+	"## Summary Await the first lifecycle run's asynchronous word-index snapshot promotion before reseeding the current-format snapshot for the fallback run. ## Tests - Native master flake justification for the count barrier: 2/10 forced runs reproduced the promotion race. - Fixed lifecycle test: 5/5 tests passed. ### Test assessment - tests/clients/word-index-lifecycle.test.ts uniquely pins the ordering guard. ## Blast radius This change is test-only. ## Class sweep The async-persist lifecycle race is fully covered. ## Observability The test observes existing project snapshot records.";
+
+describe("flattened PR body repair", () => {
+	it("detects the clearly flattened real-world shape and repairs it", () => {
+		expect(lintPrBody(flattenedBody)).toMatchObject({ valid: false });
+		expect(detectFlattenedBody(flattenedBody)).toBe(true);
+		const repaired = repairFlattenedBody(flattenedBody);
+		expect(lintPrBody(repaired, { requireTestAssessment: true })).toEqual({
+			valid: true,
+			errors: [],
+		});
+	});
+
+	it.each([
+		body,
+		"Summary\nShort body.\n\n## Tests\nDone.\n\n## Blast radius\nNone.\n\n## Class sweep\nDone.\n\n## Observability\nRecorded.",
+	])("does not detect a normal or short valid body", (candidate) => {
+		expect(detectFlattenedBody(candidate)).toBe(false);
+		expect(repairFlattenedBody(candidate)).toBe(candidate);
+	});
+
+	it("does not classify a long valid body with incidental inline headings", () => {
+		const incidental = `${body}\n\nExtra context.\n\n\nThe text mentions ## Tests and ## Blast radius as examples.`;
+		expect(lintPrBody(incidental)).toMatchObject({ valid: true });
+		expect(detectFlattenedBody(incidental)).toBe(false);
+	});
+
+	it("is idempotent", () => {
+		const repaired = repairFlattenedBody(flattenedBody);
+		expect(repairFlattenedBody(repaired)).toBe(repaired);
+	});
+});
+
+describe("flattened body CI entrypoint", () => {
+	afterEach(() => vi.unstubAllEnvs());
+
+	function stubApi() {
+		vi.stubEnv("GITHUB_TOKEN", "t");
+		vi.stubEnv("GITHUB_API_URL", "https://api.example");
+		vi.stubEnv("GITHUB_REPOSITORY", "o/r");
+	}
+
+	it("patches only the repaired body and reports a notice", async () => {
+		stubApi();
+		const log = vi.spyOn(console, "log").mockImplementation(() => {});
+		const fetchImpl = vi
+			.fn()
+			.mockImplementation(async (url: string, init?: RequestInit) => {
+				if (String(url).includes("/files"))
+					return new Response(
+						JSON.stringify([{ filename: "tests/foo.test.ts" }]),
+						{ status: 200 },
+					);
+				if (init?.method === "PATCH")
+					return new Response("{}", { status: 200 });
+				return new Response(JSON.stringify({ body: flattenedBody }), {
+					status: 200,
+				});
+			});
+		expect(
+			await lintPullRequestEvent(fetchImpl, {
+				pull_request: { number: 2144, body: flattenedBody },
+			}),
+		).toEqual({ valid: true, repaired: true });
+		expect(fetchImpl).toHaveBeenCalledWith(
+			"https://api.example/repos/o/r/pulls/2144",
+			expect.objectContaining({
+				method: "PATCH",
+				body: expect.stringContaining("## Tests\\n"),
+			}),
+		);
+		expect(log).toHaveBeenCalledWith(
+			expect.stringContaining("::notice::Repaired flattened PR body"),
+		);
+		log.mockRestore();
+	});
+
+	it("reports original errors and does not write when repair remains invalid", async () => {
+		stubApi();
+		const invalidFlattenedBody = flattenedBody.replace(
+			"## Blast radius This change is test-only.",
+			"## Blast radius",
+		);
+		const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+		const fetchImpl = vi.fn().mockImplementation(async (url: string) =>
+			String(url).includes("/files")
+				? new Response("[]", { status: 200 })
+				: new Response(JSON.stringify({ body: invalidFlattenedBody }), {
+						status: 200,
+					}),
+		);
+		const result = await lintPullRequestEvent(fetchImpl, {
+			pull_request: { number: 2144, body: invalidFlattenedBody },
+		});
+		expect(result).toMatchObject({ valid: false, repaired: false });
+		expect(errors).toHaveBeenCalledWith(
+			expect.stringContaining("PR body is missing a Summary section"),
+		);
+		expect(fetchImpl).not.toHaveBeenCalledWith(
+			expect.anything(),
+			expect.objectContaining({ method: "PATCH" }),
+		);
+		errors.mockRestore();
+	});
+});
 
 describe("PR body lint (#1844)", () => {
 	it("accepts the required sections", () => {
