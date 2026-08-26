@@ -1,8 +1,9 @@
 /** Cross-process mutual exclusion for the machine-global instance registry. */
 
 import * as fs from "node:fs";
+import { randomInt } from "node:crypto";
 import * as path from "node:path";
-import { recordDegradationOnce } from "./degradation-ledger.js";
+import { incrementDegradationCount } from "./degradation-ledger.js";
 
 const LOCK_STALE_MS = 5_000;
 const LOCK_WAIT_MS = 500;
@@ -35,27 +36,42 @@ function isPidAlive(pid: number | undefined): boolean {
 function staleLock(lock: string): boolean {
 	try {
 		const stat = fs.statSync(lock);
-		return (
-			Date.now() - stat.mtimeMs > LOCK_STALE_MS || !isPidAlive(ownerPid(lock))
-		);
+		if (Date.now() - stat.mtimeMs > LOCK_STALE_MS) return true;
+		const pid = ownerPid(lock);
+		return pid !== undefined && !isPidAlive(pid);
 	} catch {
 		return false;
 	}
 }
 
 function recordLockTimeout(target: string): void {
-	recordDegradationOnce({
+	incrementDegradationCount({
 		kind: "instance-registry-lock-timeout",
-		subject: String(process.pid),
+		subject: path.resolve(target),
 		reason: `lock acquisition exhausted for ${path.basename(target)}`,
 	});
 }
 
 function backoff(): void {
-	const delay =
-		LOCK_MIN_BACKOFF_MS +
-		Math.floor(Math.random() * (LOCK_MAX_BACKOFF_MS - LOCK_MIN_BACKOFF_MS + 1));
+	const delay = randomInt(LOCK_MIN_BACKOFF_MS, LOCK_MAX_BACKOFF_MS + 1);
 	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay);
+}
+
+function ownsLock(lock: string): boolean {
+	return ownerPid(lock) === process.pid;
+}
+
+async function releaseLock(lock: string): Promise<void> {
+	if (ownsLock(lock)) await fs.promises.unlink(lock).catch(() => {});
+}
+
+function releaseLockSync(lock: string): void {
+	if (!ownsLock(lock)) return;
+	try {
+		fs.unlinkSync(lock);
+	} catch {
+		// A stale takeover may have displaced the lock after ownership was read.
+	}
 }
 
 function takeOverStale(lock: string): void {
@@ -82,9 +98,10 @@ export async function withInstanceRegistryLock<T>(
 	const deadline = Date.now() + LOCK_WAIT_MS;
 	await fs.promises.mkdir(path.dirname(target), { recursive: true });
 	while (Date.now() <= deadline) {
-		let handle: fs.promises.FileHandle | undefined;
 		try {
-			handle = await fs.promises.open(lock, "wx");
+			await fs.promises.writeFile(lock, `${process.pid} ${Date.now()}\n`, {
+				flag: "wx",
+			});
 		} catch (error) {
 			if (!isLockContention(error)) throw error;
 			takeOverStale(lock);
@@ -95,11 +112,9 @@ export async function withInstanceRegistryLock<T>(
 			continue;
 		}
 		try {
-			await handle.writeFile(`${process.pid} ${Date.now()}\n`);
 			return await op();
 		} finally {
-			await handle.close();
-			await fs.promises.unlink(lock).catch(() => {});
+			await releaseLock(lock);
 		}
 	}
 	recordLockTimeout(target);
@@ -115,17 +130,11 @@ export function withInstanceRegistryLockSync<T>(
 	fs.mkdirSync(path.dirname(target), { recursive: true });
 	while (Date.now() <= deadline) {
 		try {
-			const fd = fs.openSync(lock, "wx");
+			fs.writeFileSync(lock, `${process.pid} ${Date.now()}\n`, { flag: "wx" });
 			try {
-				fs.writeSync(fd, `${process.pid} ${Date.now()}\n`);
 				return op();
 			} finally {
-				fs.closeSync(fd);
-				try {
-					fs.unlinkSync(lock);
-				} catch {
-					// A stale takeover may have displaced the lock after a crash.
-				}
+				releaseLockSync(lock);
 			}
 		} catch (error) {
 			if (!isLockContention(error)) throw error;

@@ -136,6 +136,7 @@ describe("session_start keys on the project root (#2129 wiring)", () => {
 			makeCtx({ cwd, sessionId: "sibling-session" }),
 		);
 		expect(getSecondarySessionCount()).toBe(1);
+		await settleRegistryWrites();
 		return secondary;
 	}
 

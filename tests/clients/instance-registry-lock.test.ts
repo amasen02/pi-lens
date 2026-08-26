@@ -2,7 +2,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { withInstanceRegistryLock } from "../../clients/instance-registry-lock.js";
+import {
+	withInstanceRegistryLock,
+	withInstanceRegistryLockSync,
+} from "../../clients/instance-registry-lock.js";
 import { getDegradationSummary } from "../../clients/degradation-ledger.js";
 import { removeTempDirSync } from "./test-utils.js";
 
@@ -48,9 +51,65 @@ describe("instance registry lock", () => {
 		expect(getDegradationSummary()).toContainEqual(
 			expect.objectContaining({
 				kind: "instance-registry-lock-timeout",
-				count: 1,
+				count: 2,
+				latestReasons: [
+					expect.objectContaining({ subject: path.resolve(target) }),
+				],
 			}),
 		);
 		fs.unlinkSync(`${target}.lock`);
+	});
+
+	it("does not reclaim a fresh empty lock", async () => {
+		const dir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-registry-lock-"),
+		);
+		dirs.push(dir);
+		const target = path.join(dir, "instances.json");
+		fs.writeFileSync(`${target}.lock`, "");
+
+		await expect(
+			withInstanceRegistryLock(target, async () => "not reached"),
+		).resolves.toBeUndefined();
+		expect(fs.existsSync(`${target}.lock`)).toBe(true);
+		fs.unlinkSync(`${target}.lock`);
+	});
+
+	it("keeps a replacement lock when the displaced holder releases", () => {
+		const dir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-registry-lock-"),
+		);
+		dirs.push(dir);
+		const target = path.join(dir, "instances.json");
+		const lock = `${target}.lock`;
+
+		expect(
+			withInstanceRegistryLockSync(target, () => {
+				fs.writeFileSync(lock, "999999 0\n");
+				return "acquired";
+			}),
+		).toBe("acquired");
+		expect(fs.readFileSync(lock, "utf8")).toBe("999999 0\n");
+		fs.unlinkSync(lock);
+	});
+
+	it("excludes async acquisition while the sync path owns the lock", async () => {
+		const dir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-registry-lock-"),
+		);
+		dirs.push(dir);
+		const target = path.join(dir, "instances.json");
+		let contender: Promise<string | undefined> | undefined;
+
+		expect(
+			withInstanceRegistryLockSync(target, () => {
+				contender = withInstanceRegistryLock(target, async () => "async");
+				const end = Date.now() + 50;
+				while (Date.now() < end) {}
+				return "sync";
+			}),
+		).toBe("sync");
+		expect(contender).toBeDefined();
+		expect(await contender!).toBe("async");
 	});
 });

@@ -4848,7 +4848,7 @@ export async function createLSPClient(options: {
 		marker: extractSpawnMarker(lspProcess.args),
 		sessionIdentity: {
 			projectRoot: sessionCwd ?? process.cwd(),
-			rootSource: sessionCwd ? "session-cwd" : "lsp-fallback",
+			rootSource: sessionCwd ? "service-cwd" : "lsp-fallback",
 			startedAt: new Date(
 				workspaceDiagnosticsCacheSessionStart(),
 			).toISOString(),

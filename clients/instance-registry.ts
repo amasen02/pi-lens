@@ -78,7 +78,7 @@ export interface InstanceEntry {
 	 */
 	projectRoot: string;
 	/** Provenance when a child had to synthesize the host identity. */
-	rootSource?: "session-cwd" | "lsp-fallback";
+	rootSource?: "session-cwd" | "service-cwd" | "lsp-fallback";
 	/**
 	 * Every root this host serves, insertion-ordered, `projectRoot` first
 	 * (#2130). Registration is ADDITIVE: a second root joins the set instead of
@@ -476,7 +476,7 @@ export interface RecordLspChildInput {
 	sessionIdentity?: {
 		projectRoot: string;
 		startedAt: string;
-		rootSource?: "session-cwd" | "lsp-fallback";
+		rootSource?: "session-cwd" | "service-cwd" | "lsp-fallback";
 	};
 }
 

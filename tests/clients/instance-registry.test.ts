@@ -490,6 +490,29 @@ describe("instance-registry", () => {
 		);
 	});
 
+	it("records the identity fallback when child-first registration lacks session identity", async () => {
+		const { recordLspChild } =
+			await import("../../clients/instance-registry.js");
+		const { getDegradationSummary } =
+			await import("../../clients/degradation-ledger.js");
+
+		await recordLspChild({
+			pid: 335,
+			serverId: "typescript",
+			command: "d",
+		});
+
+		const entry = JSON.parse(fs.readFileSync(registryFilePath(), "utf8"))
+			.instances[0];
+		expect(entry.rootSource).toBe("lsp-fallback");
+		expect(getDegradationSummary()).toContainEqual(
+			expect.objectContaining({
+				kind: "instance-registry-identity-fallback",
+				count: 1,
+			}),
+		);
+	});
+
 	it("updateHeartbeat refreshes heartbeatAt and rssBytes for this pid", async () => {
 		const { registerInstance, updateHeartbeat, readInstanceRegistry } =
 			await import("../../clients/instance-registry.js");

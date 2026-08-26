@@ -1835,7 +1835,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 							sessionStartDecision.sameRoot === false &&
 							typeof sessionStartCwd === "string"
 						) {
-							await registerInstanceRoot(sessionStartCwd).catch(() => {
+							void registerInstanceRoot(sessionStartCwd).catch(() => {
 								// best-effort observability — never fail session_start
 							});
 						}
