@@ -181,9 +181,7 @@ export function repairFlattenedBody(body = "") {
 	const templateHeadings = repairedHeadings.filter((heading) =>
 		new RegExp(`^(?:${REPAIR_HEADING_PATTERN})$`, "i").test(heading),
 	);
-	const distinctTemplateHeadings = new Set(
-		templateHeadings.map((heading) => heading.replace(/ \d+$/, "")),
-	);
+	const distinctTemplateHeadings = new Set(templateHeadings);
 	if (repairedHeadings.length !== distinctTemplateHeadings.size) return source;
 	return repaired;
 }

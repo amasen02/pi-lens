@@ -207,6 +207,7 @@ async function runManagedVerification(
 	stamp: string,
 	priorAttempts: number,
 	generation: GenerationHandle,
+	verificationArgs: string[] = ["--version"],
 ): Promise<ManagedVerdict> {
 	let transient = false;
 	let ok: boolean;
@@ -219,6 +220,7 @@ async function runManagedVerification(
 				transient = true;
 			},
 			MANAGED_VERIFY_TIMEOUT_MS,
+			verificationArgs,
 		);
 	} catch {
 		// The verifier itself could not run — installer-isolated unit tests mock
@@ -262,6 +264,7 @@ async function runManagedVerification(
 
 async function verifyManagedCandidate(
 	candidate: string,
+	verificationArgs: string[] = ["--version"],
 ): Promise<ManagedVerdict> {
 	let stamp: string;
 	try {
@@ -285,6 +288,7 @@ async function verifyManagedCandidate(
 		stamp,
 		priorAttempts,
 		generation,
+		verificationArgs,
 	).finally(() => {
 		// A settling old-session probe must not evict the live entry a new
 		// session already started for the same shim (#1674 review F5).
@@ -320,9 +324,10 @@ async function verifyManagedCandidate(
  */
 export async function findManagedNodeToolBinary(
 	tool: string,
+	verificationArgs: string[] = ["--version"],
 ): Promise<string | null> {
 	for (const candidate of managedNodeToolCandidates(tool)) {
-		const verdict = await verifyManagedCandidate(candidate);
+		const verdict = await verifyManagedCandidate(candidate, verificationArgs);
 		if (verdict === "ok" || verdict === "unverified") return candidate;
 	}
 	return null;
@@ -343,6 +348,7 @@ export async function findManagedNodeToolBinary(
 export function createVenvFinder(
 	command: string,
 	windowsExt = "",
+	verificationArgs: string[] = ["--version"],
 ): (cwd: string) => Promise<string> {
 	return async (cwd: string): Promise<string> => {
 		const venvPaths = [
@@ -369,7 +375,7 @@ export function createVenvFinder(
 		// check settles it without a spawn — after one verification per shim per
 		// session, so a shim that cannot run falls through to PATH instead of
 		// shadowing a working binary (#1657).
-		const managed = await findManagedNodeToolBinary(command);
+		const managed = await findManagedNodeToolBinary(command, verificationArgs);
 		if (managed) return managed;
 
 		// Fall back to global
@@ -864,7 +870,7 @@ export function createAvailabilityChecker(
 	let checkerGeneration = availabilityGeneration.current();
 	let checkerFlightGeneration = 0;
 
-	const findCommand = createVenvFinder(command, windowsExt);
+	const findCommand = createVenvFinder(command, windowsExt, versionArgs);
 
 	function ensureCurrentGeneration(): void {
 		if (checkerGeneration === availabilityGeneration.current()) return;
@@ -1080,6 +1086,7 @@ export function createAvailabilityChecker(
 							timeout: options.probeTimeout ?? 5000,
 							cwd: resolvedCwd,
 							env,
+							input: "",
 						}),
 				);
 				probeJoined = shared.joined;
@@ -1486,6 +1493,7 @@ async function verifyOrInstallCommand(
 		const versionCheck = await safeSpawnAsync(command, versionArgs, {
 			timeout,
 			cwd,
+			input: "",
 		});
 		if (!versionCheck.error && versionCheck.status === 0) {
 			return command;
@@ -1534,7 +1542,7 @@ export async function resolveCommandArgsWithInstallFallback(
 	const versionCheck = await safeSpawnAsync(
 		command.cmd,
 		[...command.args, ...versionArgs],
-		{ timeout, cwd },
+		{ timeout, cwd, input: "" },
 	);
 	if (!versionCheck.error && versionCheck.status === 0) {
 		return command;

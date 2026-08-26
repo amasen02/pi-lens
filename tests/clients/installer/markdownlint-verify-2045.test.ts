@@ -67,6 +67,23 @@ describe("managed markdownlint verification (#2045)", () => {
 		},
 	);
 
+	it("keeps typed timeout telemetry ahead of output truncation", async () => {
+		sessionLog.mockClear();
+		safeSpawnAsync.mockResolvedValueOnce(
+			result({
+				error: new Error("output cap raced with timeout"),
+				outputTruncated: true,
+				spawnFailure: { kind: "timeout" },
+			}),
+		);
+		await expect(
+			verifyToolBinary("timeout-with-capped-output", undefined, undefined, 10),
+		).resolves.toBe(false);
+		expect(sessionLog).toHaveBeenLastCalledWith(
+			expect.stringContaining("check=--version, kind=timeout"),
+		);
+	});
+
 	it("covers signal-only, nonzero, and successful output", async () => {
 		sessionLog.mockClear();
 		safeSpawnAsync.mockResolvedValueOnce(
@@ -164,6 +181,18 @@ describe("managed markdownlint verification (#2045)", () => {
 				fs.writeFileSync(path.join(cwd, "project.md"), "# title\n", "utf8");
 				const old = await runProbe(binary!, ["--version"], cwd);
 				expect(`${old.stdout}\n${old.stderr}`).toContain("Finding: --version");
+				const corrected = await runProbe(
+					binary!,
+					["--no-globs", "-"],
+					cwd,
+					"# title\n",
+				);
+				expect(`${corrected.stdout}\n${corrected.stderr}`).not.toContain(
+					"Finding: --version",
+				);
+				expect(`${corrected.stdout}\n${corrected.stderr}`).toContain(
+					"Linting: 1 file",
+				);
 			} finally {
 				removeTempDirSync(cwd);
 			}
@@ -189,6 +218,7 @@ function runProbe(
 	binary: string,
 	args: string[],
 	cwd: string,
+	input = "",
 ): Promise<{ stdout: string; stderr: string }> {
 	const command =
 		process.platform === "win32" ? (process.env.ComSpec ?? "cmd.exe") : binary;
@@ -202,7 +232,7 @@ function runProbe(
 			(_error, stdout, stderr) =>
 				resolve({ stdout: String(stdout), stderr: String(stderr) }),
 		);
-		child.stdin?.end();
+		child.stdin?.end(input);
 	});
 }
 
@@ -213,7 +243,8 @@ function resolveMarkdownlintBinary(): string | undefined {
 			: "markdownlint-cli2";
 	const candidates = [
 		path.join(
-			process.env.PI_LENS_HOME ?? os.homedir(),
+			os.homedir(),
+			".pi-lens",
 			"tools",
 			"node_modules",
 			".bin",

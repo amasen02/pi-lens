@@ -177,6 +177,33 @@ describe("runner-helpers availability checker", () => {
 		);
 
 		expect(resolved).toEqual({ cmd: "bundle", args: ["exec", "rubocop"] });
+		expect(
+			vi.mocked(safeSpawnMod.safeSpawnAsync).mock.calls[0]?.[2],
+		).toMatchObject({
+			input: "",
+		});
+	});
+
+	it("closes stdin on the fallback verification probe", async () => {
+		const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
+		const installerMod = await import("../../../../clients/installer/index.js");
+		vi.mocked(installerMod.isSpawnableCommand).mockResolvedValue(true);
+		vi.mocked(safeSpawnMod.safeSpawnAsync)
+			.mockResolvedValueOnce({ stdout: "", stderr: "rejected", status: 1 })
+			.mockResolvedValueOnce({ stdout: "tool 1.0.0", stderr: "", status: 0 });
+
+		await expect(
+			resolveCommandArgsWithInstallFallback(
+				{ cmd: "tool", args: [] },
+				"tool",
+				process.cwd(),
+			),
+		).resolves.toEqual({ cmd: "tool", args: [] });
+		expect(
+			vi.mocked(safeSpawnMod.safeSpawnAsync).mock.calls[1]?.[2],
+		).toMatchObject({
+			input: "",
+		});
 	});
 
 	it("does not auto-install config-first tools", async () => {
@@ -246,6 +273,45 @@ describe("runner-helpers availability checker", () => {
 		const checker = createAvailabilityChecker("zig", ".exe", ["version"]);
 		expect(await checker.isAvailableAsync(process.cwd())).toBe(true);
 		expect(probedArgs).toEqual(["version"]);
+		expect(
+			vi.mocked(safeSpawnMod.safeSpawnAsync).mock.calls.at(-1)?.[2],
+		).toMatchObject({
+			input: "",
+		});
+	});
+
+	it("forwards custom verification args to managed-shim verification", async () => {
+		const env = setupTestEnvironment("pi-lens-managed-check-args-");
+		try {
+			const managedHome = path.join(env.tmpDir, "managed-home");
+			vi.stubEnv("PI_LENS_HOME", managedHome);
+			fs.mkdirSync(path.join(managedHome, "tools", "node_modules", ".bin"), {
+				recursive: true,
+			});
+			const managedBinary = path.join(
+				managedHome,
+				"tools",
+				"node_modules",
+				".bin",
+				"markdownlint-cli2",
+			);
+			fs.writeFileSync(managedBinary, "#!/bin/sh\nexit 0\n");
+			const installerMod =
+				await import("../../../../clients/installer/index.js");
+			await createVenvFinder("markdownlint-cli2", ".cmd", ["--no-globs", "-"])(
+				env.tmpDir,
+			);
+			expect(installerMod.verifyToolBinary).toHaveBeenCalledWith(
+				managedBinary,
+				undefined,
+				expect.any(Function),
+				expect.any(Number),
+				["--no-globs", "-"],
+			);
+		} finally {
+			vi.unstubAllEnvs();
+			env.cleanup();
+		}
 	});
 
 	it("does not let an old in-flight probe delete a newer generation", async () => {

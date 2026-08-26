@@ -5,6 +5,11 @@ import { makeRunnerCtx } from "../../../support/runner-ctx.js";
 import { setupTestEnvironment } from "../../test-utils.js";
 
 const safeSpawnAsync = vi.fn();
+const createAvailabilityCheckerMock = vi.fn(() => ({
+	isAvailable: () => true,
+	isAvailableAsync: async () => true,
+	getCommand: () => "markdownlint-cli2",
+}));
 const hasMarkdownlintConfigMock = vi.fn(() => true);
 
 vi.mock("../../../../clients/safe-spawn.js", () => ({
@@ -13,11 +18,7 @@ vi.mock("../../../../clients/safe-spawn.js", () => ({
 }));
 
 vi.mock("../../../../clients/dispatch/runners/utils/runner-helpers.js", () => ({
-	createAvailabilityChecker: () => ({
-		isAvailable: () => true,
-		isAvailableAsync: async () => true,
-		getCommand: () => "markdownlint-cli2",
-	}),
+	createAvailabilityChecker: createAvailabilityCheckerMock,
 	resolveToolCommandWithInstallFallback: vi.fn(async () => "markdownlint-cli2"),
 }));
 
@@ -44,7 +45,17 @@ describe("markdownlint runner — fixable metadata", () => {
 	beforeEach(() => {
 		vi.resetModules();
 		safeSpawnAsync.mockReset();
+		createAvailabilityCheckerMock.mockClear();
 		hasMarkdownlintConfigMock.mockReset().mockReturnValue(true);
+	});
+
+	it("constructs the bounded stdin availability probe", async () => {
+		await import("../../../../clients/dispatch/runners/markdownlint.js");
+		expect(createAvailabilityCheckerMock).toHaveBeenCalledWith(
+			"markdownlint-cli2",
+			".cmd",
+			["--no-globs", "-"],
+		);
 	});
 
 	it("marks known-fixable MD rules as fixable with a fixSuggestion", async () => {

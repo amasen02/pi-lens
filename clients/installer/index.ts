@@ -2205,7 +2205,7 @@ export async function verifyToolBinary(
 					? "spawn-error"
 					: "exit-nonzero");
 		logSessionStart(
-			`auto-install verify: failed for ${binPath} (kind=${kind}${result.status !== null ? `, exit=${result.status}` : ""})`,
+			`auto-install verify: failed for ${binPath} (check=${verificationArgs.join(" ")}, kind=${kind}${result.status !== null ? `, exit=${result.status}` : ""})`,
 		);
 		return false;
 	} catch (err) {
