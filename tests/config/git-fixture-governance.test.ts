@@ -2,6 +2,10 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { assertNonEmptyScan } from "../support/sweep-kit.js";
+import {
+	KNOWN_FIXTURE_EMAILS,
+	KNOWN_FIXTURE_NAMES,
+} from "../support/git-config-guard.js";
 
 const directGitSpawn =
 	/\b(execSync|execFileSync|spawnSync|spawn|execFile|safeSpawnAsync)\s*\(\s*["'`]git\b/g;
@@ -9,10 +13,24 @@ const helperImport =
 	/import\s*{([^}]+)}\s*from\s*["'`][^"'`]*git-fixture-env/gs;
 
 const OWN_IMPLEMENTATION_FILES = [
-	"git-fixture-governance.test.ts",
-	"git-fixture-env.ts",
-	"git-fixture-env.mjs",
+	"tests/config/git-fixture-governance.test.ts",
+	"tests/support/git-fixture-env.ts",
+	"scripts/lib/git-fixture-env.mjs",
 ] as const;
+const NOT_A_FIXTURE = ["scripts/pre-push-targeted-tests.mjs"] as const;
+
+const REPO_ROOT = path.resolve(__dirname, "../..");
+
+function repoRelative(file: string): string {
+	if (!path.isAbsolute(file)) return file.replaceAll("\\", "/");
+	return path.relative(REPO_ROOT, file).replaceAll("\\", "/");
+}
+
+export function isExpectedScriptExemption(file: string): boolean {
+	return NOT_A_FIXTURE.includes(
+		repoRelative(file) as (typeof NOT_A_FIXTURE)[number],
+	);
+}
 
 export function findGitSpawnOffenders(
 	files: ReadonlyArray<{ file: string; source: string }>,
@@ -20,7 +38,12 @@ export function findGitSpawnOffenders(
 	return files
 		.filter(({ file, source }) => {
 			directGitSpawn.lastIndex = 0;
-			if (OWN_IMPLEMENTATION_FILES.some((name) => file.endsWith(name)))
+			const relativeFile = repoRelative(file);
+			if (
+				OWN_IMPLEMENTATION_FILES.includes(
+					relativeFile as (typeof OWN_IMPLEMENTATION_FILES)[number],
+				)
+			)
 				return false;
 			const imported = new Set<string>();
 			for (const match of source.matchAll(helperImport)) {
@@ -33,6 +56,30 @@ export function findGitSpawnOffenders(
 			return false;
 		})
 		.map(({ file }) => file);
+}
+
+function fixtureIdentityWrites(
+	files: ReadonlyArray<{ file: string; source: string }>,
+): Array<{ file: string; kind: "name" | "email"; value: string }> {
+	const writes: Array<{
+		file: string;
+		kind: "name" | "email";
+		value: string;
+	}> = [];
+	const literal =
+		/\buser\.(name|email)(?:["']\s*,\s*["']([^"']+)["']|\s+["']([^"']+)["']|\s+([^\s"'`,}\]]+))/g;
+	for (const { file, source } of files) {
+		for (const line of source.split(/\r?\n/)) {
+			if (!/\bconfig\b/.test(line)) continue;
+			literal.lastIndex = 0;
+			for (const match of line.matchAll(literal)) {
+				const value = match[2] ?? match[3] ?? match[4];
+				if (value)
+					writes.push({ file, kind: match[1] as "name" | "email", value });
+			}
+		}
+	}
+	return writes;
 }
 
 function walkFiles(
@@ -81,28 +128,44 @@ describe("real Git fixture governance", () => {
 		const offenders = findGitSpawnOffenders(
 			scriptFiles(path.resolve(__dirname, "../../scripts")),
 		);
-		const REMAINING_OFFENDERS = [
-			// #2163 F7 remainder: filed as #2177.
-			"characterize-lsp.mjs",
-			"server-capabilities.mjs",
-			"smoke-gitleaks-scratch-exclusion.mjs",
-			"smoke-tools.mjs",
-		];
-		const NOT_A_FIXTURE = [
-			// Queries the developer's OWN real repo (git diff against the branch
-			// range) to pick which tests to run. No throwaway fixture directory
-			// involved, so fixture-isolation policy does not apply here.
-			"pre-push-targeted-tests.mjs",
-		];
+		const REMAINING_OFFENDERS: string[] = [];
 		const unexpected = offenders.filter(
 			(file) =>
-				!REMAINING_OFFENDERS.some((name) => file.endsWith(name)) &&
-				!NOT_A_FIXTURE.some((name) => file.endsWith(name)),
+				!REMAINING_OFFENDERS.includes(repoRelative(file)) &&
+				!isExpectedScriptExemption(file),
 		);
 		expect(
 			unexpected,
 			`Unexpected bare Git spawns found:\n${unexpected.join("\n")}`,
 		).toEqual([]);
+	});
+
+	it("anchors script exemptions to the repository-relative path", () => {
+		expect(
+			isExpectedScriptExemption("scripts/pre-push-targeted-tests.mjs"),
+		).toBe(true);
+		expect(
+			isExpectedScriptExemption("scripts/zzdir/pre-push-targeted-tests.mjs"),
+		).toBe(false);
+	});
+
+	it("keeps every literal fixture Git identity in the guard sets", () => {
+		const files = [
+			...walkFiles(
+				path.resolve(__dirname, ".."),
+				(name) => name.endsWith(".ts") || name.endsWith(".mts"),
+			),
+			...walkFiles(path.resolve(__dirname, "../../scripts"), (name) =>
+				name.endsWith(".mjs"),
+			),
+		];
+		const unknown = fixtureIdentityWrites(files).filter(
+			({ kind, value }) =>
+				(kind === "name" ? KNOWN_FIXTURE_NAMES : KNOWN_FIXTURE_EMAILS).has(
+					value,
+				) === false,
+		);
+		expect(unknown).toEqual([]);
 	});
 
 	it("detects a synthetic bare Git offender", () => {

@@ -42,11 +42,15 @@ export function localConfigPath(repoRoot: string): string {
 export const KNOWN_FIXTURE_NAMES: ReadonlySet<string> = new Set([
 	"pi-lens test",
 	"t",
+	"Test",
+	"fixture",
+	"pi-lens smoke",
 ]);
 export const KNOWN_FIXTURE_EMAILS: ReadonlySet<string> = new Set([
 	"test@example.com",
 	"t@t.t",
 	"t@t.local",
+	"smoke@pi-lens.test",
 ]);
 
 export function assertCleanGitConfig(configPath: string): void {

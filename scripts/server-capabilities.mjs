@@ -16,12 +16,12 @@
  * generating host are listed as unavailable (a non-failure) — run in a
  * provisioned env (the nightly) to capture those rows.
  */
-import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { mergeServerCapabilitiesDoc } from "./lib/md-matrix.mjs";
+import { gitExecFileSync } from "./lib/git-fixture-env.mjs";
 
 const repoRoot = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -69,7 +69,7 @@ for (const fx of fixtures) {
 	const absFile = path.join(dst, fx.file);
 	if (fx.gitInit) {
 		try {
-			execFileSync("git", ["init", "-q"], { cwd: dst, stdio: "ignore" });
+			gitExecFileSync(["init", "-q"], { cwd: dst, stdio: "ignore" });
 		} catch {}
 	}
 	if (fx.disableServers) {

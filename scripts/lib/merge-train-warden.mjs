@@ -138,6 +138,7 @@ function normalizePr(node) {
 export async function fetchOpenPullRequests(fetcher, owner, name) {
 	const prs = [];
 	const errors = [];
+	const seenNumbers = new Set();
 	let after;
 	for (let page = 0; page < MAX_PAGES; page++) {
 		let payload;
@@ -155,15 +156,31 @@ export async function fetchOpenPullRequests(fetcher, owner, name) {
 			);
 		const connection = payload?.data?.repository?.pullRequests;
 		if (!connection || !Array.isArray(connection.nodes)) break;
-		for (const node of connection.nodes) prs.push(normalizePr(node));
+		for (const node of connection.nodes) {
+			if (seenNumbers.has(node.number)) {
+				errors.push(
+					`GraphQL pagination repeated PR #${node.number} across pages; collection may be incomplete`,
+				);
+				continue;
+			}
+			seenNumbers.add(node.number);
+			prs.push(normalizePr(node));
+		}
 		if (!connection.pageInfo?.hasNextPage) break;
+		const nextCursor = connection.pageInfo.endCursor;
+		if (nextCursor == null || nextCursor === after) {
+			errors.push(
+				"GraphQL pagination truncated because cursor did not advance",
+			);
+			break;
+		}
 		if (page === MAX_PAGES - 1) {
 			errors.push(
 				`GraphQL pagination truncated after ${MAX_PAGES} pages while hasNextPage=true`,
 			);
 			break;
 		}
-		after = connection.pageInfo.endCursor;
+		after = nextCursor;
 	}
 	return { prs, errors };
 }
