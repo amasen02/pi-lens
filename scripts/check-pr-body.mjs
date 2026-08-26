@@ -130,7 +130,7 @@ export function detectFlattenedBody(body = "") {
 	// A flattened body containing these markers has already lost data. It is
 	// safer to report the original lint errors than to write a guessed repair.
 	if (
-		/[\f\t]|\r(?!\n)|\\[ftr]/.test(source) ||
+		/[`\f\t]|\r(?!\n)|\\[ftr]/.test(source) ||
 		/\\n/.test(source) ||
 		new RegExp(
 			`(?:^|[\\s])(?:${CORRUPTED_HEADING_TAILS.join("|")})(?=\\s|$)`,
@@ -241,39 +241,42 @@ export function lintPrBody(body = "", options = {}) {
 	return { valid: errors.length === 0, errors };
 }
 
+async function fetchLivePrBody(payloadPr, fetchImpl) {
+	const token = process.env.GITHUB_TOKEN;
+	if (!token) throw new Error("GITHUB_TOKEN is not set");
+	const apiUrl = process.env.GITHUB_API_URL;
+	const repository = process.env.GITHUB_REPOSITORY;
+	if (!apiUrl || !repository)
+		throw new Error("GITHUB_API_URL or GITHUB_REPOSITORY is missing");
+	const response = await fetchImpl(
+		`${apiUrl}/repos/${repository}/pulls/${payloadPr.number}`,
+		{
+			signal: AbortSignal.timeout(10_000),
+			headers: {
+				Accept: "application/vnd.github+json",
+				Authorization: `Bearer ${token}`,
+				"X-GitHub-Api-Version": "2022-11-28",
+			},
+		},
+	);
+	if (!response.ok) throw new Error(`GitHub API returned ${response.status}`);
+	const data = await response.json();
+	if (typeof data.body !== "string")
+		throw new Error("GitHub API returned no body");
+	return data.body;
+}
+
 export async function resolveLivePrBody(
 	payloadPr,
 	fetchImpl = globalThis.fetch,
 ) {
-	const fallback = payloadPr.body ?? "";
 	try {
-		const token = process.env.GITHUB_TOKEN;
-		if (!token) throw new Error("GITHUB_TOKEN is not set");
-		const apiUrl = process.env.GITHUB_API_URL;
-		const repository = process.env.GITHUB_REPOSITORY;
-		if (!apiUrl || !repository)
-			throw new Error("GITHUB_API_URL or GITHUB_REPOSITORY is missing");
-		const response = await fetchImpl(
-			`${apiUrl}/repos/${repository}/pulls/${payloadPr.number}`,
-			{
-				signal: AbortSignal.timeout(10_000),
-				headers: {
-					Accept: "application/vnd.github+json",
-					Authorization: `Bearer ${token}`,
-					"X-GitHub-Api-Version": "2022-11-28",
-				},
-			},
-		);
-		if (!response.ok) throw new Error(`GitHub API returned ${response.status}`);
-		const data = await response.json();
-		if (typeof data.body !== "string")
-			throw new Error("GitHub API returned no body");
-		return data.body;
+		return await fetchLivePrBody(payloadPr, fetchImpl);
 	} catch (error) {
 		console.warn(
 			`::warning::Could not fetch the live PR body; using the event payload instead (${error instanceof Error ? error.message : error}).`,
 		);
-		return fallback;
+		return payloadPr.body ?? "";
 	}
 }
 
@@ -364,13 +367,6 @@ export async function resolveTouchesTests(
  * (no tests/ files) both skip it, so a flaky fetch can never misfire the
  * check (#2124 review F2 pinned this consumption).
  */
-export async function lintLivePrBody(payloadPr, fetchImpl = globalThis.fetch) {
-	return lintPrBody(await resolveLivePrBody(payloadPr, fetchImpl), {
-		requireTestAssessment:
-			(await resolveTouchesTests(payloadPr, fetchImpl)) === true,
-	});
-}
-
 function eventPayload() {
 	const eventPath = process.env.GITHUB_EVENT_PATH;
 	if (!eventPath) throw new Error("GITHUB_EVENT_PATH is required");
@@ -397,7 +393,7 @@ export async function lintPullRequestEvent(
 		const repairedResult = lintPrBody(repairedBody, { requireTestAssessment });
 		if (repairedResult.valid) {
 			try {
-				const latestBody = await resolveLivePrBody(pullRequest, fetchImpl);
+				const latestBody = await fetchLivePrBody(pullRequest, fetchImpl);
 				if (latestBody !== body) {
 					console.log(
 						`::notice::Skipped flattened PR body repair for #${pullRequest.number}; the body changed during linting.`,
@@ -411,8 +407,8 @@ export async function lintPullRequestEvent(
 				);
 				return { valid: true, repaired: true };
 			} catch (error) {
-				console.error(
-					`::warning::Could not write the repaired PR body; preserving original lint errors (${error instanceof Error ? error.message : error}).`,
+				console.warn(
+					`::warning::Skipped flattened PR body repair for #${pullRequest.number}; freshness check failed, preserving original lint errors (${error instanceof Error ? error.message : error}).`,
 				);
 			}
 		}

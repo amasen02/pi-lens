@@ -805,11 +805,11 @@ labeled. (#1432)
 
 The PR body advisory lint may auto-repair only clearly flattened bodies: two or
 more inline template headings, at most two physical newlines, and a minimum
-body length. Detection refuses bodies with escape-loss markers, and repair only
-splits inline headings. `repairFlattenedBody` is idempotent via its detection
-short-circuit and must pass `lintPrBody` before `patchLivePrBody` writes through
-the GitHub API; failed or stale repairs report the original errors and never
-write. The workflow grants
+body length. Detection refuses bodies with escape-loss markers or any backtick,
+and repair only splits inline headings. `repairFlattenedBody` is idempotent via
+its detection short-circuit and must pass `lintPrBody` before `patchLivePrBody`
+writes through the GitHub API; failed, stale, or uncheckable repairs report the
+original errors and never write. The workflow grants
 `pull-requests: write` only to the PR body lint job. (#2145)
 
 Message-end attribution uses a bounded two-slot session anchor. A primary

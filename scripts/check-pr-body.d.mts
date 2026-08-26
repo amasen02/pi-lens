@@ -20,10 +20,6 @@ export declare function resolveTouchesTests(
 	payloadPr: { number: number },
 	fetchImpl?: typeof fetch,
 ): Promise<boolean | null>;
-export declare function lintLivePrBody(
-	payloadPr: { number: number; body?: string | null },
-	fetchImpl?: typeof fetch,
-): Promise<{ valid: boolean; errors: string[] }>;
 export declare function lintPullRequestEvent(
 	fetchImpl?: typeof fetch,
 	event?: { pull_request?: { number: number; body?: string | null } },

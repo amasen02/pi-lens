@@ -3,7 +3,6 @@ import { describe, expect, it, afterEach, vi } from "vitest";
 import {
 	detectFlattenedBody,
 	lintPullRequestEvent,
-	lintLivePrBody,
 	lintPrBody,
 	repairFlattenedBody,
 	resolveLivePrBody,
@@ -40,14 +39,20 @@ describe("flattened PR body repair", () => {
 	});
 
 	it("rejects the minimum-length boundary", () => {
-		const boundary = "## Summary x ## Tests x".padEnd(199, "x");
+		const boundary = "x ## Summary x ## Tests x".padEnd(199, "x");
 		expect(boundary).toHaveLength(199);
+		expect(
+			boundary.match(/(?<!^)\s#{2,4}\s+(?:Summary|Tests)(?=\s|$)/g),
+		).toHaveLength(2);
 		expect(detectFlattenedBody(boundary)).toBe(false);
 	});
 
 	it("requires at least two inline headings", () => {
-		const oneHeading = `## Summary ${"x".repeat(220)}`;
+		const oneHeading = `x ## Summary ${"x".repeat(220)}`;
 		expect(oneHeading).not.toMatch(/\r?\n/);
+		expect(
+			oneHeading.match(/(?<!^)\s#{2,4}\s+(?:Summary|Tests)(?=\s|$)/g),
+		).toHaveLength(1);
 		expect(detectFlattenedBody(oneHeading)).toBe(false);
 	});
 
@@ -75,14 +80,13 @@ describe("flattened PR body repair", () => {
 		expect(repairFlattenedBody(candidate)).toBe(candidate);
 	});
 
-	it("leaves fenced code and prose hyphens unchanged", () => {
+	it("refuses bodies containing backticks", () => {
 		const candidate = flattenedBody.replace(
 			"word-index",
 			"word-index ```bash echo hi``` The well - known race",
 		);
-		const repaired = repairFlattenedBody(candidate);
-		expect(repaired).toContain("```bash echo hi```");
-		expect(repaired).toContain("The well - known race");
+		expect(detectFlattenedBody(candidate)).toBe(false);
+		expect(repairFlattenedBody(candidate)).toBe(candidate);
 	});
 
 	it("is idempotent", () => {
@@ -133,6 +137,66 @@ describe("flattened body CI entrypoint", () => {
 			expect.stringContaining("::notice::Repaired flattened PR body"),
 		);
 		log.mockRestore();
+	});
+
+	it("refuses a flattened fenced template and preserves lint errors", async () => {
+		stubApi();
+		const fencedBody =
+			flattenedBody + " ```text ## Summary one ## Tests two ```";
+		const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+		const fetchImpl = vi
+			.fn()
+			.mockImplementation(async (url: string) =>
+				String(url).includes("/files")
+					? new Response(JSON.stringify([]), { status: 200 })
+					: new Response(JSON.stringify({ body: fencedBody }), { status: 200 }),
+			);
+		expect(
+			await lintPullRequestEvent(fetchImpl, {
+				pull_request: { number: 2144, body: fencedBody },
+			}),
+		).toEqual({ valid: false, repaired: false });
+		expect(fetchImpl).not.toHaveBeenCalledWith(
+			expect.anything(),
+			expect.objectContaining({ method: "PATCH" }),
+		);
+		expect(errors).toHaveBeenCalled();
+		errors.mockRestore();
+	});
+
+	it("skips the patch when freshness GET fails", async () => {
+		stubApi();
+		const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+		let bodyGets = 0;
+		const fetchImpl = vi
+			.fn()
+			.mockImplementation(async (url: string, init?: RequestInit) => {
+				if (String(url).includes("/files"))
+					return new Response(JSON.stringify([]), { status: 200 });
+				if (init?.method === "PATCH")
+					return new Response("{}", { status: 200 });
+				bodyGets += 1;
+				if (bodyGets === 2) throw new Error("transient GET failure");
+				return new Response(JSON.stringify({ body: flattenedBody }), {
+					status: 200,
+				});
+			});
+		expect(
+			await lintPullRequestEvent(fetchImpl, {
+				pull_request: { number: 2144, body: flattenedBody },
+			}),
+		).toEqual({ valid: false, repaired: false });
+		expect(fetchImpl).not.toHaveBeenCalledWith(
+			expect.anything(),
+			expect.objectContaining({ method: "PATCH" }),
+		);
+		expect(warning).toHaveBeenCalledWith(
+			expect.stringContaining("freshness check failed"),
+		);
+		expect(errors).toHaveBeenCalled();
+		warning.mockRestore();
+		errors.mockRestore();
 	});
 
 	it("skips the patch when the live body changes after linting", async () => {
@@ -548,69 +612,5 @@ describe("renames out of tests/ still require the assessment (#2124 F3)", () => 
 		);
 		expect(await resolveTouchesTests({ number: 7 }, fetchImpl)).toBe(true);
 		vi.unstubAllEnvs();
-	});
-});
-
-describe("the entrypoint consumes the tri-state (#2124 F2)", () => {
-	const assessedBody = `${body}
-
-### Test assessment
-foo.test.ts uniquely pins the retry ladder.`;
-
-	afterEach(() => vi.unstubAllEnvs());
-
-	function fetchFor(bodyText: string, files: unknown) {
-		return vi.fn().mockImplementation(async (url: string | URL | Request) => {
-			if (String(url).includes("/files"))
-				return files instanceof Error
-					? Promise.reject(files)
-					: new Response(JSON.stringify(files), { status: 200 });
-			return new Response(JSON.stringify({ body: bodyText }), { status: 200 });
-		});
-	}
-
-	function stubApi() {
-		vi.stubEnv("GITHUB_TOKEN", "t");
-		vi.stubEnv("GITHUB_API_URL", "https://api.example");
-		vi.stubEnv("GITHUB_REPOSITORY", "o/r");
-	}
-
-	it("requires the section when the live file list touches tests/", async () => {
-		stubApi();
-		const result = await lintLivePrBody(
-			{ number: 7, body },
-			fetchFor(body, [{ filename: "tests/clients/foo.test.ts" }]),
-		);
-		expect(result.valid).toBe(false);
-		expect(result.errors.join(" ")).toContain("Test assessment");
-	});
-
-	it("accepts the assessed body when required", async () => {
-		stubApi();
-		const result = await lintLivePrBody(
-			{ number: 7, body: assessedBody },
-			fetchFor(assessedBody, [{ filename: "tests/clients/foo.test.ts" }]),
-		);
-		expect(result).toMatchObject({ valid: true });
-	});
-
-	it("skips the section for production-only PRs", async () => {
-		stubApi();
-		const result = await lintLivePrBody(
-			{ number: 7, body },
-			fetchFor(body, [{ filename: "clients/foo.ts" }]),
-		);
-		expect(result).toMatchObject({ valid: true });
-	});
-
-	it("skips the section on file-list fetch trouble (null never enforces)", async () => {
-		stubApi();
-		const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
-		const result = await lintLivePrBody(
-			{ number: 7, body },
-			fetchFor(body, new Error("boom")),
-		);
-		expect(result).toMatchObject({ valid: true });
-		warning.mockRestore();
 	});
 });
