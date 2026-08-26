@@ -18,7 +18,6 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { MessageConnection } from "vscode-jsonrpc";
 import { removeLspChild } from "../../../clients/instance-registry.js";
 import { logLatency } from "../../../clients/latency-logger.js";
-import { BoundedLruCache } from "../../../clients/bounded-cache.js";
 
 // Keep both budgets short so a wedged double is bounded well inside the
 // per-test timeout. Assigned before any dynamic `client.js` import below, so
@@ -67,7 +66,6 @@ function createWedgedState(kill: ReturnType<typeof vi.fn>) {
 		pendingDiagnostics: new Map(),
 		pendingOpens: new Set(),
 		openDocuments: new Set(),
-		normalizedDocumentPaths: new BoundedLruCache(2048),
 		openDocumentUris: new Map(),
 		projectIdentityProbedFiles: new Set<string>(),
 		watchQueue: { cancel: vi.fn() },

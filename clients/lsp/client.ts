@@ -37,7 +37,6 @@ import {
 	newLspMutationCorrelationId,
 } from "../lsp-mutation.js";
 import { getAmbientAbortSignal } from "../safe-spawn.js";
-import { BoundedLruCache } from "../bounded-cache.js";
 import { raceToCompletion } from "./aggregation.js";
 import {
 	hashDiagnosticContent,
@@ -1006,8 +1005,6 @@ export interface LSPClientState {
 		}
 	>;
 	readonly openDocuments: Set<string>;
-	/** Per-client raw spelling to canonical path memo for document sync. */
-	readonly normalizedDocumentPaths: BoundedLruCache<string, string>;
 	/** Paths explicitly closed during this client lifetime; late publishes are dropped. */
 	readonly closedDocuments?: Set<string>;
 	/** Original URI spelling for each open document; path keys are normalized. */
@@ -1159,30 +1156,6 @@ function isClientAlive(state: LSPClientState): boolean {
 	);
 }
 
-const MAX_NORMALIZED_DOCUMENT_PATHS = 2048;
-
-function normalizedDocumentPath(
-	state: LSPClientState,
-	filePath: string,
-): string {
-	const cached = state.normalizedDocumentPaths.get(filePath);
-	if (cached !== undefined) return cached;
-	const normalized = normalizeMapKey(filePath);
-	state.normalizedDocumentPaths.set(filePath, normalized);
-	return normalized;
-}
-
-function forgetNormalizedDocumentPath(
-	state: LSPClientState,
-	filePath: string,
-	normalizedPath: string,
-): void {
-	state.normalizedDocumentPaths.delete(filePath);
-	for (const [spelling, key] of state.normalizedDocumentPaths) {
-		if (key === normalizedPath) state.normalizedDocumentPaths.delete(spelling);
-	}
-}
-
 function disposeClientConnection(state: LSPClientState): void {
 	if (state.connectionDisposed) return;
 	state.connectionDisposed = true;
@@ -1193,7 +1166,6 @@ function disposeClientConnection(state: LSPClientState): void {
 	// above, means a crash that never re-attaches still frees its retained
 	// text instead of pinning it for the rest of the process lifetime.
 	activeLspClients.delete(state);
-	state.normalizedDocumentPaths.clear();
 	try {
 		state.connection.dispose();
 	} catch {
@@ -3735,7 +3707,7 @@ export function handleNotifyExternalChange(
 	type: number,
 ): void {
 	if (!isClientAlive(state)) return;
-	const normalizedPath = normalizedDocumentPath(state, filePath);
+	const normalizedPath = normalizeMapKey(filePath);
 	const uri =
 		state.openDocumentUris?.get(normalizedPath) ?? pathToFileURL(filePath).href;
 	state.watchQueue.enqueue(uri, type);
@@ -3750,7 +3722,7 @@ export async function handleNotifyOpen(
 	silent = false,
 ): Promise<void> {
 	if (!isClientAlive(state)) return;
-	const normalizedPath = normalizedDocumentPath(state, filePath);
+	const normalizedPath = normalizeMapKey(filePath);
 	const uri =
 		state.openDocumentUris?.get(normalizedPath) ?? pathToFileURL(filePath).href;
 
@@ -3888,7 +3860,7 @@ export async function handleNotifyChange(
 	content: string,
 ): Promise<void> {
 	if (!isClientAlive(state)) return;
-	const normalizedPath = normalizedDocumentPath(state, filePath);
+	const normalizedPath = normalizeMapKey(filePath);
 	const uri =
 		state.openDocumentUris?.get(normalizedPath) ?? pathToFileURL(filePath).href;
 
@@ -3938,7 +3910,7 @@ export async function closeDocument(
 	filePath: string,
 ): Promise<void> {
 	if (!isClientAlive(state)) return;
-	const normalizedPath = normalizedDocumentPath(state, filePath);
+	const normalizedPath = normalizeMapKey(filePath);
 	if (!state.openDocuments.has(normalizedPath)) return;
 	await safeSendNotification(state.connection, "textDocument/didClose", {
 		textDocument: {
@@ -3950,7 +3922,6 @@ export async function closeDocument(
 	state.openDocuments.delete(normalizedPath);
 	state.closedDocuments?.add(normalizedPath);
 	state.openDocumentUris?.delete(normalizedPath);
-	forgetNormalizedDocumentPath(state, filePath, normalizedPath);
 	state.documentVersions.delete(normalizedPath);
 	state.documentOpenedAt.delete(normalizedPath);
 	state.diagnosticPublicationCounts.delete(normalizedPath);
@@ -4091,7 +4062,6 @@ async function clientShutdownOnce(
 	state.pendingDiagnostics.clear();
 	state.pendingOpens.clear();
 	state.openDocuments.clear();
-	state.normalizedDocumentPaths.clear();
 	state.openDocumentUris?.clear();
 	// #1412 L1: mirror openDocuments' clear — a shut-down/evicted client's
 	// probe memo is moot along with everything else document-scoped.
@@ -5029,7 +4999,6 @@ export async function createLSPClient(options: {
 		pullRequestSequences: new Map(),
 		workspacePullResultCache: new Map(),
 		openDocuments: new Set(),
-		normalizedDocumentPaths: new BoundedLruCache(MAX_NORMALIZED_DOCUMENT_PATHS),
 		closedDocuments: new Set(),
 		openDocumentUris: new Map(),
 		pendingOpens: new Set(),

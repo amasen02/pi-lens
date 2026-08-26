@@ -11,7 +11,6 @@
 
 import { EventEmitter } from "node:events";
 import { vi } from "vitest";
-import { BoundedLruCache } from "../../../clients/bounded-cache.js";
 import type { MessageConnection } from "vscode-jsonrpc";
 import type { LSPClientState } from "../../../clients/lsp/client.js";
 import { TEXT_DOCUMENT_SYNC_KIND_FULL } from "../../../clients/lsp/sync-kind.js";
@@ -83,7 +82,6 @@ export function createMockState(
 		pullResultIds: new Map(),
 		workspacePullResultCache: new Map(),
 		openDocuments: new Set(),
-		normalizedDocumentPaths: new BoundedLruCache(2048),
 		closedDocuments: new Set(),
 		// #1669 review F8: REQUIRED, not left to the `?.`-optional default —
 		// both are `optional` on `LSPClientState`, and a factory that omits
