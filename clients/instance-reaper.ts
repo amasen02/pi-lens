@@ -85,10 +85,10 @@ import {
 	recordDegradationOnce,
 } from "./degradation-ledger.js";
 import { getGlobalPiLensDir } from "./file-utils.js";
-import { withInstanceRegistryLock } from "./instance-registry-lock.js";
 import {
 	type InstanceEntry,
 	isInstanceRegistryEnabled,
+	pruneDeadInstances as pruneDeadRegistryInstances,
 	readInstanceRegistry,
 } from "./instance-registry.js";
 import { logLatency } from "./latency-logger.js";
@@ -1589,21 +1589,8 @@ export async function sweepOrphans(): Promise<void> {
  *  rename, which the hand-rolled copy did not, and puts this writer back on
  *  the same scheme as the other writer of this same file. */
 export async function pruneDeadInstances(deadPids: Set<number>): Promise<void> {
-	const target = path.join(getGlobalPiLensDir(), "instances.json");
 	try {
-		await withInstanceRegistryLock(target, async () => {
-			const raw = await fs.promises.readFile(target, "utf-8");
-			const parsed = JSON.parse(raw);
-			if (!parsed || !Array.isArray(parsed.instances)) return;
-			const remaining = parsed.instances.filter(
-				(entry: InstanceEntry) => !deadPids.has(entry.pid),
-			);
-			if (remaining.length === parsed.instances.length) return;
-			await writeFileAtomicAsync(
-				target,
-				JSON.stringify({ instances: remaining }),
-			);
-		});
+		await pruneDeadRegistryInstances(deadPids);
 	} catch {
 		// best-effort
 	}

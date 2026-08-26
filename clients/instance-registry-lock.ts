@@ -52,9 +52,12 @@ function recordLockTimeout(target: string): void {
 	});
 }
 
+function backoffMs(): number {
+	return randomInt(LOCK_MIN_BACKOFF_MS, LOCK_MAX_BACKOFF_MS + 1);
+}
+
 function backoff(): void {
-	const delay = randomInt(LOCK_MIN_BACKOFF_MS, LOCK_MAX_BACKOFF_MS + 1);
-	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay);
+	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, backoffMs());
 }
 
 function ownsLock(lock: string): boolean {
@@ -62,6 +65,8 @@ function ownsLock(lock: string): boolean {
 }
 
 async function releaseLock(lock: string): Promise<void> {
+	// Residual TOCTOU: ownership and unlink are separate syscalls, so a stale
+	// takeover can still replace the lock between them.
 	if (ownsLock(lock)) await fs.promises.unlink(lock).catch(() => {});
 }
 
@@ -106,9 +111,7 @@ export async function withInstanceRegistryLock<T>(
 			if (!isLockContention(error)) throw error;
 			takeOverStale(lock);
 			if (Date.now() <= deadline)
-				await new Promise((resolve) =>
-					setTimeout(resolve, 5 + Math.floor(Math.random() * 21)),
-				);
+				await new Promise((resolve) => setTimeout(resolve, backoffMs()));
 			continue;
 		}
 		try {

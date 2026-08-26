@@ -941,10 +941,9 @@ export async function getResourceFootprint(
  *  an earlier snapshot) to narrow — not eliminate — the last-writer-wins race
  *  already accepted for this module's read-modify-write model (see the
  *  module docstring). Mirrors clients/instance-reaper.ts's
- *  `pruneDeadInstances`, kept local here rather than imported to avoid
- *  reaching back across the same import edge `realIsPidAlive` already
- *  crosses in the other direction. */
-async function prunePids(deadPids: Set<number>): Promise<void> {
+ *  `pruneDeadInstances` in the reaper delegates here so this module owns the
+ *  registry lock seam without creating a dependency on the reaper. */
+export async function pruneDeadInstances(deadPids: Set<number>): Promise<void> {
 	await withInstanceRegistryLock(registryPath(), async () => {
 		const file = await readRegistryAsync();
 		const remaining = file.instances.filter(
@@ -953,4 +952,8 @@ async function prunePids(deadPids: Set<number>): Promise<void> {
 		if (remaining.length === file.instances.length) return;
 		await writeRegistryAsync({ instances: remaining });
 	});
+}
+
+async function prunePids(deadPids: Set<number>): Promise<void> {
+	await pruneDeadInstances(deadPids);
 }

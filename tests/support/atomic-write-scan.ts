@@ -143,6 +143,8 @@ const TMP_TARGET_PATTERN = /\btmp[A-Z]\w*|os\.tmpdir\(\)/;
 export const EXEMPT_RAW_WRITE_FILES: Readonly<Record<string, string>> = {
 	// --- Defines the seam itself ---
 	"atomic-write.ts": "defines writeFileAtomic/writeFileAtomicAsync",
+	"instance-registry-lock.ts":
+		"lines 102 and 133 create the O_EXCL lock with a raw exclusive write; tmp+rename would destroy the exclusivity",
 
 	// --- Append-only NDJSON logs: a torn tail is a documented, tolerated read
 	// shape (line-oriented readers skip an unparseable trailing line; #1609

@@ -1,6 +1,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	withInstanceRegistryLock,
@@ -111,5 +113,35 @@ describe("instance registry lock", () => {
 		).toBe("sync");
 		expect(contender).toBeDefined();
 		expect(await contender!).toBe("async");
+	});
+
+	it("holds the lock against a child-process contender during the sync body", () => {
+		const dir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-registry-lock-"),
+		);
+		dirs.push(dir);
+		const target = path.join(dir, "instances.json");
+		const marker = path.join(dir, "sync-body.marker");
+		const lockModule = pathToFileURL(
+			path.resolve("clients/instance-registry-lock.js"),
+		).href;
+		const childScript = `import(${JSON.stringify(lockModule)}).then(({ withInstanceRegistryLockSync }) => { const result = withInstanceRegistryLockSync(process.argv[1], () => "acquired"); process.stdout.write(result === undefined ? "blocked" : result); });`;
+
+		expect(
+			withInstanceRegistryLockSync(target, () => {
+				fs.writeFileSync(marker, "sync body reached\n");
+				return execFileSync(
+					process.execPath,
+					["--input-type=module", "-e", childScript, target],
+					{
+						encoding: "utf8",
+						cwd: process.cwd(),
+						timeout: 2_000,
+						windowsHide: true,
+					},
+				).trim();
+			}),
+		).toBe("blocked");
+		expect(fs.readFileSync(marker, "utf8")).toBe("sync body reached\n");
 	});
 });
