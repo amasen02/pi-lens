@@ -18,6 +18,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { verifyToolBinary } from "../../../clients/installer/index.js";
+import { safeSpawnAsync } from "../../../clients/safe-spawn.js";
 import { removeTempDirSync } from "../test-utils.js";
 
 let binDir = "";
@@ -119,4 +120,38 @@ describe("verifyToolBinary (#2015)", () => {
 			expect(fs.existsSync(marker)).toBe(false);
 		}
 	}, 25_000);
+
+	it("rescues a transport error emitted after the output cap trips", async () => {
+		const writer = path.join(binDir, "late-rescue.cjs");
+		fs.writeFileSync(
+			writer,
+			"process.on('SIGTERM', () => {});" +
+				"for (let i = 0; i < 24; i++) process.stderr.write('x'.repeat(4096));" +
+				"setTimeout(() => process.stderr.write('Connection input stream is not set\\n'), 500);",
+			"utf8",
+		);
+		const safeWriter = writer.replace(/[^A-Za-z0-9_\\/. :-]/g, "_");
+		const bin = writeShim("late-rescue", `node "${safeWriter}"`);
+		await expect(
+			verifyToolBinary(bin, undefined, undefined, 10_000, ["--version"]),
+		).resolves.toBe(true);
+	}, 15_000);
+
+	it("latches a matching chunk before retained output can discard it", async () => {
+		const writer = path.join(binDir, "streaming-latch.cjs");
+		fs.writeFileSync(
+			writer,
+			"process.on('SIGTERM', () => {});" +
+				"for (let i = 0; i < 24; i++) process.stderr.write('x'.repeat(4096));" +
+				"setTimeout(() => process.stderr.write('RESCUE\\n'), 500);",
+			"utf8",
+		);
+		const result = await safeSpawnAsync(process.execPath, [writer], {
+			timeout: 10_000,
+			maxOutputBytes: 64 * 1024,
+			matchWhileStreaming: /RESCUE/,
+		});
+		expect(result.outputTruncated).toBe(true);
+		expect(result.streamingMatch).toBe(true);
+	}, 15_000);
 });

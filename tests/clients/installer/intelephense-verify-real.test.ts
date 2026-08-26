@@ -6,8 +6,14 @@ import { describe, expect, it } from "vitest";
 import { verifyToolBinary } from "../../../clients/installer/index.js";
 
 const binaryCandidates = [
-	path.join(os.homedir(), ".pi-lens", "tools", "node_modules", ".bin", "intelephense"),
-	"C:\\Users\\apman\\.pi-lens\\tools\\node_modules\\.bin\\intelephense",
+	path.join(
+		os.homedir(),
+		".pi-lens",
+		"tools",
+		"node_modules",
+		".bin",
+		"intelephense",
+	),
 ];
 const binaryPath = binaryCandidates.find((candidate) =>
 	fs.existsSync(`${candidate}${process.platform === "win32" ? ".cmd" : ""}`),
@@ -17,7 +23,11 @@ describe("intelephense verification output retention", () => {
 	it.skipIf(!binaryPath)(
 		"recognizes the transport rescue in the tail under the production cap",
 		async () => {
-			expect(await verifyToolBinary(binaryPath!, undefined, undefined, 10000, ["--version"])).toBe(true);
+			expect(
+				await verifyToolBinary(binaryPath!, undefined, undefined, 10000, [
+					"--version",
+				]),
+			).toBe(true);
 		},
 		15000,
 	);

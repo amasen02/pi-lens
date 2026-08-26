@@ -12,7 +12,10 @@ vi.mock("../../../clients/sessionstart-logger.js", () => ({
 	logSessionStart: sessionLog,
 }));
 
-import { getDegradationSummary, resetDegradationLedger } from "../../../clients/degradation-ledger.js";
+import {
+	getDegradationSummary,
+	resetDegradationLedger,
+} from "../../../clients/degradation-ledger.js";
 import { TOOLS, verifyToolBinary } from "../../../clients/installer/index.js";
 import { removeTempDirSync } from "../test-utils.js";
 
@@ -167,7 +170,10 @@ describe("managed markdownlint verification (#2045)", () => {
 		expect(safeSpawnAsync).toHaveBeenLastCalledWith(
 			process.platform === "win32" ? "intelephense.cmd" : "intelephense",
 			["--version"],
-			expect.objectContaining({ maxOutputBytes: 64 * 1024 }),
+			expect.objectContaining({
+				maxOutputBytes: 64 * 1024,
+				matchWhileStreaming: expect.any(RegExp),
+			}),
 		);
 		expect(getDegradationSummary()).toEqual([
 			expect.objectContaining({

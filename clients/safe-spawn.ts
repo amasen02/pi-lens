@@ -149,6 +149,8 @@ export interface SpawnResult {
 	};
 	/** True when stdout or stderr was capped before process completion. */
 	outputTruncated?: boolean;
+	/** True when the optional streaming matcher saw a matching chunk. */
+	streamingMatch?: boolean;
 	/** Peak/average CPU%+RSS sampled across this spawn's lifetime (#620).
 	 *  `undefined` when no sample ever landed (process exited faster than the
 	 *  first poll tick, or sampling failed for the whole invocation) — never
@@ -344,6 +346,8 @@ export interface SafeSpawnOptions {
 	resourceLabel?: string;
 	/** Maximum bytes retained across stdout and stderr for this child. */
 	maxOutputBytes?: number;
+	/** Match output chunks before output-cap truncation can discard them. */
+	matchWhileStreaming?: RegExp;
 	/** Optional stdin payload. Supplying it always writes and closes stdin. */
 	input?: string;
 	/**
@@ -1166,6 +1170,7 @@ export async function safeSpawnAsync(
 		let aborted = false;
 		let killed = false;
 		let outputTruncated = false;
+		let streamingMatch = false;
 		// #1651 review: a single boolean the close/error handlers both check
 		// AND set, so whichever one decides the outcome first wins outright —
 		// the DECISION itself is shape-based (see the `close` handler below),
@@ -1297,7 +1302,11 @@ export async function safeSpawnAsync(
 				headRemaining -= Buffer.byteLength(kept);
 			}
 			let tailRemaining = tailBytes;
-			for (let index = parts.length - 1; index >= 0 && tailRemaining > 0; index--) {
+			for (
+				let index = parts.length - 1;
+				index >= 0 && tailRemaining > 0;
+				index--
+			) {
 				const part = parts[index];
 				const kept = byteSuffix(part.text, tailRemaining);
 				if (kept) {
@@ -1583,12 +1592,26 @@ export async function safeSpawnAsync(
 		child.stdout?.setEncoding("utf-8");
 		child.stderr?.setEncoding("utf-8");
 		child.stdout?.on("data", (data) => {
+			if (!streamingMatch && options?.matchWhileStreaming) {
+				const matcher = options.matchWhileStreaming;
+				matcher.lastIndex = 0;
+				streamingMatch = matcher.test(
+					typeof data === "string" ? data : data.toString(),
+				);
+			}
 			stdout = appendOutput("stdout", stdout, data);
 			if (outputTruncated) refreshRetainedOutputs();
 			stopForOutputLimit();
 			rearmIdleGrace?.();
 		});
 		child.stderr?.on("data", (data) => {
+			if (!streamingMatch && options?.matchWhileStreaming) {
+				const matcher = options.matchWhileStreaming;
+				matcher.lastIndex = 0;
+				streamingMatch = matcher.test(
+					typeof data === "string" ? data : data.toString(),
+				);
+			}
 			stderr = appendOutput("stderr", stderr, data);
 			if (outputTruncated) refreshRetainedOutputs();
 			stopForOutputLimit();
@@ -1790,6 +1813,7 @@ export async function safeSpawnAsync(
 			const resourceUsage = finishResourceUsage();
 
 			const outputInfo = outputTruncated ? { outputTruncated: true } : {};
+			const streamingMatchInfo = streamingMatch ? { streamingMatch: true } : {};
 			// #1816: surface the signal name as a field on every path where one
 			// exists, so callers can NAME it instead of scraping `error.message`.
 			const signalInfo = signal ? { signal } : {};
@@ -1816,6 +1840,7 @@ export async function safeSpawnAsync(
 					...(timeoutTeardown && { timeoutTeardown }),
 					spawnFailure: new SpawnFailureError("timeout", cause.message, cause),
 					...outputInfo,
+					...streamingMatchInfo,
 					resourceUsage,
 				});
 			} else if (aborted) {
@@ -1829,6 +1854,7 @@ export async function safeSpawnAsync(
 					...signalInfo,
 					spawnFailure: new SpawnFailureError("killed", cause.message, cause),
 					...outputInfo,
+					...streamingMatchInfo,
 					resourceUsage,
 				});
 			} else if (signal) {
@@ -1842,6 +1868,7 @@ export async function safeSpawnAsync(
 					...signalInfo,
 					spawnFailure: new SpawnFailureError("killed", cause.message, cause),
 					...outputInfo,
+					...streamingMatchInfo,
 					resourceUsage,
 				});
 			} else if (code === null || code < 0) {
@@ -1870,10 +1897,18 @@ export async function safeSpawnAsync(
 					failure: "spawn",
 					spawnFailure,
 					...outputInfo,
+					...streamingMatchInfo,
 					resourceUsage,
 				});
 			} else {
-				resolve({ stdout, stderr, status: code, ...outputInfo, resourceUsage });
+				resolve({
+					stdout,
+					stderr,
+					status: code,
+					...outputInfo,
+					...streamingMatchInfo,
+					resourceUsage,
+				});
 			}
 		};
 

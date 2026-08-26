@@ -2068,6 +2068,9 @@ export function isLspTransportRequiredError(output: string): boolean {
 	);
 }
 
+const lspTransportRequiredMatcher =
+	/Connection (?:input|output) stream is not set|Use arguments of createConnection/i;
+
 /**
  * Parse the exact version pinned in a TOOLS `packageName` spec, e.g.
  * `"jscpd@3.5.10"` -> `"3.5.10"`. Scoped packages (`"@ast-grep/cli"`) have no
@@ -2168,6 +2171,7 @@ export async function verifyToolBinary(
 			// megabytes-long diagnostic on stderr. Keep verification bounded even
 			// when the child reaches its normal timeout first.
 			maxOutputBytes: 64 * 1024,
+			matchWhileStreaming: lspTransportRequiredMatcher,
 		});
 		const output = `${result.stdout}\n${result.stderr}`;
 		if (result.outputTruncated) {
@@ -2184,7 +2188,7 @@ export async function verifyToolBinary(
 			onVersionOutput?.(result.stdout);
 			return true;
 		}
-		if (isLspTransportRequiredError(output)) {
+		if (result.streamingMatch || isLspTransportRequiredError(output)) {
 			// Valid stdio LSP server that rejects `--version` (#208) — the
 			// transport-required error proves the binary works.
 			debugLog(`Verified (stdio LSP, transport-required): ${binPath}`);
