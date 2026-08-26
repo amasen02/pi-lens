@@ -3475,6 +3475,8 @@ export interface RefreshableManagedTool {
 	packageName?: string;
 	/** npm only — what `installNpmTool` verifies after an install or update. */
 	binaryName?: string;
+	/** Registry-scoped ceiling for managed verification probes. */
+	verificationTimeoutMs?: number;
 	/**
 	 * The identity of what the tool's coordinate resolves to TODAY, when that
 	 * identity is knowable without a network call. `archive` and `maven` entries
@@ -3529,6 +3531,7 @@ export function getRefreshableManagedTools(): RefreshableManagedTool[] {
 					checkArgs: tool.checkArgs,
 					packageName: tool.packageName,
 					binaryName: tool.binaryName,
+					verificationTimeoutMs: tool.verificationTimeoutMs,
 				});
 				break;
 			}
@@ -3654,7 +3657,7 @@ async function probeManagedToolVersion(
 	if (!cached?.path || !existsSync(cached.path)) return undefined;
 	try {
 		const result = await safeSpawnAsync(cached.path, tool.checkArgs, {
-			timeout: 10_000,
+			timeout: getToolVerificationTimeout(tool),
 			input: "",
 			ignoreAmbientSignal: true,
 			resourceLabel: `tool-refresh-version:${tool.id}`,

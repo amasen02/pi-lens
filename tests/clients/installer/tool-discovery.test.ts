@@ -126,7 +126,7 @@ vi.mock("../../../clients/atomic-write.js", () => ({
 
 // ── child_process spawn mock ────────────────────────────────────────────
 const spawnCalls = vi.hoisted(
-	() => [] as Array<{ cmd: string; args: string[] }>,
+	() => [] as Array<{ cmd: string; args: string[]; timeout?: number }>,
 );
 const mockSpawn = vi.hoisted(() =>
 	vi.fn((cmd: string, args: string[], _opts?: unknown) => {
@@ -159,8 +159,16 @@ vi.mock("node:child_process", () => ({ spawn: mockSpawn }));
 // failure simulate it at their own seams (network, fs access).
 vi.mock("../../../clients/safe-spawn.js", () => ({
 	safeSpawn: vi.fn(() => ({ stdout: "", stderr: "", status: 0 })),
-	safeSpawnAsync: async (command: string, args: string[]) => {
-		spawnCalls.push({ cmd: String(command), args: args ?? [] });
+	safeSpawnAsync: async (
+		command: string,
+		args: string[],
+		options?: { timeout?: number },
+	) => {
+		spawnCalls.push({
+			cmd: String(command),
+			args: args ?? [],
+			timeout: options?.timeout,
+		});
 		return { stdout: "", stderr: "", status: 0 };
 	},
 	resetSafeSpawnWindowsCommandCache: vi.fn(),
@@ -335,6 +343,29 @@ describe("getToolPath ordering", () => {
 // ═════════════════════════════════════════════════════════════════════════
 
 describe("managed npm executable paths", () => {
+	it("passes the Vue verification budget to the managed-local probe", async () => {
+		process.env.PI_LENS_TEST_PLATFORM = "win32";
+		const localPath = path.join(
+			TEST_HOME,
+			".pi-lens",
+			"tools",
+			"node_modules",
+			".bin",
+			"vue-language-server.cmd",
+		);
+		fakeAccess(localPath);
+
+		await expect(
+			ensureTool("@vue/language-server", { allowInstall: false }),
+		).resolves.toBe(localPath);
+		expect(
+			spawnCalls.some(
+				({ cmd, args, timeout }) =>
+					cmd === localPath && args.includes("--version") && timeout === 30_000,
+			),
+		).toBe(true);
+	});
+
 	it("returns the stored Windows .cmd shim from the real npm install path", async () => {
 		process.env.PI_LENS_TEST_PLATFORM = "win32";
 		process.env.PI_LENS_TEST_MODE = "1";
@@ -364,6 +395,34 @@ describe("managed npm executable paths", () => {
 			// fire-and-forget `void updateProbeCache(...)` a tick to complete.
 			await new Promise((resolve) => setImmediate(resolve));
 			await expect(checkProbeCache("stylelint")).resolves.toBe(expected);
+		});
+	});
+
+	it("passes the Vue verification budget through npm install", async () => {
+		process.env.PI_LENS_TEST_PLATFORM = "win32";
+		process.env.PI_LENS_TEST_MODE = "1";
+		process.env.PI_LENS_TEST_NPM_SCRIPT = "install";
+		await withEmptyPath(async () => {
+			const expected = path.join(
+				TEST_HOME,
+				".pi-lens",
+				"tools",
+				"node_modules",
+				".bin",
+				"vue-language-server.cmd",
+			);
+			fakeAccess(expected);
+			mockFsStat.mockResolvedValue({ mtimeMs: 1 });
+			await expect(
+				ensureTool("@vue/language-server", { forceReinstall: true }),
+			).resolves.toBe(expected);
+			const verificationCalls = spawnCalls.filter(
+				({ cmd, args }) => cmd === expected && args.includes("--version"),
+			);
+			expect(verificationCalls.length).toBeGreaterThan(0);
+			expect(verificationCalls.every(({ timeout }) => timeout === 30_000)).toBe(
+				true,
+			);
 		});
 	});
 

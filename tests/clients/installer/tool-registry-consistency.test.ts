@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
 	GITHUB_TOOLS,
 	TOOLS,
+	getRefreshableManagedTools,
 	getToolVerificationTimeout,
 } from "../../../clients/installer/index.js";
 
@@ -53,6 +54,13 @@ describe("TOOLS registry consistency", () => {
 		expect(
 			getToolVerificationTimeout(TOOLS.find((tool) => tool.id === "pyright")!),
 		).toBe(10_000);
+	});
+
+	it("carries the Vue timeout into refresh candidates", () => {
+		const vue = getRefreshableManagedTools().find(
+			(tool) => tool.toolId === "@vue/language-server",
+		);
+		expect(vue?.verificationTimeoutMs).toBe(30_000);
 	});
 
 	it("every tool has the required base wiring (id, name, checkCommand, checkArgs, strategy)", () => {

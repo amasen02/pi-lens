@@ -972,6 +972,22 @@ describe("post-update verification (review F2)", () => {
 		expect(logRows().some((row) => row.includes("verified"))).toBe(true);
 	});
 
+	it("passes the default timeout through npm refresh", async () => {
+		installFixture("knip", "6.4.1");
+		stubSpawn("ok", { knip: "6.32.2" });
+
+		const outcome = await runManagedToolRefresh(NOW);
+
+		expect(outcome.refreshed[0]).toMatchObject({
+			toolId: "knip",
+			ok: true,
+			verified: true,
+		});
+		expect(verifyOptions).toHaveBeenCalledWith(
+			expect.objectContaining({ timeout: 10_000 }),
+		);
+	});
+
 	it("pins the registry argv through public getToolPath", async () => {
 		installFixture("knip", "6.4.1");
 

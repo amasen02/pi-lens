@@ -607,6 +607,12 @@ and only `lsp_server_spawned` answers "how many servers did we start".
 
 ### Dispatch, runners, formatters, and installer
 
+Managed verification uses the registry's optional `verificationTimeoutMs` at
+every installer-owned probe seam, including local discovery, npm install, and
+periodic refresh. The refresh candidate projection carries that policy instead
+of reintroducing a shared literal; dispatch keeps its separate 5-second budget
+until its own issue defines the broader hot-path change. (#2176, #2194)
+
 The project ignore matcher keeps its per-path verdict memo hot between edits.
 The write-result seam calls `invalidateProjectIgnoreMatcherForPath` for a
 `.gitignore` mutation: it scans every cached root containing the edited path,

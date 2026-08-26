@@ -354,6 +354,7 @@ export interface RefreshCandidate {
 	/** npm only — what `refreshNpmOne` verifies after `npm update`. */
 	binaryName?: string;
 	checkArgs: string[];
+	verificationTimeoutMs: number;
 }
 
 /**
@@ -374,6 +375,7 @@ async function installedRefreshCandidates(): Promise<RefreshCandidate[]> {
 			toolId: tool.toolId,
 			strategy: tool.strategy,
 			checkArgs: tool.checkArgs,
+			verificationTimeoutMs: tool.verificationTimeoutMs ?? 10_000,
 			...(tool.packageName !== undefined && { packageName: tool.packageName }),
 			...(tool.binaryName !== undefined && { binaryName: tool.binaryName }),
 		});
@@ -714,7 +716,7 @@ async function performNpmRefresh(
 		binPath,
 		undefined,
 		undefined,
-		10000,
+		candidate.verificationTimeoutMs,
 		candidate.checkArgs,
 	);
 	if (!verified) {
