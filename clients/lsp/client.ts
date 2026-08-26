@@ -263,6 +263,8 @@ export interface LSPCallHierarchyOutgoingCall {
 export interface LSPClientInfo {
 	serverId: string;
 	root: string;
+	/** Session cwd, distinct from the language-server project root. */
+	sessionCwd?: string;
 	connection: MessageConnection;
 	/** Check if the connection is still alive */
 	isAlive: () => boolean;
@@ -4810,6 +4812,8 @@ export async function createLSPClient(options: {
 	serverId: string;
 	process: LSPProcess;
 	root: string;
+	/** Session cwd, distinct from the language-server project root. */
+	sessionCwd?: string;
 	initialization?: Record<string, unknown>;
 	initializeTimeoutMs?: number;
 	/** See `LSPServerInfo.spawn`'s `launchVariant` (server.ts) — which concrete
@@ -4824,6 +4828,7 @@ export async function createLSPClient(options: {
 		serverId,
 		process: lspProcess,
 		root,
+		sessionCwd,
 		initialization,
 		initializeTimeoutMs = INITIALIZE_TIMEOUT_MS,
 		launchVariant,
@@ -4842,7 +4847,8 @@ export async function createLSPClient(options: {
 		command: lspProcess.command,
 		marker: extractSpawnMarker(lspProcess.args),
 		sessionIdentity: {
-			projectRoot: root,
+			projectRoot: sessionCwd ?? process.cwd(),
+			rootSource: sessionCwd ? "session-cwd" : "lsp-fallback",
 			startedAt: new Date(
 				workspaceDiagnosticsCacheSessionStart(),
 			).toISOString(),

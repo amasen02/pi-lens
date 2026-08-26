@@ -12,10 +12,11 @@
  * File shape: `{ instances: InstanceEntry[] }`. Missing or corrupt file is
  * treated as `{ instances: [] }` — this module must never throw on a read.
  *
- * Concurrency: every write is read-modify-write-whole-file with an atomic
- * tmp+rename (same pattern as clients/review-graph/builder.ts). File locking
- * remains deferred, but writers re-read after publication and retry when their
- * own mutation is absent, which bounds the cross-process lost-update window.
+ * Concurrency: every whole-file writer holds the adjacent `<registry>.lock`
+ * O_EXCL lock across its read-modify-write. Contenders use 5-25ms jittered
+ * backoff for up to 500ms; stale locks older than 5s or owned by a dead pid
+ * are displaced and reclaimed. A crash can still leave a stale lock during
+ * that window, so takeover remains deliberately bounded and observable.
  */
 
 import * as fs from "node:fs";
@@ -23,6 +24,10 @@ import * as path from "node:path";
 import { writeFileAtomic, writeFileAtomicAsync } from "./atomic-write.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
 import { getGlobalPiLensDir } from "./file-utils.js";
+import {
+	withInstanceRegistryLock,
+	withInstanceRegistryLockSync,
+} from "./instance-registry-lock.js";
 // #735: reuse the #449/#525 reaper's exact conservative liveness check
 // (`process.kill(pid, 0)`, ESRCH-only-means-dead) rather than inventing a
 // second one — see realIsPidAlive's own docstring, which already calls out
@@ -72,6 +77,8 @@ export interface InstanceEntry {
 	 * {@link getInstanceRoots}, never this field alone.
 	 */
 	projectRoot: string;
+	/** Provenance when a child had to synthesize the host identity. */
+	rootSource?: "session-cwd" | "lsp-fallback";
 	/**
 	 * Every root this host serves, insertion-ordered, `projectRoot` first
 	 * (#2130). Registration is ADDITIVE: a second root joins the set instead of
@@ -222,10 +229,12 @@ async function writeRegistryWithRetry(
 	mutate: (file: RegistryFile) => RegistryFile,
 	isCommitted: (file: RegistryFile) => boolean,
 ): Promise<void> {
-	for (let attempt = 0; attempt < REGISTRY_WRITE_RETRIES; attempt++) {
-		await writeRegistryAsync(mutate(await readRegistryAsync()));
-		if (isCommitted(await readRegistryAsync())) return;
-	}
+	await withInstanceRegistryLock(registryPath(), async () => {
+		for (let attempt = 0; attempt < REGISTRY_WRITE_RETRIES; attempt++) {
+			await writeRegistryAsync(mutate(await readRegistryAsync()));
+			if (isCommitted(await readRegistryAsync())) return;
+		}
+	});
 }
 
 function writeRegistrySync(file: RegistryFile): void {
@@ -379,29 +388,25 @@ async function registerInstanceRootNow(projectRoot: string): Promise<void> {
 	if (!isInstanceRegistryEnabled()) return;
 	const pid = process.pid;
 	const normalizedRoot = normalizeFilePath(projectRoot);
-	const file = await readRegistryAsync();
-	const idx = file.instances.findIndex((entry) => entry.pid === pid);
-	if (idx === -1) return;
-	const current = file.instances[idx];
-	const priorRoots = getInstanceRoots(current);
-	const roots = mergeInstanceRoots(priorRoots, normalizedRoot);
-	// Nothing changed (already registered, or evicted straight back out) — skip
-	// the write rather than re-serializing the whole file over a concurrent
-	// update.
-	if (
-		roots.length === priorRoots.length &&
-		roots.every((root, index) => root === priorRoots[index])
-	) {
-		return;
-	}
-	file.instances[idx] = {
-		...current,
-		// `projectRoot` stays pinned: a declined start must never become the
-		// host's advertised root, which is the whole point of #2130.
-		projectRoot: roots[0] ?? current.projectRoot,
-		projectRoots: roots,
-	};
-	await writeRegistryAsync(file);
+	await withInstanceRegistryLock(registryPath(), async () => {
+		const file = await readRegistryAsync();
+		const idx = file.instances.findIndex((entry) => entry.pid === pid);
+		if (idx === -1) return;
+		const current = file.instances[idx];
+		const priorRoots = getInstanceRoots(current);
+		const roots = mergeInstanceRoots(priorRoots, normalizedRoot);
+		if (
+			roots.length === priorRoots.length &&
+			roots.every((root, index) => root === priorRoots[index])
+		)
+			return;
+		file.instances[idx] = {
+			...current,
+			projectRoot: roots[0] ?? current.projectRoot,
+			projectRoots: roots,
+		};
+		await writeRegistryAsync(file);
+	});
 }
 
 export interface HeartbeatPatch {
@@ -428,36 +433,38 @@ export async function updateHeartbeat(
 ): Promise<void> {
 	if (!isInstanceRegistryEnabled()) return;
 	const pid = process.pid;
-	const file = await readRegistryAsync();
-	const idx = file.instances.findIndex((entry) => entry.pid === pid);
-	if (idx === -1) {
-		// No prior registerInstance in this run (e.g. registry file was reaped
-		// out from under us, or heartbeat fired before session_start finished) —
-		// nothing to update against; skip rather than fabricate a projectRoot.
-		return;
-	}
-	const now = new Date().toISOString();
-	const current = file.instances[idx];
-	const lspChildren = patch.childUsage
-		? current.lspChildren.map((child) => {
-				const usage = patch.childUsage?.[child.pid];
-				if (!usage) return child;
-				return {
-					...child,
-					rssBytes: usage.rssBytes ?? child.rssBytes,
-					cpuPercent: usage.cpuPercent ?? child.cpuPercent,
-				};
-			})
-		: current.lspChildren;
-	file.instances[idx] = {
-		...current,
-		rssBytes: patch.rssBytes ?? process.memoryUsage().rss,
-		cpuPercent: patch.cpuPercent ?? current.cpuPercent,
-		lspChildren,
-		lspChildCount: lspChildren.length,
-		heartbeatAt: now,
-	};
-	await writeRegistryAsync(file);
+	await withInstanceRegistryLock(registryPath(), async () => {
+		const file = await readRegistryAsync();
+		const idx = file.instances.findIndex((entry) => entry.pid === pid);
+		if (idx === -1) {
+			// No prior registerInstance in this run (e.g. registry file was reaped
+			// out from under us, or heartbeat fired before session_start finished) —
+			// nothing to update against; skip rather than fabricate a projectRoot.
+			return;
+		}
+		const now = new Date().toISOString();
+		const current = file.instances[idx];
+		const lspChildren = patch.childUsage
+			? current.lspChildren.map((child) => {
+					const usage = patch.childUsage?.[child.pid];
+					if (!usage) return child;
+					return {
+						...child,
+						rssBytes: usage.rssBytes ?? child.rssBytes,
+						cpuPercent: usage.cpuPercent ?? child.cpuPercent,
+					};
+				})
+			: current.lspChildren;
+		file.instances[idx] = {
+			...current,
+			rssBytes: patch.rssBytes ?? process.memoryUsage().rss,
+			cpuPercent: patch.cpuPercent ?? current.cpuPercent,
+			lspChildren,
+			lspChildCount: lspChildren.length,
+			heartbeatAt: now,
+		};
+		await writeRegistryAsync(file);
+	});
 }
 
 export interface RecordLspChildInput {
@@ -466,7 +473,11 @@ export interface RecordLspChildInput {
 	command: string;
 	marker?: string;
 	/** Session identity used if this child arrives before host registration. */
-	sessionIdentity?: { projectRoot: string; startedAt: string };
+	sessionIdentity?: {
+		projectRoot: string;
+		startedAt: string;
+		rootSource?: "session-cwd" | "lsp-fallback";
+	};
 }
 
 // Every mutation routed through this tail (`registerInstance`,
@@ -545,6 +556,7 @@ async function recordLspChildNow(entry: RecordLspChildInput): Promise<void> {
 		marker: entry.marker,
 		spawnedAt: now,
 	};
+	const hostIdentity = getSubagentIdentity();
 	await writeRegistryWithRetry(
 		(file) => {
 			const idx = file.instances.findIndex((inst) => inst.pid === pid);
@@ -557,6 +569,13 @@ async function recordLspChildNow(entry: RecordLspChildInput): Promise<void> {
 					reason: "synthesizing host entry while recording an LSP child",
 				});
 				const identity = entry.sessionIdentity;
+				if (!identity?.projectRoot) {
+					recordDegradationOnce({
+						kind: "instance-registry-identity-fallback",
+						subject: String(pid),
+						reason: "session cwd unavailable; using process cwd",
+					});
+				}
 				const projectRoot = normalizeFilePath(
 					identity?.projectRoot ?? process.cwd(),
 				);
@@ -564,22 +583,20 @@ async function recordLspChildNow(entry: RecordLspChildInput): Promise<void> {
 					pid,
 					startedAt: identity?.startedAt ?? now,
 					projectRoot,
+					rootSource: identity?.rootSource ?? "lsp-fallback",
 					projectRoots: [projectRoot],
 					lspChildren: [childEntry],
 					lspChildCount: 1,
 					rssBytes: process.memoryUsage().rss,
 					heartbeatAt: now,
-					...(getSubagentIdentity()
+					...(hostIdentity
 						? {
-								subagent: (() => {
-									const identity = getSubagentIdentity();
-									return {
-										marker: identity?.marker,
-										agentType: identity?.agentName,
-										parentPid: identity?.parentPid,
-										runId: identity?.runId,
-									};
-								})(),
+								subagent: {
+									marker: hostIdentity.marker,
+									agentType: hostIdentity.agentName,
+									parentPid: hostIdentity.parentPid,
+									runId: hostIdentity.runId,
+								},
 							}
 						: {}),
 				});
@@ -632,24 +649,26 @@ async function removeLspChildNow(
 ): Promise<void> {
 	if (!isInstanceRegistryEnabled()) return;
 	const selfPid = process.pid;
-	const file = await readRegistryAsync();
-	const idx = file.instances.findIndex((inst) => inst.pid === selfPid);
-	if (idx === -1) return;
-	const current = file.instances[idx];
-	const filtered = current.lspChildren.filter((child) => {
-		if (child.pid !== pid) return true; // keep — different pid
-		if (expectedMarker && child.marker && child.marker !== expectedMarker) {
-			return true; // keep — pid recycled onto a differently-marked child
-		}
-		return false; // drop — this is the child we're deregistering
+	await withInstanceRegistryLock(registryPath(), async () => {
+		const file = await readRegistryAsync();
+		const idx = file.instances.findIndex((inst) => inst.pid === selfPid);
+		if (idx === -1) return;
+		const current = file.instances[idx];
+		const filtered = current.lspChildren.filter((child) => {
+			if (child.pid !== pid) return true; // keep — different pid
+			if (expectedMarker && child.marker && child.marker !== expectedMarker) {
+				return true; // keep — pid recycled onto a differently-marked child
+			}
+			return false; // drop — this is the child we're deregistering
+		});
+		if (filtered.length === current.lspChildren.length) return; // nothing removed
+		file.instances[idx] = {
+			...current,
+			lspChildren: filtered,
+			lspChildCount: filtered.length,
+		};
+		await writeRegistryAsync(file);
 	});
-	if (filtered.length === current.lspChildren.length) return; // nothing removed
-	file.instances[idx] = {
-		...current,
-		lspChildren: filtered,
-		lspChildCount: filtered.length,
-	};
-	await writeRegistryAsync(file);
 }
 
 /**
@@ -660,10 +679,12 @@ async function removeLspChildNow(
 export function deregisterInstance(): void {
 	if (!isInstanceRegistryEnabled()) return;
 	const pid = process.pid;
-	const file = readRegistrySync();
-	const remaining = file.instances.filter((entry) => entry.pid !== pid);
-	if (remaining.length === file.instances.length) return; // nothing to remove
-	writeRegistrySync({ instances: remaining });
+	withInstanceRegistryLockSync(registryPath(), () => {
+		const file = readRegistrySync();
+		const remaining = file.instances.filter((entry) => entry.pid !== pid);
+		if (remaining.length === file.instances.length) return;
+		writeRegistrySync({ instances: remaining });
+	});
 }
 
 /**
@@ -681,26 +702,28 @@ export function deregisterInstanceRoot(projectRoot: string): void {
 	if (!isInstanceRegistryEnabled()) return;
 	const pid = process.pid;
 	const normalizedRoot = normalizeFilePath(projectRoot);
-	const file = readRegistrySync();
-	const idx = file.instances.findIndex((entry) => entry.pid === pid);
-	if (idx === -1) return;
-	const current = file.instances[idx];
-	const remainingRoots = getInstanceRoots(current).filter(
-		(root) => root !== normalizedRoot,
-	);
-	if (remainingRoots.length === getInstanceRoots(current).length) return;
-	if (remainingRoots.length === 0) {
-		writeRegistrySync({
-			instances: file.instances.filter((entry) => entry.pid !== pid),
-		});
-		return;
-	}
-	file.instances[idx] = {
-		...current,
-		projectRoot: remainingRoots[0],
-		projectRoots: remainingRoots,
-	};
-	writeRegistrySync(file);
+	withInstanceRegistryLockSync(registryPath(), () => {
+		const file = readRegistrySync();
+		const idx = file.instances.findIndex((entry) => entry.pid === pid);
+		if (idx === -1) return;
+		const current = file.instances[idx];
+		const remainingRoots = getInstanceRoots(current).filter(
+			(root) => root !== normalizedRoot,
+		);
+		if (remainingRoots.length === getInstanceRoots(current).length) return;
+		if (remainingRoots.length === 0) {
+			writeRegistrySync({
+				instances: file.instances.filter((entry) => entry.pid !== pid),
+			});
+			return;
+		}
+		file.instances[idx] = {
+			...current,
+			projectRoot: remainingRoots[0],
+			projectRoots: remainingRoots,
+		};
+		writeRegistrySync(file);
+	});
 }
 
 /**
@@ -922,8 +945,12 @@ export async function getResourceFootprint(
  *  reaching back across the same import edge `realIsPidAlive` already
  *  crosses in the other direction. */
 async function prunePids(deadPids: Set<number>): Promise<void> {
-	const file = await readRegistryAsync();
-	const remaining = file.instances.filter((entry) => !deadPids.has(entry.pid));
-	if (remaining.length === file.instances.length) return;
-	await writeRegistryAsync({ instances: remaining });
+	await withInstanceRegistryLock(registryPath(), async () => {
+		const file = await readRegistryAsync();
+		const remaining = file.instances.filter(
+			(entry) => !deadPids.has(entry.pid),
+		);
+		if (remaining.length === file.instances.length) return;
+		await writeRegistryAsync({ instances: remaining });
+	});
 }

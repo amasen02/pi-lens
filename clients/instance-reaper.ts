@@ -85,6 +85,7 @@ import {
 	recordDegradationOnce,
 } from "./degradation-ledger.js";
 import { getGlobalPiLensDir } from "./file-utils.js";
+import { withInstanceRegistryLock } from "./instance-registry-lock.js";
 import {
 	type InstanceEntry,
 	isInstanceRegistryEnabled,
@@ -1570,8 +1571,8 @@ export async function sweepOrphans(): Promise<void> {
 /** Drop dead-parent AND stale-heartbeat (#525, record-cleanup-only)
  *  instances from the registry. Re-reads immediately before
  *  writing (rather than reusing the earlier `readInstanceRegistry()` snapshot)
- *  to narrow — not eliminate — the last-writer-wins race already accepted for
- *  slice 1's read-modify-write model.
+ *  under the instance-registry lock so the reaper cannot lose a registration
+ *  or heartbeat while pruning.
  *
  *  Exported for the #1217 concurrency regression test; `sweepOrphans` is the
  *  only production caller.
@@ -1590,18 +1591,19 @@ export async function sweepOrphans(): Promise<void> {
 export async function pruneDeadInstances(deadPids: Set<number>): Promise<void> {
 	const target = path.join(getGlobalPiLensDir(), "instances.json");
 	try {
-		const raw = await fs.promises.readFile(target, "utf-8");
-		const parsed = JSON.parse(raw);
-		if (!parsed || !Array.isArray(parsed.instances)) return;
-		const remaining = parsed.instances.filter(
-			(entry: InstanceEntry) => !deadPids.has(entry.pid),
-		);
-		if (remaining.length === parsed.instances.length) return;
-		await fs.promises.mkdir(getGlobalPiLensDir(), { recursive: true });
-		await writeFileAtomicAsync(
-			target,
-			JSON.stringify({ instances: remaining }),
-		);
+		await withInstanceRegistryLock(target, async () => {
+			const raw = await fs.promises.readFile(target, "utf-8");
+			const parsed = JSON.parse(raw);
+			if (!parsed || !Array.isArray(parsed.instances)) return;
+			const remaining = parsed.instances.filter(
+				(entry: InstanceEntry) => !deadPids.has(entry.pid),
+			);
+			if (remaining.length === parsed.instances.length) return;
+			await writeFileAtomicAsync(
+				target,
+				JSON.stringify({ instances: remaining }),
+			);
+		});
 	} catch {
 		// best-effort
 	}

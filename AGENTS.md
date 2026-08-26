@@ -818,10 +818,11 @@ Tier-2 cache bounds (#1389) use the Tier-1 idle-timer/LRU shape where entries ar
 
 ### Session lifecycle, telemetry, and observability
 
-The machine-global instance registry keeps a lost-update recovery bounded
-without file locking: registration writers re-read after atomic publication
-and retry when their own pid is absent. Child-first synthesis receives the
-session's real root and start time from the LSP client, preserves subagent
+The machine-global instance registry serializes every whole-file writer with
+an adjacent O_EXCL lock. Contenders use jittered backoff for 500ms, and locks
+older than 5s or owned by dead pids are displaced and reclaimed; a crash can
+still leave a stale lock during that window. Child-first synthesis receives
+the session cwd and start time from the LSP client, preserves subagent
 identity, and records `instance-registry-registration-missing` once when the
 host registration is absent. (#2173)
 
