@@ -92,6 +92,6 @@ describe("dependency boundary governance", () => {
 			),
 		) as unknown[];
 
-		expect(baseline).toHaveLength(29);
+		expect(baseline).toHaveLength(30);
 	}, 30_000);
 });
