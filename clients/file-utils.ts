@@ -416,7 +416,10 @@ function buildProjectIgnoreMatcher(
 		for (const key of patternMemo.keys()) {
 			const memoPath = key.slice(2);
 			const relative = path.relative(resolvedSubtree, memoPath);
-			if (!relative || (!relative.startsWith("..") && !path.isAbsolute(relative))) {
+			if (
+				!relative ||
+				(!relative.startsWith("..") && !path.isAbsolute(relative))
+			) {
 				patternMemo.delete(key);
 			}
 		}
