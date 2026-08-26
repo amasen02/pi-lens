@@ -75,7 +75,7 @@ async function paged(
 	fetcher,
 	baseUrl,
 	params = {},
-	{ exhaustive = false } = {},
+	{ exhaustive = true } = {},
 ) {
 	const values = [];
 	for (let page = 1; page <= MAX_PAGES; page++) {
@@ -120,6 +120,7 @@ export async function detectStaleOpenIssues({
 		fetcher,
 		`https://api.github.com/repos/${repository}/commits`,
 		{ sha: branch },
+		{ exhaustive: false },
 	);
 	for (const commit of commits.slice(0, MAX_COMMIT_DETAILS)) {
 		const commitText = commit.commit?.message ?? commit.message ?? "";
