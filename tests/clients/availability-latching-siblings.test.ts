@@ -70,6 +70,7 @@ vi.mock("../../clients/installer/index.js", () => ({
 	// #1500: the durable-absence arms read the installer's own attempt record, so
 	// an attempt that failed is distinguishable from one that never ran.
 	getInstallAttempt: vi.fn(() => undefined),
+	findManagedToolBinary: vi.fn(async () => undefined),
 	isSpawnableCommand: vi.fn(async () => true),
 	resetPathWalkMemo: vi.fn(),
 	getToolEnvironment: vi.fn(async () => ({})),
@@ -195,6 +196,34 @@ describe("BiomeClient availability (#1476)", () => {
 		release?.(okResult("biome 1.9.4"));
 		expect(await Promise.all(calls)).toEqual([true, true, true]);
 	});
+});
+
+it("shares a toolchain probe across independent Go consumers (#2131)", async () => {
+	let release: ((value: unknown) => void) | undefined;
+	safeSpawnAsync.mockImplementationOnce(
+		() =>
+			new Promise((resolve) => {
+				release = resolve;
+			}),
+	);
+	const { createToolchainAvailability } =
+		await import("../../clients/dispatch/runners/utils/toolchain-availability.js");
+	const config = {
+		tool: "go",
+		label: "Go",
+		windowsPaths: ["go"],
+		unixPaths: ["go"],
+		probeArgs: ["version"],
+		budgetMs: 5000,
+		log: () => {},
+	};
+	const first = createToolchainAvailability(config);
+	const second = createToolchainAvailability(config);
+	const calls = [first.isAvailable(), second.isAvailable()];
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	expect(safeSpawnAsync).toHaveBeenCalledTimes(1);
+	release?.({ stdout: "go1.23", stderr: "", status: 0 });
+	expect(await Promise.all(calls)).toEqual([true, true]);
 });
 
 describe("SgRunner availability (#1476)", () => {

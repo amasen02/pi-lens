@@ -43,7 +43,7 @@ import {
 } from "../../../tool-policy.js";
 import type { DispatchContext } from "../../types.js";
 import { isInSpawnTimeoutCooldown } from "../../../spawn-timeout-cooldown.js";
-import { createSingleFlight } from "../../../single-flight.js";
+import { createAvailabilityProbeFlight } from "../../../availability-probe-flight.js";
 import {
 	type AvailabilityCause,
 	type AvailabilityLatch,
@@ -526,23 +526,14 @@ const latchedUnavailableByCwd = new PathKeyedMap<Set<string>>(normalizeMapKey);
 // instead of five hand-rolled ones, and a dropped straddling write is visible
 // in the degradation ledger instead of silent.
 const availabilityGeneration = createGenerationSource("dispatch-availability");
+export const getDispatchAvailabilityGeneration = (): number =>
+	availabilityGeneration.current();
 
-const availabilityProbeFlights = createSingleFlight<ProbeFailureShape>({
-	generation: () => availabilityGeneration.current(),
-});
+const checkerProbeFlights = createAvailabilityProbeFlight<
+	Awaited<ReturnType<typeof safeSpawnAsync>>
+>({ generation: getDispatchAvailabilityGeneration });
 
-/** Share one external availability probe across independently-created consumers. */
-export function runSharedAvailabilityProbe<T extends ProbeFailureShape>(
-	key: string,
-	probe: () => Promise<T>,
-): { promise: Promise<T>; joined: boolean } {
-	const joined = availabilityProbeFlights.has(key);
-	return {
-		promise: availabilityProbeFlights.run(key, probe) as Promise<T>,
-		joined,
-	};
-}
-
+/** Find a binary installed by the release-managed `~/.pi-lens/bin` tier. */
 export function recordAvailabilityProbeOverrun(
 	tool: string,
 	key: string,
@@ -820,7 +811,8 @@ export function resetDispatchAvailabilityState(): void {
 	managedVerifyInFlight.clear();
 	resetPathWalkMemo();
 	availabilityGeneration.bump();
-	availabilityProbeFlights.clear();
+	checkerProbeFlights.clear();
+	cwdProbeFlights.clear();
 }
 
 /** What the last probe for a cwd decided, for messaging and telemetry (#1467). */
@@ -1081,7 +1073,7 @@ export function createAvailabilityChecker(
 			let hostStallMs: number;
 			let probeJoined = false;
 			try {
-				const shared = runSharedAvailabilityProbe(
+				const shared = checkerProbeFlights.run(
 					`checker:${command}|${versionArgs.join("|")}|${key}|${checkerFlightGeneration}|${windowsExt}|${cmd}|${JSON.stringify(Object.entries(env ?? {}).sort(([a], [b]) => a.localeCompare(b)))}`,
 					() =>
 						safeSpawnAsync(cmd, versionArgs, {
@@ -1183,6 +1175,10 @@ export function createAvailabilityChecker(
 export interface CwdProbeResult extends ProbeFailureShape {
 	status?: number | null;
 }
+
+const cwdProbeFlights = createAvailabilityProbeFlight<CwdProbeResult>({
+	generation: getDispatchAvailabilityGeneration,
+});
 
 export interface CwdCachedProbeOptions {
 	/** Tool name used in the `availability_decision` record. */
@@ -1323,7 +1319,7 @@ export function createCwdCachedProbe(
 			let thrown: unknown;
 			let probeJoined = false;
 			try {
-				const shared = runSharedAvailabilityProbe(
+				const shared = cwdProbeFlights.run(
 					`cwd:${options.tool}|${options.flightKeyComponent ?? ""}|${key}`,
 					() => probe(key),
 				);

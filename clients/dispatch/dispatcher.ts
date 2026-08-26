@@ -40,8 +40,9 @@ import {
 } from "./runners/utils/availability-policy.js";
 import {
 	recordAvailabilityProbeOverrun,
-	runSharedAvailabilityProbe,
+	getDispatchAvailabilityGeneration,
 } from "./runners/utils/runner-helpers.js";
+import { createAvailabilityProbeFlight } from "../availability-probe-flight.js";
 import type { FactStore } from "./fact-store.js";
 import { applyDispositions } from "../diagnostic-dispositions.js";
 import { applyInlineSuppressions } from "./inline-suppressions.js";
@@ -53,9 +54,14 @@ import {
 	observeRunnerLatency,
 } from "./collect-later-tier.js";
 import { deferRunnerFindings } from "./pending-runner-findings.js";
+
 import { applyRulePolicy, rulePolicyMapFromConfig } from "./rule-policy.js";
 import { getToolProfile } from "./tool-profile.js";
 import { isRunnerSkipReason } from "./types.js";
+
+const dispatcherProbeFlights = createAvailabilityProbeFlight<
+	Awaited<ReturnType<typeof safeSpawnAsync>>
+>({ generation: getDispatchAvailabilityGeneration });
 import type {
 	Diagnostic,
 	DispatchContext,
@@ -182,7 +188,7 @@ export async function checkToolAvailability(
 		let hostStallMs: number;
 		let probeJoined = false;
 		try {
-			const shared = runSharedAvailabilityProbe(`dispatcher:${key}`, () =>
+			const shared = dispatcherProbeFlights.run(`dispatcher:${key}`, () =>
 				safeSpawnAsync(command, ["--version"], {
 					timeout: TOOL_PROBE_TIMEOUT_MS,
 				}),

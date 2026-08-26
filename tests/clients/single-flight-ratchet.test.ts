@@ -28,8 +28,6 @@ const EXEMPTIONS: Record<string, string> = {
 	"dependency-checker.ts:ensureInFlight":
 		"backlog: ensureAvailable family, #1753",
 	"knip-client.ts:ensureInFlight": "backlog: ensureAvailable family, #1753",
-	"security-scan-client.ts:ensureInFlight":
-		"backlog: ensureAvailable family, #1753",
 	"installer/index.ts:ensureInFlight":
 		"backlog: ensureTool's per-tool install map, #1753",
 
@@ -56,8 +54,6 @@ const EXEMPTIONS: Record<string, string> = {
 	"lsp/jvm-runtime.ts:inFlightJavaProbe": "backlog: single JVM probe, #1753",
 	"mcp/session.ts:inFlightIpcTurnEnds":
 		"backlog: per-cwd Stop-hook pass (#1274), #1753",
-	"package-manager.ts:inFlightProbes":
-		"backlog: per-package-manager probe dedupe, #1753",
 	"installer/index.ts:_probeCacheWriteInFlight":
 		"backlog: single probe-cache flush, #1753",
 	// Found by review round 1's widened regex: an interface member, which the

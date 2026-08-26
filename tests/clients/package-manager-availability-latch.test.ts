@@ -175,6 +175,38 @@ describe("package-manager availability (#1496)", () => {
 		expect(npmProbes).toBe(1);
 	});
 
+	it("dispatch reset does not tear down an airborne package-manager flight", async () => {
+		let pnpmCalls = 0;
+		let release!: (value: unknown) => void;
+		safeSpawnAsync.mockImplementation(async (cmd: string, args: string[]) => {
+			if (cmd === finder() && args[0] === "pnpm") {
+				pnpmCalls++;
+				return new Promise((resolve) => {
+					release = resolve;
+				});
+			}
+			return notFoundResult;
+		});
+		const { resolveNodePackageManager, _resetPackageManagerCache } =
+			await import("../../clients/package-manager.js");
+		const { resetDispatchAvailabilityState } =
+			await import("../../clients/dispatch/runners/utils/runner-helpers.js");
+		_resetPackageManagerCache();
+		const dir = await emptyProjectDir();
+		const fs = await import("node:fs");
+		const path = await import("node:path");
+		fs.writeFileSync(path.join(dir, "pnpm-lock.yaml"), "");
+
+		const first = resolveNodePackageManager(dir);
+		await Promise.resolve();
+		await Promise.resolve();
+		resetDispatchAvailabilityState();
+		const second = resolveNodePackageManager(dir);
+		expect(pnpmCalls).toBe(1);
+		release(notFoundResult);
+		await Promise.all([first, second]);
+	});
+
 	/**
 	 * #1653 review F1 — `isAvailable`'s in-flight probe cleared its map entry
 	 * unconditionally: `.finally(() => inFlightProbes.delete(pm))`. A probe

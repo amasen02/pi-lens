@@ -23,6 +23,7 @@ vi.mock("../../clients/safe-spawn.js", () => ({
 
 vi.mock("../../clients/installer/index.js", () => ({
 	ensureTool: vi.fn(async () => undefined),
+	findManagedToolBinary: vi.fn(async () => undefined),
 	resetResolvedPathCache: vi.fn(),
 	// Not spawnable — forces resolveCommandWithInstallFallback down the
 	// install-fallback path (rather than the --version probe path) where

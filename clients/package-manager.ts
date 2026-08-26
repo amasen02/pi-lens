@@ -26,6 +26,7 @@ import {
 	startHostStallSampler,
 } from "./dispatch/runners/utils/availability-policy.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
+import { createAvailabilityProbeFlight } from "./availability-probe-flight.js";
 
 export type NodePackageManager = "npm" | "pnpm" | "yarn" | "bun";
 
@@ -40,6 +41,11 @@ const PREFERENCE: readonly NodePackageManager[] = [
 	"yarn",
 	"bun",
 ];
+
+const packageManagerProbeFlights =
+	createAvailabilityProbeFlight<
+		Awaited<ReturnType<typeof probeAvailability>>
+	>();
 
 function onWindows(): boolean {
 	return process.platform === "win32";
@@ -120,7 +126,6 @@ const PROBE_TIMEOUT_MS = 5_000;
  * a timeout, abort or host stall expires on a cooldown and is re-probed.
  */
 const availabilityLatches = new Map<NodePackageManager, AvailabilityLatch>();
-const inFlightProbes = new Map<NodePackageManager, Promise<boolean>>();
 
 function getLatch(pm: NodePackageManager): AvailabilityLatch {
 	let latch = availabilityLatches.get(pm);
@@ -216,21 +221,10 @@ function isAvailable(
 
 	// A verdict can now expire, so concurrent callers arriving just after a
 	// cooldown must share ONE probe rather than each spawning their own.
-	const inFlight = inFlightProbes.get(pm);
-	if (inFlight) return inFlight.then(reportIfTransient);
-
-	// #1653 review F1: a probe started before a session reset can settle AFTER
-	// a later session's own probe for the same manager is already in flight.
-	// An unconditional delete-by-key would evict that NEWER entry out from
-	// under it, so a third caller in the gap finds nothing in-flight and
-	// spawns a duplicate. Only remove the entry if it is still THIS call's
-	// promise — the same identity guard `resolveMadge` uses in
-	// dependency-checker.ts for the equivalent race.
-	const probe: Promise<boolean> = probeAvailability(pm).finally(() => {
-		if (inFlightProbes.get(pm) === probe) inFlightProbes.delete(pm);
-	});
-	inFlightProbes.set(pm, probe);
-	return probe.then(reportIfTransient);
+	const shared = packageManagerProbeFlights.run(`package-manager:${pm}`, () =>
+		probeAvailability(pm),
+	);
+	return shared.promise.then(reportIfTransient);
 }
 
 /**
@@ -248,7 +242,7 @@ function isAvailable(
  */
 export function _resetPackageManagerCache(): void {
 	availabilityLatches.clear();
-	inFlightProbes.clear();
+	packageManagerProbeFlights.clear();
 }
 
 // ============================================================================

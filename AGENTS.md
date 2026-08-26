@@ -594,6 +594,15 @@ Coverage markers are deduped per session by normalized kind, file, and the
 normalized silent-scanner set. A changed set admits a new marker, and a marker
 is appended after primary diagnostics so both remain visible.
 
+Availability probes for package managers, dispatch, Go and Cargo toolchains,
+security scans, checkers, and cwd probes use owner-local keyed flights created
+by `createAvailabilityProbeFlight`. Each owner reset clears only its own
+registry; dispatch-owned flights also use the dispatch generation guard, and
+joined records retain `classifiedBy: "joined"`. Release-managed binaries under
+`~/.pi-lens/bin` resolve before PATH probing, and the resolved path reaches
+security scans. Overrun records use the cache key as their second subject
+component, not a root. (#2131, #2140)
+
 Formatter PATH availability is session-scoped and must be re-armed in the
 primary `handleSessionStart` reset block beside dispatch availability. Its
 module-local state is not covered by the dispatch generation, and secondary
@@ -1059,7 +1068,7 @@ diagnostic rather than a silent mount failure. (#1381)
   installer/index.ts      Auto-install + ensureTool; probe-cache.json for fast restarts. Strategies: npm/pip/gem/github + maven (fat JAR → java -jar launcher) + archive (tree). github API is token-authed (api.github.com only, Authorization dropped on cross-host redirect — unauth=60/hr silently fails CI installs); tar extract is recursive-find (handles FLAT tarballs like gleam, not --strip-components). GITHUB_TOOLS kept in sync with the registry by tool-registry-consistency.test.ts
   lsp/                    40+ LSP server IDs (incl. CMake via cmake-language-server and Fish via fish-lsp; opengrep + ast-grep + zizmor + typos are cross-cutting AUXILIARY diagnostic LSPs — role:"auxiliary", #111/#239/#272/#283), config, lifecycle. clojure-lsp + gleam now auto-install via github (native binary / flat tarball). zizmor (GitHub Actions security, `zizmor --lsp`) attaches to YAML; advisory unless the repo ships zizmor.yml; online audits need a token (env or `gh auth token`) via clients/zizmor-config.ts. typos (source-code spell checker, `typos-lsp`, native win-arm64 build) attaches to the code-aux set PLUS markdown (#283 option B); allow-list dictionary (only KNOWN misspellings) so low-FP; advisory (default WARNING) unless the repo ships typos.toml via clients/typos-config.ts
   dispatch/               Pipeline dispatcher + 46 registered runners (incl. spotbugs — flag-gated via withSpotbugsGroup, #133). Auxiliary LSPs (opengrep, ast-grep, zizmor, typos, …) are NOT runners — they attach via the lsp runner's with-auxiliary path; see clients/dispatch/auxiliary-lsp.ts
-  runner-helpers.ts       Shared availability seam supports optional probe timeouts and synchronous managed-command fast paths; clients using it retain install suppression, session reset, typed missing outcomes, and whole probe+install in-flight dedupe per (cwd, toolId). Independent consumers share one tool/root probe flight only when their resolved binary and probe options match; refreshed probes carry a caller-owned freshness component. Waiters classify as `joined`, and budget overruns enter the bounded degradation ledger only when they exceed the two-times timeout threshold or do not return a timeout verdict. Cached-positive bare commands revalidate through installer's `(name, PATH-hash)` session memo so dispatch pays one PATH walk per command/session; session reset clears all verdicts and typed spawn ENOENT feedback evicts the affected command immediately. Absolute paths still receive a single per-hit stat.
+  runner-helpers.ts       Shared availability seam supports optional probe timeouts and synchronous managed-command fast paths; clients using it retain install suppression, session reset, typed missing outcomes, and whole probe+install in-flight dedupe per (cwd, toolId). Dispatch-owned checker and cwd probe flights are generation-guarded and reset with dispatch state; other owners keep separate registries. Managed release binaries resolve before PATH, and overrun subjects use cache keys rather than roots. Cached-positive bare commands revalidate through installer's `(name, PATH-hash)` session memo so dispatch pays one PATH walk per command/session; session reset clears all verdicts and typed spawn ENOENT feedback evicts the affected command immediately. Absolute paths still receive a single per-hit stat.
   widget-state.ts         Footer widget rendering (@earendil-works/pi-tui)
 tools/                    ast-grep-search, lsp-navigation tool handlers
 tests/                    Vitest test suite (mirrors clients/ structure)

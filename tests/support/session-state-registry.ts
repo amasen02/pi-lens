@@ -451,7 +451,7 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 	{
 		id: "package-manager:availabilityLatches",
 		module: "package-manager.ts",
-		state: "availabilityLatches, inFlightProbes",
+		state: "availabilityLatches and package-manager probe flights",
 		policy: "session_start",
 		resetName: "_resetPackageManagerCache",
 		reason:
@@ -1083,7 +1083,7 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"mcp/session.ts": 2,
 	"module-report-lsp.ts": 1,
 	"ndjson-logger.ts": 0,
-	"package-manager.ts": 2,
+	"package-manager.ts": 1,
 	"project-changes.ts": 0,
 	"project-lens-config.ts": 3,
 	"project-report.ts": 1,

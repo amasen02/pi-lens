@@ -39,6 +39,7 @@ vi.mock("../../clients/latency-logger.js", () => ({
 vi.mock("../../clients/installer/index.js", () => ({
 	ensureTool,
 	getInstallAttempt,
+	findManagedToolBinary: async () => undefined,
 	isSpawnableCommand: async () => true,
 	resetPathWalkMemo: () => {},
 	getToolEnvironment: async () => ({ ...process.env }),

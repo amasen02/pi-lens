@@ -34,6 +34,7 @@ vi.mock("../../clients/safe-spawn.js", () => ({
 
 vi.mock("../../clients/installer/index.js", () => ({
 	ensureTool: vi.fn(async () => null),
+	findManagedToolBinary: vi.fn(async () => undefined),
 	isSpawnableCommand: vi.fn(async () => true),
 	resetPathWalkMemo: vi.fn(),
 	getToolEnvironment: vi.fn(async () => ({ ...process.env })),

@@ -15,14 +15,21 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TRANSIENT_BASE_COOLDOWN_MS } from "../../clients/dispatch/runners/utils/availability-policy.js";
 
-const { safeSpawnAsync, safeSpawn, ensureTool, getInstallAttempt, logLatency } =
-	vi.hoisted(() => ({
-		safeSpawnAsync: vi.fn(),
-		safeSpawn: vi.fn(),
-		ensureTool: vi.fn(),
-		getInstallAttempt: vi.fn(),
-		logLatency: vi.fn(),
-	}));
+const {
+	safeSpawnAsync,
+	safeSpawn,
+	ensureTool,
+	getInstallAttempt,
+	findManagedToolBinary,
+	logLatency,
+} = vi.hoisted(() => ({
+	safeSpawnAsync: vi.fn(),
+	safeSpawn: vi.fn(),
+	ensureTool: vi.fn(),
+	getInstallAttempt: vi.fn(),
+	findManagedToolBinary: vi.fn(),
+	logLatency: vi.fn(),
+}));
 
 // Spread the real module: only `logLatency` is intercepted, so the rest of
 // the import graph (including availability-policy's logAvailabilityDecision,
@@ -42,6 +49,7 @@ vi.mock("../../clients/safe-spawn.js", () => ({
 vi.mock("../../clients/installer/index.js", () => ({
 	ensureTool,
 	getInstallAttempt,
+	findManagedToolBinary,
 	isSpawnableCommand: vi.fn(async () => true),
 	resetPathWalkMemo: vi.fn(),
 	getToolEnvironment: vi.fn(async () => ({})),
@@ -146,8 +154,81 @@ function advancePastCooldown(): void {
 beforeEach(() => {
 	vi.resetAllMocks();
 	ensureTool.mockResolvedValue(null);
+	findManagedToolBinary.mockResolvedValue(undefined);
 	safeSpawn.mockReturnValue({ stdout: "", stderr: "", status: 1 });
 	vi.useFakeTimers({ toFake: ["Date"] });
+});
+
+it("uses a present managed binary as the only availability probe (#2140)", async () => {
+	findManagedToolBinary.mockResolvedValue("C:/managed/opengrep.exe");
+	safeSpawnAsync.mockImplementation(async (cmd: string, args: string[]) => {
+		if (args[0] === "scan") {
+			const reportPath = args[args.indexOf("--json-output") + 1];
+			const fs = await import("node:fs/promises");
+			await fs.writeFile(reportPath, JSON.stringify({ results: [] }));
+		}
+		return okResult(cmd === "C:/managed/opengrep.exe" ? "opengrep 1.0.0" : "");
+	});
+	const client = await makeClient("opengrep");
+
+	expect(await client.ensureAvailable()).toBe(true);
+	expect(safeSpawnAsync).toHaveBeenCalledTimes(1);
+	expect(safeSpawnAsync).toHaveBeenCalledWith(
+		"C:/managed/opengrep.exe",
+		["--version"],
+		expect.any(Object),
+	);
+	expect(decisionsFor("opengrep")).toHaveLength(1);
+	expect(decisionsFor("opengrep")[0].metadata).toMatchObject({
+		verdict: "available",
+		evidence: { source: "managed-dir", binary: "opengrep.exe" },
+	});
+	await (client as unknown as { scan(cwd: string): Promise<unknown> }).scan(
+		process.cwd(),
+	);
+	expect(safeSpawnAsync.mock.calls.at(-1)?.[0]).toBe("C:/managed/opengrep.exe");
+});
+
+it("shares opengrep availability across independent clients (#2131)", async () => {
+	let release: ((value: unknown) => void) | undefined;
+	findManagedToolBinary.mockResolvedValue(undefined);
+	safeSpawnAsync.mockImplementationOnce(
+		() =>
+			new Promise((resolve) => {
+				release = resolve;
+			}),
+	);
+	const first = await makeClient("opengrep");
+	const second = await makeClient("opengrep");
+	const calls = [first.ensureAvailable(), second.ensureAvailable()];
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	expect(safeSpawnAsync).toHaveBeenCalledTimes(1);
+	release?.(okResult("opengrep 1.0.0"));
+	expect(await Promise.all(calls)).toEqual([true, true]);
+	expect(
+		decisionsFor("opengrep").map((record) => metadataOf(record).classifiedBy),
+	).toEqual(["probe", "joined"]);
+});
+
+it("package-manager reset does not tear down an airborne security flight", async () => {
+	let release: ((value: unknown) => void) | undefined;
+	findManagedToolBinary.mockResolvedValue(undefined);
+	safeSpawnAsync.mockImplementationOnce(
+		() =>
+			new Promise((resolve) => {
+				release = resolve;
+			}),
+	);
+	const first = await makeClient("opengrep");
+	const second = await makeClient("opengrep");
+	const calls = [first.ensureAvailable(), second.ensureAvailable()];
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	const { _resetPackageManagerCache } =
+		await import("../../clients/package-manager.js");
+	_resetPackageManagerCache();
+	expect(safeSpawnAsync).toHaveBeenCalledTimes(1);
+	release?.(okResult("opengrep 1.0.0"));
+	await expect(Promise.all(calls)).resolves.toEqual([true, true]);
 });
 
 afterEach(() => {
