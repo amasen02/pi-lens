@@ -117,6 +117,8 @@ export interface WordIndex {
 	fileSizes: PathKeyedMap<number>;
 	/** Bounded scalar aggregate for the current persist window. */
 	replacementStats?: { count: number; totalMs: number; maxMs: number };
+	/** Files whose wire contribution changed since the last serialized snapshot. */
+	dirtyFiles?: Set<string>;
 }
 
 export interface RankedFile {
@@ -304,6 +306,7 @@ function createEmptyWordIndex(truncated: boolean): WordIndex {
 		fileMtimes: new PathKeyedMap<number>(wordIndexKey),
 		fileSizes: new PathKeyedMap<number>(wordIndexKey),
 		replacementStats: { count: 0, totalMs: 0, maxMs: 0 },
+		dirtyFiles: new Set<string>(),
 	};
 }
 
@@ -436,6 +439,7 @@ function commitWordIndexDocumentReplacement(
 	index.forward!.set(doc.path, WordForwardEntry.fromTally(tokenLineCounts));
 	index.fileMtimes.set(doc.path, -1);
 	index.fileSizes.set(doc.path, Buffer.byteLength(doc.content, "utf-8"));
+	index.dirtyFiles?.add(wordIndexKey(doc.path));
 	index.totalTokens += docLength;
 	index.docCount += 1;
 	recordWordIndexReplacement(index, startedAt);
@@ -479,6 +483,9 @@ function finishWordIndexDocument(
 		doc.path,
 		doc.size ?? Buffer.byteLength(doc.content, "utf-8"),
 	);
+	// A build has no prior wire cache. Keeping the marker makes a future
+	// serializer cache explicit and gives incremental refresh one uniform seam.
+	index.dirtyFiles?.add(wordIndexKey(doc.path));
 	index.totalTokens += docLength;
 	index.docCount += 1;
 }
@@ -582,6 +589,7 @@ export function removeWordIndexDocument(
 	index.forward.delete(filePath);
 	index.fileMtimes.delete(filePath);
 	index.fileSizes.delete(filePath);
+	index.dirtyFiles?.add(wordIndexKey(filePath));
 	index.fileTable.release(removedKey);
 	index.totalTokens -= docLength;
 	index.docCount = Math.max(0, index.docCount - 1);
@@ -721,6 +729,7 @@ function commitWordIndexDocumentRemoval(
 	index.forward?.delete(filePath);
 	index.fileMtimes.delete(filePath);
 	index.fileSizes.delete(filePath);
+	index.dirtyFiles?.add(wordIndexKey(filePath));
 	index.fileTable.release(wordIndexKey(filePath));
 	index.totalTokens -= staged.docLength;
 	index.docCount = Math.max(0, index.docCount - 1);
@@ -1673,7 +1682,18 @@ export interface SerializedWordIndex {
 /** Persisted word-index serialization format version. Bump on breaking format changes. */
 export const WORD_INDEX_FORMAT_VERSION = 2;
 
-export function serializeWordIndex(index: WordIndex): SerializedWordIndex {
+interface SerializedWordIndexCache {
+	serialized: SerializedWordIndex;
+	slotByFileId: Map<number, number>;
+	tokensByFile: Map<string, Set<string>>;
+}
+
+const serializedWordIndexCaches = new WeakMap<
+	WordIndex,
+	SerializedWordIndexCache
+>();
+
+function serializeWordIndexFull(index: WordIndex): SerializedWordIndexCache {
 	const files = [...index.docLengths.keys()];
 	// `files` carries whatever spelling `docLengths` last stored, which can
 	// differ from the spelling the file table interned. Both fold through
@@ -1704,7 +1724,7 @@ export function serializeWordIndex(index: WordIndex): SerializedWordIndex {
 				])
 			: undefined;
 
-	return {
+	const serialized: SerializedWordIndex = {
 		version: WORD_INDEX_FORMAT_VERSION,
 		files,
 		postings,
@@ -1716,6 +1736,141 @@ export function serializeWordIndex(index: WordIndex): SerializedWordIndex {
 		fileSizes: files.map((file) => index.fileSizes.get(file) ?? 0),
 		forward,
 	};
+	const tokensByFile = new Map<string, Set<string>>();
+	if (index.forward) {
+		for (const file of files) {
+			tokensByFile.set(
+				wordIndexKey(file),
+				new Set(index.forward.get(file)?.keys() ?? []),
+			);
+		}
+	}
+	return { serialized, slotByFileId, tokensByFile };
+}
+
+/**
+ * Refresh the cached wire view without walking untouched posting lanes.
+ * Existing files keep their slots, so a document replacement only rebuilds
+ * the token lists named by that document's old or new forward entry. A file
+ * removal or reordering changes slot identity and deliberately takes the
+ * bounded full path.
+ */
+function serializeWordIndexIncrementally(
+	index: WordIndex,
+	cache: SerializedWordIndexCache,
+): SerializedWordIndexCache {
+	const files = [...index.docLengths.keys()];
+	const priorFiles = cache.serialized.files;
+	const currentKeys = new Set(files.map(wordIndexKey));
+	const priorKeys = new Set(priorFiles.map(wordIndexKey));
+	if ([...priorKeys].some((key) => !currentKeys.has(key))) {
+		return serializeWordIndexFull(index);
+	}
+	// Re-flattening most lanes costs more than rebuilding the compact wire view.
+	// The review fixture crosses over between 10% and 100% dirty, so use the
+	// midpoint as a conservative bound until a workload-specific model exists.
+	const dirty = index.dirtyFiles;
+	if (dirty && dirty.size * 2 > files.length) {
+		return serializeWordIndexFull(index);
+	}
+	// A replacement deletes and re-adds a PathKeyedMap entry, which changes Map
+	// insertion order. Keep the cached wire slots stable instead of rewriting
+	// every posting just because one document changed order.
+	const filesInWireOrder = [
+		...priorFiles,
+		...files.filter((file) => !priorKeys.has(wordIndexKey(file))),
+	];
+	if (!dirty || dirty.size === 0) return cache;
+
+	const slotByFileId = new Map(cache.slotByFileId);
+	for (let i = priorFiles.length; i < filesInWireOrder.length; i += 1) {
+		const fileId = index.fileTable.idFor(wordIndexKey(filesInWireOrder[i]));
+		if (fileId !== undefined) slotByFileId.set(fileId, i);
+	}
+	const postings = cache.serialized.postings.slice() as Array<
+		[string, number[]]
+	>;
+	const postingAt = new Map<string, number>();
+	postings.forEach(([token], i) => postingAt.set(token, i));
+	const removedTokens = new Set<string>();
+	const tokensByFile = new Map(cache.tokensByFile);
+	const fileByKey = new Map(
+		filesInWireOrder.map((file) => [wordIndexKey(file), file]),
+	);
+	const affectedTokens = new Set<string>();
+	for (const fileKey of dirty) {
+		const file = fileByKey.get(fileKey);
+		const oldTokens = tokensByFile.get(fileKey) ?? new Set<string>();
+		const currentEntry =
+			file === undefined ? undefined : index.forward?.get(file);
+		const currentTokens = new Set(currentEntry?.keys() ?? []);
+		for (const token of oldTokens) affectedTokens.add(token);
+		for (const token of currentTokens) affectedTokens.add(token);
+		if (file === undefined) tokensByFile.delete(fileKey);
+		else tokensByFile.set(fileKey, currentTokens);
+	}
+	for (const token of affectedTokens) {
+		const list = index.postings.get(token);
+		const flat: number[] = [];
+		if (list) {
+			for (let i = 0; i < list.length; i += 1) {
+				const slot = slotByFileId.get(list.fileIdAt(i));
+				if (slot !== undefined) flat.push(slot, list.lineAt(i));
+			}
+		}
+		const at = postingAt.get(token);
+		if (flat.length === 0) {
+			if (at !== undefined) removedTokens.add(token);
+		} else if (at === undefined) {
+			postings.push([token, flat]);
+			postingAt.set(token, postings.length - 1);
+		} else {
+			postings[at] = [postings[at][0], flat];
+		}
+	}
+	const compactedPostings = removedTokens.size
+		? postings.filter(([token]) => !removedTokens.has(token))
+		: postings;
+	const forward = index.forward
+		? (cache.serialized.forward
+				?.slice()
+				.map(
+					(entry) => [entry[0], entry[1]] as [number, Array<[string, number]>],
+				) ?? [])
+		: undefined;
+	for (const fileKey of dirty) {
+		const file = fileByKey.get(fileKey);
+		const fileId =
+			file === undefined
+				? undefined
+				: index.fileTable.idFor(wordIndexKey(file));
+		const slot = fileId === undefined ? undefined : slotByFileId.get(fileId);
+		if (slot === undefined || !forward || file === undefined) continue;
+		forward[slot] = [slot, [...(index.forward?.get(file)?.entries() ?? [])]];
+	}
+	const serialized: SerializedWordIndex = {
+		...cache.serialized,
+		files: filesInWireOrder,
+		postings: compactedPostings,
+		docLengths: filesInWireOrder.map((file) => index.docLengths.get(file) ?? 0),
+		fileMtimes: filesInWireOrder.map((file) => index.fileMtimes.get(file) ?? 0),
+		fileSizes: filesInWireOrder.map((file) => index.fileSizes.get(file) ?? 0),
+		forward,
+		totalTokens: index.totalTokens,
+		indexedFileCount: index.docCount,
+		truncated: index.truncated,
+	};
+	return { serialized, slotByFileId, tokensByFile };
+}
+
+export function serializeWordIndex(index: WordIndex): SerializedWordIndex {
+	const prior = serializedWordIndexCaches.get(index);
+	const cache = prior
+		? serializeWordIndexIncrementally(index, prior)
+		: serializeWordIndexFull(index);
+	serializedWordIndexCaches.set(index, cache);
+	index.dirtyFiles?.clear();
+	return cache.serialized;
 }
 
 export function deserializeWordIndex(
@@ -2012,8 +2167,11 @@ async function writeWordIndexSnapshot(
 			cachedExports: [],
 		};
 		snapshot.generatedAt = new Date().toISOString();
+		const serializeStartedAt = performance.now();
 		snapshot.wordIndex = serializeWordIndex(index);
+		const serializeMs = performance.now() - serializeStartedAt;
 		saveProjectSnapshot(cwd, snapshot);
+		const writeMs = performance.now() - serializeStartedAt - serializeMs;
 		dbg?.(
 			`word-index persist: ${index.docCount} files, ${index.postings.size} tokens`,
 		);
@@ -2026,6 +2184,8 @@ async function writeWordIndexSnapshot(
 			cwd: path.resolve(cwd),
 			trigger: "per_edit",
 			durationMs: Date.now() - persistStartedAt,
+			serializeMs,
+			writeMs,
 			indexedFileCount: index.docCount,
 			tokens: index.postings.size,
 			postingEntries: countWordIndexPostingEntries(index),

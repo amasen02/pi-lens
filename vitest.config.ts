@@ -213,6 +213,7 @@ const timingSensitiveInclude = [
 	"tests/clients/pipeline-snapshot-occupancy.test.ts",
 	"tests/clients/word-index-async-build.test.ts",
 	"tests/clients/word-index-cooperative-occupancy.test.ts",
+	"tests/clients/word-index-persist-occupancy.test.ts",
 	//   - cooperative-budget: #1215 acceptance screens — sampler-based
 	//     occupancy at 800-item scale plus the abort-latency bound.
 	"tests/clients/cooperative-budget.test.ts",
