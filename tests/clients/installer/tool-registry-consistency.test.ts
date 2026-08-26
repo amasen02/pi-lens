@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
-import { GITHUB_TOOLS, TOOLS } from "../../../clients/installer/index.js";
+import {
+	GITHUB_TOOLS,
+	TOOLS,
+	getToolVerificationTimeout,
+} from "../../../clients/installer/index.js";
 
 // Use the real installer module, not any mock another test file registered.
 vi.unmock("../../../clients/installer/index.js");
@@ -40,6 +44,15 @@ function resolvesFullMatrix(tool: (typeof TOOLS)[number]): boolean {
 describe("TOOLS registry consistency", () => {
 	it("is non-empty", () => {
 		expect(TOOLS.length).toBeGreaterThan(0);
+	});
+
+	it("uses the Vue-specific cold-start budget without changing the default", () => {
+		const vue = TOOLS.find((tool) => tool.id === "@vue/language-server");
+		expect(vue).toBeDefined();
+		expect(getToolVerificationTimeout(vue!)).toBe(30_000);
+		expect(
+			getToolVerificationTimeout(TOOLS.find((tool) => tool.id === "pyright")!),
+		).toBe(10_000);
 	});
 
 	it("every tool has the required base wiring (id, name, checkCommand, checkArgs, strategy)", () => {
