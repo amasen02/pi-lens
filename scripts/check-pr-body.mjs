@@ -130,7 +130,7 @@ export function detectFlattenedBody(body = "") {
 	// A flattened body containing these markers has already lost data. It is
 	// safer to report the original lint errors than to write a guessed repair.
 	if (
-		/[`\f\t]|\r(?!\n)|\\[ftr]/.test(source) ||
+		/[\f\t]|\r(?!\n)|\\[ftr]/.test(source) ||
 		/\\n/.test(source) ||
 		new RegExp(
 			`(?:^|[\\s])(?:${CORRUPTED_HEADING_TAILS.join("|")})(?=\\s|$)`,
@@ -170,6 +170,21 @@ export function repairFlattenedBody(body = "") {
 		),
 		"\n\n",
 	);
+	const repairedHeadings = repaired
+		.split("\n")
+		.map((line) => HEADING.exec(line)?.[1].trim().toLowerCase())
+		.filter(Boolean);
+	const templateHeadings = repairedHeadings.filter((heading) =>
+		new RegExp(`^(?:${REPAIR_HEADING_PATTERN})$`, "i").test(heading),
+	);
+	const distinctTemplateHeadings = new Set(
+		templateHeadings.map((heading) => heading.replace(/ \d+$/, "")),
+	);
+	if (
+		templateHeadings.length !== distinctTemplateHeadings.size ||
+		repairedHeadings.length > distinctTemplateHeadings.size
+	)
+		return source;
 	return repaired;
 }
 
@@ -360,6 +375,12 @@ export async function resolveTouchesTests(
 	}
 }
 
+function eventPayload() {
+	const eventPath = process.env.GITHUB_EVENT_PATH;
+	if (!eventPath) throw new Error("GITHUB_EVENT_PATH is required");
+	return JSON.parse(readFileSync(eventPath, "utf8"));
+}
+
 /**
  * The full live lint: resolve body and file list, then lint. The tri-state
  * from resolveTouchesTests is consumed HERE: only an affirmative true
@@ -367,12 +388,6 @@ export async function resolveTouchesTests(
  * (no tests/ files) both skip it, so a flaky fetch can never misfire the
  * check (#2124 review F2 pinned this consumption).
  */
-function eventPayload() {
-	const eventPath = process.env.GITHUB_EVENT_PATH;
-	if (!eventPath) throw new Error("GITHUB_EVENT_PATH is required");
-	return JSON.parse(readFileSync(eventPath, "utf8"));
-}
-
 export async function lintPullRequestEvent(
 	fetchImpl = globalThis.fetch,
 	event = eventPayload(),

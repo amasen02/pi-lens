@@ -12,6 +12,11 @@ import {
 const body = `Summary\nOpening context.\n\n## Tests\nTargeted tests pass.\n\n## Blast radius\nNo runtime module touched.\n\n## Class sweep\nWhole-tree grep completed.\n\n## Observability\nThe advisory check run is the record.`;
 const flattenedBody =
 	"## Summary Await the first lifecycle run's asynchronous word-index snapshot promotion before reseeding the current-format snapshot for the fallback run. ## Tests - Native master flake justification for the count barrier: 2/10 forced runs reproduced the promotion race. - Fixed lifecycle test: 5/5 tests passed. ### Test assessment - tests/clients/word-index-lifecycle.test.ts uniquely pins the ordering guard. ## Blast radius This change is test-only. ## Class sweep The async-persist lifecycle race is fully covered. ## Observability The test observes existing project snapshot records.";
+const motivatingFlattenedBodies = [
+	"## Summary Fix #2052 R1 by making MCP LSP readiness consult the authoritative session-root registry. When the 128-root registry evicts a root, a later request re-registers it instead of returning from the stale lspReadyCwds memo. Add the remainder matrix cells: one mixed inside/outside batch, and an explicit /Users/... case-boundary fixture whose expected result follows the actual filesystem. ## Tests - Red-first mutation proof against the old memo-only guard: firstRootStillServed=false - npm run lint: passed. - npm run build: passed before every test run. - tests/clients/lsp/root-coalescing.test.ts: 12/12 focused tests passed. ### Test assessment - root-coalescing.test.ts uniquely pins the session-root registry and eviction transition. ## Blast radius MCP server readiness and the LSP session-root registry. ## Class sweep The memo-versus-registry readiness pair is fixed here. ## Observability Evicted roots recover; foreign roots retain the existing bounded decline record.",
+	"## Summary Fixes #2104 by making the stale-open-issues detector prove exhaustion for the open-issue population. If the safety bound is reached while a full page remains, the detector throws instead of interpreting a partial population. ## Tests - tests/scripts/stale-open-issues.test.ts adds a page-aware regression. - F1 mutation red after dropping the exhaustive flag. - Green targeted run: 20 tests passed. ### Test assessment - stale-open-issues.test.ts uniquely pins exhaustive pagination and truncation disclosure. ## Blast radius The scheduled stale-open-issues detector and its pagination helper. ## Class sweep Bounded API reads classify truncation before interpreting results. ## Observability Successful comments include the scanned population; a bound hit fails the workflow.",
+	flattenedBody,
+].map((candidate) => candidate.replaceAll("\\n", " "));
 
 describe("flattened PR body repair", () => {
 	it("detects the clearly flattened real-world shape and repairs it", () => {
@@ -80,12 +85,29 @@ describe("flattened PR body repair", () => {
 		expect(repairFlattenedBody(candidate)).toBe(candidate);
 	});
 
-	it("refuses bodies containing backticks", () => {
-		const candidate = flattenedBody.replace(
-			"word-index",
-			"word-index ```bash echo hi``` The well - known race",
-		);
-		expect(detectFlattenedBody(candidate)).toBe(false);
+	it.each(motivatingFlattenedBodies)(
+		"repairs a flattened motivating body shape",
+		(candidate) => {
+			expect(detectFlattenedBody(candidate)).toBe(true);
+			expect(
+				lintPrBody(repairFlattenedBody(candidate), {
+					requireTestAssessment: true,
+				}),
+			).toMatchObject({ valid: true });
+		},
+	);
+
+	it.each([
+		[
+			"plain quoted headings",
+			`${flattenedBody} \"## Summary one ## Tests two\"`,
+		],
+		[
+			"fenced quoted headings",
+			`${flattenedBody} \`\`\`text ## Summary one ## Tests two \`\`\``,
+		],
+	])("refuses structurally corrupted headings: %s", (_name, candidate) => {
+		expect(detectFlattenedBody(candidate)).toBe(true);
 		expect(repairFlattenedBody(candidate)).toBe(candidate);
 	});
 
@@ -612,5 +634,68 @@ describe("renames out of tests/ still require the assessment (#2124 F3)", () => 
 		);
 		expect(await resolveTouchesTests({ number: 7 }, fetchImpl)).toBe(true);
 		vi.unstubAllEnvs();
+	});
+});
+
+describe("the event entrypoint consumes the tri-state (#2124 F2)", () => {
+	const assessedBody = `${body}
+
+### Test assessment
+foo.test.ts uniquely pins the retry ladder.`;
+
+	afterEach(() => vi.unstubAllEnvs());
+
+	function stubApi() {
+		vi.stubEnv("GITHUB_TOKEN", "t");
+		vi.stubEnv("GITHUB_API_URL", "https://api.example");
+		vi.stubEnv("GITHUB_REPOSITORY", "o/r");
+	}
+
+	function fetchFor(bodyText: string, files: unknown) {
+		return vi.fn().mockImplementation(async (url: string | URL | Request) => {
+			if (String(url).includes("/files")) {
+				if (files instanceof Error) throw files;
+				return new Response(JSON.stringify(files), { status: 200 });
+			}
+			return new Response(JSON.stringify({ body: bodyText }), { status: 200 });
+		});
+	}
+
+	it("requires the section when the live file list touches tests/", async () => {
+		stubApi();
+		const result = await lintPullRequestEvent(
+			fetchFor(body, [{ filename: "tests/clients/foo.test.ts" }]),
+			{ pull_request: { number: 7, body } },
+		);
+		expect(result.valid).toBe(false);
+	});
+
+	it("accepts the assessed body when required", async () => {
+		stubApi();
+		const result = await lintPullRequestEvent(
+			fetchFor(assessedBody, [{ filename: "tests/clients/foo.test.ts" }]),
+			{ pull_request: { number: 7, body: assessedBody } },
+		);
+		expect(result).toMatchObject({ valid: true });
+	});
+
+	it("skips the section for production-only PRs", async () => {
+		stubApi();
+		const result = await lintPullRequestEvent(
+			fetchFor(body, [{ filename: "clients/foo.ts" }]),
+			{ pull_request: { number: 7, body } },
+		);
+		expect(result).toMatchObject({ valid: true });
+	});
+
+	it("skips the section on file-list fetch trouble", async () => {
+		stubApi();
+		const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const result = await lintPullRequestEvent(
+			fetchFor(body, new Error("boom")),
+			{ pull_request: { number: 7, body } },
+		);
+		expect(result).toMatchObject({ valid: true });
+		warning.mockRestore();
 	});
 });
