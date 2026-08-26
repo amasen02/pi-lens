@@ -12,6 +12,7 @@ vi.mock("../../../clients/sessionstart-logger.js", () => ({
 	logSessionStart: sessionLog,
 }));
 
+import { getDegradationSummary, resetDegradationLedger } from "../../../clients/degradation-ledger.js";
 import { TOOLS, verifyToolBinary } from "../../../clients/installer/index.js";
 import { removeTempDirSync } from "../test-utils.js";
 
@@ -148,14 +149,15 @@ describe("managed markdownlint verification (#2045)", () => {
 		const calls = safeSpawnAsync.mock.calls;
 		expect(calls.map((call) => call[1])).toEqual([
 			["--no-globs", "-"],
-			["--help"],
-			["--help"],
+			["--version"],
+			["--version"],
 			["--version"],
 		]);
 		expect(calls.every((call) => call[2].input === "")).toBe(true);
 	});
 
 	it("bounds retained output for noisy language-server probes", async () => {
+		resetDegradationLedger();
 		safeSpawnAsync.mockResolvedValueOnce(
 			result({ status: 1, outputTruncated: true }),
 		);
@@ -167,6 +169,12 @@ describe("managed markdownlint verification (#2045)", () => {
 			["--version"],
 			expect.objectContaining({ maxOutputBytes: 64 * 1024 }),
 		);
+		expect(getDegradationSummary()).toEqual([
+			expect.objectContaining({
+				kind: "installer-verification-output-truncated",
+				count: 1,
+			}),
+		]);
 	});
 
 	it.skipIf(!resolveMarkdownlintBinary())(

@@ -1213,19 +1213,100 @@ export async function safeSpawnAsync(
 			options.maxOutputBytes > 0
 				? Math.floor(options.maxOutputBytes)
 				: undefined;
-		const appendOutput = (current: string, chunk: string | Buffer): string => {
-			const text = typeof chunk === "string" ? chunk : chunk.toString();
-			if (maxOutputBytes === undefined) return current + text;
-			const used = Buffer.byteLength(stdout) + Buffer.byteLength(stderr);
-			const remaining = maxOutputBytes - used;
-			if (remaining <= 0) {
-				outputTruncated = true;
-				return current;
+		const outputTruncationMarker = "\n...[output truncated]...\n";
+		type OutputStream = "stdout" | "stderr";
+		type OutputPart = { stream: OutputStream; text: string };
+		let retainedHead: OutputPart[] = [];
+		let retainedTail: OutputPart[] = [];
+		let retainedTailBytes = 0;
+		let retainedTailLimit = 0;
+		let truncationStream: OutputStream = "stderr";
+		const bytePrefix = (text: string, bytes: number): string =>
+			Buffer.from(text).subarray(0, bytes).toString();
+		const byteSuffix = (text: string, bytes: number): string => {
+			const buffer = Buffer.from(text);
+			return buffer.subarray(Math.max(0, buffer.byteLength - bytes)).toString();
+		};
+		const appendTail = (part: OutputPart, maxBytes: number): void => {
+			if (maxBytes <= 0) return;
+			retainedTail.push({ stream: part.stream, text: part.text });
+			retainedTailBytes += Buffer.byteLength(part.text);
+			while (retainedTailBytes > maxBytes && retainedTail.length > 0) {
+				const first = retainedTail[0];
+				const excess = retainedTailBytes - maxBytes;
+				const firstBytes = Buffer.byteLength(first.text);
+				if (firstBytes <= excess) {
+					retainedTail.shift();
+					retainedTailBytes -= firstBytes;
+				} else {
+					first.text = byteSuffix(first.text, firstBytes - excess);
+					retainedTailBytes -= excess;
+				}
 			}
+		};
+		const renderOutput = (stream: OutputStream): string => {
+			const head = retainedHead
+				.filter((part) => part.stream === stream)
+				.map((part) => part.text)
+				.join("");
+			const tail = retainedTail
+				.filter((part) => part.stream === stream)
+				.map((part) => part.text)
+				.join("");
+			const marker = stream === truncationStream ? outputTruncationMarker : "";
+			return head + marker + tail;
+		};
+		const refreshRetainedOutputs = (): void => {
+			stdout = renderOutput("stdout");
+			stderr = renderOutput("stderr");
+		};
+		const appendOutput = (
+			stream: OutputStream,
+			current: string,
+			chunk: string | Buffer,
+		): string => {
+			const text = typeof chunk === "string" ? chunk : chunk.toString();
+			if (maxOutputBytes === undefined || outputTruncated) {
+				if (maxOutputBytes === undefined) return current + text;
+				appendTail({ stream, text }, retainedTailLimit);
+				truncationStream = stream;
+				return renderOutput(stream);
+			}
+			const used = Buffer.byteLength(stdout) + Buffer.byteLength(stderr);
 			const bytes = Buffer.byteLength(text);
-			if (bytes <= remaining) return current + text;
+			if (used + bytes <= maxOutputBytes) return current + text;
 			outputTruncated = true;
-			return current + Buffer.from(text).subarray(0, remaining).toString();
+			truncationStream = stream;
+			const available = Math.max(
+				0,
+				maxOutputBytes - Buffer.byteLength(outputTruncationMarker),
+			);
+			const headBytes = Math.floor(available / 2);
+			const tailBytes = available - headBytes;
+			retainedTailLimit = tailBytes;
+			const parts: OutputPart[] = [
+				{ stream: "stdout", text: stdout },
+				{ stream: "stderr", text: stderr },
+				{ stream, text },
+			];
+			let headRemaining = headBytes;
+			for (const part of parts) {
+				if (headRemaining <= 0) break;
+				const kept = bytePrefix(part.text, headRemaining);
+				if (kept) retainedHead.push({ stream: part.stream, text: kept });
+				headRemaining -= Buffer.byteLength(kept);
+			}
+			let tailRemaining = tailBytes;
+			for (let index = parts.length - 1; index >= 0 && tailRemaining > 0; index--) {
+				const part = parts[index];
+				const kept = byteSuffix(part.text, tailRemaining);
+				if (kept) {
+					retainedTail.unshift({ stream: part.stream, text: kept });
+					tailRemaining -= Buffer.byteLength(kept);
+				}
+			}
+			retainedTailBytes = tailBytes - tailRemaining;
+			return renderOutput(stream);
 		};
 
 		// Spawn the process (non-blocking). Keeping Node's `shell` option false
@@ -1502,12 +1583,14 @@ export async function safeSpawnAsync(
 		child.stdout?.setEncoding("utf-8");
 		child.stderr?.setEncoding("utf-8");
 		child.stdout?.on("data", (data) => {
-			stdout = appendOutput(stdout, data);
+			stdout = appendOutput("stdout", stdout, data);
+			if (outputTruncated) refreshRetainedOutputs();
 			stopForOutputLimit();
 			rearmIdleGrace?.();
 		});
 		child.stderr?.on("data", (data) => {
-			stderr = appendOutput(stderr, data);
+			stderr = appendOutput("stderr", stderr, data);
+			if (outputTruncated) refreshRetainedOutputs();
 			stopForOutputLimit();
 			rearmIdleGrace?.();
 		});

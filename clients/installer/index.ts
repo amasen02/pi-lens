@@ -702,9 +702,7 @@ export const TOOLS: ToolDefinition[] = [
 		id: "@prisma/language-server",
 		name: "Prisma Language Server",
 		checkCommand: "prisma-language-server",
-		// `--version` can wait for the LSP transport before exiting. `--help`
-		// loads the same executable and exits within the installer budget (#2169).
-		checkArgs: ["--help"],
+		checkArgs: ["--version"],
 		installStrategy: "npm",
 		packageName: "@prisma/language-server",
 		binaryName: "prisma-language-server",
@@ -722,9 +720,7 @@ export const TOOLS: ToolDefinition[] = [
 		id: "svelte-language-server",
 		name: "Svelte Language Server",
 		checkCommand: "svelteserver",
-		// `--version` can wait for the LSP transport before exiting. `--help`
-		// loads the same executable and exits within the installer budget (#2169).
-		checkArgs: ["--help"],
+		checkArgs: ["--version"],
 		installStrategy: "npm",
 		packageName: "svelte-language-server",
 		binaryName: "svelteserver",

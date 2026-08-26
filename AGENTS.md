@@ -1120,8 +1120,10 @@ Thread `getManagedToolEnvironment(tool, cwd)` into probes/spawns. Direct
 surfaces are guarded by `tests/clients/managed-tool-seam-coverage.test.ts`.
 
 Managed language-server verification arguments are registry-owned and must
-finish within the installer budget against the real binary. Prefer a fast
-loading argument such as `--help` when `--version` waits for an LSP transport.
+finish within the installer budget against the real binary. Choose a faster
+argument such as `--help` only when a real-binary A/B reproduces a benefit;
+otherwise retain the tool's established probe and leave the cold-path question
+explicitly open.
 `verifyToolBinary` retains at most 64 KiB of child output; output-cap episodes
 use the `installer-verification-output-truncated` degradation kind and
 `recordDegradationOnce` so noisy probes remain bounded and identifiable.
