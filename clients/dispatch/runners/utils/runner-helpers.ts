@@ -37,6 +37,7 @@ import {
 } from "../../../lsp/config.js";
 import { findGlobalBinary } from "../../../package-manager.js";
 import { safeSpawnAsync } from "../../../safe-spawn.js";
+import { compareOrdinal } from "../../../string-utils.js";
 import {
 	getToolCommandSpec,
 	shouldAutoInstallTool,
@@ -1080,7 +1081,7 @@ export function createAvailabilityChecker(
 			let probeJoined = false;
 			try {
 				const shared = checkerProbeFlights.run(
-					`checker:${command}|${versionArgs.join("|")}|${key}|${checkerFlightGeneration}|${windowsExt}|${cmd}|${JSON.stringify(Object.entries(env ?? {}).sort(([a], [b]) => a.localeCompare(b)))}`,
+					`checker:${command}|${versionArgs.join("|")}|${key}|${checkerFlightGeneration}|${windowsExt}|${cmd}|${JSON.stringify(Object.entries(env ?? {}).sort(([a], [b]) => compareOrdinal(a, b)))}`,
 					() =>
 						safeSpawnAsync(cmd, versionArgs, {
 							timeout: options.probeTimeout ?? 5000,

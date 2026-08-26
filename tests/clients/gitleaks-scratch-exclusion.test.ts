@@ -34,7 +34,7 @@
  *     from Go's directory walk, so a forward-slash-only anchor never matches
  *     on Windows).
  */
-import { execFileSync } from "node:child_process";
+import { execFileSync } from "../support/git-fixture-env.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";

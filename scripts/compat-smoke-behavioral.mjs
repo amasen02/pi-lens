@@ -71,6 +71,7 @@ import {
 	parseNdjsonEntries,
 	phaseWasLogged,
 } from "./lib/latency-log-phases.mjs";
+import { gitExecFileSync } from "./lib/git-fixture-env.mjs";
 
 const isWindows = process.platform === "win32";
 const HEAVYWEIGHT_SCAN_PHASES = [
@@ -109,11 +110,11 @@ function setUpFixtureProject(dir) {
 		path.join(dir, "package.json"),
 		'{ "name": "d", "version": "1.0.0", "type": "module" }\n',
 	);
-	execFileSync("git", ["init", "-q"], { cwd: dir });
-	execFileSync("git", ["config", "user.email", "t@t.t"], { cwd: dir });
-	execFileSync("git", ["config", "user.name", "t"], { cwd: dir });
-	execFileSync("git", ["add", "-A"], { cwd: dir });
-	execFileSync("git", ["commit", "-qm", "init"], { cwd: dir });
+	gitExecFileSync(["init", "-q"], { cwd: dir });
+	gitExecFileSync(["config", "user.email", "t@t.t"], { cwd: dir });
+	gitExecFileSync(["config", "user.name", "t"], { cwd: dir });
+	gitExecFileSync(["add", "-A"], { cwd: dir });
+	gitExecFileSync(["commit", "-qm", "init"], { cwd: dir });
 }
 
 function installPiLens(projectDir, tarball) {

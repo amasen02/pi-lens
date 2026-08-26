@@ -36,6 +36,7 @@ import {
 } from "../path-utils.js";
 import { collectProjectSourceFilesWithBudgetAsync } from "../project-scan-policy.js";
 import { getReviewGraphMaxFilesDerived } from "../project-scale.js";
+import { compareOrdinal } from "../string-utils.js";
 import { BoundedLruCache } from "../bounded-cache.js";
 import {
 	jsTsCandidatePaths,
@@ -956,7 +957,7 @@ async function sourceSignatureMapAsync(
 
 function sourceSignatureFromMap(signatures: Map<string, string>): string {
 	return [...signatures.entries()]
-		.sort(([a], [b]) => a.localeCompare(b))
+		.sort(([a], [b]) => compareOrdinal(a, b))
 		.map(([file, signature]) => `${file}:${signature}`)
 		.join("|");
 }
@@ -2650,7 +2651,7 @@ function reviewGraphCheckpointPath(cwd: string): string {
 function hashIgnoredIds(ignoredIds: ReadonlySet<string> | undefined): string {
 	if (ignoredIds === undefined) return "unavailable";
 	const joined = [...ignoredIds]
-		.sort((a, b) => a.localeCompare(b))
+		.sort((a, b) => compareOrdinal(a, b))
 		.join("\u0000");
 	return createHash("sha256").update(joined).digest("hex");
 }
@@ -4433,7 +4434,7 @@ function importTargetsForFile(graph: ReviewGraph, filePath: string): string[] {
 		const target = graph.nodes.get(edge.to)?.filePath;
 		if (target) targets.add(normalizeMapKey(target));
 	}
-	return [...targets].sort((a, b) => a.localeCompare(b));
+	return [...targets].sort((a, b) => compareOrdinal(a, b));
 }
 
 async function updateGraphFiles(
@@ -5486,7 +5487,7 @@ async function _doBuildGraph(
  * rather than by coincidence.
  */
 function buildCacheKey(cwd: string, changedFiles: string[]): string {
-	return `${buildCacheWorkspaceKey(cwd)}|${[...changedFiles].sort((a, b) => a.localeCompare(b)).join(",")}`;
+	return `${buildCacheWorkspaceKey(cwd)}|${[...changedFiles].sort((a, b) => compareOrdinal(a, b)).join(",")}`;
 }
 
 /**

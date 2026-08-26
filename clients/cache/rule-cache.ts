@@ -12,6 +12,7 @@ import { getProjectDataDir } from "../file-utils.js";
 import { readJsonCache } from "../json-cache-read.js";
 import { resolvePackagePath } from "../package-root.js";
 import { writeFileAtomic } from "../atomic-write.js";
+import { compareOrdinal } from "../string-utils.js";
 
 // v4: cache skip_test_files + fix_action — v3 entries silently dropped them,
 // and ruleHash (rule-file mtimes) never invalidates on a code-only fix.
@@ -109,7 +110,7 @@ export class RuleCache {
 
 	private computeRuleHash(ruleFiles: string[]): string {
 		const hash = crypto.createHash("sha256");
-		for (const file of ruleFiles.sort((a, b) => a.localeCompare(b))) {
+		for (const file of ruleFiles.sort(compareOrdinal)) {
 			const resolved = path.resolve(file);
 			if (!fs.existsSync(resolved)) continue;
 			const stat = fs.statSync(resolved);

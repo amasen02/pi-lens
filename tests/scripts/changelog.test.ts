@@ -8,7 +8,7 @@
  * changelog-extract.mjs CLI end-to-end.
  */
 
-import { execFileSync } from "node:child_process";
+import { execFileSync } from "../support/git-fixture-env.js";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";

@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	_resetTrackedFilesCacheForTests,
@@ -14,6 +13,7 @@ import {
 import { normalizeMapKey } from "../../clients/path-utils.js";
 import * as safeSpawn from "../../clients/safe-spawn.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
+import { gitExecFileSync } from "../support/git-fixture-env.js";
 
 describe("parseUntrackedIgnoredOutput", () => {
 	it("parses repo-relative lines into normalized ids, skipping blanks", () => {
@@ -39,9 +39,11 @@ describe("collectUntrackedIgnoredIds (#694)", () => {
 	});
 
 	function initGitRepo(cwd: string): void {
-		execFileSync("git", ["init", "-q"], { cwd });
-		execFileSync("git", ["config", "user.email", "test@example.com"], { cwd });
-		execFileSync("git", ["config", "user.name", "Test"], { cwd });
+		gitExecFileSync("git", ["init", "-q"], { cwd });
+		gitExecFileSync("git", ["config", "user.email", "test@example.com"], {
+			cwd,
+		});
+		gitExecFileSync("git", ["config", "user.name", "Test"], { cwd });
 	}
 
 	it("returns the untracked-AND-ignored set, excluding tracked files that merely match the pattern", async () => {
@@ -53,8 +55,8 @@ describe("collectUntrackedIgnoredIds (#694)", () => {
 				"src/vendor.js",
 				"exports.vendor = 1;\n",
 			);
-			execFileSync("git", ["add", "src/vendor.js"], { cwd: env.tmpDir });
-			execFileSync("git", ["commit", "-q", "-m", "vendor"], {
+			gitExecFileSync("git", ["add", "src/vendor.js"], { cwd: env.tmpDir });
+			gitExecFileSync("git", ["commit", "-q", "-m", "vendor"], {
 				cwd: env.tmpDir,
 			});
 			createTempFile(env.tmpDir, ".gitignore", "*.js\n");
@@ -137,8 +139,10 @@ describe("collectUntrackedIgnoredIds (#694)", () => {
 		try {
 			initGitRepo(env.tmpDir);
 			createTempFile(env.tmpDir, ".gitignore", "*.js\n");
-			execFileSync("git", ["add", ".gitignore"], { cwd: env.tmpDir });
-			execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: env.tmpDir });
+			gitExecFileSync("git", ["add", ".gitignore"], { cwd: env.tmpDir });
+			gitExecFileSync("git", ["commit", "-q", "-m", "init"], {
+				cwd: env.tmpDir,
+			});
 
 			const first = await collectUntrackedIgnoredIds(env.tmpDir);
 			expect(first?.size ?? 0).toBe(0);

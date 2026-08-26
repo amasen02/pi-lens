@@ -157,22 +157,29 @@ function makeClient(
 			close: vi.fn(async () => {}),
 		},
 		waitForDiagnostics: vi.fn(
-			(filePath: string) =>
+			(filePath: string, timeoutMs: number) =>
 				new Promise<void>((resolve) =>
-					setTimeout(() => {
-						waitSettled = true;
-						// A genuine publish is what advances the version on a real
-						// client; a settle with NOTHING published must not, or the
-						// evidence-based outcome check below can't tell the two apart.
-						// #1493: an empty publish is still a publish — opt into it with
-						// `publishesWhenClean` to model a scanner that ran and found
-						// nothing.
-						if (diags.length > 0 || options.publishesWhenClean) {
-							version += 1;
-							stampsByPath.set(filePath, version);
-						}
-						resolve();
-					}, delayMs),
+					setTimeout(
+						() => {
+							const fitWithinBudget = delayMs <= timeoutMs;
+							if (fitWithinBudget) waitSettled = true;
+							// A genuine publish is what advances the version on a real
+							// client; a settle with NOTHING published must not, or the
+							// evidence-based outcome check below can't tell the two apart.
+							// #1493: an empty publish is still a publish — opt into it with
+							// `publishesWhenClean` to model a scanner that ran and found
+							// nothing.
+							if (
+								fitWithinBudget &&
+								(diags.length > 0 || options.publishesWhenClean)
+							) {
+								version += 1;
+								stampsByPath.set(filePath, version);
+							}
+							resolve();
+						},
+						Math.min(delayMs, timeoutMs),
+					),
 				),
 		),
 	};
@@ -444,6 +451,79 @@ describe("R8 — aux grace: touchFile with-auxiliary path", () => {
 		expect(result?.diags.map((diagnostic) => diagnostic.message)).toContain(
 			"aux finding",
 		);
+	});
+
+	it.each([
+		{ observedMs: 1000, expectedFinding: false },
+		{ observedMs: 2500, expectedFinding: true },
+	])(
+		"tracks a cold typos spawn of $observedMs ms instead of using a flat grace",
+		async ({ observedMs, expectedFinding }) => {
+			const { LSPService, auxWaitBudgetMs } =
+				await import("../../../clients/lsp/index.js");
+			const {
+				recordSuccessfulLspSpawn,
+				_clearSuccessfulLspSpawnHistoryForTests,
+			} = await import("../../../clients/lsp/spawn-history.js");
+			_clearSuccessfulLspSpawnHistoryForTests();
+			recordSuccessfulLspSpawn("typos", observedMs);
+			expect(auxWaitBudgetMs("typos", true, undefined, 1500)).toBe(
+				observedMs === 1000 ? 1500 : 3000,
+			);
+			const service = new LSPService();
+			const auxServer = makeAuxServer("typos");
+			auxServer.spawn.mockImplementation(
+				async () =>
+					new Promise((resolve) =>
+						setTimeout(
+							() => resolve({ process: makeFakeProcess(), source: "test" }),
+							observedMs,
+						),
+					),
+			);
+			getServersForFileWithConfig.mockReturnValue([
+				makePrimaryServer("ts-primary"),
+				auxServer,
+			]);
+			const auxClient = makeClient(2500, [makeDiagnostic("cold aux finding")], {
+				serverId: "typos",
+			});
+			createLSPClient
+				.mockResolvedValueOnce(
+					makeClient(100, [makeDiagnostic("primary-only sentinel")], {
+						serverId: "ts-primary",
+					}),
+				)
+				.mockResolvedValueOnce(auxClient);
+
+			const touch = service.touchFile(FILE, "cold-adaptive", {
+				clientScope: "with-auxiliary",
+				auxiliaryServerIds: ["typos"],
+				collectDiagnostics: true,
+				diagnostics: "document",
+			});
+			await vi.advanceTimersByTimeAsync(observedMs + 2600);
+			const result = await touch;
+			expect(auxClient.waitForDiagnostics).toHaveBeenCalledWith(
+				FILE,
+				expectedFinding ? 3000 : 1500,
+				expect.objectContaining({ minVersion: 0 }),
+			);
+			expect(result?.diags.map((diagnostic) => diagnostic.message)).toContain(
+				expectedFinding ? "cold aux finding" : "primary-only sentinel",
+			);
+		},
+	);
+
+	it("clamps a cold auxiliary budget at 8000 ms", async () => {
+		const { auxWaitBudgetMs } = await import("../../../clients/lsp/index.js");
+		const {
+			recordSuccessfulLspSpawn,
+			_clearSuccessfulLspSpawnHistoryForTests,
+		} = await import("../../../clients/lsp/spawn-history.js");
+		_clearSuccessfulLspSpawnHistoryForTests();
+		recordSuccessfulLspSpawn("typos", 9000);
+		expect(auxWaitBudgetMs("typos", true, undefined, 1500)).toBe(8000);
 	});
 
 	it("still waits for slow primary even if aux settles early", async () => {

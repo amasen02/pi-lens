@@ -14,20 +14,12 @@
  * observes the real leak rather than asserting on mocked call arguments.
  */
 
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { gitFixtureEnv, hasGit } from "../../support/git-fixture-env.js";
 
 const LAUNCH_JS = path.resolve(__dirname, "../../../clients/lsp/launch.js");
-
-function hasGit(): boolean {
-	try {
-		execFileSync("git", ["--version"], { stdio: "ignore" });
-		return true;
-	} catch {
-		return false;
-	}
-}
 
 describe("launch.ts runStderrGuardedProbe stderr suppression (#2095)", () => {
 	it.skipIf(!hasGit())(
@@ -43,6 +35,7 @@ describe("launch.ts runStderrGuardedProbe stderr suppression (#2095)", () => {
 
 			const result = spawnSync(process.execPath, ["-e", script], {
 				encoding: "utf-8",
+				env: gitFixtureEnv(process.cwd()),
 			});
 
 			expect(result.error).toBeUndefined();

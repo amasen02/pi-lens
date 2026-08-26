@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import type { CircularDep } from "../../dependency-checker.js";
+import { compareOrdinal } from "../../string-utils.js";
 import type { ProjectDiagnostic } from "../types.js";
 
 function resolveCyclePath(cwd: string, file: string): string {
@@ -48,7 +49,7 @@ export function circularDepsToProjectDiagnostics(
 	for (const dep of circular) {
 		const key = cycleMembers(dep)
 			.map((f) => resolveCyclePath(cwd, f))
-			.sort((a, b) => a.localeCompare(b))
+			.sort(compareOrdinal)
 			.join("|");
 		if (seen.has(key)) continue;
 		seen.add(key);

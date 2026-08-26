@@ -27,6 +27,7 @@ import { recordDegradation } from "./degradation-ledger.js";
 import { logExtension } from "./extension-log.js";
 import { isFullyQualifiedWin32 } from "./path-utils.js";
 import { startSpawnUsageSampler } from "./resource-sampler.js";
+import { compareOrdinal } from "./string-utils.js";
 
 export interface SpawnResourceUsage {
 	sampleCount: number;
@@ -952,7 +953,7 @@ export function resolveWindowsCommandForEnvironment(
 				? ([[key.toLowerCase(), value] as const] as const)
 				: [],
 		)
-		.sort(([left], [right]) => left.localeCompare(right));
+		.sort(([left], [right]) => compareOrdinal(left, right));
 	// Keep presence separate from value: absent PATHEXT means the Windows
 	// default extension list, while PATHEXT="" means no implicit extensions.
 	// The per-drive snapshot is equally important: it is provenance for
