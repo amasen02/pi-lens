@@ -111,6 +111,42 @@ describe("flattened PR body repair", () => {
 		expect(repairFlattenedBody(candidate)).toBe(candidate);
 	});
 
+	it.each(
+		[
+			[
+				"quoted Test assessment mid-sentence",
+				"## Summary Opening context. Workers keep writing the ## Test assessment heading inline inside the Tests prose. ## Tests Targeted coverage. ## Blast radius Runtime impact. ## Class sweep Covered. ## Observability Recorded.",
+			],
+			[
+				"quoted Fix round mid-sentence",
+				"## Summary Opening context. Workers carried a ## Fix round 1 heading inline in the evidence. ## Tests Targeted coverage. ## Blast radius Runtime impact. ## Class sweep Covered. ## Observability Recorded.",
+			],
+		].map(([name, candidate]) => [name, candidate.padEnd(220, " ")]),
+	)("refuses a mid-sentence quoted heading: %s", (_name, candidate) => {
+		expect(detectFlattenedBody(candidate)).toBe(true);
+		expect(repairFlattenedBody(candidate)).toBe(candidate);
+	});
+
+	it("refuses duplicate template headings through the count check", () => {
+		const duplicate =
+			"## Summary Opening context. ## Tests First report. ## Tests Second report. ## Blast radius Runtime impact. ## Class sweep Covered. ## Observability Recorded.".padEnd(
+				220,
+				" ",
+			);
+		expect(detectFlattenedBody(duplicate)).toBe(true);
+		expect(repairFlattenedBody(duplicate)).toBe(duplicate);
+	});
+
+	it("refuses an extra repaired heading through the count check", () => {
+		const extraHeading =
+			"## Summary Opening context. ## Tests Targeted coverage.\n### Existing nested heading\n## Blast radius Runtime impact. ## Class sweep Covered. ## Observability Recorded.".padEnd(
+				220,
+				" ",
+			);
+		expect(detectFlattenedBody(extraHeading)).toBe(true);
+		expect(repairFlattenedBody(extraHeading)).toBe(extraHeading);
+	});
+
 	it("is idempotent", () => {
 		const repaired = repairFlattenedBody(flattenedBody);
 		expect(repairFlattenedBody(repaired)).toBe(repaired);

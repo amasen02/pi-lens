@@ -816,8 +816,10 @@ labeled. (#1432)
 The PR body advisory lint may auto-repair only clearly flattened bodies: two or
 more inline template headings, at most two physical newlines, and a minimum
 body length. Detection refuses bodies with escape-loss markers, while the
-post-split structural guard refuses duplicate template headings or more
-headings than distinct template sections. Repair only splits inline headings.
+post-split structural guard compares repaired heading count with distinct
+template-section count and refuses inconsistent structures. Repair only splits
+inline headings
+whose preceding text ends at body start or sentence-ending punctuation.
 `repairFlattenedBody` is idempotent via its detection short-circuit and must
 pass `lintPrBody` before `patchLivePrBody` writes through the GitHub API; failed,
 stale, or uncheckable repairs report the original errors and never write. The workflow grants

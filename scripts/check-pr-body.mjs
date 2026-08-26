@@ -160,16 +160,20 @@ export function repairFlattenedBody(body = "") {
 	if (!detectFlattenedBody(source)) return source;
 	let repaired = source.replace(/\r\n?/g, "\n");
 	repaired = repaired.replace(
-		new RegExp(`(#{2,4}\\s+(?:${REPAIR_HEADING_PATTERN}))(?=\\s)`, "g"),
-		"$1\n",
-	);
-	repaired = repaired.replace(
 		new RegExp(
-			`(?<!^)[ \\t]+(?=#{2,4}\\s+(?:${REPAIR_HEADING_PATTERN})(?=\\s|$))`,
-			"gm",
+			`(^|[.!?])[ \\t]*(#{2,4}\\s+(?:${REPAIR_HEADING_PATTERN}))(?=\\s|$)`,
+			"g",
 		),
-		"\n\n",
+		(_match, sentenceEnd, heading) =>
+			sentenceEnd ? `${sentenceEnd}\n\n${heading}\n` : `${heading}\n`,
 	);
+	const residualInlineHeadings = repaired.match(
+		new RegExp(
+			`(?<!^)[ \\t]#{2,4}\\s+(?:${REPAIR_HEADING_PATTERN})(?=\\s|$)`,
+			"g",
+		),
+	);
+	if (residualInlineHeadings?.length) return source;
 	const repairedHeadings = repaired
 		.split("\n")
 		.map((line) => HEADING.exec(line)?.[1].trim().toLowerCase())
@@ -180,11 +184,7 @@ export function repairFlattenedBody(body = "") {
 	const distinctTemplateHeadings = new Set(
 		templateHeadings.map((heading) => heading.replace(/ \d+$/, "")),
 	);
-	if (
-		templateHeadings.length !== distinctTemplateHeadings.size ||
-		repairedHeadings.length > distinctTemplateHeadings.size
-	)
-		return source;
+	if (repairedHeadings.length !== distinctTemplateHeadings.size) return source;
 	return repaired;
 }
 
