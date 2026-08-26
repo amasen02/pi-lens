@@ -1117,6 +1117,13 @@ Thread `getManagedToolEnvironment(tool, cwd)` into probes/spawns. Direct
 `ensureTool()` calls and bare managed-tool spawns outside the sanctioned wrapper
 surfaces are guarded by `tests/clients/managed-tool-seam-coverage.test.ts`.
 
+Managed language-server verification arguments are registry-owned and must
+finish within the installer budget against the real binary. Prefer a fast
+loading argument such as `--help` when `--version` waits for an LSP transport.
+`verifyToolBinary` retains at most 64 KiB of child output; output-cap episodes
+use the `installer-verification-output-truncated` degradation kind and
+`recordDegradationOnce` so noisy probes remain bounded and identifiable.
+
 Installer package-manager and archive-extraction subprocesses must use
 `safeSpawnAsync` with `lifetimeCoupled: true` and `ignoreAmbientSignal: true`.
 This gives timeouts an awaited Windows tree-kill and prevents interrupted parent

@@ -118,7 +118,12 @@ describe("managed markdownlint verification (#2045)", () => {
 	it("pins effective argv for npm and non-npm verification samples", async () => {
 		safeSpawnAsync.mockClear();
 		safeSpawnAsync.mockResolvedValue(result({ status: 0, error: undefined }));
-		for (const id of ["markdownlint", "svelte-language-server", "mypy"]) {
+		for (const id of [
+			"markdownlint",
+			"svelte-language-server",
+			"@prisma/language-server",
+			"mypy",
+		]) {
 			const tool = TOOLS.find((entry) => entry.id === id);
 			expect(tool).toBeDefined();
 			await verifyToolBinary(id, undefined, undefined, 10, tool!.checkArgs);
@@ -126,10 +131,25 @@ describe("managed markdownlint verification (#2045)", () => {
 		const calls = safeSpawnAsync.mock.calls;
 		expect(calls.map((call) => call[1])).toEqual([
 			["--no-globs", "-"],
-			["--version"],
+			["--help"],
+			["--help"],
 			["--version"],
 		]);
 		expect(calls.every((call) => call[2].input === "")).toBe(true);
+	});
+
+	it("bounds retained output for noisy language-server probes", async () => {
+		safeSpawnAsync.mockResolvedValueOnce(
+			result({ status: 1, outputTruncated: true }),
+		);
+		await verifyToolBinary("intelephense", undefined, undefined, 10, [
+			"--version",
+		]);
+		expect(safeSpawnAsync).toHaveBeenLastCalledWith(
+			process.platform === "win32" ? "intelephense.cmd" : "intelephense",
+			["--version"],
+			expect.objectContaining({ maxOutputBytes: 64 * 1024 }),
+		);
 	});
 
 	it.skipIf(!resolveMarkdownlintBinary())(

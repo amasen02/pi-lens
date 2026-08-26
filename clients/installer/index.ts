@@ -702,7 +702,9 @@ export const TOOLS: ToolDefinition[] = [
 		id: "@prisma/language-server",
 		name: "Prisma Language Server",
 		checkCommand: "prisma-language-server",
-		checkArgs: ["--version"],
+		// `--version` can wait for the LSP transport before exiting. `--help`
+		// loads the same executable and exits within the installer budget (#2169).
+		checkArgs: ["--help"],
 		installStrategy: "npm",
 		packageName: "@prisma/language-server",
 		binaryName: "prisma-language-server",
@@ -720,7 +722,9 @@ export const TOOLS: ToolDefinition[] = [
 		id: "svelte-language-server",
 		name: "Svelte Language Server",
 		checkCommand: "svelteserver",
-		checkArgs: ["--version"],
+		// `--version` can wait for the LSP transport before exiting. `--help`
+		// loads the same executable and exits within the installer budget (#2169).
+		checkArgs: ["--help"],
 		installStrategy: "npm",
 		packageName: "svelte-language-server",
 		binaryName: "svelteserver",
@@ -2164,8 +2168,19 @@ export async function verifyToolBinary(
 		const result = await safeSpawnAsync(execPath, verificationArgs, {
 			timeout: timeoutMs,
 			input: "",
+			// A broken or version-blind language server can emit a bundled
+			// megabytes-long diagnostic on stderr. Keep verification bounded even
+			// when the child reaches its normal timeout first.
+			maxOutputBytes: 64 * 1024,
 		});
 		const output = `${result.stdout}\n${result.stderr}`;
+		if (result.outputTruncated) {
+			recordDegradationOnce({
+				kind: "installer-verification-output-truncated",
+				subject: binPath,
+				reason: `verification output exceeded 65536 bytes (${verificationArgs.join(" ")})`,
+			});
+		}
 		if (result.status === 0 && !result.error) {
 			debugLog(
 				`Verified: ${binPath} (${verificationArgs.join(" ")}: ${result.stdout.trim()})`,
