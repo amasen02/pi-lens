@@ -6,6 +6,11 @@ import { CacheManager } from "../clients/cache-manager.js";
 import { getEffectiveLspIdleResetMs } from "../clients/runtime-turn.js";
 import { createPiMock, makeCtx, makeStaleCtx } from "./support/pi-mock.js";
 import { removeTempDirSync } from "./clients/test-utils.js";
+// #2146: process-scope state (the primary-session registration, the instance
+// registry's mutation tail) now lives on `globalThis`, so `vi.resetModules()`
+// no longer clears it — that is the fix, not a regression. This suite gives
+// every case a cold extension graph, so it must reset the process state too.
+import { _resetProcessSingletonsForTests } from "../clients/process-singletons.js";
 
 const r6Mocks = vi.hoisted(() => ({
 	incrementDegradationCount: vi.fn(),
@@ -133,6 +138,7 @@ describe("index.ts integration", () => {
 	beforeEach(() => {
 		vi.resetModules();
 		vi.clearAllMocks();
+		_resetProcessSingletonsForTests();
 		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-index-int-"));
 		originalStartupMode = process.env.PI_LENS_STARTUP_MODE;
 		process.env.PI_LENS_STARTUP_MODE = "quick";
@@ -1831,6 +1837,7 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 		vi.doUnmock("../clients/runtime-session.js");
 		vi.doUnmock("../clients/lsp/index.js");
 		quietTasks = [];
+		_resetProcessSingletonsForTests();
 		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-turn-summary-"));
 		originalStartupMode = process.env.PI_LENS_STARTUP_MODE;
 		process.env.PI_LENS_STARTUP_MODE = "quick";

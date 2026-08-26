@@ -233,11 +233,11 @@ import {
 	observeCachePrefix,
 } from "./clients/cache-observability.js";
 import {
+	buildStartupTimingRecords,
 	getPiLensEvalMs,
 	markPiLensLoaded,
 	getPiLensLoadedAtMs,
 	consumeHostReadyDelayAnchor,
-	PI_LENS_HOST_BOOT_MS,
 	PI_LENS_LOADED_FROM,
 } from "./clients/startup-timing.js";
 import { toRunnerDisplayPath } from "./clients/dispatch/runner-context.js";
@@ -460,27 +460,12 @@ export function createHostPorts(
 dbg(
 	`pi-lens loaded: ${PI_LENS_LOAD_MS}ms after process start (from ${PI_LENS_LOADED_FROM})`,
 );
-logLatency({
-	type: "phase",
-	filePath: "<pi-lens>",
-	phase: "extension_loaded",
-	durationMs: PI_LENS_LOAD_MS,
-	metadata: { loadedFrom: PI_LENS_LOADED_FROM },
-});
-logLatency({
-	type: "phase",
-	filePath: "<pi-lens>",
-	phase: "host_boot",
-	durationMs: PI_LENS_HOST_BOOT_MS,
-	metadata: { loadedFrom: PI_LENS_LOADED_FROM },
-});
-logLatency({
-	type: "phase",
-	filePath: "<pi-lens>",
-	phase: "extension_eval",
-	durationMs: PI_LENS_EVAL_MS,
-	metadata: { loadedFrom: PI_LENS_LOADED_FROM },
-});
+for (const record of buildStartupTimingRecords({
+	loadMs: PI_LENS_LOAD_MS,
+	evalMs: PI_LENS_EVAL_MS,
+})) {
+	logLatency(record);
+}
 
 // No-op log function (verbose console logging was removed with lens-verbose flag)
 function log(_msg: string) {
@@ -624,12 +609,16 @@ function activateExtension(hostPi: ExtensionAPI) {
 	const classifyOwnedSessionShutdown = (
 		ctx: unknown,
 		sessionId: string | undefined,
+		// #2146 F1: this session's own root. Only consulted on the fallback path
+		// below — when this extension instance never recorded a role of its own,
+		// so the shared registration is the only evidence available.
+		root: string | undefined,
 	): "primary" | "secondary" =>
 		ownedSessionRole === "concurrent-secondary"
 			? "secondary"
 			: ownedSessionRole === "primary"
 				? "primary"
-				: noteSessionShutdown(ctx, sessionId);
+				: noteSessionShutdown(ctx, sessionId, root);
 	// biome-ignore lint/suspicious/noExplicitAny: heterogeneous pi event ctx shapes
 	const rememberOwnEventCtx = (ctx: any): void => {
 		if (!ctx) return;
@@ -2985,9 +2974,21 @@ function activateExtension(hostPi: ExtensionAPI) {
 				return undefined;
 			}
 		})();
+		// #2146 F1: read once, up here, so the classifier and the scoped
+		// deregistration below both see the same value. A stale ctx must never
+		// break teardown, so an unreadable cwd degrades to `undefined`, which
+		// changes no verdict.
+		const shutdownCwd = (() => {
+			try {
+				return (ctx as { cwd?: string })?.cwd;
+			} catch {
+				return undefined;
+			}
+		})();
 		const shutdownClassification = classifyOwnedSessionShutdown(
 			ctx,
 			stableSessionId,
+			shutdownCwd,
 		);
 		if (shutdownClassification === "secondary") {
 			emitCacheUsageSummaryAtSessionEnd(
@@ -3004,7 +3005,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 			// host is still working in. A root this session never registered is a
 			// documented no-op inside `deregisterInstanceRoot`.
 			try {
-				const secondaryRoot = (ctx as { cwd?: string })?.cwd;
+				const secondaryRoot = shutdownCwd;
 				const primaryRoot = getActivePrimaryRoot();
 				if (
 					typeof secondaryRoot === "string" &&

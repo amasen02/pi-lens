@@ -937,6 +937,8 @@ export const EXEMPT_SESSION_STATE_FILES: Readonly<Record<string, string>> = {
 	"lens-config.ts":
 		"global config warn-once set, tied to the config file it warned about",
 	"instance-registry.ts": "instance-registry enablement flag",
+	"process-singletons.ts":
+		"the globalThis-keyed container for process-scope state (#2146). It owns storage, never lifecycle: every family keeps whatever boundary it already had, and each one is a PROCESS boundary rather than a session boundary. session-lifecycle.ts releases its registration at the primary's own session_shutdown (releasePrimarySession), not at session_start. startup-timing.ts's host-ready anchor is registered here as policy process_lifetime with a ForTests-only reset, because resetting it at a session boundary would fabricate host stalls from the original process boot. The instance-registry mutation tail must outlive every session by construction. A reset in this module would therefore wipe state no session boundary owns. Its only module-scope binding is the Symbol.for container key, a constant.",
 	"session-lifecycle.ts":
 		"the session_start decision seam itself — it is the boundary, not state behind it",
 
@@ -1085,6 +1087,9 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"ndjson-logger.ts": 0,
 	"package-manager.ts": 2,
 	"project-changes.ts": 0,
+	// #2146: the container key is a Symbol.for constant, so the scan sees no
+	// mutable module-scope container here.
+	"process-singletons.ts": 0,
 	"project-lens-config.ts": 3,
 	"project-report.ts": 1,
 	"project-scale.ts": 0,
@@ -1104,6 +1109,8 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	// GIT_GLOBAL_OPTIONS_WITH_VALUE — command-shape vocabulary, not state.
 	"runtime-tool-result.ts": 5,
 	"safe-spawn.ts": 3,
+	// #2146 moved the four registration fields onto the process singleton, so the
+	// scan sees no module-scope container here either.
 	"session-lifecycle.ts": 0,
 	"sgconfig.ts": 2,
 	"slow-fs.ts": 0,

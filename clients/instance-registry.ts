@@ -37,6 +37,7 @@ import { getGlobalPiLensDir } from "./file-utils.js";
 // import is actually invoked.
 import { realIsPidAlive, STALE_HEARTBEAT_MS } from "./instance-reaper.js";
 import { normalizeFilePath } from "./path-utils.js";
+import { getProcessSingleton } from "./process-singletons.js";
 import { getSubagentIdentity, isSubagentSession } from "./subagent-mode.js";
 
 export interface LspChildEntry {
@@ -110,6 +111,11 @@ function registryPath(): string {
 
 // --- Kill switch (lazy, memoized — house style per clients/runtime-config.ts) ---
 
+// #2146 class-sweep verdict: STAYS at module scope. Duplicating this memo
+// across module evaluations is wasteful, not wrong — every copy re-reads the
+// same `process.env` and reaches the same answer, so no caller can observe a
+// disagreement. Only state that is WRONG when duplicated moves to
+// `process-singletons.ts`.
 let _enabledCache: boolean | undefined;
 
 /**
@@ -465,11 +471,34 @@ export interface RecordLspChildInput {
 // and "remove" can never interleave their read-modify-write against each
 // other — the single seam both the forced-shutdown and self-crash
 // deregistration paths route through.
-let registryMutationTail: Promise<void> = Promise.resolve();
+//
+// #2146: the tail must be the PROCESS's one serialization point, and module
+// scope did not deliver that. pi evaluates the pi-lens module graph up to nine
+// times per process, so this module had up to nine tails, each serializing only
+// its own callers. The dogfood run measured the consequence directly: three
+// `instance-registry-corrupt` records inside nine seconds, with two project
+// roots and one live instance's entry lost from `instances.json` — exactly the
+// torn read-modify-write this tail exists to prevent, reintroduced by
+// duplication rather than by a missing await. Keying it on `globalThis` makes
+// every evaluation queue onto the same tail.
+const REGISTRY_TAIL_FAMILY = "instance-registry.mutation-tail";
+/** Bump when the tail cell's shape changes. */
+const REGISTRY_TAIL_VERSION = 1;
+
+function registryTailState(): { tail: Promise<void> } {
+	return getProcessSingleton(
+		REGISTRY_TAIL_FAMILY,
+		REGISTRY_TAIL_VERSION,
+		() => ({
+			tail: Promise.resolve(),
+		}),
+	);
+}
 
 function queueRegistryMutation(op: () => Promise<void>): Promise<void> {
-	const run = registryMutationTail.then(op);
-	registryMutationTail = run.catch(() => {});
+	const state = registryTailState();
+	const run = state.tail.then(op);
+	state.tail = run.catch(() => {});
 	return run;
 }
 

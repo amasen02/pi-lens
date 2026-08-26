@@ -7,6 +7,15 @@ import {
 	getSinkWriteFailures,
 	resetSinkWriteFailures,
 } from "./ndjson-logger.js";
+// #2146: pulled at READ time, never pushed. `process-singletons.ts` is a
+// dependency leaf on purpose — it cannot import this module without closing a
+// no-client-cycles cycle through instance-registry/instance-reaper — so the
+// ledger reaches IN for its reset log, the same inversion `getSinkWriteFailures`
+// above uses.
+import {
+	getProcessSingletonResets,
+	PROCESS_SINGLETON_RESET_KIND,
+} from "./process-singletons.js";
 
 // Re-exported so existing importers keep one name for the ledger's bound.
 export { LEDGER_FIELD_MAX, truncateForLedger };
@@ -622,6 +631,21 @@ export function getDegradationSummary(): DegradationGroup[] {
 			})),
 		});
 	}
+	// #2146, same read-time fold: process-singleton resets live in the leaf
+	// module's own bounded log. One entry per family, so this group's count is
+	// the number of families this build could not adopt, never an event tally.
+	const singletonResets = getProcessSingletonResets();
+	if (singletonResets.length > 0) {
+		summary.push({
+			kind: PROCESS_SINGLETON_RESET_KIND,
+			count: singletonResets.length,
+			droppedCount: 0,
+			latestReasons: singletonResets.map((reset) => ({
+				subject: truncateForLedger(reset.family),
+				reason: truncateForLedger(reset.reason),
+			})),
+		});
+	}
 	return summary;
 }
 
@@ -681,6 +705,18 @@ export function resetDegradationLedger(): void {
 	// process-lifetime latch too — it re-arms alongside the rest of the
 	// ledger rather than surviving past the session that observed it.
 	resetSinkWriteFailures();
+	// #2146 review F3: the OTHER pulled source, `getProcessSingletonResets()`,
+	// deliberately does NOT re-arm here, and the difference from its neighbour
+	// above is the point. A sink write failure recurs — new writes fail, so
+	// clearing the tally costs nothing and a later session re-observes the
+	// problem. A process-singleton reset happens once, at module-evaluation
+	// time, and cannot recur: after it, the container holds only compatible
+	// cells. Clearing it would show the fact in the first session's
+	// `pilens_health` and hide it from every session after, which is exactly
+	// when someone reads that line. The row is bounded independently of the
+	// session (one entry per family, capped at 16), so leaving it costs a fixed
+	// handful of lines and keeps a process-scope fact visible for the process's
+	// life. Deliberate exception to catalog shape 17, not an oversight.
 }
 
 export const DEGRADATION_ENTRIES_PER_KIND = ENTRIES_PER_KIND;
