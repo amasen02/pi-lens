@@ -579,9 +579,13 @@ and only `lsp_server_spawned` answers "how many servers did we start".
 
 The project ignore matcher keeps its per-path verdict memo hot between edits.
 The write-result seam calls `invalidateProjectIgnoreMatcherForPath` for a
-`.gitignore` mutation: root changes rebuild the matcher, while nested changes
-evict only that directory's subtree. This preserves compiled-glob reuse and
-avoids a nested-file stat on every `isIgnored` verdict. (#2071)
+`.gitignore` mutation: it scans every cached root containing the edited path,
+rebuilds a root matcher, and evicts only the changed subtree for nested files.
+This handles non-git trees and nested git roots, preserves compiled-glob reuse,
+and avoids a nested-file stat on every `isIgnored` verdict. IDE edits, checkout
+or merge restoration, and writes under already-ignored directories remain
+outside the tool-result producer and are tracked by the freshness-probe issue.
+(#2071)
 
 Knip's dispatch memo is instance-owned and keyed by canonical project root plus
 the runtime's monotonic project sequence. Only callers that supply that content

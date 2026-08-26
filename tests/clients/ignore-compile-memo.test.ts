@@ -127,6 +127,45 @@ describe("#1976 compiled-glob memo", () => {
 		}
 	});
 
+	it("refreshes a nested .gitignore in a non-git tree", () => {
+		const env = setupTestEnvironment("pi-lens-2071-no-git-");
+		try {
+			const nested = path.join(env.tmpDir, "packages", "app");
+			fs.mkdirSync(nested, { recursive: true });
+			const ignoredPath = path.join(nested, "generated.ts");
+			const ignorePath = path.join(nested, ".gitignore");
+			fs.writeFileSync(ignorePath, "generated.ts\n");
+			const matcher = getProjectIgnoreMatcher(env.tmpDir);
+			expect(matcher.isIgnored(ignoredPath)).toBe(true);
+
+			fs.writeFileSync(ignorePath, "!generated.ts\n");
+			invalidateProjectIgnoreMatcherForPath(ignorePath);
+			expect(matcher.isIgnored(ignoredPath)).toBe(false);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("refreshes an outer matcher when a nested git root changes", () => {
+		const env = setupTestEnvironment("pi-lens-2071-nested-git-");
+		try {
+			fs.mkdirSync(path.join(env.tmpDir, ".git"));
+			const nested = path.join(env.tmpDir, "submodule");
+			fs.mkdirSync(path.join(nested, ".git"), { recursive: true });
+			const ignoredPath = path.join(nested, "generated.ts");
+			const ignorePath = path.join(nested, ".gitignore");
+			fs.writeFileSync(ignorePath, "generated.ts\n");
+			const matcher = getProjectIgnoreMatcher(env.tmpDir);
+			expect(matcher.isIgnored(ignoredPath)).toBe(true);
+
+			fs.writeFileSync(ignorePath, "!generated.ts\n");
+			invalidateProjectIgnoreMatcherForPath(ignorePath);
+			expect(matcher.isIgnored(ignoredPath)).toBe(false);
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("compiles each expanded pattern once per matcher instance across a walk over unique paths", () => {
 		const env = setupTestEnvironment("pi-lens-1976-compile-");
 		try {

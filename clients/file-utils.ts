@@ -18,7 +18,11 @@ import {
 	getGlobalIgnorePatterns,
 	getPiLensGlobalConfigPath,
 } from "./lens-config.js";
-import { normalizeEphemeralMapKey, normalizeFilePath } from "./path-utils.js";
+import {
+	isUnderDir,
+	normalizeEphemeralMapKey,
+	normalizeFilePath,
+} from "./path-utils.js";
 import {
 	findPiLensConfigInDir,
 	findPiLensProjectConfig,
@@ -677,15 +681,18 @@ export function getProjectIgnoreMatcher(rootDir: string): ProjectIgnoreMatcher {
  */
 export function invalidateProjectIgnoreMatcherForPath(filePath: string): void {
 	const resolvedPath = path.resolve(filePath);
-	if (path.basename(resolvedPath) !== ".gitignore") return;
-	const resolvedRoot = resolveGitIgnoreRoot(path.dirname(resolvedPath));
-	const cached = projectIgnoreMatcherCache.get(resolvedRoot);
-	if (!cached) return;
-	if (resolvedPath === path.join(resolvedRoot, ".gitignore")) {
-		projectIgnoreMatcherCache.delete(resolvedRoot);
-		return;
+	if (path.basename(resolvedPath).toLowerCase() !== ".gitignore") return;
+	for (const [cachedRoot, cached] of projectIgnoreMatcherCache) {
+		if (!isUnderDir(resolvedPath, cachedRoot)) continue;
+		if (
+			normalizeFilePath(resolvedPath) ===
+			normalizeFilePath(path.join(cachedRoot, ".gitignore"))
+		) {
+			projectIgnoreMatcherCache.delete(cachedRoot);
+			continue;
+		}
+		cached.matcher.invalidateSubtree(path.dirname(resolvedPath));
 	}
-	cached.matcher.invalidateSubtree(path.dirname(resolvedPath));
 }
 
 export function isPathIgnoredByProject(
