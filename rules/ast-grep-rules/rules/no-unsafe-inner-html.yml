@@ -1,0 +1,6 @@
+id: no-unsafe-inner-html
+language: Tsx
+severity: error
+message: "Dynamic HTML requires an adjacent safe-html provenance marker"
+rule:
+  kind: jsx_attribute

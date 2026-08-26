@@ -1,0 +1,8 @@
+id: no-vacuous-throw-assertion
+language: TypeScript
+severity: error
+message: "Name the expected error in toThrow()"
+rule:
+  any:
+    - pattern: expect($EXPR).toThrow()
+    - pattern: expect($EXPR).toThrowError()

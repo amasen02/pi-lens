@@ -1,0 +1,6 @@
+id: no-async-context-enter-with
+language: TypeScript
+severity: error
+message: "Use AsyncLocalStorage.run() instead of enterWith()"
+rule:
+  pattern: $STORE.enterWith($VALUE)

@@ -607,6 +607,13 @@ and only `lsp_server_spawned` answers "how many servers did we start".
 
 ### Dispatch, runners, formatters, and installer
 
+The Oxlint runner honors the nearest `.oxlintrc.json` that declares `jsPlugins`
+through its explicit config path. The curated Stella subset is pinned under
+`vendor/stella/oxlint-plugins`, compiled from the upstream TypeScript modules,
+and enabled at error severity; `@oxlint/plugins` stays pinned to Oxlint 1.79.0.
+Syntax-only Stella checks belong in the recursive ast-grep catalog, where they
+share the normal policy, fixture, and catalog validation seams. (#2196, #2195)
+
 Managed verification uses the registry's optional `verificationTimeoutMs` at
 every installer-owned probe seam, including local discovery, npm install, and
 periodic refresh. The refresh candidate projection carries that policy instead

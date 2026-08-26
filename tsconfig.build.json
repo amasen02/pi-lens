@@ -10,5 +10,5 @@
 		"types": ["node"]
 	},
 	"include": ["**/*.ts"],
-	"exclude": ["node_modules", "test-lsp-files", "_trigger-test.ts", "tests"]
+	"exclude": ["node_modules", "test-lsp-files", "_trigger-test.ts", "tests", "vendor/stella/oxlint-plugins/**/*.ts"]
 }

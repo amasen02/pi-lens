@@ -1,0 +1,8 @@
+id: no-static-devtools-import
+language: TypeScript
+severity: error
+message: "Do not statically import development-only tooling"
+rule:
+  any:
+    - pattern: import $A from "@tanstack/react-query-devtools"
+    - pattern: import $A from "@hookform/devtools"

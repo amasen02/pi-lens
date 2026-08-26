@@ -1,0 +1,8 @@
+id: no-swallowed-rejection
+language: TypeScript
+severity: error
+message: "Do not convert a rejected promise into a constant empty value"
+rule:
+  any:
+    - pattern: $PROMISE.catch(() => [])
+    - pattern: $PROMISE.catch(() => undefined)

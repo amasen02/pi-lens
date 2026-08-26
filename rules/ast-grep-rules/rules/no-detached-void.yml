@@ -1,0 +1,6 @@
+id: no-detached-void
+language: TypeScript
+severity: error
+message: "Do not detach promises with void; use detached()"
+rule:
+  pattern: void $EXPR

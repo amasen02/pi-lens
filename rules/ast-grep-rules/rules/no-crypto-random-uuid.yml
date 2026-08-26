@@ -1,0 +1,6 @@
+id: no-crypto-random-uuid
+language: TypeScript
+severity: error
+message: "Use the owned UUID generator"
+rule:
+  pattern: crypto.randomUUID()

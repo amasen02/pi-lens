@@ -83,6 +83,26 @@ function resolveLocalVp(cwd: string): string | null {
 	return null;
 }
 
+/** Return the nearest pi-lens config that opts into bundled JS plugins. */
+function resolvePluginConfig(cwd: string): string | null {
+	for (const dir of walkUpDirs(cwd)) {
+		const candidate = path.join(dir, ".oxlintrc.json");
+		if (!fs.existsSync(candidate)) continue;
+		try {
+			const config = JSON.parse(fs.readFileSync(candidate, "utf8")) as {
+				jsPlugins?: unknown;
+			};
+			if (Array.isArray(config.jsPlugins) && config.jsPlugins.length > 0) {
+				return candidate;
+			}
+		} catch {
+			// Oxlint remains the source of truth for malformed configuration.
+			return null;
+		}
+	}
+	return null;
+}
+
 async function resolveVitePlusCommand(cwd: string): Promise<string | null> {
 	const local = resolveLocalVp(cwd);
 	if (local) return local;
@@ -123,6 +143,10 @@ const oxlintRunner: RunnerDefinition = {
 				? oxlintCmd
 				: await resolveToolCommandWithInstallFallback(cwd, "oxlint");
 			args = ["--format", "json", ctx.filePath];
+		}
+		const pluginConfig = resolvePluginConfig(cwd);
+		if (pluginConfig && !hasVitePlusConfig(cwd)) {
+			args.splice(1, 0, "--config", pluginConfig);
 		}
 		if (!cmd) {
 			return { status: "skipped", diagnostics: [], semantic: "none" };

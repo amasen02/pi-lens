@@ -14,5 +14,5 @@
 		"types": ["node"]
 	},
 	"include": ["**/*.ts"],
-	"exclude": ["node_modules", "tests/fixtures"]
+	"exclude": ["node_modules", "tests/fixtures", "vendor/stella/oxlint-plugins/**/*.ts"]
 }

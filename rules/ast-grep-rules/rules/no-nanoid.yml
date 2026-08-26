@@ -1,0 +1,6 @@
+id: no-nanoid
+language: TypeScript
+severity: error
+message: "Do not reintroduce Nano ID"
+rule:
+  pattern: nanoid($$$ARGS)

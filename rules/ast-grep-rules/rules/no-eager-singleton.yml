@@ -1,0 +1,6 @@
+id: no-eager-singleton
+language: TypeScript
+severity: error
+message: "Construct side-effecting clients lazily"
+rule:
+  pattern: const $NAME = new $CLIENT($$$ARGS)

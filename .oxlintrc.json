@@ -1,6 +1,38 @@
 {
   "$schema": "https://raw.githubusercontent.com/oxc-project/oxc/main/npm/oxlint/configuration_schema.json",
-  "ignorePatterns": [
-    "tests/fixtures/**"
-  ]
+	"ignorePatterns": [
+		"tests/fixtures/**"
+	],
+	"jsPlugins": [
+		"./vendor/stella/oxlint-plugins/runtime/no-db-await-in-loop.js",
+		"./vendor/stella/oxlint-plugins/runtime/no-object-url-leak.js",
+		"./vendor/stella/oxlint-plugins/runtime/no-secret-in-log-sink.js",
+		"./vendor/stella/oxlint-plugins/runtime/no-unvalidated-json-domain-cast.js",
+		"./vendor/stella/oxlint-plugins/runtime/no-raw-error-logging.js",
+		"./vendor/stella/oxlint-plugins/runtime/no-raw-api-url.js",
+		"./vendor/stella/oxlint-plugins/runtime/no-omitted-prop-respread.js",
+		"./vendor/stella/oxlint-plugins/runtime/no-broad-translation-callable.js",
+		"./vendor/stella/oxlint-plugins/runtime/no-facade-imports.js",
+		"./vendor/stella/oxlint-plugins/runtime/require-stream-reader-disposal.js",
+		"./vendor/stella/oxlint-plugins/runtime/require-fetch-timeout.js",
+		"./vendor/stella/oxlint-plugins/runtime/require-eden-error-check.js",
+		"./vendor/stella/oxlint-plugins/runtime/no-awaited-builder-union.js",
+		"./vendor/stella/oxlint-plugins/runtime/no-coerced-optional-union-enum.js"
+	],
+	"rules": {
+		"no-db-await-in-loop/no-db-await-in-loop": "error",
+		"no-object-url-leak/no-object-url-leak": "error",
+		"no-secret-in-log-sink/no-secret-in-log-sink": "error",
+		"no-unvalidated-json-domain-cast/no-unvalidated-json-domain-cast": "error",
+		"no-raw-error-logging/no-raw-error-logging": "error",
+		"no-raw-api-url/no-raw-api-url": "error",
+		"no-omitted-prop-respread/no-omitted-prop-respread": "error",
+		"no-broad-translation-callable/no-broad-translation-callable": "error",
+		"no-facade-imports/no-facade-imports": "error",
+		"require-stream-reader-disposal/require-stream-reader-disposal": "error",
+		"require-fetch-timeout/require-fetch-timeout": "error",
+		"require-eden-error-check/require-eden-error-check": "error",
+		"no-awaited-builder-union/no-awaited-builder-union": "error",
+		"no-coerced-optional-union-enum/no-coerced-optional-union-enum": "error"
+	}
 }

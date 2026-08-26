@@ -1,0 +1,6 @@
+id: no-unjustified-double-assertion
+language: TypeScript
+severity: error
+message: "Explain a double assertion with a nearby SAFETY comment"
+rule:
+  pattern: $EXPR as $A as $B

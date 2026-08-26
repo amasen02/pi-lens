@@ -1,0 +1,8 @@
+id: no-path-prefix-containment
+language: TypeScript
+severity: error
+message: "Use path-aware containment instead of a bare prefix check"
+rule:
+  any:
+    - pattern: $PATH.startsWith($ROOT)
+    - pattern: $ROOT.startsWith($PATH)

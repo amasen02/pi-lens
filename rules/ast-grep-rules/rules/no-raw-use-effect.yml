@@ -1,0 +1,6 @@
+id: no-raw-use-effect
+language: Tsx
+severity: error
+message: "Use the owned lifecycle primitive instead of useEffect"
+rule:
+  pattern: useEffect($$$ARGS)

@@ -1,0 +1,9 @@
+Stella Oxlint plugin subset
+
+Copyright 2025 Stella contributors.
+
+This directory contains selected plugin modules from Stella, commit
+d98741a5e183bbb3c0dbace7d5c4fcd67aa0d465, redistributed under the Apache
+License, Version 2.0. The complete license text is in LICENSE.
+
+The source project is available at https://github.com/stella/stella.
