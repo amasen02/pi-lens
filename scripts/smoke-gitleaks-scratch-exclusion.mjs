@@ -38,6 +38,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { gitExecFileSync } from "./lib/git-fixture-env.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const repoRoot = path.resolve(path.dirname(__filename), "..");
@@ -66,7 +67,7 @@ const SCRATCH_REL = path.join(".pi-lens", "cache", "notes.md");
 const TRACKED_REL = path.join("src", "config.ts");
 
 function git(cwd, args) {
-	execFileSync("git", args, { cwd, stdio: "ignore" });
+	gitExecFileSync(args, { cwd, stdio: "ignore" });
 }
 
 function buildFixtureRepo() {

@@ -16,7 +16,7 @@ const SCRUBBED = [
 // file. See tests/support/git-fixture-env.ts for the same fix (#2163).
 const CONFIG_KV_PATTERN = /^GIT_CONFIG_(?:KEY|VALUE)_\d+$/;
 
-function envFor(cwd, overrides) {
+export function envFor(cwd, overrides) {
 	const env = { ...process.env, ...(overrides ?? {}) };
 	for (const name of SCRUBBED) delete env[name];
 	for (const key of Object.keys(env))

@@ -1078,8 +1078,11 @@ itself starts with a contaminated environment; never trust the parent process
 environment for a spawned Git fixture. `git-fixture-governance.test.ts` sweeps test
 sources and requires the direct Git callee to be imported from that helper, while
 the script-side fixture probes use `scripts/lib/git-fixture-env.mjs`. The global-
-setup teardown guard rejects local identity entries or `core.bare=true` in the
-repository config after the suite.
+setup teardown guard rejects known fixture identity entries or `core.bare=true`
+in the repository config after the suite. The governance sweep anchors its
+implementation and justified-exemption lists to repo-relative paths, and its
+identity sweep keeps every literal `user.name`/`user.email` write in the guard's
+known sets.
 
 Git command classification has ONE implementation. `detectGuardedGitVerb`
 takes a `GitVerbMatcher` and owns the wrapper, `$IFS`, substitution, PATHEXT,
@@ -1119,8 +1122,10 @@ bounded commit-detail population opts out explicitly.
 
 The merge-train warden's GraphQL PR reader follows the same bounded-read contract:
 `fetchOpenPullRequests` preserves collected pages but records a fatal list error
-when `hasNextPage` remains true at `MAX_PAGES`. Its consumer prints that error and
-sets a nonzero exit code, while deliberately bounded sibling reads remain scoped.
+when `hasNextPage` remains true at `MAX_PAGES` or the cursor does not advance.
+It deduplicates PR numbers before `runWarden` decides or applies actions. Its
+consumer prints that error and sets a nonzero exit code, while deliberately
+bounded sibling reads remain scoped.
 
 CI validates GitHub close-keyword syntax through `scripts/check-close-keywords.mjs`:
 PR bodies may not use a comma-separated close list because GitHub applies only

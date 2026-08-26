@@ -578,6 +578,70 @@ describe("merge-train warden GraphQL fetch + REST apply (#1844)", () => {
 		expect(result.errors).toEqual([]);
 	});
 
+	// #2150: a repeating/null endCursor must not make the collector replay a
+	// page. The error keeps the partial result visibly truncated.
+	it("stops on a non-advancing cursor and keeps one copy of the PR", async () => {
+		const { fetcher, calls } = fakeGithub({
+			"POST /graphql": graphqlPage([prNode()], true, null),
+		});
+		const result = await fetchOpenPullRequests(fetcher, "acme", "repo");
+		expect(calls).toHaveLength(1);
+		expect(result.prs).toHaveLength(1);
+		expect(result.errors).toEqual([
+			"GraphQL pagination truncated because cursor did not advance",
+		]);
+	});
+
+	it("does not return or process the same PR twice across distinct pages", async () => {
+		const pages = [
+			graphqlPage(
+				[prNode({ number: 7 }), prNode({ number: 8 })],
+				true,
+				"cursor-1",
+			),
+			graphqlPage(
+				[prNode({ number: 8 }), prNode({ number: 9 })],
+				false,
+				"cursor-2",
+			),
+		];
+		const calls: unknown[] = [];
+		const fetcher = async (_url: string, init?: { body?: string }) => {
+			const body = JSON.parse(init?.body ?? "{}");
+			calls.push(body);
+			return {
+				ok: true,
+				status: 200,
+				json: async () => pages[calls.length - 1],
+			};
+		};
+		const result = await fetchOpenPullRequests(fetcher, "acme", "repo");
+		expect(result.prs).toHaveLength(3);
+		expect(result.prs.map(({ number }) => number)).toEqual([7, 8, 9]);
+		expect(result.errors).toEqual([
+			"GraphQL pagination repeated PR #8 across pages; collection may be incomplete",
+		]);
+	});
+
+	it("decides actions once when pagination repeats a PR", async () => {
+		const { fetcher, calls } = fakeGithub({
+			"POST /graphql": graphqlPage([prNode()], true, null),
+		});
+		await runWarden({ fetcher, owner: "acme", repo: "repo" });
+		expect(
+			calls.filter(
+				({ method, url }) =>
+					method === "POST" && url.endsWith("/issues/7/labels"),
+			),
+		).toHaveLength(1);
+		expect(
+			calls.filter(
+				({ method, url }) =>
+					method === "POST" && url.endsWith("/issues/7/comments"),
+			),
+		).toHaveLength(1);
+	});
+
 	it("applyAction issues the exact REST call for each action type", async () => {
 		const { fetcher, calls } = fakeGithub({});
 		const record = pr({ number: 5, headSha: "abc123" });

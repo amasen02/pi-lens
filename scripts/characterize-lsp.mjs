@@ -10,7 +10,6 @@
  *   node scripts/characterize-lsp.mjs [lang ...]
  * Requires `npm run build:dist`. Measures only already-installed servers.
  */
-import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -21,6 +20,7 @@ import {
 	parseTable,
 	replaceTable,
 } from "./lib/md-matrix.mjs";
+import { gitExecFileSync } from "./lib/git-fixture-env.mjs";
 
 const repoRoot = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -50,7 +50,7 @@ for (const fx of fixtures) {
 	const absFile = path.join(dst, fx.file);
 	if (fx.gitInit) {
 		try {
-			execFileSync("git", ["init", "-q"], { cwd: dst, stdio: "ignore" });
+			gitExecFileSync(["init", "-q"], { cwd: dst, stdio: "ignore" });
 		} catch {}
 	}
 	if (fx.disableServers) {
