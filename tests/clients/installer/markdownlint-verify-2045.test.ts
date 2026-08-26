@@ -12,6 +12,10 @@ vi.mock("../../../clients/sessionstart-logger.js", () => ({
 	logSessionStart: sessionLog,
 }));
 
+import {
+	getDegradationSummary,
+	resetDegradationLedger,
+} from "../../../clients/degradation-ledger.js";
 import { TOOLS, verifyToolBinary } from "../../../clients/installer/index.js";
 import { removeTempDirSync } from "../test-utils.js";
 
@@ -42,6 +46,20 @@ describe("managed markdownlint verification (#2045)", () => {
 		expect(fixture).toContain("markdownlint-cli2 v0.23.2");
 		expect(fixture).toContain("Linting: 1 file");
 		expect(fixture).toContain("Summary: 0 issues in 0 files");
+	});
+
+	it("accepts a transport rescue visible only through the streaming latch", async () => {
+		safeSpawnAsync.mockResolvedValueOnce(
+			result({
+				stderr: "x".repeat(64 * 1024),
+				outputTruncated: true,
+				streamingMatch: true,
+			}),
+		);
+
+		await expect(
+			verifyToolBinary("latch-only-tool", undefined, undefined, 10),
+		).resolves.toBe(true);
 	});
 
 	it.each([
@@ -135,7 +153,12 @@ describe("managed markdownlint verification (#2045)", () => {
 	it("pins effective argv for npm and non-npm verification samples", async () => {
 		safeSpawnAsync.mockClear();
 		safeSpawnAsync.mockResolvedValue(result({ status: 0, error: undefined }));
-		for (const id of ["markdownlint", "svelte-language-server", "mypy"]) {
+		for (const id of [
+			"markdownlint",
+			"svelte-language-server",
+			"@prisma/language-server",
+			"mypy",
+		]) {
 			const tool = TOOLS.find((entry) => entry.id === id);
 			expect(tool).toBeDefined();
 			await verifyToolBinary(id, undefined, undefined, 10, tool!.checkArgs);
@@ -145,8 +168,33 @@ describe("managed markdownlint verification (#2045)", () => {
 			["--no-globs", "-"],
 			["--version"],
 			["--version"],
+			["--version"],
 		]);
 		expect(calls.every((call) => call[2].input === "")).toBe(true);
+	});
+
+	it("bounds retained output for noisy language-server probes", async () => {
+		resetDegradationLedger();
+		safeSpawnAsync.mockResolvedValueOnce(
+			result({ status: 1, outputTruncated: true }),
+		);
+		await verifyToolBinary("intelephense", undefined, undefined, 10, [
+			"--version",
+		]);
+		expect(safeSpawnAsync).toHaveBeenLastCalledWith(
+			process.platform === "win32" ? "intelephense.cmd" : "intelephense",
+			["--version"],
+			expect.objectContaining({
+				maxOutputBytes: 64 * 1024,
+				matchWhileStreaming: expect.any(RegExp),
+			}),
+		);
+		expect(getDegradationSummary()).toEqual([
+			expect.objectContaining({
+				kind: "installer-verification-output-truncated",
+				count: 1,
+			}),
+		]);
 	});
 
 	it.skipIf(!resolveMarkdownlintBinary())(

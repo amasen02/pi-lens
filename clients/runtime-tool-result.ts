@@ -64,6 +64,7 @@ import type { RuntimeCoordinator } from "./runtime-coordinator.js";
 import { syncGitGuardRecord } from "./git-guard.js";
 import { scheduleWordIndexPersist } from "./word-index.js";
 import { RUNTIME_CONFIG } from "./runtime-config.js";
+import { getActiveSessionId } from "./session-lifecycle.js";
 
 const AUTHORITATIVE_CONTENT_MAX_BYTES = RUNTIME_CONFIG.pipeline.lspMaxFileBytes;
 
@@ -1237,7 +1238,15 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			},
 		});
 		dbg(`runPipeline crash stack: ${(pipelineErr as Error).stack}`);
-		if (!getFlag("no-lsp")) {
+		// The LSP fleet is process-wide, but a pipeline crash belongs to one
+		// evaluation. A registered primary owns the fleet; a known secondary
+		// must not tear it down. Keep the historical reset when no registration
+		// exists because synthetic callers and early startup have no role evidence.
+		const activePrimarySessionId = getActiveSessionId();
+		const crashBelongsToPrimary =
+			activePrimarySessionId === undefined ||
+			activePrimarySessionId === runtime.telemetrySessionId;
+		if (!getFlag("no-lsp") && crashBelongsToPrimary) {
 			resetLSPService({ fast: true, reason: "pipeline_crash" });
 		}
 

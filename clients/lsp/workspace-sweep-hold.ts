@@ -41,6 +41,7 @@
  */
 
 import { logLatency } from "../latency-logger.js";
+import { getProcessSingleton } from "../process-singletons.js";
 
 /** Extra headroom beyond the sweep's own wall-clock ceiling before an
  *  idle-reset delay (or the max-hold-age failsafe) trusts that a real sweep
@@ -49,15 +50,29 @@ import { logLatency } from "../latency-logger.js";
  *  budget-shortened) — never a second independently-tunable literal. */
 export const SWEEP_IDLE_SAFETY_MARGIN_MS = 60_000;
 
-let holds = new Map<number, number>(); // holdId -> acquiredAt (Date.now())
-let nextHoldId = 1;
-let idleWaiters: Array<() => void> = [];
+interface WorkspaceSweepHoldState {
+	holds: Map<number, number>;
+	nextHoldId: number;
+	idleWaiters: Array<() => void>;
+}
+
+const WORKSPACE_SWEEP_HOLD_FAMILY = "lsp.workspace-sweep-hold";
+const WORKSPACE_SWEEP_HOLD_VERSION = 1;
+
+function state(): WorkspaceSweepHoldState {
+	return getProcessSingleton(
+		WORKSPACE_SWEEP_HOLD_FAMILY,
+		WORKSPACE_SWEEP_HOLD_VERSION,
+		() => ({ holds: new Map(), nextHoldId: 1, idleWaiters: [] }),
+	);
+}
 
 function flushIdleWaitersIfEmpty(): void {
-	if (holds.size > 0) return;
-	if (idleWaiters.length === 0) return;
-	const waiters = idleWaiters;
-	idleWaiters = [];
+	const current = state();
+	if (current.holds.size > 0) return;
+	if (current.idleWaiters.length === 0) return;
+	const waiters = current.idleWaiters;
+	current.idleWaiters = [];
 	for (const waiter of waiters) {
 		try {
 			waiter();
@@ -80,13 +95,14 @@ export function getWorkspaceSweepMaxHoldAgeMs(): number {
 }
 
 function reapStaleHolds(): void {
-	if (holds.size === 0) return;
+	const current = state();
+	if (current.holds.size === 0) return;
 	const maxAgeMs = getWorkspaceSweepMaxHoldAgeMs();
 	const now = Date.now();
-	for (const [holdId, acquiredAt] of holds) {
+	for (const [holdId, acquiredAt] of current.holds) {
 		const ageMs = now - acquiredAt;
 		if (ageMs <= maxAgeMs) continue;
-		holds.delete(holdId);
+		current.holds.delete(holdId);
 		logLatency({
 			type: "phase",
 			phase: "lsp_workspace_sweep_hold_force_released",
@@ -106,10 +122,11 @@ function reapStaleHolds(): void {
  * force-released (session reset / max-age reap), is a no-op.
  */
 export function acquireWorkspaceSweepHold(): () => void {
-	const holdId = nextHoldId++;
-	holds.set(holdId, Date.now());
+	const current = state();
+	const holdId = current.nextHoldId++;
+	current.holds.set(holdId, Date.now());
 	return () => {
-		if (!holds.delete(holdId)) return;
+		if (!state().holds.delete(holdId)) return;
 		flushIdleWaitersIfEmpty();
 	};
 }
@@ -119,7 +136,7 @@ export function acquireWorkspaceSweepHold(): () => void {
  *  "active" past its own max age. */
 export function isWorkspaceSweepActive(): boolean {
 	reapStaleHolds();
-	return holds.size > 0;
+	return state().holds.size > 0;
 }
 
 /**
@@ -129,11 +146,12 @@ export function isWorkspaceSweepActive(): boolean {
  */
 export function runWhenWorkspaceSweepIdle(cb: () => void): void {
 	reapStaleHolds();
-	if (holds.size === 0) {
+	const current = state();
+	if (current.holds.size === 0) {
 		cb();
 		return;
 	}
-	idleWaiters.push(cb);
+	current.idleWaiters.push(cb);
 }
 
 /**
@@ -146,23 +164,25 @@ export function runWhenWorkspaceSweepIdle(cb: () => void): void {
  * silent.
  */
 export function clearWorkspaceSweepHoldForSessionStart(): void {
-	if (holds.size === 0) return;
+	const current = state();
+	if (current.holds.size === 0) return;
 	logLatency({
 		type: "phase",
 		phase: "lsp_workspace_sweep_hold_session_reset",
 		filePath: "",
 		durationMs: 0,
-		metadata: { clearedHolds: holds.size },
+		metadata: { clearedHolds: current.holds.size },
 	});
-	holds.clear();
+	current.holds.clear();
 	flushIdleWaitersIfEmpty();
 }
 
-/** Test-only: reset the module-scope hold state between tests. */
+/** Test-only: reset the process-singleton hold state between tests. */
 export function _resetWorkspaceSweepHoldForTests(): void {
-	holds = new Map();
-	idleWaiters = [];
-	nextHoldId = 1;
+	const current = state();
+	current.holds.clear();
+	current.idleWaiters = [];
+	current.nextHoldId = 1;
 }
 
 /**

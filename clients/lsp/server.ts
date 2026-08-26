@@ -55,6 +55,7 @@ import { createLombokJdtlsArgs } from "./lombok.js";
 import { resolveJavaRuntimeEnv } from "./jvm-runtime.js";
 import { normalizeMapKey } from "./path-utils.js";
 import { getRubyVersionDirNamesSync } from "./ruby-drive-dirs.js";
+import { getProcessSingleton } from "../process-singletons.js";
 
 // --- Types ---
 
@@ -1367,21 +1368,30 @@ async function findAncestorFileAmong(
  * Svelte). Without this guard an offline or partial install re-runs a 120 s
  * forced reinstall on every spawn.
  *
- * The guard is a plain module-level flag, so without an explicit re-arm it
+ * The guard is process-singleton state, so without an explicit re-arm it
  * would latch for the whole extension-host process — a repair that failed
  * once (transient registry hiccup) would stay unrepairable for every later
  * session in that process. `resetClassicTsRepairGuard` re-arms it; callers
  * wire that into `session_start` alongside the other per-session resets
  * (#1570).
  */
-let classicTsRepairAttempted = false;
+const CLASSIC_TS_REPAIR_FAMILY = "lsp.classic-ts-repair-guard";
+const CLASSIC_TS_REPAIR_VERSION = 1;
+
+function classicTsRepairState(): { attempted: boolean } {
+	return getProcessSingleton(
+		CLASSIC_TS_REPAIR_FAMILY,
+		CLASSIC_TS_REPAIR_VERSION,
+		() => ({ attempted: false }),
+	);
+}
 
 /** Re-arm the classic-repair guard so a new session gets its own attempt. */
 export function resetClassicTsRepairGuard(): void {
-	classicTsRepairAttempted = false;
+	classicTsRepairState().attempted = false;
 }
 
-/** Test hook — clears the per-process classic-repair guard. */
+/** Test hook — clears the process-singleton classic-repair guard. */
 export function _resetClassicTsRepairForTests(): void {
 	resetClassicTsRepairGuard();
 }
@@ -1499,7 +1509,7 @@ async function findTsserverPath(
 		discoveredTsserver ||
 		!discoveredTsc ||
 		!installAllowed ||
-		classicTsRepairAttempted
+		classicTsRepairState().attempted
 	) {
 		return discoveredTsserver;
 	}
@@ -1514,7 +1524,7 @@ async function findTsserverPath(
 	// An older managed tree took `latest` before the registry pinned the classic
 	// compiler. Reinstall the pinned version once so that tree self-heals,
 	// without deleting user or project-local TypeScript installations.
-	classicTsRepairAttempted = true;
+	classicTsRepairState().attempted = true;
 	logSessionStart(
 		`lsp typescript: managed compiler resolved to TypeScript ${discoveredVersion.version}, which ships no tsserver.js; reinstalling pinned classic fallback`,
 	);

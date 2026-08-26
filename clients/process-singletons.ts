@@ -182,11 +182,15 @@ export function getProcessSingletonResets(): readonly ProcessSingletonReset[] {
  *
  * `create()` runs at most once per process per family, unless an incompatible
  * cell forced a reset.
+ *
+ * `onIncompatible` is for values that own external resources. It runs before
+ * the cell is replaced, so the owner can tear those resources down safely.
  */
 export function getProcessSingleton<T extends object>(
 	family: string,
 	version: number,
 	create: () => T,
+	onIncompatible?: (value: unknown) => void,
 ): T {
 	const cells = container();
 	const existing = cells.get(family);
@@ -196,6 +200,7 @@ export function getProcessSingleton<T extends object>(
 		// nine evaluations must not write nine records (AGENTS.md's bounded-record
 		// rule; `recordDegradationOnce` keys on kind + subject).
 		recordIncompatibleCell(family, version, existing as Partial<SingletonCell>);
+		onIncompatible?.((existing as Partial<SingletonCell>).value);
 	}
 	const value = create();
 	cells.set(family, { schema: SINGLETON_SCHEMA, version, value });

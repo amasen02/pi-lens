@@ -89,4 +89,21 @@ describe("safeSpawnAsync ambient abort signal (#197)", () => {
 			Buffer.byteLength(result.stdout) + Buffer.byteLength(result.stderr),
 		).toBeLessThanOrEqual(1024);
 	});
+
+	it("retains late output in the tail after an output-cap kill", async () => {
+		const result = await safeSpawnAsync(
+			NODE,
+			[
+				"-e",
+				"process.stdout.write('h'.repeat(100000)); process.stdout.write('late-rescue');",
+			],
+			{ timeout: 5000, maxOutputBytes: 1024 },
+		);
+
+		expect(result.outputTruncated).toBe(true);
+		expect(`${result.stdout}\n${result.stderr}`).toContain("late-rescue");
+		expect(
+			Buffer.byteLength(result.stdout) + Buffer.byteLength(result.stderr),
+		).toBeLessThanOrEqual(1024);
+	});
 });

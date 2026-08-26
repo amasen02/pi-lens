@@ -119,6 +119,7 @@ import {
 	formatRetirementNote,
 } from "./demoted-finding-render.js";
 import { STALE_LINE_MARKER } from "./stale-marker.js";
+import { getActiveSessionId } from "./session-lifecycle.js";
 import {
 	getWidgetBlockingFilesForSweep,
 	markWidgetFileBlockersStale,
@@ -239,6 +240,20 @@ function scheduleLSPIdleReset(
 	delayMs: number,
 	options: {
 		isCurrentSession?: () => boolean;
+		/**
+		 * #2157 fix round 2: an idle-reset timer armed by a SECONDARY session
+		 * (e.g. a subagent evaluation, `isSubagentSession()`) must not tear down
+		 * a PRIMARY session's shared LSP fleet. `isCurrentSession` alone cannot
+		 * catch this — it only asks whether THIS evaluation's own session
+		 * generation moved on, which stays true for the secondary's own
+		 * generation for its whole (shortened) delay while it fires against the
+		 * fleet the primary is actively using. Mirrors the
+		 * `pipeline_crash`-reset gate in `runtime-tool-result.ts`
+		 * (`getActiveSessionId()` vs `runtime.telemetrySessionId`): undefined
+		 * primary (no registration yet) is fail-safe "belongs to primary", same
+		 * as today's un-gated behavior.
+		 */
+		isPrimarySession?: () => boolean;
 		onError?: (err: unknown) => void;
 	} = {},
 ): void {
@@ -276,6 +291,9 @@ function scheduleLSPIdleReset(
 		}
 		try {
 			if (options.isCurrentSession && !options.isCurrentSession()) {
+				return;
+			}
+			if (options.isPrimarySession && !options.isPrimarySession()) {
 				return;
 			}
 			resetFn();
@@ -480,6 +498,16 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			const sessionGeneration = runtime.sessionGeneration;
 			scheduleLSPIdleReset(resetLSPService, idleResetMs, {
 				isCurrentSession: () => runtime.isCurrentSession(sessionGeneration),
+				// #2157 fix round 2: a secondary (subagent) evaluation's own timer
+				// must not release the primary's shared fleet — see the option's
+				// doc comment on `scheduleLSPIdleReset`.
+				isPrimarySession: () => {
+					const activePrimarySessionId = getActiveSessionId();
+					return (
+						activePrimarySessionId === undefined ||
+						activePrimarySessionId === runtime.telemetrySessionId
+					);
+				},
 				onError: (err) => dbg(`lsp idle reset failed: ${err}`),
 			});
 		}
