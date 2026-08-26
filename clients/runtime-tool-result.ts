@@ -24,7 +24,10 @@ import {
 import type { CacheManager } from "./cache-manager.js";
 import { createFileTime } from "./file-time.js";
 import { publishFormatQueued } from "./format-events-publish.js";
-import { isPathIgnoredByProject } from "./file-utils.js";
+import {
+	invalidateProjectIgnoreMatcherForPath,
+	isPathIgnoredByProject,
+} from "./file-utils.js";
 import type { ReadGuard } from "./read-guard.js";
 import { getFormatService } from "./format-service.js";
 import {
@@ -565,6 +568,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			? rawFilePath
 			: path.resolve(resolutionBasis, rawFilePath)
 		: rawFilePath;
+	if (filePath) invalidateProjectIgnoreMatcherForPath(filePath);
 
 	// Purely diagnostic: tool_call's call-time verdict (computed on ITS OWN
 	// resolved path, which may since have been superseded) disagreed with

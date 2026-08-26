@@ -18,7 +18,11 @@ import {
 	getGlobalIgnorePatterns,
 	getPiLensGlobalConfigPath,
 } from "./lens-config.js";
-import { normalizeEphemeralMapKey, normalizeFilePath } from "./path-utils.js";
+import {
+	isUnderDir,
+	normalizeEphemeralMapKey,
+	normalizeFilePath,
+} from "./path-utils.js";
 import {
 	findPiLensConfigInDir,
 	findPiLensProjectConfig,
@@ -167,6 +171,8 @@ export interface GitignorePattern {
 export interface ProjectIgnoreMatcher {
 	rootDir: string;
 	patterns: GitignorePattern[];
+	/** Drops path verdicts below a changed nested `.gitignore`. */
+	invalidateSubtree(subtree: string): void;
 	isIgnored(filePath: string, isDirectory?: boolean): boolean;
 	/**
 	 * Primes the tracked-files set for `rootDir` (async `git ls-files`,
@@ -409,6 +415,20 @@ function buildProjectIgnoreMatcher(
 		string,
 		{ ignored: boolean; layer: GitignorePatternLayer | undefined }
 	>();
+	const invalidateSubtree = (subtree: string): void => {
+		const resolvedSubtree = path.resolve(subtree);
+		for (const key of patternMemo.keys()) {
+			const memoPath = key.slice(2);
+			const relative = path.relative(resolvedSubtree, memoPath);
+			if (
+				!relative ||
+				(!relative.startsWith("..") && !path.isAbsolute(relative))
+			) {
+				patternMemo.delete(key);
+			}
+		}
+		nestedCache.delete(resolvedSubtree);
+	};
 
 	// Compile expanded gitignore globs once per matcher instance. Relative-path
 	// resolution remains outside this cache, so nested ignore scopes cannot leak
@@ -453,6 +473,7 @@ function buildProjectIgnoreMatcher(
 	return {
 		rootDir: resolvedRoot,
 		patterns,
+		invalidateSubtree,
 		ensureTrackedIndex(): Promise<void> {
 			return collectTrackedFiles(resolvedRoot).then(() => undefined);
 		},
@@ -649,6 +670,29 @@ export function getProjectIgnoreMatcher(rootDir: string): ProjectIgnoreMatcher {
 		matcher,
 	});
 	return matcher;
+}
+
+/**
+ * Invalidate the cached matcher state affected by a written `.gitignore`.
+ *
+ * Root changes discard the whole matcher because they change its base pattern
+ * set. Nested changes evict only verdicts in that directory's subtree; the
+ * matcher and compiled-glob memo remain reusable for unrelated trees.
+ */
+export function invalidateProjectIgnoreMatcherForPath(filePath: string): void {
+	const resolvedPath = path.resolve(filePath);
+	if (path.basename(resolvedPath).toLowerCase() !== ".gitignore") return;
+	for (const [cachedRoot, cached] of projectIgnoreMatcherCache) {
+		if (!isUnderDir(resolvedPath, cachedRoot)) continue;
+		if (
+			normalizeFilePath(resolvedPath) ===
+			normalizeFilePath(path.join(cachedRoot, ".gitignore"))
+		) {
+			projectIgnoreMatcherCache.delete(cachedRoot);
+			continue;
+		}
+		cached.matcher.invalidateSubtree(path.dirname(resolvedPath));
+	}
 }
 
 export function isPathIgnoredByProject(

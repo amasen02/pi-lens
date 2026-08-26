@@ -6,6 +6,7 @@ import { readChangesSince } from "../../clients/project-changes.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { handleToolCall } from "../../clients/runtime-tool-call.js";
 import { handleToolResult } from "../../clients/runtime-tool-result.js";
+import { getProjectIgnoreMatcher } from "../../clients/file-utils.js";
 import {
 	getVerifiedPathAttributionGuessCount,
 	resetVerifiedPathAttributionGuessCount,
@@ -23,6 +24,51 @@ const notifyExternalFileChange = vi.hoisted(() => vi.fn(async () => undefined));
 vi.mock("../../clients/lsp/index.js", () => ({ notifyExternalFileChange }));
 
 describe("bash grep searchReads registration", () => {
+	it("invalidates the ignore matcher through handleToolResult", async () => {
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		vi.mocked(runPipeline).mockResolvedValue({
+			output: "",
+			hasBlockers: false,
+			isError: false,
+			fileModified: false,
+		});
+		const env = setupTestEnvironment("pi-lens-2071-tool-result-");
+		try {
+			const nested = path.join(env.tmpDir, "packages", "app");
+			fs.mkdirSync(nested, { recursive: true });
+			const ignoredPath = path.join(nested, "generated.ts");
+			const ignorePath = path.join(nested, ".gitignore");
+			fs.writeFileSync(ignorePath, "generated.ts\n");
+			const matcher = getProjectIgnoreMatcher(env.tmpDir);
+			expect(matcher.isIgnored(ignoredPath)).toBe(true);
+
+			fs.writeFileSync(ignorePath, "!generated.ts\n");
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			await handleToolResult({
+				event: {
+					toolName: "write",
+					input: { path: ignorePath },
+					content: [{ type: "text", text: "written" }],
+				},
+				getFlag: () => false,
+				dbg: () => {},
+				runtime,
+				cacheManager: { addModifiedRange: () => {}, readTurnState: () => ({}) },
+				biomeClient: {},
+				ruffClient: {},
+				metricsClient: {},
+				resetLSPService: () => {},
+				agentBehaviorRecord: () => [],
+				formatBehaviorWarnings: () => "",
+			} as any);
+
+			expect(matcher.isIgnored(ignoredPath)).toBe(false);
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("registers bash reads only from a successful tool result", async () => {
 		const env = setupTestEnvironment("pi-lens-bash-read-result-");
 		try {
