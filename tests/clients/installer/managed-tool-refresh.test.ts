@@ -101,6 +101,7 @@ import {
 	getDegradationSummary,
 	resetDegradationLedger,
 } from "../../../clients/degradation-ledger.js";
+import type { ToolDefinition } from "../../../clients/installer/index.js";
 import {
 	checkProbeCache,
 	getRefreshableManagedNpmTools,
@@ -911,6 +912,37 @@ describe("observability", () => {
  * a binary the update just replaced or broke.
  */
 describe("post-update verification (review F2)", () => {
+	it("delivers a registry-scoped timeout through npm refresh", async () => {
+		const fixtureTool: ToolDefinition = {
+			id: "refresh-timeout-fixture",
+			name: "Refresh timeout fixture",
+			checkCommand: "refresh-timeout-fixture",
+			checkArgs: ["--version"],
+			verificationTimeoutMs: 30_000,
+			installStrategy: "npm",
+			packageName: "refresh-timeout-fixture",
+			binaryName: "refresh-timeout-fixture",
+		};
+		TOOLS.push(fixtureTool);
+		try {
+			installFixture("refresh-timeout-fixture", "1.0.0");
+			stubSpawn("ok", { "refresh-timeout-fixture": "2.0.0" });
+
+			const outcome = await runManagedToolRefresh(NOW);
+
+			expect(outcome.refreshed[0]).toMatchObject({
+				toolId: "refresh-timeout-fixture",
+				ok: true,
+				verified: true,
+			});
+			expect(verifyOptions).toHaveBeenCalledWith(
+				expect.objectContaining({ timeout: 30_000 }),
+			);
+		} finally {
+			TOOLS.splice(TOOLS.indexOf(fixtureTool), 1);
+		}
+	});
+
 	it("fails the refresh when the updated binary cannot run", async () => {
 		installFixture("knip", "6.4.1");
 		spawnMock.mockImplementation(async (_c: string, args: string[]) => {
