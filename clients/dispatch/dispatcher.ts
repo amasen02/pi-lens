@@ -61,7 +61,7 @@ import { isRunnerSkipReason } from "./types.js";
 
 const dispatcherProbeFlights = createAvailabilityProbeFlight<
 	Awaited<ReturnType<typeof safeSpawnAsync>>
->({ generation: getDispatchAvailabilityGeneration });
+>({ generation: () => getDispatchAvailabilityGeneration() });
 import type {
 	Diagnostic,
 	DispatchContext,

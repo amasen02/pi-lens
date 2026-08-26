@@ -533,7 +533,6 @@ const checkerProbeFlights = createAvailabilityProbeFlight<
 	Awaited<ReturnType<typeof safeSpawnAsync>>
 >({ generation: getDispatchAvailabilityGeneration });
 
-/** Find a binary installed by the release-managed `~/.pi-lens/bin` tier. */
 export function recordAvailabilityProbeOverrun(
 	tool: string,
 	key: string,
@@ -813,6 +812,7 @@ export function resetDispatchAvailabilityState(): void {
 	availabilityGeneration.bump();
 	checkerProbeFlights.clear();
 	cwdProbeFlights.clear();
+	// The generation bump invalidates dispatcherProbeFlights in its owner module.
 }
 
 /** What the last probe for a cwd decided, for messaging and telemetry (#1467). */

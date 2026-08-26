@@ -46,6 +46,10 @@ export interface ToolchainAvailability {
 	isAvailable: () => Promise<boolean>;
 }
 
+const toolchainProbeFlights = createAvailabilityProbeFlight<
+	Awaited<ReturnType<typeof probeAvailabilityCandidates>>
+>();
+
 /**
  * Own one toolchain's availability: sweep the platform candidate list, memoize
  * the path that answered, and park the verdict behind the shared latch so a
@@ -64,17 +68,13 @@ export function createToolchainAvailability(
 	/** What the last classified candidate returned, for the decision record. */
 	let sweepEvidence: ProbeEvidence | undefined;
 	const ensureFlight = createSingleFlight<boolean>();
-	const probeFlights =
-		createAvailabilityProbeFlight<
-			Awaited<ReturnType<typeof probeAvailabilityCandidates>>
-		>();
 
 	async function findPath(): Promise<string | null> {
 		if (toolPath) return toolPath;
 
 		const paths =
 			process.platform === "win32" ? config.windowsPaths : config.unixPaths;
-		const shared = probeFlights.run(
+		const shared = toolchainProbeFlights.run(
 			`toolchain:${config.tool}|${config.probeArgs.join("|")}|${config.windowsPaths.join("|")}|${config.unixPaths.join("|")}`,
 			() =>
 				probeAvailabilityCandidates(paths, config.probeArgs, config.budgetMs),
