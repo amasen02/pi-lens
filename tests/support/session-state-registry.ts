@@ -275,7 +275,7 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 	{
 		id: "workspace-sweep-hold:holds",
 		module: "lsp/workspace-sweep-hold.ts",
-		state: "holds, idleWaiters, nextHoldId",
+		state: "process-singleton holds, idleWaiters, nextHoldId",
 		policy: "session_start",
 		resetName: "clearWorkspaceSweepHoldForSessionStart",
 		reason:
@@ -1080,7 +1080,7 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"lsp/spawn-history.ts": 1,
 	"lsp/server.ts": 6,
 	"lsp/workspace-diagnostics-cache.ts": 1,
-	"lsp/workspace-sweep-hold.ts": 1,
+	"lsp/workspace-sweep-hold.ts": 0,
 	"mcp/analyze.ts": 1,
 	"mcp/session.ts": 2,
 	"module-report-lsp.ts": 1,

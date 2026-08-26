@@ -50,6 +50,7 @@
 import { createHash } from "node:crypto";
 import { lazyEnvNumber } from "./env-utils.js";
 import { logLatency } from "./latency-logger.js";
+import { compareOrdinal } from "./string-utils.js";
 
 interface AssistantMessageLike {
 	role?: unknown;
@@ -729,7 +730,7 @@ function boundedHashObject(
 	state: BoundedHashState,
 ): string {
 	const keys = Object.keys(value).sort((left, right) =>
-		left.localeCompare(right),
+		compareOrdinal(left, right),
 	);
 	if (keys.length > 24) state.contentTruncated = true;
 	const fields = keys

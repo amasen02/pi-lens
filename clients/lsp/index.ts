@@ -81,6 +81,7 @@ import {
 	getSessionRootsForTelemetry,
 	isOutsideAllSessionRoots,
 } from "./session-roots.js";
+import { getProcessSingleton } from "../process-singletons.js";
 import { getLanguageId } from "./language.js";
 import type { LSPServerInfo } from "./server.js";
 import {
@@ -1127,7 +1128,6 @@ async function collectWorkspaceDiagnosticFiles(
 // --- Service ---
 
 export class LSPService {
-	private readonly sessionCwd: string | undefined;
 	private state: LSPState;
 	private readonly workspaceProbeLogged = new Set<string>();
 	/** Per-service immutable root-boundary verdicts; root detectors cache hits too. */
@@ -1340,9 +1340,8 @@ export class LSPService {
 	 */
 	private generationHandoff: Promise<void> | undefined;
 
-	constructor(generationHandoff?: Promise<void>, sessionCwd?: string) {
+	constructor(generationHandoff?: Promise<void>) {
 		this.generationHandoff = generationHandoff;
-		this.sessionCwd = sessionCwd;
 		this.state = {
 			clients: new Map(),
 			servers: new Map(),
@@ -3477,7 +3476,6 @@ export class LSPService {
 				serverId: server.id,
 				process: spawned.process,
 				root,
-				sessionCwd: this.sessionCwd,
 				initialization: mergedInit,
 				initializeTimeoutMs: server.initializeTimeoutMs,
 				launchVariant: spawned.launchVariant,
@@ -8708,22 +8706,59 @@ export class LSPService {
 
 // --- Singleton Instance ---
 
-let globalLSPService: LSPService | null = null;
+interface LSPProcessState {
+	service: LSPService | null;
+	generationHandoff: Promise<void> | undefined;
+}
+
+const LSP_PROCESS_FAMILY = "lsp.service";
+const LSP_PROCESS_VERSION = 1;
+
+function lspProcessState(): LSPProcessState {
+	let incompatibleHandoff: Promise<void> | undefined;
+	return getProcessSingleton(
+		LSP_PROCESS_FAMILY,
+		LSP_PROCESS_VERSION,
+		() => ({ service: null, generationHandoff: incompatibleHandoff }),
+		(value) => {
+			// Shut down a live incompatible service before replacing its cell.
+			if (!value || typeof value !== "object") return;
+			const candidate = value as {
+				service?: {
+					shutdown?: (options: LSPShutdownOptions) => Promise<void>;
+				} | null;
+				generationHandoff?: Promise<void>;
+			};
+			const previousHandoff = candidate.generationHandoff;
+			const teardown = candidate.service?.shutdown
+				? candidate.service
+						.shutdown({ fast: true, reason: "process_singleton_reset" })
+						.catch(() => undefined)
+				: undefined;
+			if (previousHandoff && teardown) {
+				incompatibleHandoff = Promise.allSettled([
+					previousHandoff,
+					teardown,
+				]).then(() => undefined);
+			} else {
+				incompatibleHandoff = previousHandoff ?? teardown;
+			}
+		},
+	);
+}
+
+function processService(): LSPService {
+	const state = lspProcessState();
+	if (!state.service) state.service = new LSPService(state.generationHandoff);
+	return state.service;
+}
 /**
  * #850: all singleton generations whose teardown is still pending. A new
  * generation may be allocated synchronously, but its first spawn waits on this
  * handoff so two generations can never own the same server/root concurrently.
  */
-let globalLSPGenerationHandoff: Promise<void> | undefined;
-
 export function getLSPService(): LSPService {
-	if (!globalLSPService) {
-		globalLSPService = new LSPService(
-			globalLSPGenerationHandoff,
-			process.cwd(),
-		);
-	}
-	return globalLSPService;
+	return processService();
 }
 
 /**
@@ -8763,8 +8798,9 @@ export function resetLSPService(options: LSPShutdownOptions = {}): void {
 		// hide behind a leaked/stuck guard from the generation before it.
 		clearWorkspaceSweepHoldForSessionStart();
 	}
-	const retiringService = globalLSPService;
-	globalLSPService = null;
+	const state = lspProcessState();
+	const retiringService = state.service;
+	state.service = null;
 	if (!retiringService) return;
 
 	// shutdown() marks the service destroyed synchronously before its first
@@ -8773,14 +8809,14 @@ export function resetLSPService(options: LSPShutdownOptions = {}): void {
 	// its predecessor. allSettled keeps teardown best-effort without ever
 	// rejecting (and therefore permanently poisoning) the next generation.
 	const teardown = retiringService.shutdown(options);
-	const pending = globalLSPGenerationHandoff
-		? [globalLSPGenerationHandoff, teardown]
+	const pending = state.generationHandoff
+		? [state.generationHandoff, teardown]
 		: [teardown];
 	const handoff = Promise.allSettled(pending).then(() => undefined);
-	globalLSPGenerationHandoff = handoff;
+	state.generationHandoff = handoff;
 	void handoff.then(() => {
-		if (globalLSPGenerationHandoff === handoff) {
-			globalLSPGenerationHandoff = undefined;
+		if (state.generationHandoff === handoff) {
+			state.generationHandoff = undefined;
 		}
 	});
 }

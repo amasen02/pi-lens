@@ -26,6 +26,10 @@ import {
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { SESSION_START_GUIDANCE } from "../../clients/runtime-session.js";
 import {
+	registerPrimarySession,
+	releasePrimarySession,
+} from "../../clients/session-lifecycle.js";
+import {
 	cancelLSPIdleReset,
 	getEffectiveLspIdleResetMs,
 	handleTurnEnd,
@@ -231,6 +235,69 @@ describe("LSP idle reset", () => {
 			cancelLSPIdleReset();
 			vi.useRealTimers();
 			emitWarning.mockRestore();
+			env.cleanup();
+		}
+	});
+
+	// #2157 fix round 2: the idle-reset timer must respect the SAME
+	// primary-registration gate as the `pipeline_crash` reset in
+	// `runtime-tool-result.ts` — a secondary (subagent) evaluation's own idle
+	// timer must not tear down the primary's shared fleet, while the primary's
+	// own idle timer must still reset it (both directions asserted).
+	it("does not let a secondary session's idle timer reset the primary fleet", async () => {
+		const env = setupTestEnvironment("pi-lens-idle-secondary-");
+		const runtime = new RuntimeCoordinator();
+		const cacheManager = new CacheManager(false);
+		const resetLSPService = vi.fn();
+
+		registerPrimarySession({}, "primary-session", env.tmpDir);
+		runtime.setSessionLifecycle({ sessionId: "secondary-session" });
+
+		vi.useFakeTimers();
+		try {
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, {
+					ctxCwd: env.tmpDir,
+					resetLSPService,
+				}),
+			);
+
+			await vi.advanceTimersByTimeAsync(getEffectiveLspIdleResetMs());
+
+			expect(resetLSPService).not.toHaveBeenCalled();
+		} finally {
+			cancelLSPIdleReset();
+			releasePrimarySession();
+			vi.useRealTimers();
+			env.cleanup();
+		}
+	});
+
+	it("still resets the fleet when the PRIMARY session's own idle timer fires", async () => {
+		const env = setupTestEnvironment("pi-lens-idle-primary-");
+		const runtime = new RuntimeCoordinator();
+		const cacheManager = new CacheManager(false);
+		const resetLSPService = vi.fn();
+
+		runtime.setSessionLifecycle({ sessionId: "primary-session" });
+		registerPrimarySession({}, "primary-session", env.tmpDir);
+
+		vi.useFakeTimers();
+		try {
+			await handleTurnEnd(
+				makeTurnEndDeps(runtime, cacheManager, {
+					ctxCwd: env.tmpDir,
+					resetLSPService,
+				}),
+			);
+
+			await vi.advanceTimersByTimeAsync(getEffectiveLspIdleResetMs());
+
+			expect(resetLSPService).toHaveBeenCalledTimes(1);
+		} finally {
+			cancelLSPIdleReset();
+			releasePrimarySession();
+			vi.useRealTimers();
 			env.cleanup();
 		}
 	});

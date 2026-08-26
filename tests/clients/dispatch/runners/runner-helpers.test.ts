@@ -314,6 +314,71 @@ describe("runner-helpers availability checker", () => {
 		}
 	});
 
+	it("keys the checker flight by code-unit order, not locale (#2155, #2165)", async () => {
+		const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
+		let releaseProbe!: (value: unknown) => void;
+		const pendingProbe = new Promise((resolve) => {
+			releaseProbe = resolve;
+		});
+		vi.mocked(safeSpawnMod.safeSpawnAsync).mockReturnValue(
+			pendingProbe as never,
+		);
+
+		// Two independent checker instances probing the SAME command in the
+		// SAME cwd with the SAME env content share one flight-registry key
+		// space (module-scoped `checkerProbeFlights`). Their env objects here
+		// carry identical entries, so a locale-independent key must join them
+		// into one physical probe regardless of what `localeCompare` says.
+		const env = { AAA: "1", BBB: "2" };
+		const checkerA = createAvailabilityChecker(
+			"dupe-locale-tool",
+			"",
+			["--version"],
+			{ environment: async () => ({ ...env }) },
+		);
+		const checkerB = createAvailabilityChecker(
+			"dupe-locale-tool",
+			"",
+			["--version"],
+			{ environment: async () => ({ ...env }) },
+		);
+
+		const realLocaleCompare = String.prototype.localeCompare;
+		try {
+			// Simulate "locale 1": AAA sorts before BBB.
+			String.prototype.localeCompare = function (this: string, that: string) {
+				if (this === "AAA" && that === "BBB") return -1;
+				if (this === "BBB" && that === "AAA") return 1;
+				return realLocaleCompare.call(this, that);
+			};
+			const first = checkerA.isAvailableAsync(process.cwd());
+			await vi.waitFor(() =>
+				expect(safeSpawnMod.safeSpawnAsync).toHaveBeenCalledTimes(1),
+			);
+
+			// Simulate "locale 2": the same two keys sort in the OPPOSITE order.
+			// A real second process under a different OS locale can see exactly
+			// this. `env` itself is untouched — only the comparator "moved".
+			String.prototype.localeCompare = function (this: string, that: string) {
+				if (this === "AAA" && that === "BBB") return 1;
+				if (this === "BBB" && that === "AAA") return -1;
+				return realLocaleCompare.call(this, that);
+			};
+			const second = checkerB.isAvailableAsync(process.cwd());
+			// Let the second call's async prefix (findCommand's fs walk) settle
+			// before asserting it did or didn't start a second physical probe.
+			await new Promise((resolve) => setTimeout(resolve, 100));
+
+			expect(safeSpawnMod.safeSpawnAsync).toHaveBeenCalledTimes(1);
+
+			releaseProbe({ stdout: "1.0.0", stderr: "", status: 0 });
+			expect(await first).toBe(true);
+			expect(await second).toBe(true);
+		} finally {
+			String.prototype.localeCompare = realLocaleCompare;
+		}
+	});
+
 	it("does not let an old in-flight probe delete a newer generation", async () => {
 		const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
 		let releaseOld!: (value: unknown) => void;

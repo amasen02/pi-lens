@@ -136,6 +136,19 @@ describe("workspace sweep hold (#1618 review round 1)", () => {
 		expect(isWorkspaceSweepActive()).toBe(false);
 	});
 
+	it("2b. a second module evaluation sees the first evaluation's hold", async () => {
+		const first = await import("../../../clients/lsp/workspace-sweep-hold.js");
+		vi.resetModules();
+		const second = await import("../../../clients/lsp/workspace-sweep-hold.js");
+		const release = first.acquireWorkspaceSweepHold();
+
+		expect(second).not.toBe(first);
+		expect(second.isWorkspaceSweepActive()).toBe(true);
+
+		release();
+		expect(second.isWorkspaceSweepActive()).toBe(false);
+	});
+
 	it("3. releasing the same hold twice is a no-op — it never affects a later, unrelated hold", () => {
 		const release = acquireWorkspaceSweepHold();
 		release();

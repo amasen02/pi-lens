@@ -222,6 +222,10 @@ This is the payoff of the two disciplines above: a bounded checklist of defect *
 24. **A second writer added to a shared field without a discriminator.** The #1631/#1641 fix PRs' `WidgetDiagnostic.stale` collision combined demote-and-exclude with demote-but-keep-tally semantics; each fix was green alone, but the incompatibility surfaced only when their branches composed (#1633/#1703). *Screen:* when your change adds a second writer to an existing field: name every existing writer (grep the field's assignments); add a reason/kind discriminator with per-writer semantics BEFORE either lands; prove composition by running the other in-flight PR's test files on a locally merged tree — never by reasoning about different structures.
 25. **A process-uniqueness assumption held in module scope.** pi evaluates the pi-lens module graph MORE THAN ONCE per process — source and compiled entries load through separate graphs, in-process subagent binds re-enter the extension loader, and dogfood pass 3 measured one pid emitting `host_boot` nine times. Every module-scope `let` therefore exists N times, so any state whose correctness depends on being the process's only copy silently breaks, and a guard built on it becomes unreachable rather than wrong. The #2133 session-start guard was correct and never fired: evaluation 2 read an empty registration, classified a subagent temp root as `primary`, and ran the full battery (three identical word-index rebuilds, 240.8s of CPU for one index). The instance registry's single mutation tail became N tails and tore `instances.json` (#2146). *Screen:* when you add module-scope state, ask whether a SECOND copy of it in the same process would be merely wasteful or actually wrong. Registrations, serialization points, and once-per-process latches are wrong: put them behind `getProcessSingleton` (`clients/process-singletons.ts`) with a family version, and make the test-reset clear the GLOBAL state. Memos that re-derive the same answer from a stable source (an env read, a host probe) stay at module scope. *Detect:* a test that evaluates the module twice (`vi.resetModules()` + dynamic import) and asserts the second instance sees the first's state; `host_boot.metadata.evaluationOrdinal` in `latency.log` proves multi-evaluation in production.
 
+For process singletons that own live child processes, an incompatible cell must
+call the owner's teardown seam before replacement and carry its pending handoff
+into the replacement. The LSP service uses this rule in `lsp/index.ts` so a
+schema reset cannot orphan a server fleet.
 
 ### AI-authorship smells
 
@@ -272,6 +276,15 @@ touch; each paragraph carries its evidence issue. New entries join their
 group (see the placement rules in "Maintaining this file").
 
 ### LSP: acquisition, touches, waits, and diagnostics
+
+The live LSP service, generation handoff, workspace-sweep hold state, and
+classic TypeScript repair latch use separate versioned families in
+`getProcessSingleton`. The service's incompatible-cell teardown uses
+`shutdown({ fast: true, reason: "process_singleton_reset" })`; the sweep hold
+and repair latch reset through their shared process state, not module copies.
+Pipeline-crash teardown is destructive only for the registered primary session;
+when no primary registration exists, the legacy reset remains the fail-safe.
+(#2157, #2174)
 
 Pull-diagnostics request deadlines send `$/cancelRequest`, but cancellation is
 advisory. While a cancelled request remains unsettled, admission blocks another
@@ -596,6 +609,13 @@ and avoids a nested-file stat on every `isIgnored` verdict. IDE edits, checkout
 or merge restoration, and writes under already-ignored directories remain
 outside the tool-result producer and are tracked by the freshness-probe issue.
 (#2071)
+
+Consumed nested `.gitignore` sources carry their build-time `mtimeMs` and size
+in the project matcher cache. `getProjectIgnoreMatcher` sweeps those sources
+at most once per root per two-second cadence and routes drift, including
+deletion, through `invalidateProjectIgnoreMatcherForPath`; newly discovered
+sources append to the baseline without replacing existing signatures, and it
+never stats on `isIgnored` verdicts. (#2159)
 
 Knip's dispatch memo is instance-owned and keyed by canonical project root plus
 the runtime's monotonic project sequence. Only callers that supply that content
@@ -1137,6 +1157,15 @@ or `resolveManagedToolClient` when an ordered candidate chain must be preserved.
 Thread `getManagedToolEnvironment(tool, cwd)` into probes/spawns. Direct
 `ensureTool()` calls and bare managed-tool spawns outside the sanctioned wrapper
 surfaces are guarded by `tests/clients/managed-tool-seam-coverage.test.ts`.
+
+Managed language-server verification arguments are registry-owned and must
+finish within the installer budget against the real binary. Choose a faster
+argument such as `--help` only when a real-binary A/B reproduces a benefit;
+otherwise retain the tool's established probe and leave the cold-path question
+explicitly open.
+`verifyToolBinary` retains at most 64 KiB of child output; output-cap episodes
+use the `installer-verification-output-truncated` degradation kind and
+`recordDegradationOnce` so noisy probes remain bounded and identifiable.
 
 Installer package-manager and archive-extraction subprocesses must use
 `safeSpawnAsync` with `lifetimeCoupled: true` and `ignoreAmbientSignal: true`.
@@ -1937,6 +1966,7 @@ session-scoped state at `session_start`. Keep tier flips and repeated slow
 observations bounded through the latency logger and degradation ledger.
 
 - **Use `safeSpawnAsync()` for all subprocess work** in hook/dispatch/install paths. The sync `safeSpawn()` is deprecated, blocks the Node event loop, and is now reachable only from the cached `TestRunnerClient.detectRunner` `which pytest` probe. Don't add new sync `safeSpawn` callers.
+- **Streaming output matches in `safeSpawnAsync()`** use `matchWhileStreaming` for bounded rescue detection before and after output-cap retention. While the matcher is armed and unmatched, the cap discards output beyond the retention budget but defers the cap kill; the caller's own timeout is the time bound. Once the matcher matches, or when no matcher is armed, the existing kill-on-cap behavior applies. This keeps memory bounded but makes the wait time-unbounded within the spawn seam, so every such caller must provide its own timeout. Carry the last `pattern.length - 1` bytes across chunks so a split match remains detectable, and preserve `streamingMatch` on error results.
 - **The hot per-edit path is the dispatch runners** (`clients/dispatch/runners/*`), not the legacy per-tool client classes (`biome-client`, `ruff-client`, `rust-client`, `ast-grep-client`, …). Those classes historically carried a *parallel sync surface* (`checkFile`/`fixFile`/`isAvailable`/`findCargoPath`/…) that the async runners superseded; #197 found almost all of it **dead** and deleted ~1600 lines. **Lesson: when you find a sync client method, grep its real callers before "converting" it — the answer is usually "delete," and the live path already has an `*Async` twin** (`fixFileAsync`, `ensureAvailable`, `runTestFileAsync`, `tempScanAsync`, `findGoPathAsync`).
 - **Ambient turn abort signal (#197):** `safeSpawnAsync` defaults its `AbortSignal` to a module-level ambient signal (`setAmbientAbortSignal` in `clients/safe-spawn.ts`). The lifecycle handlers (`tool_result`, `agent_end`, `turn_end`) publish pi's `ctx.signal` at entry and clear it in `finally`, so an Esc/interrupt kills in-flight linter/format/type-check children (process-tree kill on Windows) without threading a signal through every call site. The signal is captured at spawn time, so clearing it only affects future spawns. Pass `ignoreAmbientSignal: true` for **installs** (gem/go/dotnet/rustup) so they run to completion even if the turn is interrupted — matching the old uncancellable sync behaviour; an explicit `options.signal` always wins.
 - Expensive project scans have in-flight guards: Knip by project root, jscpd by project root + scan params, Madge by project root/file or project root scan.

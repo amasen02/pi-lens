@@ -188,6 +188,17 @@ export interface ProjectIgnoreMatcher {
 	ensureTrackedIndex(): Promise<void>;
 }
 
+interface IgnoreSource {
+	path: string;
+	mtimeMs: number;
+	size: number;
+}
+
+type ProjectIgnoreMatcherWithFreshness = ProjectIgnoreMatcher & {
+	getConsumedIgnoreSources(): readonly IgnoreSource[];
+	refreshConsumedIgnoreSource(filePath: string): void;
+};
+
 function resolveGitIgnoreRoot(startDir: string): string {
 	const fallback = path.resolve(startDir);
 	let current = fallback;
@@ -335,7 +346,13 @@ function ancestorDirsBetween(rootDir: string, targetDir: string): string[] {
 function buildProjectIgnoreMatcher(
 	resolvedRoot: string,
 	patterns: GitignorePattern[],
-): ProjectIgnoreMatcher {
+): ProjectIgnoreMatcherWithFreshness {
+	const consumedIgnoreSources = new Map<string, IgnoreSource>();
+	const rememberIgnoreSource = (filePath: string): void => {
+		const signature = fileFreshnessSignature(filePath);
+		consumedIgnoreSources.set(filePath, { path: filePath, ...signature });
+	};
+	rememberIgnoreSource(path.join(resolvedRoot, ".gitignore"));
 	const nestedCache = new Map<
 		string,
 		{
@@ -359,6 +376,7 @@ function buildProjectIgnoreMatcher(
 	const patternsForDir = (dir: string): GitignorePattern[] => {
 		if (dir === resolvedRoot) return patterns;
 		const gitignoreSig = gitignoreSignature(dir);
+		rememberIgnoreSource(path.join(dir, ".gitignore"));
 		// #1105: gate on size too. `findPiLensConfigInDir` returns `size` alongside
 		// `mtimeMs` (both from one stat), and `gitignoreSignature` reads both for
 		// the nested `.gitignore`, so an mtime-preserving, length-changing edit to
@@ -473,6 +491,11 @@ function buildProjectIgnoreMatcher(
 	return {
 		rootDir: resolvedRoot,
 		patterns,
+		getConsumedIgnoreSources: () => [...consumedIgnoreSources.values()],
+		refreshConsumedIgnoreSource(filePath: string): void {
+			// The freshness sweep refreshes this baseline after invalidation.
+			if (consumedIgnoreSources.has(filePath)) rememberIgnoreSource(filePath);
+		},
 		invalidateSubtree,
 		ensureTrackedIndex(): Promise<void> {
 			return collectTrackedFiles(resolvedRoot).then(() => undefined);
@@ -545,7 +568,7 @@ export function createProjectIgnoreMatcher(
 	rootDir: string,
 	extraPatterns: string[] = [],
 	globalPatterns: string[] = [],
-): ProjectIgnoreMatcher {
+): ProjectIgnoreMatcherWithFreshness {
 	const resolvedRoot = resolveGitIgnoreRoot(rootDir);
 	// Precedence is gitignore order: LATER patterns override earlier ones. So
 	// global (lowest) → project .gitignore → project .pi-lens.json (highest),
@@ -564,6 +587,8 @@ export function createProjectIgnoreMatcher(
 const projectIgnoreMatcherCache = new Map<
 	string,
 	{
+		ignoreSources: IgnoreSource[];
+		lastIgnoreFreshnessCheckMs: number;
 		gitignoreMtimeMs: number;
 		/** #1105 second axis for the root `.gitignore` (see FreshnessSignature). */
 		gitignoreSize: number;
@@ -577,9 +602,12 @@ const projectIgnoreMatcherCache = new Map<
 		globalConfigMtimeMs: number;
 		/** #1105 second axis for the global `~/.pi-lens/config.json`. */
 		globalConfigSize: number;
-		matcher: ProjectIgnoreMatcher;
+		matcher: ProjectIgnoreMatcherWithFreshness;
 	}
 >();
+
+/** Nested ignore sources are checked at most once per root per cadence window. */
+export const PROJECT_IGNORE_FRESHNESS_CADENCE_MS = 2_000;
 
 /**
  * `size:mtimeMs` freshness signature for a single file (#1105). mtime alone
@@ -612,6 +640,13 @@ function gitignoreSignature(rootDir: string): FreshnessSignature {
 	return fileFreshnessSignature(path.join(rootDir, ".gitignore"));
 }
 
+function hasIgnoreSourceDrift(sources: readonly IgnoreSource[]): boolean {
+	return sources.some((source) => {
+		const current = fileFreshnessSignature(source.path);
+		return current.mtimeMs !== source.mtimeMs || current.size !== source.size;
+	});
+}
+
 /**
  * The project config file found by the same upward walk as the loader. Cache
  * invalidation must track the actual file found, not only a file directly under
@@ -637,6 +672,38 @@ export function getProjectIgnoreMatcher(rootDir: string): ProjectIgnoreMatcher {
 	const globalSig = globalConfigSignature();
 	const cached = projectIgnoreMatcherCache.get(resolvedRoot);
 	if (
+		cached &&
+		Date.now() - cached.lastIgnoreFreshnessCheckMs >=
+			PROJECT_IGNORE_FRESHNESS_CADENCE_MS
+	) {
+		cached.lastIgnoreFreshnessCheckMs = Date.now();
+		if (hasIgnoreSourceDrift(cached.ignoreSources)) {
+			for (const source of cached.ignoreSources) {
+				if (hasIgnoreSourceDrift([source])) {
+					const sourceIndex = cached.ignoreSources.findIndex(
+						(cachedSource) => cachedSource.path === source.path,
+					);
+					invalidateProjectIgnoreMatcherForPath(source.path);
+					cached.matcher.refreshConsumedIgnoreSource(source.path);
+					const refreshedSource = cached.matcher
+						.getConsumedIgnoreSources()
+						.find((current) => current.path === source.path);
+					if (sourceIndex !== -1 && refreshedSource !== undefined) {
+						cached.ignoreSources.splice(sourceIndex, 1, refreshedSource);
+					}
+				}
+			}
+		}
+	}
+	// A path can be discovered during the previous matcher lookup. Publish only
+	// previously unseen sources so a walk cannot replace a pre-edit baseline.
+	if (cached) {
+		const known = new Set(cached.ignoreSources.map((source) => source.path));
+		for (const source of cached.matcher.getConsumedIgnoreSources()) {
+			if (!known.has(source.path)) cached.ignoreSources.push(source);
+		}
+	}
+	if (
 		cached?.gitignoreMtimeMs === gitignoreSig.mtimeMs &&
 		cached?.gitignoreSize === gitignoreSig.size &&
 		cached?.lensConfigPath === lensConfig.path &&
@@ -660,6 +727,8 @@ export function getProjectIgnoreMatcher(rootDir: string): ProjectIgnoreMatcher {
 		getGlobalIgnorePatterns(),
 	);
 	projectIgnoreMatcherCache.set(resolvedRoot, {
+		ignoreSources: [...matcher.getConsumedIgnoreSources()],
+		lastIgnoreFreshnessCheckMs: Date.now(),
 		gitignoreMtimeMs: gitignoreSig.mtimeMs,
 		gitignoreSize: gitignoreSig.size,
 		lensConfigPath: lensConfig.path,

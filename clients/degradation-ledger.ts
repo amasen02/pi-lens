@@ -25,6 +25,8 @@ export type DegradationKind =
 	| "mode-suppression"
 	| "ts-idle-eviction"
 	| "spawn-failure"
+	/** A managed-tool verification probe exceeded its retained output bound. */
+	| "installer-verification-output-truncated"
 	/** A git ls-files collection was truncated before parsing completed (#2075). */
 	| "git-tracked-ignore-truncated"
 	| "formatter-skip"

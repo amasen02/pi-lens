@@ -8,6 +8,7 @@ import { normalizeMapKey } from "../path-utils.js";
 import { loadReverseDependencyIndexFromSnapshot } from "../reverse-deps.js";
 import { freshnessFromMtime } from "../freshness.js";
 import { logLatency } from "../latency-logger.js";
+import { compareOrdinal } from "../string-utils.js";
 import { workspaceDiagnosticsCacheSessionStart } from "./workspace-diagnostics-session.js";
 import type { LSPDiagnostic } from "./client.js";
 import {
@@ -478,7 +479,7 @@ export function buildScopeKey(
 	excludeServerIds?: readonly string[],
 ): string {
 	const excluded = excludeServerIds
-		? [...excludeServerIds].sort((a, b) => a.localeCompare(b))
+		? [...excludeServerIds].sort(compareOrdinal)
 		: [];
 	return `${clientScope}|${excluded.join(",")}`;
 }
