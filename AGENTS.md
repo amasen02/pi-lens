@@ -577,6 +577,12 @@ and only `lsp_server_spawned` answers "how many servers did we start".
 
 ### Dispatch, runners, formatters, and installer
 
+The project ignore matcher keeps its per-path verdict memo hot between edits.
+The write-result seam calls `invalidateProjectIgnoreMatcherForPath` for a
+`.gitignore` mutation: root changes rebuild the matcher, while nested changes
+evict only that directory's subtree. This preserves compiled-glob reuse and
+avoids a nested-file stat on every `isIgnored` verdict. (#2071)
+
 Knip's dispatch memo is instance-owned and keyed by canonical project root plus
 the runtime's monotonic project sequence. Only callers that supply that content
 generation may reuse a successful result; explicit fresh-analysis callers omit
