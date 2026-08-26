@@ -99,7 +99,9 @@ import { getLSPService } from "./lsp/index.js";
 import {
 	drainPendingAuxiliaryCoverage,
 	isPendingAuxiliaryPastRearmTtl,
-	markPendingAuxiliaryCoverage,
+	rearmPendingAuxiliaryCoverage,
+	MAX_LATE_AUX_REARMS,
+	pendingAuxiliaryCoverageSize,
 } from "./lsp/pending-aux-coverage.js";
 import type { LSPDiagnostic } from "./lsp/client.js";
 import { convertLspDiagnostics } from "./dispatch/utils/lsp-diagnostics.js";
@@ -2353,6 +2355,11 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	let lateAuxRearmed = 0;
 	let lateAuxClientGone = 0;
 	let lateAuxProbeFailed = 0;
+	let lateAuxCleanConfirmed = 0;
+	let lateAuxExpired = 0;
+	let lateAuxCeilingExhausted = 0;
+	let lateAuxAnswered = 0;
+	const lateAuxStuckPairs: Array<{ filePath: string; serverId: string }> = [];
 	if (drainedPairs.length > 0) {
 		const byFile = new Map<string, typeof drainedPairs>();
 		for (const pair of drainedPairs) {
@@ -2363,7 +2370,10 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		try {
 			const service = getLSPService();
 			for (const [lateAuxPath, pairs] of byFile) {
-				let cached: Map<string, LSPDiagnostic[]>;
+				let cached: Map<
+					string,
+					{ diags: LSPDiagnostic[]; publishedAt?: number }
+				>;
 				try {
 					cached = await service.readCachedDiagnosticsForServers(
 						lateAuxPath,
@@ -2372,25 +2382,22 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				} catch {
 					// #2027 round-1 P3-2: count dropped pairs — never silent.
 					lateAuxProbeFailed += pairs.length;
-					for (const pair of pairs) {
-						markPendingAuxiliaryCoverage(
-							pair.filePath,
-							[pair.serverId],
-							Date.now(),
-						);
-					}
 					continue;
 				}
 				const displayLateAuxPath = toRunnerDisplayPath(cwd, lateAuxPath);
 				for (const pair of pairs) {
-					const rawDiags = cached.get(pair.serverId);
-					if (rawDiags === undefined) {
+					const cachedEntry = cached.get(pair.serverId);
+					if (cachedEntry === undefined) {
 						// No live client for this server any more — best-effort probe,
 						// drop the pair silently.
 						lateAuxClientGone += 1;
 						continue;
 					}
-					if (rawDiags.length === 0) {
+					const rawDiags = cachedEntry.diags;
+					if (
+						cachedEntry.publishedAt === undefined ||
+						cachedEntry.publishedAt <= pair.markedAtMs
+					) {
 						// Still scanning (or published nothing yet) — keep waiting
 						// so a scan finishing before the NEXT turn end still
 						// delivers. Two clocks, deliberately decoupled: the
@@ -2398,21 +2405,35 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 						// the delivery gate stats against — while the re-arm TTL is
 						// anchored on `lastRearmedAtMs`, advanced by every successful
 						// empty probe: the scanner is demonstrably alive, just slow.
-						if (!isPendingAuxiliaryPastRearmTtl(pair)) {
-							markPendingAuxiliaryCoverage(
-								lateAuxPath,
-								[pair.serverId],
-								pair.markedAtMs,
-								Date.now(),
-							);
+						if (
+							!isPendingAuxiliaryPastRearmTtl(pair) &&
+							(pair.rearmCount ?? 0) < MAX_LATE_AUX_REARMS
+						) {
+							rearmPendingAuxiliaryCoverage(pair);
 							lateAuxRearmed += 1;
+							if (lateAuxStuckPairs.length < 20)
+								lateAuxStuckPairs.push({
+									filePath: pair.filePath,
+									serverId: pair.serverId,
+								});
+						} else {
+							if (isPendingAuxiliaryPastRearmTtl(pair)) lateAuxExpired += 1;
+							else lateAuxCeilingExhausted += 1;
 						}
+						continue;
+					}
+					if (rawDiags.length === 0) {
+						lateAuxCleanConfirmed += 1;
 						continue;
 					}
 					const converted = convertLspDiagnostics(rawDiags, lateAuxPath, {
 						tool: "lsp",
 					});
-					if (converted.length === 0) continue;
+					if (converted.length === 0) {
+						lateAuxMissing += rawDiags.length;
+						lateAuxAnswered += 1;
+						continue;
+					}
 					// Freshness kernel (#1634 gated surface): stat the cited file
 					// against the mark timestamp. Missing → drop (no remediation for
 					// a deleted file); mtime drifted past the mark → drop too, NOT
@@ -2432,22 +2453,32 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 					lateAuxStale += gate.stale.length;
 					lateAuxMissing +=
 						converted.length - gate.live.length - gate.stale.length;
-					if (gate.stale.length > 0) {
-						// Stale findings mean the scan predates the last edit.
-						// Re-arm with a REFRESHED baseline so the next turn probes
-						// the newer revision (#2027 round-1 P2-1).
-						markPendingAuxiliaryCoverage(
-							lateAuxPath,
-							[pair.serverId],
-							Date.now(),
-						);
+					if (gate.live.length === 0) {
+						if (gate.stale.length > 0) {
+							// Stale findings mean the scan predates the last edit. Re-arm
+							// with a refreshed baseline and carry the ceiling count.
+							if (
+								!isPendingAuxiliaryPastRearmTtl(pair) &&
+								(pair.rearmCount ?? 0) < MAX_LATE_AUX_REARMS
+							) {
+								rearmPendingAuxiliaryCoverage(pair, Date.now(), true);
+								lateAuxRearmed += 1;
+							} else if (isPendingAuxiliaryPastRearmTtl(pair)) {
+								lateAuxExpired += 1;
+							} else {
+								lateAuxCeilingExhausted += 1;
+							}
+						} else {
+							lateAuxAnswered += 1;
+						}
+						continue;
 					}
-					if (gate.live.length === 0) continue;
 					const lines = gate.live.map(
 						(f) =>
 							`  ${displayLateAuxPath}:${f.line}:${f.column} [${f.rule}] ${f.message}`,
 					);
 					lateAuxDelivered += gate.live.length;
+					lateAuxAnswered += 1;
 					// @delivery-surface: runtime-turn:late-auxiliary-findings
 					advisoryParts.push(
 						`🕐 Late auxiliary diagnostics (${pair.serverId} answered after its grace window):\n${lines.join("\n")}`,
@@ -2465,12 +2496,19 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			durationMs: Date.now() - lateAuxStart,
 			metadata: {
 				pending: drainedPairs.length,
+				pairCreated: drainedPairs.length,
+				pendingAfter: pendingAuxiliaryCoverageSize(),
 				delivered: lateAuxDelivered,
 				stale: lateAuxStale,
 				missing: lateAuxMissing,
 				rearmed: lateAuxRearmed,
 				clientGone: lateAuxClientGone,
 				probeFailed: lateAuxProbeFailed,
+				cleanConfirmed: lateAuxCleanConfirmed,
+				expired: lateAuxExpired,
+				ceilingExhausted: lateAuxCeilingExhausted,
+				answered: lateAuxAnswered,
+				stuckPairs: lateAuxStuckPairs,
 			},
 		});
 	}

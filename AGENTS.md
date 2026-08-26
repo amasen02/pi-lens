@@ -372,6 +372,14 @@ client cache. Carry them into that read only when their stored SHA-256 content
 binding matches the touch content exactly. Unknown or changed-content bindings
 never replay. (#1458)
 
+Turn-end late-auxiliary cache probes return per-file diagnostics with the
+publication timestamp. A newer timestamp with zero diagnostics is a confirmed
+clean result; an absent or older entry is still unavailable. Keep re-arms
+bounded by both the TTL and a hard count carried across each drain, and expose
+bounded stuck-pair identity in the phase record. Pair-level retirements and
+finding-level counts use separate fields and reconcile each drained pair to
+one retirement or a pending-after count. (#2151)
+
 Every auxiliary touch emits one bounded `lsp_aux_wait_outcome` latency row, on
 both producers: the `with-auxiliary` grace wait (`waitShape: "aux_grace"`) and,
 since #1533, the `clientScope: "all"` aggregate wait (`waitShape: "aggregate"`),

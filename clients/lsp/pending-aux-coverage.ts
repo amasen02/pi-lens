@@ -50,6 +50,7 @@ export const MAX_PENDING_AUX_ENTRIES = 50;
  * forever. Overridable via `PI_LENS_LATE_AUX_REARM_TTL_MS`.
  */
 export const DEFAULT_LATE_AUX_REARM_TTL_MS = 5 * 60_000;
+export const MAX_LATE_AUX_REARMS = 8;
 
 /**
  * Read the `PI_LENS_LATE_AUX_REARM_TTL_MS` env override at call time (not
@@ -89,6 +90,7 @@ export interface PendingAuxCoverageEntry {
 	 * gate's freshness comparison.
 	 */
 	lastRearmedAtMs?: number;
+	rearmCount?: number;
 }
 
 /**
@@ -129,6 +131,7 @@ export function markPendingAuxiliaryCoverage(
 	serverIds: readonly string[],
 	markedAtMs: number = Date.now(),
 	rearmedAtMs?: number,
+	rearmCount?: number,
 ): void {
 	for (const serverId of serverIds) {
 		const key = pairKey(filePath, serverId);
@@ -149,6 +152,7 @@ export function markPendingAuxiliaryCoverage(
 							serverId,
 							markedAtMs: existing.markedAtMs,
 							lastRearmedAtMs: rearmedAtMs,
+							rearmCount: rearmCount ?? (existing.rearmCount ?? 0) + 1,
 						},
 			);
 			continue;
@@ -157,7 +161,13 @@ export function markPendingAuxiliaryCoverage(
 			key,
 			rearmedAtMs === undefined
 				? { filePath, serverId, markedAtMs }
-				: { filePath, serverId, markedAtMs, lastRearmedAtMs: rearmedAtMs },
+				: {
+						filePath,
+						serverId,
+						markedAtMs,
+						lastRearmedAtMs: rearmedAtMs,
+						rearmCount: rearmCount ?? 1,
+					},
 		);
 		while (pending.size > MAX_PENDING_AUX_ENTRIES) {
 			const oldest = pending.keys().next().value;
@@ -165,6 +175,22 @@ export function markPendingAuxiliaryCoverage(
 			pending.delete(oldest);
 		}
 	}
+}
+
+/** Re-arm a drained pair while carrying its ceiling count across the drain. */
+export function rearmPendingAuxiliaryCoverage(
+	pair: PendingAuxCoverageEntry,
+	rearmedAtMs: number = Date.now(),
+	refreshBaseline = false,
+): void {
+	const nextCount = (pair.rearmCount ?? 0) + 1;
+	markPendingAuxiliaryCoverage(
+		pair.filePath,
+		[pair.serverId],
+		refreshBaseline ? rearmedAtMs : pair.markedAtMs,
+		rearmedAtMs,
+		nextCount,
+	);
 }
 
 /**
@@ -190,10 +216,14 @@ export function drainPendingAuxiliaryCoverage(): PendingAuxCoverageEntry[] {
 	return drained;
 }
 
-/** Test-only: current pending pair count. */
-export function pendingAuxiliaryCoverageSizeForTests(): number {
+/** Current pending pair count for bounded reconciliation telemetry. */
+export function pendingAuxiliaryCoverageSize(): number {
 	return pending.size;
 }
+
+/** Test-only alias for the store-size assertion seam. */
+export const pendingAuxiliaryCoverageSizeForTests =
+	pendingAuxiliaryCoverageSize;
 
 /**
  * Session-boundary clear (#1635): pending baselines are unreachable after
