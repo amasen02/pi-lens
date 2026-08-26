@@ -163,6 +163,7 @@ const grammarHeavyInclude = [
 // smaller one) has already fully drained, so the sampler only ever
 // contends with (at most) one other file in this group.
 const timingSensitiveInclude = [
+	"tests/clients/review-graph-retention.test.ts",
 	"tests/clients/source-walk-occupancy.test.ts",
 	"tests/clients/source-filter-async.test.ts",
 	// Workspace-edit planning also uses the independent occupancy sampler; keep
@@ -208,6 +209,7 @@ const timingSensitiveInclude = [
 	"tests/clients/pipeline-snapshot-occupancy.test.ts",
 	"tests/clients/word-index-async-build.test.ts",
 	"tests/clients/word-index-cooperative-occupancy.test.ts",
+	"tests/clients/word-index-persist-occupancy.test.ts",
 	//   - cooperative-budget: #1215 acceptance screens — sampler-based
 	//     occupancy at 800-item scale plus the abort-latency bound.
 	"tests/clients/cooperative-budget.test.ts",

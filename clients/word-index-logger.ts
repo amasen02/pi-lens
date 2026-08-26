@@ -60,6 +60,9 @@ export interface WordIndexLogEntry {
 	/** Which lifecycle produced this: "session_start" | "cold_query" | "per_edit". */
 	trigger?: string;
 	durationMs?: number;
+	/** Persist split: wire assembly on the host versus snapshot dispatch/write. */
+	serializeMs?: number;
+	writeMs?: number;
 	phaseDurationsMs?: {
 		snapshotLoadMs?: number;
 		deserializeMs?: number;

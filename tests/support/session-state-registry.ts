@@ -1121,7 +1121,9 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"tui-fit.ts": 0,
 	"warm-attach.ts": 0,
 	"widget-state.ts": 2,
-	"word-index.ts": 3,
+	// #2068 added the per-index dirty-file set; it is process-local wire-cache
+	// state and is cleared by serialization, so it needs no session reset.
+	"word-index.ts": 4,
 	"workspace-topology.ts": 2,
 	"zizmor-config.ts": 0,
 };

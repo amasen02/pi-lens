@@ -956,6 +956,17 @@ Cooperative async variants are serialized per index and remain for bulk refresh.
 When touching this seam, keep posting-entry counts and replacement-cost scalars
 in word-index telemetry. #2069 intentionally builds on this prerequisite.
 
+Word-index persistence keeps the v2 wire contract and caches its flat serialized
+view per index. Every replacement or addition marks its document dirty; the next
+persist keeps wire slots and untouched token lanes, resolving dirty files through
+one slot map and flattening each affected token lane once. File removal falls
+back to a full serialization because it changes slot identity; replacements
+retain their previous wire order. `serializeWordIndex` clears dirty markers only
+after it has produced the view, so deleting the dirty mark makes the stale-
+persist test fail. Snapshot stringify and gzip remain in the existing
+project-snapshot worker; do not send a structured-clone object graph to a new
+worker.
+
 MCP warm word indexes are bounded per root in `clients/mcp/analyze.ts`: callers
 must acquire/release a lease around every use, because idle and LRU eviction
 must never retire an index mid-query. Idle timers are generation-owned,
