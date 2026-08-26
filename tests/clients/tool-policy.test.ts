@@ -1350,6 +1350,10 @@ describe("tool-policy", () => {
 	});
 
 	it("exposes centralized tool command specs", () => {
+		expect(getToolCommandSpec("markdownlint")?.versionArgs).toEqual([
+			"--no-globs",
+			"-",
+		]);
 		expect(getToolCommandSpec("eslint")).toMatchObject({
 			command: "eslint",
 			windowsExt: ".cmd",

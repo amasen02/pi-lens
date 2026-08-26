@@ -1546,7 +1546,7 @@ export async function resolveCommandArgsWithInstallFallback(
 	const versionCheck = await safeSpawnAsync(
 		command.cmd,
 		[...command.args, ...versionArgs],
-		{ timeout, cwd },
+		{ timeout, cwd, input: "" },
 	);
 	if (!versionCheck.error && versionCheck.status === 0) {
 		return command;
