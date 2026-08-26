@@ -27,6 +27,17 @@ const REPAIR_HEADINGS = [
 	"Review round \\d+",
 ];
 const REPAIR_HEADING_PATTERN = REPAIR_HEADINGS.join("|");
+const CORRUPTED_HEADING_TAILS = [
+	"ummary",
+	"ests",
+	"est assessment",
+	"last radius",
+	"lass sweep",
+	"bservability",
+	"ix round \\d+",
+	"eview round \\d+",
+];
+const CORRUPTED_IDENTIFIER_TAILS = ["etchOpenPullRequests", "px"];
 
 // Fleet census from the review of 11 bodies: ## OBSERVABILITY x5,
 // ## what changed x6, ## verification x7, and ## Summary x1. “What changed”
@@ -116,6 +127,24 @@ export function detectFlattenedBody(body = "") {
 	const newlineCount = (source.match(/\r?\n/g) ?? []).length;
 	if (newlineCount > FLATTENED_BODY_MAX_NEWLINES || source.length < 200)
 		return false;
+	// A flattened body containing these markers has already lost data. It is
+	// safer to report the original lint errors than to write a guessed repair.
+	if (
+		/[\f\t]|\r(?!\n)|\\[ftr]/.test(source) ||
+		/\\n/.test(source) ||
+		new RegExp(
+			`(?:^|[\\s])(?:${CORRUPTED_HEADING_TAILS.join("|")})(?=\\s|$)`,
+			"i",
+		).test(source) ||
+		new RegExp(
+			`(?:^|[\\s` +
+				"\\\"'" +
+				`])(?:${CORRUPTED_IDENTIFIER_TAILS.join("|")})(?=$|[\\s` +
+				"\\\"',.)" +
+				`])`,
+		).test(source)
+	)
+		return false;
 	const inlineHeadings = source.match(
 		new RegExp(
 			`(?<!^)\\s#{2,4}\\s+(?:${REPAIR_HEADING_PATTERN})(?=\\s|$)`,
@@ -129,7 +158,7 @@ export function detectFlattenedBody(body = "") {
 export function repairFlattenedBody(body = "") {
 	const source = String(body ?? "");
 	if (!detectFlattenedBody(source)) return source;
-	let repaired = source.replace(/\r\n?/g, "\n").replace(/\\r\\n|\\n/g, "\n");
+	let repaired = source.replace(/\r\n?/g, "\n");
 	repaired = repaired.replace(
 		new RegExp(`(#{2,4}\\s+(?:${REPAIR_HEADING_PATTERN}))(?=\\s)`, "g"),
 		"$1\n",
@@ -141,11 +170,6 @@ export function repairFlattenedBody(body = "") {
 		),
 		"\n\n",
 	);
-	repaired = repaired
-		.replace(/\s*```/g, "\n```")
-		.replace(/```\s*/g, "```\n")
-		.replace(/\s+(?=(?:[-*+] |\d+[.)] )\S)/g, "\n")
-		.replace(/\n{3,}/g, "\n\n");
 	return repaired;
 }
 
@@ -373,6 +397,14 @@ export async function lintPullRequestEvent(
 		const repairedResult = lintPrBody(repairedBody, { requireTestAssessment });
 		if (repairedResult.valid) {
 			try {
+				const latestBody = await resolveLivePrBody(pullRequest, fetchImpl);
+				if (latestBody !== body) {
+					console.log(
+						`::notice::Skipped flattened PR body repair for #${pullRequest.number}; the body changed during linting.`,
+					);
+					for (const error of result.errors) console.error(error);
+					return { valid: false, repaired: false };
+				}
 				await patchLivePrBody(pullRequest, repairedBody, fetchImpl);
 				console.log(
 					`::notice::Repaired flattened PR body for #${pullRequest.number} before validation passed.`,

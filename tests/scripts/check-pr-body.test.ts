@@ -39,6 +39,52 @@ describe("flattened PR body repair", () => {
 		expect(detectFlattenedBody(incidental)).toBe(false);
 	});
 
+	it("rejects the minimum-length boundary", () => {
+		const boundary = "## Summary x ## Tests x".padEnd(199, "x");
+		expect(boundary).toHaveLength(199);
+		expect(detectFlattenedBody(boundary)).toBe(false);
+	});
+
+	it("requires at least two inline headings", () => {
+		const oneHeading = `## Summary ${"x".repeat(220)}`;
+		expect(oneHeading).not.toMatch(/\r?\n/);
+		expect(detectFlattenedBody(oneHeading)).toBe(false);
+	});
+
+	it.each([
+		[
+			"form feed",
+			flattenedBody.replace("word-index", "\fetchOpenPullRequests"),
+		],
+		["tab", flattenedBody.replace("word-index", "\tpx")],
+		["lone carriage return", flattenedBody.replace("word-index", "\retch")],
+		["escaped form feed", `${flattenedBody} \\fetchOpenPullRequests`],
+		["escaped tab", `${flattenedBody} \\tpx`],
+		["escaped carriage return", `${flattenedBody} \\retch`],
+		[
+			"escaped newline",
+			flattenedBody.replace("word-index", "`fetch\\nOpenPullRequests`"),
+		],
+		[
+			"missing heading letter",
+			flattenedBody.replace("## Summary", "## ummary"),
+		],
+		["missing identifier letter", `${flattenedBody} etchOpenPullRequests`],
+	])("refuses data-loss marker: %s", (_name, candidate) => {
+		expect(detectFlattenedBody(candidate)).toBe(false);
+		expect(repairFlattenedBody(candidate)).toBe(candidate);
+	});
+
+	it("leaves fenced code and prose hyphens unchanged", () => {
+		const candidate = flattenedBody.replace(
+			"word-index",
+			"word-index ```bash echo hi``` The well - known race",
+		);
+		const repaired = repairFlattenedBody(candidate);
+		expect(repaired).toContain("```bash echo hi```");
+		expect(repaired).toContain("The well - known race");
+	});
+
 	it("is idempotent", () => {
 		const repaired = repairFlattenedBody(flattenedBody);
 		expect(repairFlattenedBody(repaired)).toBe(repaired);
@@ -85,6 +131,43 @@ describe("flattened body CI entrypoint", () => {
 		);
 		expect(log).toHaveBeenCalledWith(
 			expect.stringContaining("::notice::Repaired flattened PR body"),
+		);
+		log.mockRestore();
+	});
+
+	it("skips the patch when the live body changes after linting", async () => {
+		stubApi();
+		const log = vi.spyOn(console, "log").mockImplementation(() => {});
+		let bodyGets = 0;
+		const changedBody = `${flattenedBody} changed`;
+		const fetchImpl = vi
+			.fn()
+			.mockImplementation(async (url: string, init?: RequestInit) => {
+				if (String(url).includes("/files"))
+					return new Response(JSON.stringify([]), { status: 200 });
+				if (init?.method === "PATCH")
+					return new Response("{}", { status: 200 });
+				bodyGets += 1;
+				return new Response(
+					JSON.stringify({
+						body: bodyGets === 1 ? flattenedBody : changedBody,
+					}),
+					{
+						status: 200,
+					},
+				);
+			});
+		expect(
+			await lintPullRequestEvent(fetchImpl, {
+				pull_request: { number: 2144, body: flattenedBody },
+			}),
+		).toEqual({ valid: false, repaired: false });
+		expect(fetchImpl).not.toHaveBeenCalledWith(
+			expect.anything(),
+			expect.objectContaining({ method: "PATCH" }),
+		);
+		expect(log).toHaveBeenCalledWith(
+			expect.stringContaining("body changed during linting"),
 		);
 		log.mockRestore();
 	});
