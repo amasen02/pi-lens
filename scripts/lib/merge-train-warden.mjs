@@ -157,6 +157,12 @@ export async function fetchOpenPullRequests(fetcher, owner, name) {
 		if (!connection || !Array.isArray(connection.nodes)) break;
 		for (const node of connection.nodes) prs.push(normalizePr(node));
 		if (!connection.pageInfo?.hasNextPage) break;
+		if (page === MAX_PAGES - 1) {
+			errors.push(
+				`GraphQL pagination truncated after ${MAX_PAGES} pages while hasNextPage=true`,
+			);
+			break;
+		}
 		after = connection.pageInfo.endCursor;
 	}
 	return { prs, errors };

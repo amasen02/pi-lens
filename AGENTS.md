@@ -1020,6 +1020,13 @@ bounded `master` commit details. It paginates each response until an empty page
 proves exhaustion and fails loudly at the safety bound instead of interpreting a
 partial response. It comments one candidate summary on #1323 and writes the
 workflow summary; it must never close or edit detected issues.
+The shared `paged` helper demands exhaustion by default; the intentionally
+bounded commit-detail population opts out explicitly.
+
+The merge-train warden's GraphQL PR reader follows the same bounded-read contract:
+`fetchOpenPullRequests` preserves collected pages but records a fatal list error
+when `hasNextPage` remains true at `MAX_PAGES`. Its consumer prints that error and
+sets a nonzero exit code, while deliberately bounded sibling reads remain scoped.
 
 CI validates GitHub close-keyword syntax through `scripts/check-close-keywords.mjs`:
 PR bodies may not use a comma-separated close list because GitHub applies only
