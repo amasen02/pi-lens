@@ -243,6 +243,8 @@ async function scanFileMajorRules(
 				{
 					maxMatchesPerRule: AST_GREP_SCAN_MAX_MATCHES_PER_RULE,
 					maxTotalDiagnostics: AST_GREP_SCAN_MAX_DIAGNOSTICS_PER_FILE,
+					content,
+					sgModule,
 				},
 			);
 			for (const diagnostic of fileDiagnostics) {

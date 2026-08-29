@@ -3740,7 +3740,13 @@ export const OpengrepServer: LSPServerInfo = {
 // Gate B). NOTE: the napi runner is NOT a subset — it delegates to napi's native
 // engine via root.findAll({rule}) (#206), the SAME Rust core as this LSP and the
 // ast-grep CLI, so rule semantics are identical across all three. The LSP's edge
-// is engine-driven codeAction fixes, not faithfulness of matching.
+// is engine-driven codeAction fixes, not faithfulness of matching. #2347 closed
+// the one known divergence under Gate B: the LSP/CLI resolve embedded `<script>`
+// bodies in HTML and run `language: JavaScript` rules inside them, and the napi
+// fallback now mirrors that (each script body is reparsed as JS and findings are
+// translated back to file coordinates). A future ast-grep embedded-content
+// surface (for example `<style>` bodies, which 0.45.1 does NOT inject) must land
+// on both routes together or be recorded here as an accepted divergence.
 const AST_GREP_KINDS = [
 	"csharp",
 	"cxx",
