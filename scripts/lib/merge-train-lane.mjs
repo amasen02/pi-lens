@@ -37,6 +37,7 @@ export const POST_MERGE_EVENT = "merge-train-post-merge";
 export const POST_MERGE_DISPATCH_ATTEMPTS = 2;
 export const POST_MERGE_RECONCILE_WINDOW_MS = 24 * 60 * 60 * 1000;
 export const POST_MERGE_RECONCILE_GRACE_MS = 15 * 60 * 1000;
+export const POST_MERGE_RETRY_GENERATION_MS = 6 * 60 * 60 * 1000;
 export const POST_MERGE_VALIDATION_WORKFLOWS = Object.freeze([
 	"ci.yml",
 	"lint.yml",
@@ -421,8 +422,8 @@ export async function dispatchPostMergeValidationWithRetry(
 	throw lastError ?? new Error("post-merge validation dispatch failed");
 }
 
-function postMergeRequestMarker(mergeSha, attempt, requestedAt) {
-	return `<!-- merge-train-post-merge:sha=${mergeSha}:state=requested:attempt=${attempt}:at=${requestedAt} -->`;
+function postMergeRequestMarker(mergeSha, attempt, generation, requestedAt) {
+	return `<!-- merge-train-post-merge:sha=${mergeSha}:state=requested:attempt=${attempt}:generation=${generation}:at=${requestedAt} -->`;
 }
 
 async function readIssueComments(fetcher, owner, repo, number) {
@@ -434,12 +435,11 @@ async function readIssueComments(fetcher, owner, repo, number) {
 
 async function readPostMergeState(fetcher, owner, repo, number, mergeSha, now) {
 	const comments = await readIssueComments(fetcher, owner, repo, number);
-	const requestedAttempts = [];
-	let latestRequestedAt = null;
+	const requests = [];
 	const workflows = new Map();
 	const escapedSha = mergeSha.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 	const requestPattern = new RegExp(
-		`merge-train-post-merge:sha=${escapedSha}:state=requested:attempt=(\\d+):at=(\\d+)`,
+		`merge-train-post-merge:sha=${escapedSha}:state=requested:attempt=(\\d+):generation=(\\d+):at=(\\d+)`,
 	);
 	const legacyPattern = new RegExp(
 		`merge-train-post-merge:sha=${escapedSha}:dispatched`,
@@ -453,18 +453,18 @@ async function readPostMergeState(fetcher, owner, repo, number, mergeSha, now) {
 		const request = body.match(requestPattern);
 		if (request) {
 			const attempt = Number(request[1]);
-			const requestedAt = Number(request[2]);
+			const generation = Number(request[2]);
+			const requestedAt = Number(request[3]);
 			if (
 				Number.isSafeInteger(attempt) &&
+				Number.isSafeInteger(generation) &&
 				Number.isSafeInteger(requestedAt) &&
 				requestedAt <= now
 			) {
-				requestedAttempts.push(attempt);
-				latestRequestedAt = Math.max(latestRequestedAt ?? 0, requestedAt);
+				requests.push({ attempt, generation, requestedAt });
 			}
 		} else if (legacyPattern.test(body)) {
-			requestedAttempts.push(1);
-			latestRequestedAt = 0;
+			requests.push({ attempt: 1, generation: 0, requestedAt: 0 });
 		}
 		const validation = body.match(validationPattern);
 		if (!validation || !POST_MERGE_VALIDATION_WORKFLOWS.includes(validation[1]))
@@ -472,7 +472,7 @@ async function readPostMergeState(fetcher, owner, repo, number, mergeSha, now) {
 		const previous = workflows.get(validation[1]);
 		if (previous !== "failed") workflows.set(validation[1], validation[2]);
 	}
-	return { requestedAttempts, latestRequestedAt, workflows };
+	return { requests, workflows };
 }
 
 async function recordPostMergeDispatch(
@@ -482,6 +482,7 @@ async function recordPostMergeDispatch(
 	number,
 	mergeSha,
 	attempt,
+	generation,
 	requestedAt,
 ) {
 	return rest(
@@ -489,7 +490,7 @@ async function recordPostMergeDispatch(
 		"POST",
 		`https://api.github.com/repos/${owner}/${repo}/issues/${number}/comments`,
 		{
-			body: `Post-merge validation dispatch requested for ${mergeSha} (attempt ${attempt}).\n\n${postMergeRequestMarker(mergeSha, attempt, requestedAt)}`,
+			body: `Post-merge validation dispatch requested for ${mergeSha} (generation ${generation}, attempt ${attempt}).\n\n${postMergeRequestMarker(mergeSha, attempt, generation, requestedAt)}`,
 		},
 	);
 }
@@ -582,12 +583,19 @@ export async function reconcilePostMergeValidations({
 			)
 		)
 			continue;
-		if (
-			state.latestRequestedAt != null &&
-			now - state.latestRequestedAt < graceMs
-		)
-			continue;
-		const attempt = Math.max(0, ...state.requestedAttempts) + 1;
+		const generation = Math.floor(
+			Math.max(0, now - mergedAt) / POST_MERGE_RETRY_GENERATION_MS,
+		);
+		const generationRequests = state.requests.filter(
+			(request) => request.generation === generation,
+		);
+		const latestRequestedAt = Math.max(
+			-1,
+			...generationRequests.map((request) => request.requestedAt),
+		);
+		if (latestRequestedAt >= 0 && now - latestRequestedAt < graceMs) continue;
+		const attempt =
+			Math.max(0, ...generationRequests.map((request) => request.attempt)) + 1;
 		if (attempt > POST_MERGE_DISPATCH_ATTEMPTS) {
 			results.push({
 				number: pr.number,
@@ -608,6 +616,7 @@ export async function reconcilePostMergeValidations({
 				pr.number,
 				mergeSha,
 				attempt,
+				generation,
 				now,
 			);
 			if (!marker.ok) {
@@ -773,6 +782,7 @@ export async function runMergeLane({
 								pr.number,
 								mergeSha,
 								1,
+								0,
 								Date.now(),
 							);
 							if (!marker.ok) {

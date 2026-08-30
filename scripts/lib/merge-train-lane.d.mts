@@ -7,6 +7,7 @@ export const POST_MERGE_EVENT: string;
 export const POST_MERGE_DISPATCH_ATTEMPTS: number;
 export const POST_MERGE_RECONCILE_WINDOW_MS: number;
 export const POST_MERGE_RECONCILE_GRACE_MS: number;
+export const POST_MERGE_RETRY_GENERATION_MS: number;
 export const POST_MERGE_VALIDATION_WORKFLOWS: readonly string[];
 export const ADVISORY_SUFFIX: string;
 export const ADVISORY_CHECKS: Set<string>;

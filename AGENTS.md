@@ -1385,13 +1385,15 @@ failures and ambiguous timeouts receive one bounded retry with the same SHA;
 the scheduled lane also reconciles recent bot-merged PRs from their durable
 `merge_commit_sha` and requested/terminal state markers. It waits through a
 bounded grace period, retries missing validation across process restarts, and
-accepts completion only from bot-authored exact-SHA terminal markers. A final
+opens a later six-hour retry generation after two attempts exhaust one
+generation, without a hot loop. It accepts completion only from bot-authored
+exact-SHA terminal markers. A final
 failure leaves the merge landed but records a fatal post-merge-validation
 error. The master-push validation workflows (`ci.yml`, `lint.yml`,
 `install-smoke.yml`, and `labels.yml`) gate all repository actions behind a
 dispatch prerequisite that validates repository identity, strict SHA and PR
-number shape, authenticated exact commit resolution, and ancestry to
-`master`; they use per-workflow SHA concurrency with cancellation so duplicate
+number shape, exact-payload checkout, authenticated commit resolution, and
+ancestry to `master`; they use per-workflow SHA concurrency with cancellation so duplicate
 dispatches cannot validate one commit concurrently. A missing or invalid merge
 SHA means no dispatch, and the lane must never report that verification ran.
 
