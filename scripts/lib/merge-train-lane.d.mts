@@ -5,6 +5,7 @@ export const TRAIN_APPROVED_LABEL: string;
 export const TRAIN_SQUASH_LABEL: string;
 export const POST_MERGE_EVENT: string;
 export const POST_MERGE_DISPATCH_ATTEMPTS: number;
+export const POST_MERGE_RECONCILE_WINDOW_MS: number;
 export const ADVISORY_SUFFIX: string;
 export const ADVISORY_CHECKS: Set<string>;
 export const CONCLUDED_STATUS: string;
@@ -93,6 +94,20 @@ export function dispatchPostMergeValidationWithRetry(
 	response: { ok: boolean; status: number; json(): Promise<unknown> };
 	attempts: number;
 }>;
+export function reconcilePostMergeValidations(options: {
+	fetcher: FetchFn;
+	owner: string;
+	repo: string;
+	now?: number;
+	windowMs?: number;
+}): Promise<
+	Array<{
+		number: number | null;
+		sha: string | null;
+		dispatched: boolean;
+		errors: string[];
+	}>
+>;
 export function runMergeLane(options: {
 	fetcher: FetchFn;
 	owner: string;

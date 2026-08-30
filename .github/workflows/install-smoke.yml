@@ -61,8 +61,47 @@ permissions:
   contents: read
 
 jobs:
+  validate-merge-train-dispatch:
+    name: Validate merge-train dispatch
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Validate merge-train dispatch ancestry
+        if: github.event_name == 'repository_dispatch'
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ github.token }}
+          PAYLOAD_REPOSITORY: ${{ github.event.client_payload.repository }}
+          PAYLOAD_SHA: ${{ github.event.client_payload.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$PAYLOAD_REPOSITORY" != "$GITHUB_REPOSITORY" ]]; then
+            echo "::error::repository_dispatch repository does not match this repository"
+            exit 1
+          fi
+          if [[ ! "$PAYLOAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::repository_dispatch SHA must be a 40-hex commit"
+            exit 1
+          fi
+          compare_status="$(curl --fail-with-body --silent --show-error \
+            --header "Authorization: Bearer $GITHUB_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/compare/$PAYLOAD_SHA...master" \
+            | jq -r '.status')"
+          if [[ "$compare_status" != "ahead" && "$compare_status" != "identical" ]]; then
+            echo "::error::repository_dispatch SHA is not an ancestor of master"
+            exit 1
+          fi
+          checked_sha="$(git rev-parse --verify HEAD)"
+          if [[ "${PAYLOAD_SHA,,}" != "$checked_sha" ]]; then
+            echo "::error::checkout does not match the repository_dispatch SHA"
+            exit 1
+          fi
+
   smoke:
     name: ${{ matrix.os }} · ${{ matrix.pm }}
+    needs: validate-merge-train-dispatch
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -177,6 +216,7 @@ jobs:
   # users get) — guards the shipped artifact; the `smoke` job guards current code.
   pi-load:
     name: pi-load · ${{ matrix.os }} · ${{ matrix.pi_install }}
+    needs: validate-merge-train-dispatch
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -316,6 +356,7 @@ jobs:
   # of #285 coverage.
   mise-repro:
     name: mise repro (#285) · ${{ matrix.os }} · ${{ matrix.pi_via }}
+    needs: validate-merge-train-dispatch
     runs-on: ${{ matrix.os }}
     continue-on-error: true
     strategy:

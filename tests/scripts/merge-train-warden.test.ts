@@ -10,6 +10,7 @@ import {
 	isAdvisoryCheck,
 	laneCommentMarker,
 	MERGE_GATE_REASON,
+	reconcilePostMergeValidations,
 	resolveApprovalActor,
 	runMergeLane,
 	TRAIN_APPROVED_LABEL,
@@ -2657,10 +2658,12 @@ describe("merge-lane sweep (#2185)", () => {
 		const comments = calls.filter(
 			(c) => c.method === "POST" && c.url.endsWith("/issues/7/comments"),
 		);
-		expect(comments).toHaveLength(1);
-		expect(String((comments[0].body as { body: string }).body)).toContain(
-			"merged",
-		);
+		expect(comments).toHaveLength(2);
+		expect(
+			comments.some((comment) =>
+				String((comment.body as { body: string }).body).includes("merged"),
+			),
+		).toBe(true);
 	});
 
 	it("records missing post-merge validation when the merge response has no SHA", async () => {
@@ -2730,7 +2733,15 @@ describe("merge-lane sweep (#2185)", () => {
 		});
 		expect(results[0]).toMatchObject({ merged: true, errors: [] });
 		expect(attempts).toBe(2);
-		expect(calls.filter((c) => c.url.endsWith("/dispatches"))).toHaveLength(2);
+		const dispatches = calls.filter((c) => c.url.endsWith("/dispatches"));
+		expect(dispatches).toHaveLength(2);
+		expect(
+			dispatches.every(
+				(c) =>
+					(c.body as { client_payload: { sha: string } }).client_payload.sha ===
+					MERGE_SHA,
+			),
+		).toBe(true);
 	});
 
 	it("retries when dispatch loses an accepted response", async () => {
@@ -2756,7 +2767,15 @@ describe("merge-lane sweep (#2185)", () => {
 		});
 		expect(results[0]).toMatchObject({ merged: true, errors: [] });
 		expect(attempts).toBe(2);
-		expect(calls.filter((c) => c.url.endsWith("/dispatches"))).toHaveLength(2);
+		const dispatches = calls.filter((c) => c.url.endsWith("/dispatches"));
+		expect(dispatches).toHaveLength(2);
+		expect(
+			dispatches.every(
+				(call) =>
+					(call.body as { client_payload: { sha: string } }).client_payload
+						.sha === MERGE_SHA,
+			),
+		).toBe(true);
 	});
 
 	it("records a failed post-merge dispatch while preserving the landed merge", async () => {
@@ -2783,7 +2802,149 @@ describe("merge-lane sweep (#2185)", () => {
 			message: expect.stringContaining("dispatch -> HTTP 503"),
 			benign: false,
 		});
-		expect(calls.filter((c) => c.url.endsWith("/dispatches"))).toHaveLength(2);
+		const dispatches = calls.filter((c) => c.url.endsWith("/dispatches"));
+		expect(dispatches).toHaveLength(2);
+		expect(
+			dispatches.every(
+				(call) =>
+					(call.body as { client_payload: { sha: string } }).client_payload
+						.sha === MERGE_SHA,
+			),
+		).toBe(true);
+	});
+
+	it("reconciles a merged bot PR after a prior lane process exits", async () => {
+		let dispatchAttempts = 0;
+		const durableComments: string[] = [];
+		const { fetcher, calls } = fakeGithub({
+			"GET /repos/acme/repo/pulls": [
+				{
+					number: 7,
+					merged_at: "2026-08-26T16:20:00Z",
+					merged_by: { login: "github-actions[bot]" },
+					merge_commit_sha: MERGE_SHA,
+				},
+			],
+			"GET /repos/acme/repo/issues/7/comments": () => ({
+				ok: true,
+				status: 200,
+				json: async () =>
+					durableComments.map((body) => ({
+						body,
+						user: { login: "github-actions[bot]" },
+					})),
+			}),
+			"POST /repos/acme/repo/issues/7/comments": (body: unknown) => {
+				durableComments.push(String((body as { body: string }).body));
+				return { ok: true, status: 201, json: async () => ({}) };
+			},
+			"POST /repos/acme/repo/dispatches": () => {
+				dispatchAttempts += 1;
+				if (dispatchAttempts <= 2)
+					throw new Error("runner exited after acceptance");
+				return { ok: true, status: 204, json: async () => ({}) };
+			},
+		});
+
+		const first = await reconcilePostMergeValidations({
+			fetcher,
+			owner: "acme",
+			repo: "repo",
+			now: NOW,
+		});
+		expect(first[0]).toMatchObject({
+			number: 7,
+			sha: MERGE_SHA,
+			dispatched: false,
+		});
+		expect(first[0].errors[0]).toContain("failed after 2 attempt(s)");
+
+		const second = await reconcilePostMergeValidations({
+			fetcher,
+			owner: "acme",
+			repo: "repo",
+			now: NOW,
+		});
+		expect(second[0]).toMatchObject({
+			number: 7,
+			sha: MERGE_SHA,
+			dispatched: true,
+			errors: [],
+		});
+		expect(
+			calls
+				.filter((call) => call.url.endsWith("/dispatches"))
+				.every(
+					(call) =>
+						(call.body as { client_payload: { sha: string } }).client_payload
+							.sha === MERGE_SHA,
+				),
+		).toBe(true);
+
+		const third = await reconcilePostMergeValidations({
+			fetcher,
+			owner: "acme",
+			repo: "repo",
+			now: NOW,
+		});
+		expect(third).toEqual([]);
+		expect(dispatchAttempts).toBe(3);
+	});
+
+	it("does not replay a human merge already covered by push workflows", async () => {
+		const { fetcher, calls } = fakeGithub({
+			"GET /repos/acme/repo/pulls": [
+				{
+					number: 8,
+					merged_at: "2026-08-26T16:20:00Z",
+					merged_by: { login: "acme" },
+					merge_commit_sha: MERGE_SHA,
+				},
+			],
+		});
+		const results = await reconcilePostMergeValidations({
+			fetcher,
+			owner: "acme",
+			repo: "repo",
+			now: NOW,
+		});
+		expect(results).toEqual([]);
+		expect(calls.some((call) => call.url.endsWith("/dispatches"))).toBe(false);
+	});
+
+	it("does not trust a user-forged completion marker", async () => {
+		const { fetcher, calls } = fakeGithub({
+			"GET /repos/acme/repo/pulls": [
+				{
+					number: 7,
+					merged_at: "2026-08-26T16:20:00Z",
+					merged_by: { login: "github-actions[bot]" },
+					merge_commit_sha: MERGE_SHA,
+				},
+			],
+			"GET /repos/acme/repo/issues/7/comments": () => ({
+				ok: true,
+				status: 200,
+				json: async () => [
+					{
+						body: `<!-- merge-train-post-merge:sha=${MERGE_SHA}:dispatched -->`,
+						user: { login: "acme" },
+					},
+				],
+			}),
+		});
+		const results = await reconcilePostMergeValidations({
+			fetcher,
+			owner: "acme",
+			repo: "repo",
+			now: NOW,
+		});
+		expect(results[0]).toMatchObject({
+			number: 7,
+			sha: MERGE_SHA,
+			dispatched: true,
+		});
+		expect(calls.some((call) => call.url.endsWith("/dispatches"))).toBe(true);
 	});
 
 	it("pins every master-push workflow to post-merge dispatch and SHA concurrency", () => {
@@ -2828,6 +2989,11 @@ describe("merge-lane sweep (#2185)", () => {
 				"checkout does not match the repository_dispatch SHA",
 			);
 			expect(source).toContain("cancel-in-progress: true");
+			expect(source).toContain("/compare/$PAYLOAD_SHA...master");
+			expect(source).toContain('"$compare_status" != "ahead"');
+			expect(source).toContain('"$compare_status" != "identical"');
+			expect(source).toContain("Authorization: Bearer $GITHUB_TOKEN");
+			expect(source).toContain("needs: validate-merge-train-dispatch");
 		}
 	});
 
