@@ -2524,6 +2524,10 @@ export class LSPService {
 				client: entry.client,
 				settled,
 				armedBudgetMs: 0,
+				// SAFETY: the handle is a torn-initialized placeholder. It is armed
+				// a beat later in this same atomic claim (no await in between) and
+				// thereafter only ever written by this token's own fire/release
+				// closures, so the placeholder value is never read by anyone.
 				wedgeTimer: undefined as unknown as ReturnType<typeof setTimeout>,
 			};
 			// A write nothing accepts for the whole wedge window is a dead input
