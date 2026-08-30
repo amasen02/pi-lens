@@ -1392,8 +1392,9 @@ failure leaves the merge landed but records a fatal post-merge-validation
 error. The master-push validation workflows (`ci.yml`, `lint.yml`,
 `install-smoke.yml`, and `labels.yml`) gate all repository actions behind a
 dispatch prerequisite that validates repository identity, strict SHA and PR
-number shape, exact-payload checkout, authenticated commit resolution, and
-ancestry to `master`; they use per-workflow SHA concurrency with cancellation so duplicate
+number shape, trusted workflow-revision checkout, authenticated commit
+resolution, and ancestry to `master`; downstream jobs then check out the exact
+payload SHA. They use per-workflow SHA concurrency with cancellation so duplicate
 dispatches cannot validate one commit concurrently. A missing or invalid merge
 SHA means no dispatch, and the lane must never report that verification ran.
 

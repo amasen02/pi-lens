@@ -3292,7 +3292,26 @@ describe("merge-lane sweep (#2185)", () => {
 				"actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
 			);
 			expect(source).toContain(
-				"run: node scripts/validate-merge-train-dispatch.mjs",
+				"run: node scripts/lib/merge-train-dispatch-validation.mjs",
+			);
+			expect(source).toContain(
+				"run: node scripts/lib/merge-train-dispatch-validation.mjs\n",
+			);
+			const validatorJob = source.slice(
+				source.indexOf("  validate-merge-train-dispatch:"),
+				(() => {
+					const start = source.indexOf("  validate-merge-train-dispatch:");
+					const nextJobOffset = source
+						.slice(start + 3)
+						.search(/\n  [a-z0-9][\w-]*:/);
+					return nextJobOffset < 0 ? source.length : start + 3 + nextJobOffset;
+				})(),
+			);
+			expect(validatorJob).toContain("ref: ${{ github.sha }}");
+			expect(validatorJob.indexOf("ref: ${{ github.sha }}")).toBeLessThan(
+				validatorJob.indexOf(
+					"run: node scripts/lib/merge-train-dispatch-validation.mjs",
+				),
 			);
 			expect(source).toContain("cancel-in-progress: true");
 			expect(source).toContain("needs: validate-merge-train-dispatch");

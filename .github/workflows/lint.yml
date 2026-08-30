@@ -38,7 +38,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         if: github.event_name == 'repository_dispatch'
         with:
-          ref: ${{ github.event.client_payload.sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
       - name: Validate merge-train dispatch ancestry
@@ -49,7 +49,7 @@ jobs:
           PAYLOAD_REPOSITORY: ${{ github.event.client_payload.repository }}
           PAYLOAD_SHA: ${{ github.event.client_payload.sha }}
           PAYLOAD_PR_NUMBER: ${{ github.event.client_payload.pr_number }}
-        run: node scripts/validate-merge-train-dispatch.mjs
+        run: node scripts/lib/merge-train-dispatch-validation.mjs
 
   actionlint:
     name: actionlint
