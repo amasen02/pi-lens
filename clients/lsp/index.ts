@@ -31,6 +31,7 @@ import {
 	projectTrustDenialReason,
 } from "../project-trust.js";
 import { shouldPreferPullOnlyDiagnostics } from "../lsp-budget.js";
+import { sampleProcessTreeCpuPercent } from "../resource-sampler.js";
 import { withDeadline, withTimeout } from "../deadline-utils.js";
 import {
 	acquireWorkspaceSweepHold,
@@ -1032,6 +1033,59 @@ function notifyWedgedMs(): number {
 	return notifyWriteBudgetMs() * NOTIFY_WEDGED_BUDGET_MULTIPLIER;
 }
 
+// #2358: the wedge window's teardown decision gained a liveness discriminator.
+// The fixed window above stays the FLOOR; a server whose drain history says it
+// answers per-write in `ewmaMs` with `unacked` documents queued earns
+// `k x ewmaMs x unacked` of patience instead — the issue's "a server that
+// historically answers in 855 ms with 8 writes queued earns 15-20 s". The cap
+// bounds the whole thing so a busy-but-never-draining server still respawns.
+const NOTIFY_WEDGED_EWMA_MULTIPLIER = 2;
+const NOTIFY_WEDGED_CAP_MS = 60_000;
+
+function notifyWedgedCapMs(): number {
+	const raw = Number(process.env.PI_LENS_LSP_NOTIFY_WEDGED_CAP_MS);
+	return Number.isFinite(raw) && raw > 0 ? raw : NOTIFY_WEDGED_CAP_MS;
+}
+
+// #2358: how long the CPU-liveness discriminator watches the server between
+// two process-CPU samples before deciding "busy" vs "flat". Only ever spent
+// on a server whose write is already past its patience window — never on the
+// per-edit hot path.
+function notifyStallCpuSampleMs(): number {
+	const raw = Number(process.env.PI_LENS_LSP_NOTIFY_STALL_CPU_SAMPLE_MS);
+	return Number.isFinite(raw) && raw > 0 ? raw : 1200;
+}
+
+// A server burning more than this percent of one core across the sample
+// window counts as BUSY (progressing), not flat (wedged). A single-threaded
+// scanner under burst sits near 100; an idle or dead one near 0.
+const NOTIFY_STALL_CPU_BUSY_FLOOR_PERCENT = 10;
+
+/**
+ * #2358: the reason a notify-stall teardown fired, naming WHICH discriminator
+ * decided it. `demoteForNotifyStall` spreads this into the
+ * `lsp_notify_backpressure_broken` record, so a production kill is classifiable
+ * by its own log line.
+ */
+export type NotifyStallDemotionReason =
+	| {
+			consecutiveTimeouts: number;
+			discriminator?: "consecutive-timeouts";
+			cpuVerdict?: "flat" | "busy" | "unmeasured";
+	  }
+	| {
+			outstandingMs: number;
+			discriminator:
+				| "budget-exceeded"
+				| "budget-exceeded-cpu-flat"
+				| "cap-exceeded";
+			budgetMs?: number;
+			ewmaInputMs?: number;
+			unackedDepth?: number;
+			cpuVerdict?: "flat" | "busy" | "unmeasured";
+			cpuPercent?: number | null;
+	  };
+
 // #1714: how many document notifies one auxiliary may hold UNACKNOWLEDGED
 // before the next notify has to prove the server drained its input.
 //
@@ -1286,6 +1340,22 @@ export class LSPService {
 	 */
 	private readonly notifyWriteBackpressureStreak = new Map<string, number>();
 	/**
+	 * #2358: EWMA of one auxiliary's per-document drain latency
+	 * (ms per unacknowledged write), keyed by "serverId:normalizedRoot".
+	 *
+	 * Updated from DRAINED notify barriers only: the round-trip proves the
+	 * server processed its `outstanding` backlog, and
+	 * duration / outstanding is the per-write service time a single-threaded
+	 * scanner actually achieves under load. The breaker grants a wedged write
+	 * `k x ewma x unacked` of patience from it, so a slow-but-alive scanner is
+	 * not killed at the fixed window by construction (#2358).
+	 *
+	 * Cleared by the service teardown (via `session_start`) like the rest of
+	 * the breaker state; a stale throughput estimate from a previous session's
+	 * client must not price the next one.
+	 */
+	private readonly auxNotifyDrainLatencyEwma = new Map<string, number>();
+	/**
 	 * #1714: unacknowledged auxiliary document notifies per server key
 	 * ("serverId:normalizedRoot" — the same identity as every other gate here).
 	 *
@@ -1337,6 +1407,8 @@ export class LSPService {
 			client: LSPClientInfo;
 			settled: Promise<void>;
 			wedgeTimer: ReturnType<typeof setTimeout>;
+			/** #2358: the patience window this write's wedge timer was armed with. */
+			armedBudgetMs: number;
 		}
 	>();
 	/**
@@ -1807,9 +1879,122 @@ export class LSPService {
 			return;
 		}
 		this.notifyWriteBackpressureStreak.delete(key);
-		this.demoteForNotifyStall(key, entry, filePath, {
+		// #2358: the consecutive-timeout ladder lands here too, and its verdict
+		// must not kill a server that is demonstrably BUSY. The guarded demotion
+		// samples the live process CPU and merely resets the ladder (the next
+		// three timeouts re-try) when the server is progressing — the wedged-write
+		// path's cap owns a busy-but-never-draining server, not this streak.
+		void this.demoteNotifyStallCpuGuarded(key, entry, filePath, {
 			consecutiveTimeouts: NOTIFY_BACKPRESSURE_BROKEN_AFTER,
 		});
+	}
+
+	/**
+	 * #2358: liveness-guarded teardown for the STREAK ladder.
+	 *
+	 * The wedged-write path ({@link decideNotifyStallTeardown}) keeps its own
+	 * re-arm loop so a busy server's outstanding write stays un-torn-down; the
+	 * streak ladder has no write to hold — it simply does not demote, and the
+	 * next three timeouts re-attempt. Generation-guarded after the await so a
+	 * client replaced mid-sample is never demoted for a verdict about its
+	 * predecessor.
+	 */
+	private async demoteNotifyStallCpuGuarded(
+		key: string,
+		entry: SpawnedServer,
+		filePath: string,
+		reason: { consecutiveTimeouts: number },
+	): Promise<void> {
+		const verdict = await this.notifyStallCpuVerdict(entry);
+		if (verdict.cpuVerdict === "busy") {
+			this.logNotifyStallCpuBusy(key, entry, filePath, 0, verdict);
+			return;
+		}
+		if (this.state.clients.get(key) !== entry.client) return;
+		this.demoteForNotifyStall(key, entry, filePath, {
+			...reason,
+			discriminator: "consecutive-timeouts",
+			cpuVerdict: verdict.cpuVerdict,
+		});
+	}
+
+	/**
+	 * #2358: classify a stalled server's live process CPU.
+	 *
+	 * A client with no process handle (a test/mock double, a legacy client)
+	 * reports "unmeasured" — the caller keeps the pre-#2358 demote-at-budget
+	 * behavior, because there is no liveness evidence to override it. A sampled
+	 * process that burns a core is BUSY; anything else is FLAT, including a
+	 * query that failed to resolve the pid — a server we cannot measure is not
+	 * proven busy, and the replacement self-heal is cheap.
+	 */
+	private async notifyStallCpuVerdict(entry: SpawnedServer): Promise<{
+		cpuVerdict: "busy" | "flat" | "unmeasured";
+		cpuPercent: number | null;
+	}> {
+		const pid = entry.client.getProcessPid?.();
+		if (pid === undefined || !(Number.isFinite(pid) && pid > 0)) {
+			return { cpuVerdict: "unmeasured", cpuPercent: null };
+		}
+		const sample = await sampleProcessTreeCpuPercent(
+			pid,
+			notifyStallCpuSampleMs(),
+			NOTIFY_STALL_CPU_BUSY_FLOOR_PERCENT,
+		);
+		if (sample.busy) {
+			return { cpuVerdict: "busy", cpuPercent: sample.cpuPercent };
+		}
+		return { cpuVerdict: "flat", cpuPercent: sample.cpuPercent };
+	}
+
+	/**
+	 * #2358: one bounded row per busy defer. Not a failure record — the
+	 * discrimination succeeded — so it is a plain latency phase; its volume is
+	 * bounded by the re-arm cadence of one outstanding write (at most the wedge
+	 * cap divided by the budget, ~6 fires at defaults).
+	 */
+	private logNotifyStallCpuBusy(
+		key: string,
+		entry: SpawnedServer,
+		filePath: string,
+		outstandingMs: number,
+		verdict: { cpuPercent: number | null },
+		extra: { budgetMs?: number } = {},
+	): void {
+		logLatency({
+			type: "phase",
+			phase: "lsp_notify_stall_cpu_busy",
+			filePath: normalizeMapKey(filePath),
+			durationMs: 0,
+			metadata: {
+				serverId: entry.info.id,
+				clientKey: key,
+				outstandingMs,
+				cpuPercent: verdict.cpuPercent ?? null,
+				...extra,
+			},
+		});
+	}
+
+	/**
+	 * #2358: the patience window a wedged auxiliary write earns.
+	 *
+	 * max(fixed floor, k x EWMA per-write latency x unacked depth), capped so a
+	 * busy-but-never-draining server still respawns within the cap. The EWMA
+	 * comes from DRAINED notify barriers (see {@link noteAuxNotifyDrainLatency});
+	 * with no history the fixed floor (the pre-#2358 window) stands.
+	 */
+	private auxNotifyWedgeBudgetMs(key: string): number {
+		let budgetMs = notifyWedgedMs();
+		const ewma = this.auxNotifyDrainLatencyEwma.get(key);
+		if (ewma !== undefined && ewma > 0) {
+			const unacked = this.auxNotifyInflight.get(key)?.unacked ?? 0;
+			budgetMs = Math.max(
+				budgetMs,
+				NOTIFY_WEDGED_EWMA_MULTIPLIER * ewma * unacked,
+			);
+		}
+		return Math.min(budgetMs, notifyWedgedCapMs());
 	}
 
 	/**
@@ -1821,7 +2006,7 @@ export class LSPService {
 		key: string,
 		entry: SpawnedServer,
 		filePath: string,
-		reason: { consecutiveTimeouts: number } | { outstandingMs: number },
+		reason: NotifyStallDemotionReason,
 	): void {
 		this.notifyWriteBackpressureStreak.delete(key);
 		this.outstandingAuxNotifyWrites.delete(key);
@@ -1903,6 +2088,94 @@ export class LSPService {
 			return;
 		}
 		this.auxNotifyInflight.set(key, { client, unacked: 1 });
+	}
+
+	/**
+	 * #2358: fold one DRAINED notify barrier's per-write latency into the
+	 * per-key EWMA. A drained round-trip proves the server processed its
+	 * `outstanding` backlog after the ping; duration / outstanding is the
+	 * per-document service time the single-threaded scanner actually achieves
+	 * under load, which is exactly what a busy-server patience window must be
+	 * priced from (#2358's evidence: an 855 ms per-answer server with an
+	 * 8-write backlog, able to drain in 10-20 s while healthy).
+	 */
+	private noteAuxNotifyDrainLatency(
+		key: string,
+		durationMs: number,
+		outstanding: number,
+	): void {
+		if (!(outstanding > 0 && durationMs > 0)) return;
+		const perWriteMs = durationMs / outstanding;
+		const prev = this.auxNotifyDrainLatencyEwma.get(key);
+		this.auxNotifyDrainLatencyEwma.set(
+			key,
+			prev === undefined ? perWriteMs : 0.5 * perWriteMs + 0.5 * prev,
+		);
+	}
+
+	/**
+	 * #2358: decide whether a wedged notify write's teardown really fires.
+	 *
+	 * Before #2358 the breaker killed a server whose write stayed outstanding
+	 * past a FIXED window, conflating a dead input path with a busy scanner
+	 * draining a burst — the live opengrep kill at #2358's head. The decision
+	 * now has two guards, and the record names which one fired:
+	 *
+	 * - the window is ADAPTIVE — max(fixed floor, k x EWMA per-write latency x
+	 *   unacked depth), capped at {@link notifyWedgedCapMs} — so a server that
+	 *   historically answers in 855 ms with 8 writes queued earns 13.7 s (k=2),
+	 *   not 10 s;
+	 * - past the window, the server's process CPU is sampled twice; a BUSY
+	 *   server is left alone (the write stays outstanding and the caller re-arms
+	 *   this timer), a FLAT or unmeasured one is torn down.
+	 *
+	 * The hard cap still kills: a busy server that cannot drain inside it is
+	 * damaged, and the replacement is the self-heal the breaker exists to
+	 * provide.
+	 */
+	private async decideNotifyStallTeardown(
+		key: string,
+		entry: SpawnedServer,
+		filePath: string,
+		token: { startedAt: number; armedBudgetMs: number },
+	): Promise<
+		| { action: "demote"; reason: NotifyStallDemotionReason }
+		| { action: "rearm"; budgetMs: number }
+	> {
+		const outstandingMs = Date.now() - token.startedAt;
+		const armedBudgetMs = token.armedBudgetMs;
+		if (outstandingMs >= notifyWedgedCapMs()) {
+			return {
+				action: "demote",
+				reason: {
+					outstandingMs,
+					discriminator: "cap-exceeded",
+					budgetMs: armedBudgetMs,
+				},
+			};
+		}
+		const verdict = await this.notifyStallCpuVerdict(entry);
+		if (verdict.cpuVerdict === "busy") {
+			this.logNotifyStallCpuBusy(key, entry, filePath, outstandingMs, verdict, {
+				budgetMs: armedBudgetMs,
+			});
+			return { action: "rearm", budgetMs: this.auxNotifyWedgeBudgetMs(key) };
+		}
+		return {
+			action: "demote",
+			reason: {
+				outstandingMs,
+				discriminator:
+					verdict.cpuVerdict === "unmeasured"
+						? "budget-exceeded"
+						: "budget-exceeded-cpu-flat",
+				budgetMs: armedBudgetMs,
+				ewmaInputMs: this.auxNotifyDrainLatencyEwma.get(key),
+				unackedDepth: this.auxNotifyInflight.get(key)?.unacked ?? 0,
+				cpuVerdict: verdict.cpuVerdict,
+				cpuPercent: verdict.cpuPercent ?? null,
+			},
+		};
 	}
 
 	/**
@@ -2039,11 +2312,17 @@ export class LSPService {
 					// and the waiter is what latches. A second latch here would be
 					// unreachable, and no test could hold it honest.
 				}
+				// #2358: a DRAINED round-trip is a per-write latency measurement —
+				// the server really processed its backlog — so it feeds the EWMA
+				// the adaptive wedge window is priced from.
+				const durationMs = Date.now() - startedAt;
+				if (drained)
+					this.noteAuxNotifyDrainLatency(key, durationMs, outstanding);
 				this.noteDrainBarrierOutcome(key, entry, filePath, context, {
 					unacked: outstanding,
 					limit,
 					waitMs,
-					durationMs: Date.now() - startedAt,
+					durationMs,
 					outcome: drained ? "drained" : "stalled",
 				});
 				return drained;
@@ -2244,20 +2523,69 @@ export class LSPService {
 				startedAt: Date.now(),
 				client: entry.client,
 				settled,
-				// A write nothing accepts for the whole wedge window is a dead input
-				// path, not a slow scan. Armed HERE rather than checked by the next
-				// waiter: inside a burst every waiter arrives within one budget, so a
-				// waiter-side check could never see the wedge window elapse and a
-				// wedged scanner was never demoted. Unref'd so it cannot hold a
-				// one-shot host alive, and cleared on release.
-				wedgeTimer: setTimeout(() => {
-					if (this.outstandingAuxNotifyWrites.get(clientKey) !== token) return;
-					this.demoteForNotifyStall(clientKey, entry, filePath, {
-						outstandingMs: Date.now() - token.startedAt,
-					});
-					resolveSettled?.();
-				}, notifyWedgedMs()),
+				armedBudgetMs: 0,
+				wedgeTimer: undefined as unknown as ReturnType<typeof setTimeout>,
 			};
+			// A write nothing accepts for the whole wedge window is a dead input
+			// path, not a slow scan. Armed HERE rather than checked by the next
+			// waiter: inside a burst every waiter arrives within one budget, so a
+			// waiter-side check could never see the wedge window elapse and a
+			// wedged scanner was never demoted. Unref'd so it cannot hold a
+			// one-shot host alive, and cleared on release.
+			//
+			// #2358: the window itself is now ADAPTIVE (issue's `max(fixed,
+			// k x EWMA per-answer latency x unacked depth)`, capped), and when it
+			// fires the server's process CPU is sampled before the kill — a busy
+			// server is left alone and the timer re-arms, so a scanner draining a
+			// burst is never killed by construction. Every fire re-checks the
+			// token identity after its awaits, so a release or a concurrent
+			// demotion that lands mid-sample aborts the decision.
+			const fireWedge = async (): Promise<void> => {
+				if (this.outstandingAuxNotifyWrites.get(clientKey) !== token) return;
+				let decision:
+					| { action: "demote"; reason: NotifyStallDemotionReason }
+					| { action: "rearm"; budgetMs: number };
+				try {
+					decision = await this.decideNotifyStallTeardown(
+						clientKey,
+						entry,
+						filePath,
+						token,
+					);
+				} catch {
+					// A failed decision must not strand the outstanding write or the
+					// waiter: fall back to the pre-#2358 demote-at-budget teardown.
+					decision = {
+						action: "demote",
+						reason: {
+							outstandingMs: Date.now() - token.startedAt,
+							discriminator: "budget-exceeded",
+							budgetMs: token.armedBudgetMs,
+						},
+					};
+				}
+				if (this.outstandingAuxNotifyWrites.get(clientKey) !== token) return;
+				if (decision.action === "demote") {
+					this.demoteForNotifyStall(
+						clientKey,
+						entry,
+						filePath,
+						decision.reason,
+					);
+					resolveSettled?.();
+					return;
+				}
+				token.wedgeTimer = setTimeout(
+					() => void fireWedge(),
+					decision.budgetMs,
+				);
+				token.wedgeTimer.unref?.();
+			};
+			token.armedBudgetMs = this.auxNotifyWedgeBudgetMs(clientKey);
+			token.wedgeTimer = setTimeout(
+				() => void fireWedge(),
+				token.armedBudgetMs,
+			);
 			token.wedgeTimer.unref?.();
 			this.outstandingAuxNotifyWrites.set(clientKey, token);
 			return {
@@ -4211,11 +4539,14 @@ export class LSPService {
 									// streak outright, so only the late case retracts. A landing
 									// past the WEDGE window keeps its strike: at that point the
 									// stall was long enough that #743's demotion is the honest
-									// verdict, not a latency artifact.
+									// verdict, not a latency artifact. #2358: the wedge window
+									// is the adaptive one the timer itself arms with, so a
+									// write a BUSY server would have been left alone for also
+									// retracts its strike instead of accruing a ladder charge.
 									const outstandingMs = Date.now() - writeStartedAt;
 									if (
 										outstandingMs > budget &&
-										outstandingMs <= notifyWedgedMs()
+										outstandingMs <= this.auxNotifyWedgeBudgetMs(clientKey)
 									) {
 										this.retractNotifyWriteBackpressure(
 											clientKey,
@@ -8740,6 +9071,11 @@ export class LSPService {
 		// entry; clearing keeps the map honest rather than relying on that.
 		this.outstandingAuxNotifyWrites.clear();
 		this.notifyStallDemotions.clear();
+		// #2358: same reasoning — a per-write latency estimate belongs to a client
+		// generation, and every client is gone. `session_start` reaches this
+		// through the service reset, so the adaptive wedge window re-arms with
+		// the session rather than being priced by a previous one's throughput.
+		this.auxNotifyDrainLatencyEwma.clear();
 		// #1714: same reasoning — a backlog count belongs to a client generation,
 		// and every client is gone. `session_start` reaches this through the service
 		// reset, so the pacing state re-arms with the session rather than living for
