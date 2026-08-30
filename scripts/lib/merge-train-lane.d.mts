@@ -4,6 +4,7 @@ import type { HeadRunHealth } from "./warden-run-health.d.mts";
 export const TRAIN_APPROVED_LABEL: string;
 export const TRAIN_SQUASH_LABEL: string;
 export const POST_MERGE_EVENT: string;
+export const POST_MERGE_DISPATCH_ATTEMPTS: number;
 export const ADVISORY_SUFFIX: string;
 export const ADVISORY_CHECKS: Set<string>;
 export const CONCLUDED_STATUS: string;
@@ -83,6 +84,15 @@ export function dispatchPostMergeValidation(
 	repo: string,
 	mergeSha: string,
 ): Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
+export function dispatchPostMergeValidationWithRetry(
+	fetcher: FetchFn,
+	owner: string,
+	repo: string,
+	mergeSha: string,
+): Promise<{
+	response: { ok: boolean; status: number; json(): Promise<unknown> };
+	attempts: number;
+}>;
 export function runMergeLane(options: {
 	fetcher: FetchFn;
 	owner: string;

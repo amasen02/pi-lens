@@ -1377,15 +1377,18 @@ drift; the merge call passes `sha` so a head that moves mid-cycle 409s instead
 of merging on a stale verdict. Only the maintainer applies the label, so the
 adversarial-review-first policy is unchanged; removing the label aborts.
 
-After a successful merge, `runMergeLane` reads the merge response's exact SHA
-and sends one `merge-train-post-merge` `repository_dispatch` payload containing
+After a successful merge, `runMergeLane` reads a strict 40-hex merge SHA and
+sends a `merge-train-post-merge` `repository_dispatch` payload containing
 `{repository, sha}`. The lane uses this event because its `GITHUB_TOKEN` merge
-suppresses the ordinary `push` event. The master-push validation workflows
-(`ci.yml`, `lint.yml`, `install-smoke.yml`, and `labels.yml`) accept that event,
-check out its SHA, and use per-workflow SHA concurrency with cancellation so a
-duplicate dispatch cannot validate one commit concurrently. A missing merge
-SHA or failed dispatch leaves the merge landed but records a fatal
-post-merge-validation error; the lane must never report that verification ran.
+suppresses the ordinary `push` event. Transient HTTP failures and ambiguous
+timeouts receive one bounded retry with the same SHA; a final failure leaves the
+merge landed but records a fatal post-merge-validation error. The master-push
+validation workflows (`ci.yml`, `lint.yml`, `install-smoke.yml`, and
+`labels.yml`) accept that event, select its payload SHA, validate the repository
+identity, strict SHA shape, and resolved checkout before any repository action,
+and use per-workflow SHA concurrency with cancellation so duplicate dispatches
+cannot validate one commit concurrently. A missing or invalid merge SHA means
+no dispatch, and the lane must never report that verification ran.
 
 Four facts about THIS repository the lane must keep matching, each probed live
 rather than assumed (review round 1 on PR #2191, all four were wrong first):

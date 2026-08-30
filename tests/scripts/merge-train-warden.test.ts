@@ -2685,6 +2685,80 @@ describe("merge-lane sweep (#2185)", () => {
 		expect(calls.some((c) => c.url.endsWith("/dispatches"))).toBe(false);
 	});
 
+	it("rejects a mutable post-merge ref instead of dispatching it", async () => {
+		const { fetcher, calls } = fakeGithub({
+			"POST /graphql": graphqlPage([
+				lanePrNode({ labels: [TRAIN_APPROVED_LABEL] }),
+			]),
+			"GET /repos/acme/repo/actions/runs": runsRoute(HEALTHY_RUNS),
+			"PUT /repos/acme/repo/pulls/7/merge": { sha: "master" },
+		});
+		const results = await runMergeLane({
+			fetcher,
+			owner: "acme",
+			repo: "repo",
+			now: NOW,
+		});
+		expect(results[0]).toMatchObject({ merged: true });
+		expect(results[0].errors).toContainEqual({
+			message: expect.stringContaining("post-merge validation missing"),
+			benign: false,
+		});
+		expect(calls.some((c) => c.url.endsWith("/dispatches"))).toBe(false);
+	});
+
+	it("retries a transient post-merge dispatch for the same exact SHA", async () => {
+		let attempts = 0;
+		const { fetcher, calls } = fakeGithub({
+			"POST /graphql": graphqlPage([
+				lanePrNode({ labels: [TRAIN_APPROVED_LABEL] }),
+			]),
+			"GET /repos/acme/repo/actions/runs": runsRoute(HEALTHY_RUNS),
+			"PUT /repos/acme/repo/pulls/7/merge": { sha: MERGE_SHA },
+			"POST /repos/acme/repo/dispatches": () => {
+				attempts += 1;
+				return attempts === 1
+					? { ok: false, status: 503, json: async () => ({}) }
+					: { ok: true, status: 204, json: async () => ({}) };
+			},
+		});
+		const results = await runMergeLane({
+			fetcher,
+			owner: "acme",
+			repo: "repo",
+			now: NOW,
+		});
+		expect(results[0]).toMatchObject({ merged: true, errors: [] });
+		expect(attempts).toBe(2);
+		expect(calls.filter((c) => c.url.endsWith("/dispatches"))).toHaveLength(2);
+	});
+
+	it("retries when dispatch loses an accepted response", async () => {
+		let attempts = 0;
+		const { fetcher, calls } = fakeGithub({
+			"POST /graphql": graphqlPage([
+				lanePrNode({ labels: [TRAIN_APPROVED_LABEL] }),
+			]),
+			"GET /repos/acme/repo/actions/runs": runsRoute(HEALTHY_RUNS),
+			"PUT /repos/acme/repo/pulls/7/merge": { sha: MERGE_SHA },
+			"POST /repos/acme/repo/dispatches": () => {
+				attempts += 1;
+				if (attempts === 1)
+					throw new Error("request timed out after acceptance");
+				return { ok: true, status: 204, json: async () => ({}) };
+			},
+		});
+		const results = await runMergeLane({
+			fetcher,
+			owner: "acme",
+			repo: "repo",
+			now: NOW,
+		});
+		expect(results[0]).toMatchObject({ merged: true, errors: [] });
+		expect(attempts).toBe(2);
+		expect(calls.filter((c) => c.url.endsWith("/dispatches"))).toHaveLength(2);
+	});
+
 	it("records a failed post-merge dispatch while preserving the landed merge", async () => {
 		const { fetcher, calls } = fakeGithub({
 			"POST /graphql": graphqlPage([
@@ -2709,7 +2783,7 @@ describe("merge-lane sweep (#2185)", () => {
 			message: expect.stringContaining("dispatch -> HTTP 503"),
 			benign: false,
 		});
-		expect(calls.filter((c) => c.url.endsWith("/dispatches"))).toHaveLength(1);
+		expect(calls.filter((c) => c.url.endsWith("/dispatches"))).toHaveLength(2);
 	});
 
 	it("pins every master-push workflow to post-merge dispatch and SHA concurrency", () => {
@@ -2723,10 +2797,35 @@ describe("merge-lane sweep (#2185)", () => {
 				new URL(`../../.github/workflows/${workflow}`, import.meta.url),
 				"utf8",
 			);
+			expect(source).toContain("push:");
 			expect(source).toContain("repository_dispatch:");
 			expect(source).toContain("merge-train-post-merge");
 			expect(source).toContain(
-				"ref: ${{ github.event.client_payload.sha || github.sha }}",
+				"ref: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.sha || github.ref }}",
+			);
+			expect(source).not.toContain(
+				"github.event.client_payload.sha || github.sha",
+			);
+			expect(source).toContain(
+				"PAYLOAD_REPOSITORY: ${{ github.event.client_payload.repository }}",
+			);
+			expect(source).toContain(
+				"PAYLOAD_SHA: ${{ github.event.client_payload.sha }}",
+			);
+			expect(source).toContain(
+				"repository_dispatch SHA must be a 40-hex commit",
+			);
+			expect(source).toContain(
+				"repository_dispatch repository does not match this repository",
+			);
+			expect(source).toContain(
+				'if [[ "$PAYLOAD_REPOSITORY" != "$GITHUB_REPOSITORY" ]]',
+			);
+			expect(source).toContain(
+				'if [[ ! "$PAYLOAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]]',
+			);
+			expect(source).toContain(
+				"checkout does not match the repository_dispatch SHA",
 			);
 			expect(source).toContain("cancel-in-progress: true");
 		}

@@ -34,6 +34,7 @@ import { fetchHeadRunHealth, RUN_HEALTH } from "./warden-run-health.mjs";
 export const TRAIN_APPROVED_LABEL = "train:approved";
 export const TRAIN_SQUASH_LABEL = "train:squash";
 export const POST_MERGE_EVENT = "merge-train-post-merge";
+export const POST_MERGE_DISPATCH_ATTEMPTS = 2;
 const POST_MERGE_ERROR_CAP = 200;
 
 function boundedError(error) {
@@ -362,6 +363,49 @@ export async function dispatchPostMergeValidation(
 }
 
 /**
+ * Retry only the transient/ambiguous dispatch outcomes. A timeout can mean
+ * GitHub accepted the event before the client lost its response, so retries
+ * are intentionally idempotent at the workflow boundary: each consumer has
+ * a per-SHA concurrency key and cancels a duplicate in-flight run.
+ */
+export async function dispatchPostMergeValidationWithRetry(
+	fetcher,
+	owner,
+	repo,
+	mergeSha,
+) {
+	let lastResponse;
+	let lastError;
+	for (let attempt = 1; attempt <= POST_MERGE_DISPATCH_ATTEMPTS; attempt++) {
+		try {
+			lastResponse = await dispatchPostMergeValidation(
+				fetcher,
+				owner,
+				repo,
+				mergeSha,
+			);
+			const retryable =
+				lastResponse.status === 408 ||
+				lastResponse.status === 429 ||
+				lastResponse.status >= 500;
+			if (
+				lastResponse.ok ||
+				!retryable ||
+				attempt === POST_MERGE_DISPATCH_ATTEMPTS
+			)
+				return { response: lastResponse, attempts: attempt };
+		} catch (error) {
+			lastError = error;
+			if (attempt === POST_MERGE_DISPATCH_ATTEMPTS) throw error;
+		}
+	}
+	if (lastResponse) {
+		return { response: lastResponse, attempts: POST_MERGE_DISPATCH_ATTEMPTS };
+	}
+	throw lastError ?? new Error("post-merge validation dispatch failed");
+}
+
+/**
  * The strict-protection update kick (review round 1, F1). `expected_head_sha`
  * makes it as head-atomic as the merge call: if the branch moved since the
  * gate read, GitHub refuses rather than updating a head nobody evaluated.
@@ -464,8 +508,7 @@ export async function runMergeLane({
 						// The parse failure above already records the missing validation.
 					} else if (
 						typeof mergeSha !== "string" ||
-						mergeSha.length === 0 ||
-						mergeSha.length > 128
+						!/^[0-9a-f]{40}$/i.test(mergeSha)
 					) {
 						errors.push({
 							message: `PR #${pr.number}: post-merge validation missing; merge response had no exact merge SHA`,
@@ -473,15 +516,16 @@ export async function runMergeLane({
 						});
 					} else {
 						try {
-							const dispatch = await dispatchPostMergeValidation(
+							const dispatchResult = await dispatchPostMergeValidationWithRetry(
 								fetcher,
 								owner,
 								repo,
 								mergeSha,
 							);
+							const dispatch = dispatchResult.response;
 							if (!dispatch.ok)
 								errors.push({
-									message: `PR #${pr.number}: post-merge validation dispatch -> HTTP ${dispatch.status} for ${mergeSha.slice(0, 64)}`,
+									message: `PR #${pr.number}: post-merge validation dispatch -> HTTP ${dispatch.status} after ${dispatchResult.attempts} attempt(s) for ${mergeSha.slice(0, 64)}`,
 									benign: false,
 								});
 						} catch (error) {
