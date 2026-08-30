@@ -1020,6 +1020,23 @@ function notifyWriteBudgetMs(): number {
 	return Number.isFinite(raw) && raw > 0 ? raw : 2000;
 }
 
+// #2239: the SAME effective per-server wait floor `getClientForFile` uses to
+// size its own acquisition race — the caller's declared budget, raised to
+// whatever the file's primary server(s) configure via `clientWaitTimeoutMs`
+// (Ruby 30s, and the Bash/JSON/Vue/Svelte/Prisma overrides #2233 added). A
+// cold primary spawn is allowed to run this long, so anything downstream that
+// charges itself against `maxWaitMs` alone — rather than this floor — sees an
+// already-elapsed time it never budgeted for and clamps to zero.
+function primaryServerWaitFloorMs(
+	filePath: string,
+	maxWaitMs?: number,
+): number {
+	const serverWaitOverrideMs = getServersForFileWithConfig(filePath)
+		.filter((s) => s.role !== "auxiliary")
+		.reduce((max, server) => Math.max(max, server.clientWaitTimeoutMs ?? 0), 0);
+	return Math.max(maxWaitMs ?? 0, serverWaitOverrideMs);
+}
+
 // #1459: how long ONE auxiliary notify write may stay outstanding before the
 // server counts as wedged rather than merely slow. A scanner whose per-file work
 // exceeds the write budget is normal (opengrep routinely needs >2s on a large
@@ -2708,17 +2725,13 @@ export class LSPService {
 		const servers = getServersForFileWithConfig(filePath).filter(
 			(s) => s.role !== "auxiliary",
 		);
-		const serverWaitOverrideMs = servers.reduce(
-			(max, server) => Math.max(max, server.clientWaitTimeoutMs ?? 0),
-			0,
-		);
 		// hardCapMs is a caller-imposed ceiling (e.g. pipeline budget) that
 		// prevents tool_result from blocking the TUI for the full LSP cold-start
 		// window. When no server config sets a wait (serverWaitOverrideMs = 0),
 		// hardCapMs is used directly — Math.min(0, cap) = 0 would otherwise
 		// take the no-timeout branch and block indefinitely (e.g. pyright, which
 		// has no clientWaitTimeoutMs but can take 30s to initialize on cold start).
-		const serverBaseMs = Math.max(maxWaitMs ?? 0, serverWaitOverrideMs);
+		const serverBaseMs = primaryServerWaitFloorMs(filePath, maxWaitMs);
 		const effectiveMaxWaitMs =
 			hardCapMs !== undefined
 				? serverBaseMs > 0
@@ -4426,17 +4439,32 @@ export class LSPService {
 			if (!notifySkipped) {
 				const budget = notifyWriteBudgetMs();
 				// #1459: how long a queued auxiliary may wait for its resync slot. Bounded
-				// by the write budget AND by whatever the caller already declared it is
-				// willing to spend on this touch (`maxClientWaitMs` — cascade's cold
-				// snapshot passes 1000ms), minus what the client wait above already spent.
+				// by the write budget and by the effective primary wait floor, minus what
+				// which includes the caller's `maxClientWaitMs` and any primary
+				// server `clientWaitTimeoutMs` override. The elapsed client wait is
+				// subtracted below.
 				// A flat write-budget wait would tax a caller that asked for less than one
 				// budget in total. Non-positive means "no time left to queue": the server
 				// is reported as uncovered immediately.
+				//
+				// #2239: "what the caller already declared" is `primaryServerWaitFloorMs`,
+				// not the raw `options.maxClientWaitMs` — the SAME floor `getClientForFile`
+				// races the primary spawn against. A cold primary configured with its own
+				// `clientWaitTimeoutMs` (Ruby 30s, and the #2233 Bash/JSON/Vue/Svelte/Prisma
+				// overrides) is allowed to run past the caller's flat budget, and did just
+				// that by the time this line runs — charging the subtraction against the
+				// flat value alone always went negative and clamped to zero. The outer
+				// `Math.min(budget, …)` is unchanged, so this raises what "already spent"
+				// is measured against without widening the wait beyond one write budget.
 				const queueWaitMs =
 					options.maxClientWaitMs !== undefined
 						? Math.min(
 								budget,
-								Math.max(0, options.maxClientWaitMs - (Date.now() - startedAt)),
+								Math.max(
+									0,
+									primaryServerWaitFloorMs(filePath, options.maxClientWaitMs) -
+										(Date.now() - startedAt),
+								),
 							)
 						: budget;
 				await Promise.all(

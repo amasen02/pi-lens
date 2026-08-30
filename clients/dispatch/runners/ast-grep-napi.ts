@@ -567,6 +567,307 @@ export interface AstGrepEvaluateOptions {
 	log?: (message: string) => void;
 	/** Rule ids already reported as unsupported by the surrounding scan/run. */
 	unsupportedLanguageLog?: Set<string>;
+	/**
+	 * Original file content. Required together with `sgModule` for embedded
+	 * `<script>` coverage on HTML (#2347): every `script_element` body is
+	 * parsed as JavaScript and `language: JavaScript` rules run against those
+	 * bodies, mirroring the ast-grep CLI/LSP (ast-grep 0.45.1 injects every
+	 * script body regardless of `type`/`src`; verified by direct CLI repro).
+	 * Absent on a non-HTML file this is unused and irrelevant.
+	 */
+	content?: string;
+	/** Loaded addon, required with `content` to parse script bodies (#2347). */
+	sgModule?: AstGrepNapi;
+}
+
+/**
+ * One embedded `<script>` body of an HTML file, already parsed as JavaScript
+ * (#2347). `root` is body-relative; findings must be translated back to the
+ * original file with `startIndex` plus the file's line-start table.
+ */
+export interface HtmlScriptInjection {
+	/** The JavaScript body exactly as it appears in the file. */
+	body: string;
+	/**
+	 * UTF-16 code-unit index of `body`'s first character within the original
+	 * file. `@ast-grep/napi`'s `Pos.index` is a UTF-16 code-unit offset (not a
+	 * byte offset — verified against 0.45.1 with multibyte content), so the
+	 * translation keeps one unit everywhere and never mixes units.
+	 */
+	startIndex: number;
+	/** Root of `body` parsed with the addon's JavaScript grammar. */
+	root: { findAll(config: never): unknown[] };
+}
+
+/**
+ * Budget for embedded-`<script>` evaluation (#2347 review F2/F4). Every nonempty
+ * script body is reparsed as JS and EVERY `language: JavaScript` rule runs
+ * against it, so the work is `rules * bodies * body-size`, all multiplied by
+ * the native addon's per-call overhead. Measured on this seam (full catalog,
+ * real addon, 2026-08-30): ~8.5 ms per small body, ~9 s for 500 blocks, and
+ * ~19.5 s for one ~1 MiB dense body (the shape that made the byte axis the
+ * real bound). The caps apply to EVERY body — first one included — so an
+ * oversized single inline script is omitted and recorded like any other
+ * over-budget body. Hand-authored HTML carries a handful of small inline
+ * scripts, so the caps only ever trip on generated/pathological pages, where a
+ * bounded, recorded partial evaluation beats a seconds-long synchronous stall
+ * on the per-edit hook. Budget truncation is a coverage loss and is recorded
+ * (see `emitHtmlScriptDegradations`).
+ */
+export const MAX_SCRIPT_BODIES_EVALUATED = 64;
+/**
+ * Cumulative parsed script-body size cap; bounds the `rules * bytes` work.
+ * Every body — including the first — must fit within the running total.
+ */
+export const MAX_SCRIPT_BODY_BYTES_EVALUATED = 128 * 1024;
+
+/**
+ * The outcome of {@link collectHtmlScriptInjections}. Beyond the parsed
+ * injections it carries every bounded count the evaluation seam needs to
+ * preserve raw coverage evidence and surface silent failure modes (#2347
+ * review F3): a coverage engine that reports "no findings" must be able to say
+ * whether that was genuine, a budget cut, or a parser failure.
+ */
+export interface HtmlScriptCollectionResult {
+	/** Script bodies that were parsed and are ready for rule matching. */
+	injections: HtmlScriptInjection[];
+	/**
+	 * RAW number of `script_element` nodes found in the HTML file, before any
+	 * whitespace skip or budget cut. This is the count coverage evidence must
+	 * preserve: a reader comparing it against `bodiesEvaluated` and
+	 * `truncatedBodies` can reconstruct exactly what was and was not scanned.
+	 */
+	scriptElementCount: number;
+	/** Number of script bodies actually evaluated (post-budget, pre-failures). */
+	bodiesEvaluated: number;
+	/** Number of nonempty bodies dropped by the evaluation budget. */
+	truncatedBodies: number;
+	/** Number of evaluated bodies the JS grammar itself refused to parse. */
+	parseFailures: number;
+	/** True when the loaded addon exposes no `js` grammar. */
+	missingJsGrammar: boolean;
+	/** True when the `script_element` scan of the HTML root threw. */
+	htmlScanFailure: boolean;
+}
+
+/**
+ * UTF-16 code-unit indexes, in the original file, of every line start, newest
+ * line last. `@ast-grep/napi` reports line/column/index in UTF-16 code units
+ * (verified against 0.45.1 with `é` and emoji), so the line table must be
+ * built in the SAME unit; a UTF-8 byte walk would shift every coordinate that
+ * follows a multibyte character.
+ */
+function computeLineStartsUtf16(content: string): number[] {
+	const starts: number[] = [0];
+	for (let i = 0; i < content.length; i++) {
+		if (content.charCodeAt(i) === 0x0a) starts.push(i + 1);
+	}
+	return starts;
+}
+
+/** 0-based line and code-unit column for a UTF-16 index, via binary search. */
+function filePositionForIndex(
+	lineStarts: number[],
+	index: number,
+): { line: number; column: number } {
+	let lo = 0;
+	let hi = lineStarts.length - 1;
+	while (lo < hi) {
+		const mid = (lo + hi + 1) >> 1;
+		if (lineStarts[mid] <= index) lo = mid;
+		else hi = mid - 1;
+	}
+	return { line: lo, column: index - lineStarts[lo] };
+}
+
+/**
+ * Extract every `<script>` body from an HTML root and parse it as JavaScript
+ * (#2347). Mirrors the ast-grep CLI/LSP: the injection is unconditional —
+ * `type` and `src` attributes do not suppress it (verified against the 0.45.1
+ * CLI with `text/template`, `application/ld+json`, and `src`-bearing script
+ * tags, all injected). Whitespace-only bodies are skipped (nothing to match).
+ * A body the JS grammar cannot parse is dropped the way an unparseable `.js`
+ * file would be; the failure is counted, never silent. The evaluation budget
+ * (count + cumulative bytes) is applied BEFORE any grammar parse. The caller
+ * emits the bounded degradation records from the result — collection stays
+ * pure so the count evidence is directly testable.
+ */
+export function collectHtmlScriptInjections(
+	htmlRoot: {
+		findAll(config: unknown): unknown[];
+	},
+	sgModule: AstGrepNapi,
+): HtmlScriptCollectionResult {
+	// SAFETY: `AstGrepNapi` is the loaded addon module's own (typed) shape, so
+	// its `js` accessor is guaranteed present while the addon lives; this
+	// narrowing only names the subshape this helper consumes (a `js` grammar
+	// whose parses expose `findAll`), and the absence check right below
+	// degrades to "no embedded coverage" rather than throwing when the addon
+	// ever drops the grammar.
+	const addon = sgModule as unknown as {
+		js?: {
+			parse(src: string): { root(): { findAll(config: never): unknown[] } };
+		};
+	};
+	if (!addon.js) {
+		return {
+			injections: [],
+			scriptElementCount: 0,
+			bodiesEvaluated: 0,
+			truncatedBodies: 0,
+			parseFailures: 0,
+			missingJsGrammar: true,
+			htmlScanFailure: false,
+		};
+	}
+	let scripts: Array<{
+		children(): Array<{
+			kind(): string;
+			range(): { start: { index: number } };
+			text(): string;
+		}>;
+	}>;
+	try {
+		scripts = htmlRoot.findAll({ rule: { kind: "script_element" } }) as never;
+	} catch {
+		return {
+			injections: [],
+			scriptElementCount: 0,
+			bodiesEvaluated: 0,
+			truncatedBodies: 0,
+			parseFailures: 0,
+			missingJsGrammar: false,
+			htmlScanFailure: true,
+		};
+	}
+
+	// Extract every nonempty body first (text extraction is cheap) so the raw
+	// script-element count is exact, then apply the budget BEFORE parsing any
+	// of them.
+	let scriptElementCount = 0;
+	const candidates: Array<{ body: string; startIndex: number }> = [];
+	for (const element of scripts) {
+		scriptElementCount += 1;
+		let raw:
+			| {
+					kind(): string;
+					range(): { start: { index: number } };
+					text(): string;
+			  }
+			| undefined;
+		for (const child of element.children()) {
+			if (child.kind() === "raw_text") {
+				raw = child;
+				break;
+			}
+		}
+		if (!raw) continue;
+		const body = raw.text();
+		if (!body.trim()) continue;
+		candidates.push({
+			body,
+			startIndex: raw.range().start.index,
+		});
+	}
+	let budgetedBytes = 0;
+	const selected: Array<{ body: string; startIndex: number }> = [];
+	let truncatedBodies = 0;
+	for (const candidate of candidates) {
+		const bytes = Buffer.byteLength(candidate.body, "utf8");
+		// EVERY body must fit inside both caps — including the first. There is
+		// no "one big script" allowance: a single over-cap body (a ~1 MiB dense
+		// inline script measured 19.5 s of synchronous rule traversal on this
+		// seam) is omitted like any other over-budget body, and the omission is
+		// recorded via `truncatedBodies`, so the bounded
+		// `ast-grep-napi-html-script-budget` degradation record always explains
+		// why that file lost embedded coverage.
+		if (
+			selected.length >= MAX_SCRIPT_BODIES_EVALUATED ||
+			budgetedBytes + bytes > MAX_SCRIPT_BODY_BYTES_EVALUATED
+		) {
+			truncatedBodies += 1;
+			continue;
+		}
+		selected.push(candidate);
+		budgetedBytes += bytes;
+	}
+
+	const injections: HtmlScriptInjection[] = [];
+	let parseFailures = 0;
+	for (const candidate of selected) {
+		try {
+			const root = addon.js.parse(candidate.body).root();
+			injections.push({
+				body: candidate.body,
+				startIndex: candidate.startIndex,
+				root,
+			});
+		} catch {
+			parseFailures += 1;
+		}
+	}
+	return {
+		injections,
+		scriptElementCount,
+		bodiesEvaluated: selected.length,
+		truncatedBodies,
+		parseFailures,
+		missingJsGrammar: false,
+		htmlScanFailure: false,
+	};
+}
+
+/**
+ * Emit bounded, discriminating degradation records for every embedded-script
+ * coverage loss (#2347 review F3). Each failure mode keeps its own kind so the
+ * ledger answers WHICH failure and WHICH file; subjects are the normalized file
+ * path, bounded by the ledger's own per-kind window. Collection failures
+ * (`missingJsGrammar`, `htmlScanFailure`) are once-per-file-per-session
+ * categorical events; parse failures and budget truncation are counted per file
+ * so the EXACT totals survive past the retained-entry window.
+ */
+function emitHtmlScriptDegradations(
+	filePath: string,
+	result: HtmlScriptCollectionResult,
+): void {
+	if (result.missingJsGrammar) {
+		recordDegradationOnce({
+			kind: "ast-grep-napi-html-js-grammar-missing",
+			subject: filePath,
+			reason: "addon exposes no js grammar; embedded <script> coverage dropped",
+		});
+	}
+	if (result.htmlScanFailure) {
+		recordDegradationOnce({
+			kind: "ast-grep-napi-html-script-scan-failed",
+			subject: filePath,
+			reason:
+				"script_element enumeration failed; embedded <script> coverage dropped",
+		});
+	}
+	if (result.parseFailures > 0) {
+		incrementDegradationCount({
+			kind: "ast-grep-napi-html-script-parse-failed",
+			subject: filePath,
+			reason: `${result.parseFailures} of ${result.bodiesEvaluated} script bodies refused to parse as JS`,
+			metadata: {
+				scriptElementCount: result.scriptElementCount,
+				parseFailures: result.parseFailures,
+			},
+		});
+	}
+	if (result.truncatedBodies > 0) {
+		incrementDegradationCount({
+			kind: "ast-grep-napi-html-script-budget",
+			subject: filePath,
+			reason: `script budget truncated coverage: ${result.bodiesEvaluated}/${result.scriptElementCount} bodies evaluated, ${result.truncatedBodies} dropped`,
+			metadata: {
+				scriptElementCount: result.scriptElementCount,
+				bodiesEvaluated: result.bodiesEvaluated,
+				truncatedBodies: result.truncatedBodies,
+			},
+		});
+	}
 }
 
 function duplicateRuleIds(rules: YamlRule[]): string[] {
@@ -666,6 +967,43 @@ export function evaluateAstGrepRules(
 	const seenRuleIds = new Set<string>();
 	const suppressLinterOverlap = kind === "jsts" && hasEslintConfig(cwd);
 	const fileLang = ruleLanguageForFile(filePath);
+	// Embedded `<script>` coverage (#2347): on an HTML file, every script body
+	// is parsed as JavaScript and `language: JavaScript` rules run inside it —
+	// the exact behavior the ast-grep CLI/LSP has (verified against 0.45.1).
+	// `content` + `sgModule` are only needed for HTML; other callers of this
+	// shared seam (the per-edit runner and the project scanner both now pass
+	// them) cost a no-op on non-HTML files. The collection is budget-bounded
+	// and every silent-failure mode plus the budget cut is recorded, so "no
+	// embedded findings" stays distinguishable from "coverage was dropped"
+	// (#2347 review F2/F3).
+	const htmlCollection: HtmlScriptCollectionResult =
+		fileLang === "html" &&
+		options.content !== undefined &&
+		options.sgModule !== undefined
+			? collectHtmlScriptInjections(
+					rootNode as { findAll(config: unknown): unknown[] },
+					options.sgModule,
+				)
+			: {
+					injections: [],
+					scriptElementCount: 0,
+					bodiesEvaluated: 0,
+					truncatedBodies: 0,
+					parseFailures: 0,
+					missingJsGrammar: false,
+					htmlScanFailure: false,
+				};
+	const htmlInjections = htmlCollection.injections;
+	emitHtmlScriptDegradations(filePath, htmlCollection);
+	// UTF-16 code-unit index of each line start in the ORIGINAL file, used to
+	// translate an injected match's body-relative UTF-16 index back to file
+	// line/column. The unit matters: napi positions are UTF-16, so a UTF-8 byte
+	// table would shift every coordinate after a multibyte character (#2347
+	// review F1).
+	const fileLineStarts =
+		htmlInjections.length > 0 && options.content !== undefined
+			? computeLineStartsUtf16(options.content)
+			: [];
 	// Unsupported-language skips are expected in bulk (every non-jsts rule in the
 	// catalog, e.g. ~30 Python rules) — aggregate them into ONE latency-log entry
 	// per evaluation instead of per-rule terminal lines (#282 follow-up).
@@ -703,6 +1041,18 @@ export function evaluateAstGrepRules(
 							// ship for a language nobody decided a route for, which is the
 							// class this issue closed regrowing.
 							route: skipRouteFor(language),
+							// #2347 observability: on an HTML file the per-language skip
+							// count is only part of the picture — `mismatch:*->html`
+							// entries name a rule family that never enters scripts, and
+							// `htmlInlineScriptCount` says whether the file offered any
+							// script bodies to enter. A `javascript->html` mismatch here
+							// is necessarily `0` (JS rules RUN when scripts exist), so the
+							// field makes "no injection target" distinguishable from the
+							// same key on a plain non-HTML file, keeping the residual
+							// coverage gap countable in production.
+							...(fileLang === "html"
+								? { htmlInlineScriptCount: htmlInjections.length }
+								: {}),
 						},
 					]),
 				),
@@ -800,9 +1150,21 @@ export function evaluateAstGrepRules(
 			// rules) goes dark on every .tsx file. `language: TSX` rules
 			// stay tsx-exclusive — they're already scoped to fileLang
 			// "tsx" by the exact-match check.
+			// #2347: `language: JavaScript` rules run INSIDE an HTML file's
+			// embedded `<script>` bodies instead of being filtered out as a
+			// language mismatch — that filter is what closed napi's embedded
+			// coverage entirely while the ast-grep CLI/LSP resolves the
+			// injections itself. Only when the file has at least one inline
+			// script body; with none, a `javascript->html` rule stays a
+			// genuine mismatch with nothing to run against (countable via
+			// `htmlInlineScriptCount` in the skip record).
+			const runsInsideHtmlScript =
+				fileLang === "html" &&
+				lang === "javascript" &&
+				htmlInjections.length > 0;
 			if (lang && fileLang && lang !== fileLang) {
 				const runsAsTsOnTsx = fileLang === "tsx" && lang === "typescript";
-				if (!runsAsTsOnTsx) {
+				if (!runsAsTsOnTsx && !runsInsideHtmlScript) {
 					const key = `mismatch:${lang}->${fileLang}`;
 					if (!unsupportedLanguageLog.has(key)) {
 						const ids = newlyUnsupported.get(key) ?? [];
@@ -823,7 +1185,47 @@ export function evaluateAstGrepRules(
 			if (!rule.rule) continue;
 
 			try {
-				let matches: unknown[] = [];
+				// A `language: JavaScript` rule on an HTML file with inline
+				// scripts runs against EACH parsed script body; every other rule
+				// runs against the file root. `scope.position` maps a match onto
+				// 0-based FILE line/column — injection matches are body-relative
+				// and must be translated via the injection's `startIndex` and the
+				// file's line-start table, all in UTF-16 code units (#2347); the
+				// file-root scope is the node's own range, so its derived
+				// id/diagnostic stay byte-identical to the pre-#2347 path.
+				const scopes: Array<{
+					root: { findAll(config: never): unknown[] };
+					position(match: unknown): { line: number; column: number };
+				}> = runsInsideHtmlScript
+					? htmlInjections.map((injection) => ({
+							root: injection.root,
+							position(match) {
+								const start = (
+									match as {
+										range(): {
+											start: { line: number; column: number; index: number };
+										};
+									}
+								).range().start;
+								return filePositionForIndex(
+									fileLineStarts,
+									injection.startIndex + start.index,
+								);
+							},
+						}))
+					: [
+							{
+								root: rootNode,
+								position(match) {
+									const start = (
+										match as {
+											range(): { start: { line: number; column: number } };
+										}
+									).range().start;
+									return { line: start.line, column: start.column };
+								},
+							},
+						];
 
 				// Delegate matching to napi's native engine, which handles the
 				// full ast-grep rule grammar (pattern, kind, has/inside/follows/
@@ -833,33 +1235,44 @@ export function evaluateAstGrepRules(
 				// (#663; `NapiConfig.utils: Record<string, Rule>` per
 				// @ast-grep/napi's types, same shape napi already expects for
 				// `rule`/`constraints`). A faithful js-yaml parse feeds the rule
-				// object straight through. If napi rejects the rule (a malformed
-				// or invalid-kind rule, or an unresolved `matches:` reference),
-				// skip it — never silently match nothing through a partial
-				// interpreter.
+				// object straight through. If napi rejects the rule for a scope
+				// (a malformed or invalid-kind rule, or an unresolved `matches:`
+				// reference), skip that scope — never silently match nothing
+				// through a partial interpreter. The reject log fires once per
+				// rule; a grammar-level rejection is uniform across scopes.
 				const nativeConfig: Record<string, unknown> = { rule: rule.rule };
 				if (rule.constraints) nativeConfig.constraints = rule.constraints;
 				if (rule.utils) nativeConfig.utils = rule.utils;
-				try {
-					matches = rootNode.findAll(nativeConfig as never);
-				} catch (err) {
-					matches = [];
-					log?.(
-						`ast-grep-napi: rule "${rule.id}" rejected by native engine (${
-							err instanceof Error ? err.message : String(err)
-						})`,
-					);
+				const collected: Array<{
+					match: unknown;
+					position: { line: number; column: number };
+				}> = [];
+				let rejectLogged = false;
+				for (const scope of scopes) {
+					let found: unknown[];
+					try {
+						found = scope.root.findAll(nativeConfig as never);
+					} catch (err) {
+						if (!rejectLogged) {
+							rejectLogged = true;
+							log?.(
+								`ast-grep-napi: rule "${rule.id}" rejected by native engine (${
+									err instanceof Error ? err.message : String(err)
+								})`,
+							);
+						}
+						continue;
+					}
+					for (const match of found) {
+						if (collected.length >= maxMatchesPerRule) break;
+						collected.push({ match, position: scope.position(match) });
+					}
+					if (collected.length >= maxMatchesPerRule) break;
 				}
 
-				const limitedMatches = matches.slice(0, maxMatchesPerRule);
-
-				for (const match of limitedMatches) {
+				for (const { position } of collected) {
 					if (diagnostics.length >= maxTotalDiagnostics) break;
 
-					const node = match as {
-						range(): { start: { line: number; column: number } };
-					};
-					const range = node.range();
 					// #1777: carry the rule's own tier through. The old collapse
 					// (`=== "error" ? "error" : "warning"`) erased hint and info,
 					// so the quiet tier the #1727 anti-slop rules ship at did not
@@ -877,11 +1290,11 @@ export function evaluateAstGrepRules(
 					const ruleFix = explicitRuleFixSuggestion(rule);
 
 					diagnostics.push({
-						id: `ast-grep-napi-${range.start.line}-${rule.id}`,
+						id: `ast-grep-napi-${position.line}-${rule.id}`,
 						message: `[${rule.metadata?.category || "slop"}] ${rule.message || rule.id}`,
 						filePath,
-						line: range.start.line + 1,
-						column: range.start.column + 1,
+						line: position.line + 1,
+						column: position.column + 1,
 						severity,
 						semantic,
 						tool: "ast-grep-napi",
@@ -1071,6 +1484,8 @@ const astGrepNapiRunner: RunnerDefinition = {
 				blockingOnly: runningAsLspSubstitute ? false : ctx.blockingOnly,
 				projectRoot: ctx.projectRoot,
 				log: (message: string) => ctx.log(message),
+				content,
+				sgModule,
 			},
 		);
 

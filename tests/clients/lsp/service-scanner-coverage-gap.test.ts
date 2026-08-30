@@ -65,7 +65,11 @@ function makeFakeProcess() {
 	};
 }
 
-function makeServer(id: string, role?: "auxiliary") {
+function makeServer(
+	id: string,
+	role?: "auxiliary",
+	extra: Record<string, unknown> = {},
+) {
 	return {
 		id,
 		name: id,
@@ -73,6 +77,7 @@ function makeServer(id: string, role?: "auxiliary") {
 		...(role !== undefined && { role }),
 		root: async () => ROOT,
 		spawn: vi.fn(async () => ({ process: makeFakeProcess(), source: "test" })),
+		...extra,
 	};
 }
 
@@ -649,6 +654,144 @@ describe("#1459 — sweep fan-out must not black out a scanner silently", () => 
 		expect(row.metadata?.queueWaitMs).toBeLessThanOrEqual(callerCapMs);
 		// And the queued touch never pushed a second, overlapping resync.
 		expect(aux.stats.openOffsets).toHaveLength(1);
+	});
+
+	it("an auxiliary resync is not starved when a cold primary spawn exceeds the caller's flat budget (#2239)", async () => {
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const service = new LSPService();
+
+		// #2239: the caller's flat budget (dispatch-lsp-runner's LSP_SPAWN_BUDGET_MS)
+		// is smaller than this primary's own clientWaitTimeoutMs override (Ruby's
+		// 30s in production) — getClientForFile waits out the LARGER floor
+		// internally, so a cold spawn legitimately runs past the flat budget.
+		const FLAT_CALLER_MS = NOTIFY_BUDGET_MS / 2;
+		const PRIMARY_WAIT_FLOOR_MS = NOTIFY_BUDGET_MS * 50;
+		const PRIMARY_SPAWN_DELAY_MS = NOTIFY_BUDGET_MS * 3;
+		// Still outstanding when the cold spawn resolves; short enough that a
+		// queue wait bounded by the write budget can still outlast it.
+		const AUX_WRITE_MS = NOTIFY_BUDGET_MS * 3.5;
+
+		const aux = makeClient("opengrep", AUX_WRITE_MS, [], "never");
+		const primary = makeClient("ruby", 0);
+		getServersForFileWithConfig.mockImplementation((fp: string) =>
+			fp.endsWith("/a.ts")
+				? [makeServer("opengrep", "auxiliary")]
+				: [
+						makeServer("ruby", undefined, {
+							clientWaitTimeoutMs: PRIMARY_WAIT_FLOOR_MS,
+							spawn: vi.fn(
+								() =>
+									new Promise((resolve) => {
+										setTimeout(
+											() =>
+												resolve({ process: makeFakeProcess(), source: "test" }),
+											PRIMARY_SPAWN_DELAY_MS,
+										);
+									}),
+							),
+						}),
+						makeServer("opengrep", "auxiliary"),
+					],
+		);
+		createLSPClient.mockImplementation(
+			async (options: { serverId?: string }) =>
+				options?.serverId === "opengrep" ? aux : primary,
+		);
+
+		void service.touchFile(`${ROOT}/a.ts`, "one", {
+			clientScope: "with-auxiliary",
+			auxiliaryServerIds: ["opengrep"],
+			diagnostics: "document",
+			collectDiagnostics: true,
+			source: "dispatch-lsp-runner",
+			maxClientWaitMs: FLAT_CALLER_MS,
+		});
+		await vi.advanceTimersByTimeAsync(1);
+
+		const second = service.touchFile(`${ROOT}/b.ts`, "two", {
+			clientScope: "with-auxiliary",
+			auxiliaryServerIds: ["opengrep"],
+			diagnostics: "document",
+			collectDiagnostics: true,
+			source: "dispatch-lsp-runner",
+			maxClientWaitMs: FLAT_CALLER_MS,
+		});
+		await vi.advanceTimersByTimeAsync(NOTIFY_BUDGET_MS * 200);
+		await second;
+
+		// The cold ruby spawn alone consumed more than the flat caller budget, but
+		// the auxiliary still got queue time from the SAME per-server floor
+		// getClientForFile used internally — it was not starved to zero.
+		expect(rowsFor("lsp_notify_resync_deferred")).toHaveLength(0);
+		expect(aux.stats.openOffsets).toHaveLength(2);
+	});
+
+	it("does not widen the auxiliary's queue wait past the write budget even when a primary's per-server floor is large (#2239 guard)", async () => {
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const service = new LSPService();
+
+		// The per-server floor (Ruby-sized) is huge, but the write withholding
+		// coverage outlasts the write budget by a wide margin. Deriving queueWaitMs
+		// from the floor must not let it borrow time beyond the write budget —
+		// that would reintroduce the unbounded per-edit latency #1459 closed.
+		const FLAT_CALLER_MS = NOTIFY_BUDGET_MS / 2;
+		const PRIMARY_WAIT_FLOOR_MS = NOTIFY_BUDGET_MS * 50;
+		const PRIMARY_SPAWN_DELAY_MS = NOTIFY_BUDGET_MS / 4;
+		const AUX_WRITE_MS = NOTIFY_BUDGET_MS * 20;
+
+		const aux = makeClient("opengrep", AUX_WRITE_MS, [], "never");
+		const primary = makeClient("ruby", 0);
+		getServersForFileWithConfig.mockImplementation((fp: string) =>
+			fp.endsWith("/a.ts")
+				? [makeServer("opengrep", "auxiliary")]
+				: [
+						makeServer("ruby", undefined, {
+							clientWaitTimeoutMs: PRIMARY_WAIT_FLOOR_MS,
+							spawn: vi.fn(
+								() =>
+									new Promise((resolve) => {
+										setTimeout(
+											() =>
+												resolve({ process: makeFakeProcess(), source: "test" }),
+											PRIMARY_SPAWN_DELAY_MS,
+										);
+									}),
+							),
+						}),
+						makeServer("opengrep", "auxiliary"),
+					],
+		);
+		createLSPClient.mockImplementation(
+			async (options: { serverId?: string }) =>
+				options?.serverId === "opengrep" ? aux : primary,
+		);
+
+		void service.touchFile(`${ROOT}/a.ts`, "one", {
+			clientScope: "with-auxiliary",
+			auxiliaryServerIds: ["opengrep"],
+			diagnostics: "document",
+			collectDiagnostics: true,
+			source: "dispatch-lsp-runner",
+			maxClientWaitMs: FLAT_CALLER_MS,
+		});
+		await vi.advanceTimersByTimeAsync(1);
+
+		const second = service.touchFile(`${ROOT}/b.ts`, "two", {
+			clientScope: "with-auxiliary",
+			auxiliaryServerIds: ["opengrep"],
+			diagnostics: "document",
+			collectDiagnostics: true,
+			source: "dispatch-lsp-runner",
+			maxClientWaitMs: FLAT_CALLER_MS,
+		});
+		await vi.advanceTimersByTimeAsync(NOTIFY_BUDGET_MS * 200);
+		await second;
+
+		const deferrals = rowsFor("lsp_notify_resync_deferred");
+		expect(deferrals).toHaveLength(1);
+		const row = deferrals[0] as { metadata?: Record<string, unknown> };
+		// Bounded by the write budget, nowhere near the 50x-budget server floor.
+		expect(row.metadata?.queueWaitMs).toBeLessThanOrEqual(NOTIFY_BUDGET_MS);
 	});
 
 	it("a queued touch does not write to a client that was evicted while it waited", async () => {

@@ -1650,22 +1650,64 @@ function indexEdge(graph: ReviewGraph, edge: ReviewGraphEdge): void {
 }
 
 /**
- * Drop `edge` from both adjacency buckets (#2074). Costs one scan of the two
- * buckets the edge belongs to, never a scan of `graph.edges`, so removing a
- * changed file's edges stays proportional to that file's fan-in/fan-out.
+ * Drop `edge` from both adjacency buckets. This is kept for the single-edge
+ * dedupe path; multi-file removal uses `unindexEdges` below so a shared hub
+ * bucket is scanned once rather than once per removed edge (#2074).
  */
 function unindexEdge(graph: ReviewGraph, edge: ReviewGraphEdge): void {
 	const from = graph.edgesByFrom.get(edge.from);
 	if (from) {
+		// Count the full bucket as the linear `indexOf` scan's bounded work.
+		_rebuildCounters.removeOwnedEdgePositions += from.length;
 		const at = from.indexOf(edge);
 		if (at >= 0) from.splice(at, 1);
 		if (from.length === 0) graph.edgesByFrom.delete(edge.from);
 	}
 	const to = graph.edgesByTo.get(edge.to);
 	if (to) {
+		_rebuildCounters.removeOwnedEdgePositions += to.length;
 		const at = to.indexOf(edge);
 		if (at >= 0) to.splice(at, 1);
 		if (to.length === 0) graph.edgesByTo.delete(edge.to);
+	}
+}
+
+/**
+ * Remove a batch of edges from both live adjacency indexes. Each touched
+ * bucket is filtered once, so the work is proportional to the bucket lengths,
+ * not to the product of a hub's fan-in and its removed-edge count (#2074).
+ */
+function unindexEdges(
+	graph: ReviewGraph,
+	removedEdges: ReadonlySet<ReviewGraphEdge>,
+): void {
+	const fromIds = new Set<string>();
+	const toIds = new Set<string>();
+	for (const edge of removedEdges) {
+		fromIds.add(edge.from);
+		toIds.add(edge.to);
+	}
+	for (const fromId of fromIds) {
+		const bucket = graph.edgesByFrom.get(fromId);
+		if (!bucket) continue;
+		const kept: ReviewGraphEdge[] = [];
+		for (const edge of bucket) {
+			_rebuildCounters.removeOwnedEdgePositions++;
+			if (!removedEdges.has(edge)) kept.push(edge);
+		}
+		if (kept.length === 0) graph.edgesByFrom.delete(fromId);
+		else graph.edgesByFrom.set(fromId, kept);
+	}
+	for (const toId of toIds) {
+		const bucket = graph.edgesByTo.get(toId);
+		if (!bucket) continue;
+		const kept: ReviewGraphEdge[] = [];
+		for (const edge of bucket) {
+			_rebuildCounters.removeOwnedEdgePositions++;
+			if (!removedEdges.has(edge)) kept.push(edge);
+		}
+		if (kept.length === 0) graph.edgesByTo.delete(toId);
+		else graph.edgesByTo.set(toId, kept);
 	}
 }
 
@@ -3312,8 +3354,15 @@ async function tryResumeFromCheckpoint(
 	}
 	const graph = loaded.graph;
 	// Evict every stale (content-changed) processed file so its outdated
-	// contribution is replaced by a fresh walk below.
-	for (const file of stale) removeFileOwnedGraphData(graph, file);
+	// contribution is replaced by a fresh walk below. One shared drop set,
+	// compacted once (#2074) — pruneOrphanNonFileNodes reads graph.edges next,
+	// so the compaction must land before it runs.
+	const removedEdges = new Set<ReviewGraphEdge>();
+	for (const file of stale) removeFileOwnedGraphData(graph, file, removedEdges);
+	if (removedEdges.size > 0) {
+		unindexEdges(graph, removedEdges);
+		graph.edges = graph.edges.filter((edge) => !removedEdges.has(edge));
+	}
 	pruneOrphanNonFileNodes(graph);
 	graph.changedSymbolsByFile = new Map();
 	const remaining = filesToBuild.filter((file) => !reusableHashes.has(file));
@@ -4480,44 +4529,58 @@ function addCxxIncludeEdges(
 	}
 }
 
+/**
+ * Drop the nodes/edges a changed file owns, and index-maintain as it goes.
+ * `removedEdges` accumulates edges to drop from `graph.edges` — the CALLER
+ * compacts the array once for the whole batch (#2074): before this, each call
+ * ran its own `graph.edges.filter()`, so a batch of N changed files scanned
+ * the whole edge array N times (changedFiles x graph, not changedFiles x
+ * fan-in/out).
+ *
+ * `removedIds` is exactly `fileNodes`/`symbolNodesByFile`'s entries for this
+ * file — `file` and `symbol` are the only node kinds that ever set `filePath`
+ * (`module`/`external` placeholders never do) — so no `graph.nodes` scan is
+ * needed either, and the owned edges are read straight off `edgesByFrom` /
+ * `edgesByTo` instead of scanning `graph.edges`.
+ */
 function removeFileOwnedGraphData(
 	graph: ReviewGraph,
 	filePath: string,
+	removedEdges: Set<ReviewGraphEdge>,
 ): ReviewGraphEdge[] {
 	const normalized = normalizeMapKey(filePath);
-	const fileNodeId = `file:${normalized}`;
-	const removedIds = new Set<string>();
-	const removedSymbolIds = new Set<string>();
-	for (const [id, node] of graph.nodes) {
-		if (node.filePath !== normalized) continue;
-		removedIds.add(id);
-		if (node.kind === "symbol") removedSymbolIds.add(id);
-	}
+	const fileNodeId = graph.fileNodes.get(normalized) ?? `file:${normalized}`;
+	const removedSymbolIds = new Set(graph.symbolNodesByFile.get(normalized));
+	const removedIds = new Set(removedSymbolIds);
 	if (graph.nodes.has(fileNodeId)) removedIds.add(fileNodeId);
 
+	const candidates = new Set<ReviewGraphEdge>();
+	for (const id of removedIds) {
+		for (const edge of graph.edgesByFrom.get(id) ?? []) {
+			_rebuildCounters.removeOwnedEdgeVisits++;
+			candidates.add(edge);
+		}
+		for (const edge of graph.edgesByTo.get(id) ?? []) {
+			_rebuildCounters.removeOwnedEdgeVisits++;
+			candidates.add(edge);
+		}
+	}
+
 	const preservedIncomingSymbolEdges: ReviewGraphEdge[] = [];
-	const droppedEdges: ReviewGraphEdge[] = [];
-	graph.edges = graph.edges.filter((edge) => {
+	for (const edge of candidates) {
+		// A cross-edge can be discovered from both changed files' adjacency
+		// buckets. Preserve and remove it only once, matching eager unindexing
+		// while the batch indexes remain live until the end.
+		if (removedEdges.has(edge)) continue;
 		const fromRemoved = removedIds.has(edge.from);
-		const toRemoved = removedIds.has(edge.to);
-		if (fromRemoved) {
-			droppedEdges.push(edge);
-			return false;
-		}
-		if (removedSymbolIds.has(edge.to)) {
+		// Preserve importer edges to the stable file node id; the node is
+		// re-added below.
+		if (!fromRemoved && edge.to === fileNodeId) continue;
+		if (!fromRemoved && removedSymbolIds.has(edge.to)) {
 			preservedIncomingSymbolEdges.push({ ...edge });
-			droppedEdges.push(edge);
-			return false;
 		}
-		// Preserve importer edges to the stable file node id; the node is re-added below.
-		if (toRemoved && edge.to === fileNodeId) return true;
-		if (toRemoved) droppedEdges.push(edge);
-		return !toRemoved;
-	});
-	// #2074: keep the adjacency indexes live instead of rebuilding them over the
-	// whole graph afterwards. Only the dropped edges' own buckets are touched.
-	// Unconditional: on an unindexed graph every bucket lookup simply misses.
-	for (const edge of droppedEdges) unindexEdge(graph, edge);
+		removedEdges.add(edge);
+	}
 	for (const id of removedIds) {
 		const node = graph.nodes.get(id);
 		graph.nodes.delete(id);
@@ -4639,16 +4702,28 @@ async function addFileToGraph(
 /**
  * #2074 acceptance instrumentation. `restoreComparisons` counts edge-metadata
  * stringifications inside `restoreValidIncomingEdges`; `importTargetEdgeScans`
- * counts edges visited by `importTargetsForFile`. Before this change both grew
- * with the whole graph on every one-file rebuild. They are the count-based
- * signal the issue asks for, because wall time on this hardware is IO-noisy
- * (#1920).
+ * counts edges visited by `importTargetsForFile`; `removeOwnedEdgeVisits`
+ * counts edges visited while collecting a changed file's owned edges in
+ * `removeFileOwnedGraphData`. Before this change all three grew with the whole
+ * graph on every one-file rebuild, and `removeOwnedEdgeVisits` grew with
+ * changedFiles x graph on a multi-file batch (one full `graph.edges` scan per
+ * file). `removeOwnedEdgePositions` counts adjacency positions examined while
+ * removing edges; batching keeps a high-fan-in bucket linear instead of
+ * rescanning its prefix for every edge. They are the count-based signal the
+ * issue asks for, because wall time on this hardware is IO-noisy (#1920).
  */
-const _rebuildCounters = { restoreComparisons: 0, importTargetEdgeScans: 0 };
+const _rebuildCounters = {
+	restoreComparisons: 0,
+	importTargetEdgeScans: 0,
+	removeOwnedEdgeVisits: 0,
+	removeOwnedEdgePositions: 0,
+};
 
 export function _getReviewGraphRebuildCountersForTests(): {
 	restoreComparisons: number;
 	importTargetEdgeScans: number;
+	removeOwnedEdgeVisits: number;
+	removeOwnedEdgePositions: number;
 } {
 	return { ..._rebuildCounters };
 }
@@ -4656,6 +4731,8 @@ export function _getReviewGraphRebuildCountersForTests(): {
 export function _resetReviewGraphRebuildCountersForTests(): void {
 	_rebuildCounters.restoreComparisons = 0;
 	_rebuildCounters.importTargetEdgeScans = 0;
+	_rebuildCounters.removeOwnedEdgeVisits = 0;
+	_rebuildCounters.removeOwnedEdgePositions = 0;
 }
 
 /**
@@ -4804,9 +4881,19 @@ async function updateGraphFiles(
 		priorTargets: importTargetsForFile(graph, file),
 	}));
 	const preservedIncoming: ReviewGraphEdge[] = [];
+	// #2074: one shared drop set for the whole batch, compacted into graph.edges
+	// exactly once below — not once per file, which made a multi-file rebuild
+	// scan the edge array changedFiles times over.
+	const removedEdges = new Set<ReviewGraphEdge>();
 	for (const file of files) {
-		preservedIncoming.push(...removeFileOwnedGraphData(graph, file));
+		preservedIncoming.push(
+			...removeFileOwnedGraphData(graph, file, removedEdges),
+		);
 		await addFileToGraph(graph, cwd, file, facts, ignoredIds);
+	}
+	if (removedEdges.size > 0) {
+		unindexEdges(graph, removedEdges);
+		graph.edges = graph.edges.filter((edge) => !removedEdges.has(edge));
 	}
 	restoreValidIncomingEdges(graph, preservedIncoming);
 	resolveDeferredSymbolEdges(graph, false);

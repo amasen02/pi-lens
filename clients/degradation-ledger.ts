@@ -501,7 +501,40 @@ export type DegradationKind =
 	 * the ledger still answers which server's earlier finding never resurfaced
 	 * after the count-bound stops naming files.
 	 */
-	| "aux-runner-findings-lost";
+	| "aux-runner-findings-lost"
+	/**
+	 * The napi HTML embedded-`<script>` evaluation (#2347) hit its evaluation
+	 * budget (body-count and/or cumulative body-bytes cap) and dropped the
+	 * remainder without parsing them. Subject is the file path, so the ledger
+	 * says WHICH generated/pathological page keeps losing embedded coverage.
+	 * Counted per file: the exact dropped total matters more than one retained
+	 * reason, and the recorded counts (`scriptElementCount`, `bodiesEvaluated`,
+	 * `truncatedBodies`) make the truncation reconstructable.
+	 */
+	| "ast-grep-napi-html-script-budget"
+	/**
+	 * A `<script>` body of an HTML file the napi runner was evaluating (#2347)
+	 * refused to parse as JavaScript, so that body contributed no embedded
+	 * findings. Subject is the file path; counted so the totals survive the
+	 * ledger's retained-entry window. A parse refusal on a whole file degrades
+	 * that file to "no embedded coverage" like an unparseable `.js` file and is
+	 * recorded as such, never as a clean empty result.
+	 */
+	| "ast-grep-napi-html-script-parse-failed"
+	/**
+	 * The loaded addon exposed no `js` grammar while an HTML file's embedded
+	 * `language: JavaScript` evaluation asked for one (#2347). The embedded
+	 * coverage degrades to nothing for the whole file, silently prior to this
+	 * kind. Once per file per session; subject is the file path.
+	 */
+	| "ast-grep-napi-html-js-grammar-missing"
+	/**
+	 * The `script_element` scan of an HTML root threw while napi prepared the
+	 * embedded-`<script>` evaluation (#2347). The embedded coverage degrades to
+	 * nothing for the file, silently prior to this kind. Once per file per
+	 * session; subject is the file path.
+	 */
+	| "ast-grep-napi-html-script-scan-failed";
 
 export interface DegradationRecord {
 	kind: unknown;
