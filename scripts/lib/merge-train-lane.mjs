@@ -426,6 +426,10 @@ function postMergeRequestMarker(mergeSha, attempt, generation, requestedAt) {
 	return `<!-- merge-train-post-merge:sha=${mergeSha}:state=requested:attempt=${attempt}:generation=${generation}:at=${requestedAt} -->`;
 }
 
+function postMergeExhaustedMarker(mergeSha, generation, exhaustedAt) {
+	return `<!-- merge-train-post-merge:sha=${mergeSha}:state=exhausted:generation=${generation}:at=${exhaustedAt} -->`;
+}
+
 async function readIssueComments(fetcher, owner, repo, number) {
 	return paginate(
 		fetcher,
@@ -436,6 +440,7 @@ async function readIssueComments(fetcher, owner, repo, number) {
 async function readPostMergeState(fetcher, owner, repo, number, mergeSha, now) {
 	const comments = await readIssueComments(fetcher, owner, repo, number);
 	const requests = [];
+	const exhaustedGenerations = new Set();
 	const workflows = new Map();
 	const escapedSha = mergeSha.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 	const requestPattern = new RegExp(
@@ -443,6 +448,9 @@ async function readPostMergeState(fetcher, owner, repo, number, mergeSha, now) {
 	);
 	const legacyPattern = new RegExp(
 		`merge-train-post-merge:sha=${escapedSha}:dispatched`,
+	);
+	const exhaustedPattern = new RegExp(
+		`merge-train-post-merge:sha=${escapedSha}:state=exhausted:generation=(\\d+):at=(\\d+)`,
 	);
 	const validationPattern = new RegExp(
 		`merge-train-post-merge:sha=${escapedSha}:workflow=([^:]+):state=(succeeded|failed)`,
@@ -466,13 +474,16 @@ async function readPostMergeState(fetcher, owner, repo, number, mergeSha, now) {
 		} else if (legacyPattern.test(body)) {
 			requests.push({ attempt: 1, generation: 0, requestedAt: 0 });
 		}
+		const exhausted = body.match(exhaustedPattern);
+		if (exhausted && Number.isSafeInteger(Number(exhausted[1])))
+			exhaustedGenerations.add(Number(exhausted[1]));
 		const validation = body.match(validationPattern);
 		if (!validation || !POST_MERGE_VALIDATION_WORKFLOWS.includes(validation[1]))
 			continue;
 		const previous = workflows.get(validation[1]);
 		if (previous !== "failed") workflows.set(validation[1], validation[2]);
 	}
-	return { requests, workflows };
+	return { requests, exhaustedGenerations, workflows };
 }
 
 async function recordPostMergeDispatch(
@@ -491,6 +502,25 @@ async function recordPostMergeDispatch(
 		`https://api.github.com/repos/${owner}/${repo}/issues/${number}/comments`,
 		{
 			body: `Post-merge validation dispatch requested for ${mergeSha} (generation ${generation}, attempt ${attempt}).\n\n${postMergeRequestMarker(mergeSha, attempt, generation, requestedAt)}`,
+		},
+	);
+}
+
+async function recordPostMergeExhausted(
+	fetcher,
+	owner,
+	repo,
+	number,
+	mergeSha,
+	generation,
+	exhaustedAt,
+) {
+	return rest(
+		fetcher,
+		"POST",
+		`https://api.github.com/repos/${owner}/${repo}/issues/${number}/comments`,
+		{
+			body: `Post-merge validation has no terminal result for ${mergeSha} after ${POST_MERGE_DISPATCH_ATTEMPTS} request attempts in generation ${generation}.\n\n${postMergeExhaustedMarker(mergeSha, generation, exhaustedAt)}`,
 		},
 	);
 }
@@ -597,13 +627,36 @@ export async function reconcilePostMergeValidations({
 		const attempt =
 			Math.max(0, ...generationRequests.map((request) => request.attempt)) + 1;
 		if (attempt > POST_MERGE_DISPATCH_ATTEMPTS) {
+			if (state.exhaustedGenerations.has(generation)) continue;
+			let exhaustedMarker;
+			try {
+				exhaustedMarker = await recordPostMergeExhausted(
+					fetcher,
+					owner,
+					repo,
+					pr.number,
+					mergeSha,
+					generation,
+					now,
+				);
+			} catch (error) {
+				results.push({
+					number: pr.number,
+					sha: mergeSha,
+					dispatched: false,
+					errors: [`post-merge exhaustion marker -> ${boundedError(error)}`],
+				});
+				continue;
+			}
 			results.push({
 				number: pr.number,
 				sha: mergeSha,
 				dispatched: false,
-				errors: [
-					`post-merge validation missing after ${POST_MERGE_DISPATCH_ATTEMPTS} request attempt(s) for ${mergeSha}`,
-				],
+				errors: exhaustedMarker.ok
+					? [
+							`post-merge validation missing after ${POST_MERGE_DISPATCH_ATTEMPTS} request attempt(s) for ${mergeSha}`,
+						]
+					: [`post-merge exhaustion marker -> HTTP ${exhaustedMarker.status}`],
 			});
 			continue;
 		}

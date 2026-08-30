@@ -3061,6 +3061,50 @@ describe("merge-lane sweep (#2185)", () => {
 		expect(calls.some((call) => call.url.endsWith("/dispatches"))).toBe(false);
 	});
 
+	it("persists one exhaustion record instead of repeating it each restart", async () => {
+		const durableComments = [1, 2].map((attempt) => ({
+			body: `<!-- merge-train-post-merge:sha=${MERGE_SHA}:state=requested:attempt=${attempt}:generation=0:at=${NOW} -->`,
+			user: { login: "github-actions[bot]" },
+		}));
+		const { fetcher, calls } = fakeGithub({
+			"GET /repos/acme/repo/pulls": [
+				{
+					number: 7,
+					merged_at: "2026-08-26T16:20:00Z",
+					merged_by: { login: "github-actions[bot]" },
+					merge_commit_sha: MERGE_SHA,
+				},
+			],
+			"GET /repos/acme/repo/issues/7/comments": () => ({
+				ok: true,
+				status: 200,
+				json: async () => durableComments,
+			}),
+			"POST /repos/acme/repo/issues/7/comments": (body: unknown) => {
+				durableComments.push({
+					body: String((body as { body: string }).body),
+					user: { login: "github-actions[bot]" },
+				});
+				return { ok: true, status: 201, json: async () => ({}) };
+			},
+		});
+		const options = {
+			fetcher,
+			owner: "acme",
+			repo: "repo",
+			now: NOW + POST_MERGE_RECONCILE_GRACE_MS + 1,
+		};
+		const first = await reconcilePostMergeValidations(options);
+		const second = await reconcilePostMergeValidations(options);
+		expect(first[0].errors[0]).toContain("missing after 2 request attempt(s)");
+		expect(second).toEqual([]);
+		expect(
+			calls.filter(
+				(call) => call.method === "POST" && call.url.endsWith("/comments"),
+			),
+		).toHaveLength(1);
+	});
+
 	it("reopens a later retry generation after an exhausted no-terminal window", async () => {
 		let requestCount = 0;
 		const { fetcher, calls } = fakeGithub({
