@@ -67,6 +67,7 @@
   "./clients/sessionstart-logger.js",
   "./clients/smells-rollup.js",
   "./clients/startup-timing.js",
+  "./clients/test-runner-delivery.js",
   "./clients/tool-definition.js",
   "./clients/tool-render.js",
   "./clients/tool-set-policy.js",

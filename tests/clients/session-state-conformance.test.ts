@@ -31,9 +31,11 @@ import {
 import {
 	SWEEP_HEURISTIC_LIMITS,
 	callsWithinFunction,
+	callsWithinSessionStartClosure,
 	clientSourceFiles,
 	resetNameDefinitions,
 	scanSessionStateCandidates,
+	sessionStartClosureResetNames,
 	sessionStartResetNames,
 	stripCommentsAndStrings,
 } from "../support/session-state-scan.js";
@@ -216,8 +218,94 @@ describe("session-state scan — walker smuggle probes (R1/S1)", () => {
 	});
 });
 
+// The closure walker's own correctness, pinned against synthetic source the
+// same way the handleSessionStart walker is above (#2319). A reset named only
+// in a comment inside the closure, or a brace smuggled through a string, must
+// not read as a call — the closure-site registry entries depend on it.
+describe("session-state scan — closure walker smuggle probes (#2319)", () => {
+	const closureSource = (body: string[]) =>
+		[
+			"pi.on(",
+			'\t"session_start",',
+			'\twrapSessionEventHandler("session_start", async (event, ctx) => {',
+			...body,
+			"\t});",
+			");",
+		].join("\n");
+
+	it("a reset named only in a comment in the closure does not count as called", () => {
+		const source = closureSource([
+			"\t\t// resetConcurrentSessionBindRollupCounts(); — #2319 says this belongs here",
+			"\t\tresetVerifiedPathAttributionGuessCount();",
+		]);
+		const calls = callsWithinSessionStartClosure(source);
+		expect(calls).toContain("resetVerifiedPathAttributionGuessCount");
+		expect(calls).not.toContain("resetConcurrentSessionBindRollupCounts");
+	});
+
+	it("a brace inside a string in the closure cannot end the body early", () => {
+		const source = closureSource([
+			'\t\tconst s = "a } here";',
+			"\t\tresetVerifiedPathAttributionGuessCount();",
+		]);
+		expect(callsWithinSessionStartClosure(source)).toContain(
+			"resetVerifiedPathAttributionGuessCount",
+		);
+	});
+
+	it("the real call is still found when both forms are present", () => {
+		const source = closureSource([
+			"\t\t// resetVerifiedPathAttributionGuessCount() — see #2319",
+			"\t\tresetConcurrentSessionBindRollupCounts();",
+		]);
+		const calls = callsWithinSessionStartClosure(source);
+		expect(calls).toContain("resetConcurrentSessionBindRollupCounts");
+		expect(calls).not.toContain("resetVerifiedPathAttributionGuessCount");
+	});
+
+	it("a reset deferred to a callback does not count as a direct call", () => {
+		const source = closureSource([
+			"\t\tsetImmediate(() => resetVerifiedPathAttributionGuessCount());",
+			"\t\tPromise.resolve().then(() => {",
+			"\t\t\tresetConcurrentSessionBindRollupCounts();",
+			"\t\t});",
+		]);
+		expect(callsWithinSessionStartClosure(source)).not.toContain(
+			"resetVerifiedPathAttributionGuessCount",
+		);
+		expect(callsWithinSessionStartClosure(source)).not.toContain(
+			"resetConcurrentSessionBindRollupCounts",
+		);
+	});
+
+	it("a reset deferred to a function callback does not count as direct", () => {
+		const source = closureSource([
+			"\t\tsetImmediate(function () {",
+			"\t\t\tresetVerifiedPathAttributionGuessCount();",
+			"\t\t});",
+		]);
+		expect(callsWithinSessionStartClosure(source)).not.toContain(
+			"resetVerifiedPathAttributionGuessCount",
+		);
+	});
+
+	it("returns empty when the registration shape changes — the failure is loud, not silent", () => {
+		// #2319: if the wrapper/event registration is renamed or reformatted,
+		// the derivation yields nothing and every closure-site registry entry
+		// goes red through its wiring test. It must never report a phantom set.
+		const source = [
+			"pi.on(",
+			'\t"session_start",',
+			"\thonSessionStart(doTheThing);",
+			");",
+		].join("\n");
+		expect(callsWithinSessionStartClosure(source)).toEqual([]);
+	});
+});
+
 describe("session-state registry — session_start wiring", () => {
 	const wired = sessionStartResetNames();
+	const closureWired = sessionStartClosureResetNames();
 
 	it("derives a non-trivial reset chain from handleSessionStart", () => {
 		// A silent derivation failure (renamed entry point, broken brace match)
@@ -227,14 +315,39 @@ describe("session-state registry — session_start wiring", () => {
 		expect(wired.has("resetDegradationLedger")).toBe(true);
 	});
 
+	it("derives the session_start closure resets from index.ts (#2319)", () => {
+		// The closure-site entries below depend on THIS derivation, so a silent
+		// failure (renamed wrapper, moved registration) would make their wiring
+		// claims vacuous — the same guard the floor above gives `wired`. The
+		// exact members can shift with legitimate edits; the three registered
+		// ones cannot, or their entries red here.
+		expect(closureWired.size).toBeGreaterThanOrEqual(5);
+		for (const name of [
+			"resetVerifiedPathAttributionGuessCount",
+			"resetCurrentPhaseForSession",
+			"resetConcurrentSessionBindRollupCounts",
+		]) {
+			expect(closureWired.has(name)).toBe(true);
+		}
+	});
+
 	for (const entry of SESSION_STATE_REGISTRY) {
 		if (entry.policy !== "session_start" || entry.gap) continue;
 		const sessionStartName = entry.sessionStartResetName ?? entry.resetName;
 		it(`${entry.id}: ${sessionStartName} runs at session_start`, () => {
+			// #2319: entries whose reset deliberately lives in index.ts's
+			// session_start CLOSURE (not handleSessionStart's reachable graph)
+			// are checked against the closure derivation. Every other entry
+			// keeps the handleSessionStart walk, unchanged.
+			const reached = entry.sessionStartClosureReset ? closureWired : wired;
+			const site = entry.sessionStartClosureReset
+				? "index.ts's session_start closure"
+				: "handleSessionStart";
 			expect(
-				wired.has(sessionStartName),
-				`${sessionStartName} is not reachable from handleSessionStart. ` +
-					"Either wire it in, or change the entry's policy and say why.",
+				reached.has(sessionStartName),
+				`${sessionStartName} is not reachable from ${site}. ` +
+					"Either wire it in, change the entry's policy and say why, or drop " +
+					"the sessionStartClosureReset marker.",
 			).toBe(true);
 		});
 	}

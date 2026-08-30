@@ -74,6 +74,8 @@ const HAND_ROLLED_GENERATION_GUARDS: Readonly<Record<string, string>> = {
 		"the turn_end test-runner path captures testRunGeneration before awaiting the runners and re-reads the persisted generation before writing failures, so this IS the guarded-write shape. Deferred because the generation lives in a persisted cache entry rather than an in-process counter, which the primitive does not model yet",
 	"runtime-coordinator.ts":
 		"clearStartupScanInFlight guards a DELETE on the in-flight map with the generation that owns the entry — the eviction direction, the same guard #1674's F5 round added by hand. A GenerationSource candidate, deferred so #1754 lands with two migrations rather than five",
+	"test-runner-delivery.ts":
+		"the persisted test-runner-findings cache owns the generation high-water mark across asynchronous runner completion and session restarts. The delivery map compares that durable generation before appending, so an in-process GenerationSource cannot replace the persisted ordering contract; the provenance and generation integration tests cover the drop-before-append path",
 	"mcp/analyze.ts":
 		"the warm word-index idle eviction captures a per-entry generation before its timer fires and re-checks it in the callback, alongside an entry-identity compare. The eviction direction again, on a per-entry counter rather than a keyed map; a migration candidate once GenerationMap gains an entry-scoped form",
 

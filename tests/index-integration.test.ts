@@ -40,6 +40,7 @@ function createMockPi(overrides: Record<string, boolean> = {}) {
 		...overrides,
 	});
 	return {
+		mock,
 		pi: mock.asExtensionAPI(),
 		// #484: raw mock recordings not on the ExtensionAPI type surface
 		// (sentMessages, messageRenderers) — exposed directly for tests that
@@ -386,31 +387,40 @@ describe("index.ts integration", () => {
 			const telemetry =
 				await import("../clients/path-attribution-telemetry.js");
 			const { default: registerExtension } = await import("../index.js");
-			const primary = createMockPi();
-			registerExtension(primary.pi as any);
-			await primary.trigger(
+			const primary = createPiMock({
+				"lens-lsp": true,
+				"no-lsp": false,
+				"lens-guard": false,
+			});
+			registerExtension(primary.asExtensionAPI());
+			await primary.emit(
 				"session_start",
 				{},
 				makeCtx({ cwd: tmpDir, sessionId: "primary" }),
 			);
+			telemetry.recordVerifiedPathAttributionGuess();
 			const lspServer = await import("../clients/lsp/server.js");
 			lspServer._markDirectLspCommandUnavailableForTests(
 				"secondary-must-not-reset",
 			);
-			const secondary = createMockPi();
-			registerExtension(secondary.pi as any);
-			await secondary.trigger(
+			const secondary = createPiMock({
+				"lens-lsp": true,
+				"no-lsp": false,
+				"lens-guard": false,
+			});
+			registerExtension(secondary.asExtensionAPI());
+			await secondary.emit(
 				"session_start",
 				{},
 				makeCtx({ cwd: tmpDir, sessionId: "secondary" }),
 			);
+			expect(telemetry.getVerifiedPathAttributionGuessCount()).toBe(1);
 			expect(
 				lspServer.isDirectLspCommandTemporarilyUnavailable(
 					"secondary-must-not-reset",
 				),
 			).toBe(true);
-			telemetry.recordVerifiedPathAttributionGuess();
-			await secondary.trigger(
+			await secondary.emit(
 				"session_shutdown",
 				{},
 				makeCtx({ cwd: tmpDir, sessionId: "secondary" }),
@@ -423,7 +433,7 @@ describe("index.ts integration", () => {
 				),
 			).toHaveLength(0);
 			expect(telemetry.getVerifiedPathAttributionGuessCount()).toBe(1);
-			await primary.trigger(
+			await primary.emit(
 				"session_shutdown",
 				{},
 				makeCtx({ cwd: tmpDir, sessionId: "primary" }),
@@ -2008,7 +2018,23 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 	// real scheduler (clients/quiet-window.ts) is exercised by its own suite;
 	// here we only need "index.ts registered the task" + "running the task
 	// chain at settle produces the emission".
-	let quietTasks: Array<{ name: string; fn: () => Promise<void> | void }>;
+	let quietTasks: Array<{
+		name: string;
+		fn: (context?: {
+			runtime: unknown;
+			cwd?: string;
+			sessionId?: string;
+			ownerId?: string;
+		}) => Promise<void> | void;
+	}>;
+	let handleTurnEndHook:
+		| ((deps: {
+				onTestRunnerComplete?: (args: any) => void;
+				runtime: any;
+				ctxCwd?: string;
+				sessionId?: string;
+		  }) => void)
+		| undefined;
 
 	beforeEach(() => {
 		vi.resetModules();
@@ -2024,6 +2050,7 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 		vi.doUnmock("../clients/runtime-session.js");
 		vi.doUnmock("../clients/lsp/index.js");
 		quietTasks = [];
+		handleTurnEndHook = undefined;
 		_resetProcessSingletonsForTests();
 		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-turn-summary-"));
 		originalStartupMode = process.env.PI_LENS_STARTUP_MODE;
@@ -2067,7 +2094,9 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 		// exercises only the #484 seam (collector → quiet-window emit) without
 		// depending on that machinery or its real-filesystem/timer effects.
 		vi.doMock("../clients/runtime-turn.js", () => ({
-			handleTurnEnd: vi.fn(async () => undefined),
+			handleTurnEnd: vi.fn(async (deps: any) => {
+				handleTurnEndHook?.(deps);
+			}),
 			cancelLSPIdleReset: vi.fn(),
 		}));
 		// Light quiet-window stub: record registrations, run them in order on
@@ -2077,15 +2106,25 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 		vi.doMock("../clients/quiet-window.js", () => ({
 			registerQuietWindowTask: (
 				name: string,
-				fn: () => Promise<void> | void,
+				fn: (context?: {
+					runtime: unknown;
+					cwd?: string;
+					sessionId?: string;
+					ownerId?: string;
+				}) => Promise<void> | void,
 			) => {
 				quietTasks.push({ name, fn });
 			},
 			registerBuiltinQuietWindowTasks: () => {},
-			runQuietWindow: async () => {
+			runQuietWindow: async (deps: {
+				runtime: unknown;
+				cwd?: string;
+				sessionId?: string;
+				ownerId?: string;
+			}) => {
 				for (const task of quietTasks) {
 					try {
-						await task.fn();
+						await task.fn(deps);
 					} catch {
 						// mirror the real scheduler: task failures are isolated
 					}
@@ -2164,7 +2203,7 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 	) {
 		const settled = handlers.agent_settled?.[0];
 		expect(settled).toBeTypeOf("function");
-		await settled?.({}, { cwd: tmpDir });
+		await settled?.({}, { cwd: tmpDir, isIdle: () => true });
 		// index.ts kicks runQuietWindow off unawaited (fire-and-forget by
 		// design — the SDK awaits the handler); drain the microtask queue so
 		// the stub's task chain completes before assertions.
@@ -2180,6 +2219,143 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 			registerExtension(pi as any);
 
 			expect(quietTasks.map((t) => t.name)).toContain("turn_summary_emit");
+		},
+		INTEGRATION_TIMEOUT_MS,
+	);
+
+	it(
+		"does not add test-runner failures to a later model context",
+		async () => {
+			mockSuiteDeps();
+			const cache = new CacheManager(false);
+			cache.writeCache(
+				"test-runner-findings",
+				{ content: "FAIL test/app.test.ts:1" },
+				tmpDir,
+			);
+
+			const { default: registerExtension } = await import("../index.js");
+			const { pi, mock } = createMockPi();
+			registerExtension(pi as any);
+
+			const result = await mock.emit(
+				"context",
+				{ messages: [{ role: "user", content: "continue" }] },
+				{ cwd: tmpDir },
+			);
+			expect(result).toBeUndefined();
+		},
+		INTEGRATION_TIMEOUT_MS,
+	);
+
+	it(
+		"delivers staged test failures once through a non-context custom entry",
+		async () => {
+			mockSuiteDeps();
+			const cache = new CacheManager(false);
+			cache.writeCache(
+				"test-runner-findings",
+				{ content: "FAIL test/app.test.ts:1", testRunGeneration: 1 },
+				tmpDir,
+			);
+			const filePath = path.join(tmpDir, "src", "app.ts");
+			fs.mkdirSync(path.dirname(filePath), { recursive: true });
+			fs.writeFileSync(filePath, "export const x = 1;\n");
+			handleTurnEndHook = (deps) =>
+				deps.onTestRunnerComplete?.({
+					cwd: tmpDir,
+					sessionId: deps.runtime.telemetrySessionId,
+					generation: 1,
+					targetCount: 1,
+					hasFindings: true,
+				});
+
+			const { default: registerExtension } = await import("../index.js");
+			const { pi, mock, handlers, sentMessages } = createMockPi();
+			registerExtension(pi as any);
+			await driveEditThenTurnEnd(handlers, filePath);
+
+			await fireAgentSettled(handlers);
+
+			expect(mock.appendedEntries).toHaveLength(1);
+			expect(mock.appendedEntries[0]).toMatchObject({
+				customType: "pilens:test-runner-findings",
+				data: { content: expect.stringContaining("FAIL") },
+			});
+			expect(sentMessages).toHaveLength(0);
+			expect(mock.entryRenderers.has("pilens:test-runner-findings")).toBe(true);
+		},
+		INTEGRATION_TIMEOUT_MS,
+	);
+
+	it(
+		"keeps primary and concurrent secondary test delivery on their owning activation",
+		async () => {
+			mockSuiteDeps();
+			vi.doMock("../clients/runtime-session.js", () => ({
+				handleSessionStart: vi.fn(async () => {}),
+			}));
+			handleTurnEndHook = (deps) =>
+				deps.onTestRunnerComplete?.({
+					cwd: deps.ctxCwd ?? tmpDir,
+					sessionId: deps.sessionId ?? "unknown",
+					generation: 1,
+					targetCount: deps.sessionId === "secondary-delivery" ? 22 : 11,
+					hasFindings: true,
+				});
+			new CacheManager(false).writeCache(
+				"test-runner-findings",
+				{ content: "FAIL cross-session.test.ts:1", testRunGeneration: 1 },
+				tmpDir,
+			);
+
+			const { default: registerExtension } = await import("../index.js");
+			const primary = createMockPi();
+			registerExtension(primary.pi as any);
+			await primary.trigger(
+				"session_start",
+				{},
+				makeCtx({ cwd: tmpDir, sessionId: "primary-delivery" }),
+			);
+			const secondary = createMockPi();
+			registerExtension(secondary.pi as any);
+			await secondary.trigger(
+				"session_start",
+				{},
+				makeCtx({ cwd: tmpDir, sessionId: "secondary-delivery" }),
+			);
+
+			await primary.trigger(
+				"turn_end",
+				{},
+				makeCtx({ cwd: tmpDir, sessionId: "primary-delivery" }),
+			);
+			await secondary.trigger(
+				"turn_end",
+				{},
+				makeCtx({ cwd: tmpDir, sessionId: "secondary-delivery" }),
+			);
+			await primary.trigger(
+				"agent_settled",
+				{},
+				makeCtx({ cwd: tmpDir, sessionId: "primary-delivery" }),
+			);
+			await secondary.trigger(
+				"agent_settled",
+				{},
+				makeCtx({ cwd: tmpDir, sessionId: "secondary-delivery" }),
+			);
+
+			expect(primary.mock.appendedEntries).toHaveLength(1);
+			expect(secondary.mock.appendedEntries).toHaveLength(1);
+			expect(primary.mock.appendedEntries[0]?.data).toMatchObject({
+				sessionId: "primary-delivery",
+				targetCount: 11,
+			});
+			expect(secondary.mock.appendedEntries[0]?.data).toMatchObject({
+				sessionId: "secondary-delivery",
+				targetCount: 22,
+			});
 		},
 		INTEGRATION_TIMEOUT_MS,
 	);

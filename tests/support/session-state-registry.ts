@@ -174,6 +174,20 @@ export interface SessionStateEntry {
 	 * so this cannot rot into a false claim after the fix lands.
 	 */
 	gap?: string;
+	/**
+	 * Set when `policy` is `session_start` and `resetName` runs inside
+	 * `index.ts`'s `pi.on("session_start", ...)` CLOSURE rather than inside
+	 * `handleSessionStart`'s reachable call graph — #2319. The conformance test
+	 * checks the reset against {@link sessionStartClosureResetNames} (derived
+	 * from that closure), an exact mirror of the `sessionStartResetNames` walk
+	 * every other entry is checked against. Use ONLY when the reset's placement
+	 * is load-bearing (behind the #473 concurrent-secondary gate but outside
+	 * `handleSessionStart`'s own body, or before it runs): `resetCurrentPhaseForSession`
+	 * is the canonical precedent (#1723 review F4), and the two rollup counters
+	 * that must never self-reset from a declined bind's own `session_start`
+	 * inherit the same gate placement.
+	 */
+	sessionStartClosureReset?: boolean;
 	/** Optional runtime proof that the reset re-arms the state. */
 	probe?: SessionStateProbe;
 }
@@ -190,6 +204,15 @@ function scratchCwd(): string {
 }
 
 export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
+	{
+		id: "test-runner-delivery:pending",
+		module: "test-runner-delivery.ts",
+		state: "pending",
+		policy: "session_start",
+		resetName: "resetTestRunnerDelivery",
+		reason:
+			"#2366: staged test results belong to their owning session and must not cross a primary session replacement; the durable findings cache remains available to pull diagnostics.",
+	},
 	{
 		id: "message-end-attribution:two-slot-anchor",
 		module: "message-end-attribution.ts",
@@ -229,6 +252,75 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 			isArmed: () => _boundedTurnCountForTest("loop_block") === 0,
 			reset: () => resetBoundedTelemetry(),
 		},
+	},
+	// ── #2319 process-singleton state with closure-located resets ──────────
+	// These resets run inside index.ts's `pi.on("session_start", ...)` closure,
+	// NOT inside handleSessionStart's reachable call graph, so the
+	// `sessionStartResetNames()` walk cannot see them (they would fail the
+	// "not reachable from handleSessionStart" test on line 238). Each carries
+	// `sessionStartClosureReset` and the conformance suite checks it against
+	// `sessionStartClosureResetNames()` instead — the derived evidence, never
+	// a hand-copied claim. The placement is load-bearing in every case: two of
+	// the resets re-arm counters that a DECLINED bind's own session_start
+	// increments (a reset there would erase a live sibling's tally), and the
+	// others must sit inside the #473 gate but before handleSessionStart runs.
+	// Together with widget-state.ts's exemption for `clearWidgetState`, every
+	// reset the closure derivation sees is now accounted for on this registry.
+	{
+		id: "session-start-observability:bindRollupCounters",
+		module: "session-start-observability.ts",
+		state:
+			"the concurrent-session bind rollup counters (process-singleton backed)",
+		policy: "session_start",
+		resetName: "resetConcurrentSessionBindRollupCounts",
+		sessionStartClosureReset: true,
+		reason:
+			"#2319: #2249's declined-bind rollup is process-singleton backed (catalog shape 25), so the module-scope container scan could not see it. Its reset runs in index.ts's session_start closure on the primary-continuation path behind the #473 concurrent-secondary gate - a declined bind's own session_start increments these counters, so resetting there would erase every prior sibling's tally; the closure placement (with the emit-before-reset first line) still lets a primary that crashed before session_shutdown start from zero.",
+	},
+	{
+		id: "path-attribution-telemetry:verifiedGuessCount",
+		module: "path-attribution-telemetry.ts",
+		state: "verifiedGuessCount (process-singleton backed as of #2319)",
+		policy: "session_start",
+		resetName: "resetVerifiedPathAttributionGuessCount",
+		sessionStartClosureReset: true,
+		reason:
+			"#2319: the verified path-attribution guess tally is a per-session counter that emits one path_attribution_verified_rollup row at session end; PR #2312's class sweep flagged the module-scope `let` as the same latent shape as the bind rollup, so it now rides getProcessSingleton (shape 25). Its reset runs in index.ts's session_start closure after the #473 decision and only on the primary path, so a secondary cannot erase the primary's tally; the count is memory-only best-effort observability, so a lost tally is noise, not data.",
+	},
+	// The exemption this entry replaces (#2319): liveBrackets is NOT exempt
+	// any longer - it is real session-scoped process-shared state whose reset
+	// the closure-site derivation now proves. The exemption's text said "the
+	// reset sits in the closure, so the handleSessionStart walk cannot see it;
+	// exempted rather than falsely registered" - the closure site IS that
+	// registration now.
+	{
+		id: "latency-logger:liveBrackets",
+		module: "latency-logger.ts",
+		state:
+			"liveBrackets, closedBrackets (the in-flight-phase bracket map); LAST_PHASE_EXCLUDED is a constant, not state",
+		policy: "session_start",
+		resetName: "resetCurrentPhaseForSession",
+		sessionStartClosureReset: true,
+		reason:
+			"#1723 review F4: the in-flight-phase live-bracket map is process-shared state that only a confirmed full session start may re-arm - the reset must sit INSIDE the #473 concurrent-secondary gate, yet outside handleSessionStart's own body (it runs before handleSessionStart), so it is called directly in index.ts's session_start closure, unreachable from the handleSessionStart walk. #2319 adds the closure-site evidence and this entry replaces the file's exemption. See resetCurrentPhaseForSession's own doc comment for the full placement reasoning.",
+	},
+	// #2319 survey catch: the session_start closure ALSO resets the
+	// #1999 rising-edge memory-sample cadence. Its state is two module-scope
+	// SCALARS, so the container scan cannot flag the file (SWEEP_HEURISTIC_LIMITS
+	// item 1 - the registry covers scalar session state by hand). The module's
+	// own doc calls this session state reset at primary session_start, so it
+	// registers as another closure-site entry and the derived closure set maps
+	// to the registry (or a widget-state exemption) one-to-one.
+	{
+		id: "memory-sampler:cadence",
+		module: "memory-sampler.ts",
+		state:
+			"_lastSampledHeapUsedBytes, _tightenThroughTurn (rising-edge cadence)",
+		policy: "session_start",
+		resetName: "resetMemorySamplerCadence",
+		sessionStartClosureReset: true,
+		reason:
+			"#2319 survey: #1999's rising-edge memory-sample cadence tightens sampling after rapid heap growth until it stabilizes; the latch is module-scope SCALAR session state (SWEEP_HEURISTIC_LIMITS item 1 - the container scan cannot see it, so the registry covers it by hand). Its reset runs in index.ts's session_start closure behind the #473 gate, and the #2319 derivation is what surfaced that it was never registered; see the module's own defect-shape-17 note.",
 	},
 	// ── #2000 phase 2 opaque-recovery baselines ─────────────────────────
 	{
@@ -989,8 +1081,6 @@ export const EXEMPT_SESSION_STATE_FILES: Readonly<Record<string, string>> = {
 		"diagnostics publisher registration and dirty-path dedupe",
 	"bus-events-logger.ts": "bus event rollup counters, an observability tally",
 	"ndjson-logger.ts": "registered log-file paths",
-	"latency-logger.ts":
-		"the scan's two flagged containers here are LAST_PHASE_EXCLUDED (a fixed, never-mutated Set of phase names — a constant, not state) and, since #1723, liveBrackets (the in-flight-phase bracket map). liveBrackets DOES have a genuine session-boundary reset, resetCurrentPhaseForSession — but it is called from the `pi.on(\"session_start\", ...)` handler in index.ts itself, BEFORE `handleSessionStart(...)` runs (deliberately: #1723 review F4 needs it positioned behind the #473 concurrent-secondary gate but is not part of handleSessionStart's own body), so `sessionStartResetNames()`'s walk — which starts specifically from handleSessionStart — cannot see it. Exempted here rather than added to SESSION_STATE_REGISTRY with a false reachability claim; see resetCurrentPhaseForSession's own doc comment for the full placement reasoning.",
 	"quiet-window.ts": "quiet-window task registration",
 	"quiet-window-config.ts":
 		"the env-derived quiet-window kill switch and wait budget, split out of quiet-window.ts by #1462; a memo of configuration, not of a session verdict",
@@ -1139,6 +1229,10 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"module-report-lsp.ts": 1,
 	"ndjson-logger.ts": 0,
 	"package-manager.ts": 1,
+	// #2319: the verified-guess tally moved behind getProcessSingleton, so the
+	// module-scope scan sees no container here; the getProcessSingleton SIGNAL
+	// is what flags this file now.
+	"path-attribution-telemetry.ts": 0,
 	"project-changes.ts": 0,
 	// #2146: the container key is a Symbol.for constant, so the scan sees no
 	// mutable module-scope container here.
@@ -1165,12 +1259,18 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	// #2146 moved the four registration fields onto the process singleton, so the
 	// scan sees no module-scope container here either.
 	"session-lifecycle.ts": 0,
+	// #2319: the bind-rollup counters live behind getProcessSingleton, so the
+	// module-scope scan sees no container here; the getProcessSingleton SIGNAL
+	// is what flags this file now.
+	"session-start-observability.ts": 0,
 	"sgconfig.ts": 2,
 	"slow-fs.ts": 0,
 	"smells-rollup.ts": 1,
 	"startup-timing.ts": 0,
 	"subagent-mode.ts": 0,
 	"tree-sitter-shared.ts": 0,
+	// #2366: one bounded pending-delivery map, cleared at primary session_start.
+	"test-runner-delivery.ts": 1,
 	"tui-fit.ts": 0,
 	"warm-attach.ts": 0,
 	"widget-state.ts": 2,

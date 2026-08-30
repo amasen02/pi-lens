@@ -6,6 +6,8 @@ All notable changes to pi-lens will be documented in this file.
 
 ### Added
 
+- **Deliver test-runner failures after the agent settles (refs #2366)** — failed test results remain in the pull-diagnostics and commit-guard cache, then appear once through a provenance-validated non-context custom entry after the agent is idle. Automatic delivery no longer injects a synthetic user message into the next model context.
+
 ### Changed
 
 ### Deprecated

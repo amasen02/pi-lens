@@ -95,6 +95,8 @@ export const BOUNDED_TELEMETRY_PHASES = [
 	 * the state cap. Selection checks and detailed rows are both capped per turn.
 	 */
 	"test_runner_failed_target_state",
+	/** #2366: bounded lifecycle records for automatic test-result delivery. */
+	"test_runner_delivery",
 	/**
 	 * #1723: an event-loop block at or above the floor. Not a degradation, so
 	 * no ledger kind; bounded by call cadence (one `turn_end` runs it once per

@@ -93,6 +93,8 @@ export type DegradationKind =
 	 * checks stay attributable.
 	 */
 	| "test-runner-failed-target-state"
+	/** Automatic test-result delivery could not reach the host entry surface. */
+	| "test-runner-delivery"
 	| "formatter-failure"
 	| "wasm-abort"
 	| "lsp-diagnostics-timeout"

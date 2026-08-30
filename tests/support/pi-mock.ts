@@ -68,6 +68,12 @@ export interface CapturedMessage {
 	details: unknown;
 }
 
+/** A persisted custom entry appended outside model context. */
+export interface CapturedEntry {
+	customType: string;
+	data: unknown;
+}
+
 export interface PiMock {
 	// ── recordings ───────────────────────────────────────────────────────────
 	readonly flags: Map<string, RecordedFlag>;
@@ -77,6 +83,8 @@ export interface PiMock {
 	readonly flagValues: Map<string, boolean | string>;
 	readonly messageRenderers: Map<string, unknown>;
 	readonly sentMessages: CapturedMessage[];
+	readonly entryRenderers: Map<string, unknown>;
+	readonly appendedEntries: CapturedEntry[];
 	/**
 	 * #dynamic-tooling: tools registered via `registerTool` are active by
 	 * default (mirrors the real host — see docs' `getActiveTools`/
@@ -93,6 +101,7 @@ export interface PiMock {
 	getFlag(name: string): boolean | string | undefined;
 	/** #484: registered message renderers, keyed by customType. */
 	registerMessageRenderer(customType: string, renderer: unknown): void;
+	registerEntryRenderer(customType: string, renderer: unknown): void;
 	/** #484: captures every `pi.sendMessage(...)` call into `sentMessages`. */
 	sendMessage(message: {
 		customType: string;
@@ -100,6 +109,7 @@ export interface PiMock {
 		display: boolean;
 		details?: unknown;
 	}): void;
+	appendEntry(customType: string, data?: unknown): void;
 
 	// ── test helpers ─────────────────────────────────────────────────────────
 	/** Pre-set a flag value (read back via getFlag); call before `extension(pi)`. */
@@ -157,6 +167,8 @@ export function createPiMock(
 	);
 	const messageRenderers = new Map<string, unknown>();
 	const sentMessages: CapturedMessage[] = [];
+	const entryRenderers = new Map<string, unknown>();
+	const appendedEntries: CapturedEntry[] = [];
 	const activeTools = new Set<string>();
 
 	const mock: PiMock = {
@@ -167,6 +179,8 @@ export function createPiMock(
 		flagValues,
 		messageRenderers,
 		sentMessages,
+		entryRenderers,
+		appendedEntries,
 		activeTools,
 
 		registerFlag(name, options) {
@@ -200,6 +214,9 @@ export function createPiMock(
 		registerMessageRenderer(customType, renderer) {
 			messageRenderers.set(customType, renderer);
 		},
+		registerEntryRenderer(customType, renderer) {
+			entryRenderers.set(customType, renderer);
+		},
 		sendMessage(message) {
 			sentMessages.push({
 				customType: message.customType,
@@ -207,6 +224,9 @@ export function createPiMock(
 				display: message.display,
 				details: message.details,
 			});
+		},
+		appendEntry(customType, data) {
+			appendedEntries.push({ customType, data });
 		},
 
 		setFlag(name, value) {

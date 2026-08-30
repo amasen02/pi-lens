@@ -264,9 +264,24 @@ const timingSensitiveInclude = [
 // file itself, which corrects the timeout values to match ast-grep's own
 // declared budget instead of a shorter invented constant — belt-and-braces,
 // not a substitute for phasing).
+// Membership is enforced, not conventional (#2344): tests/config/
+// lsp-spawn-heavy-coverage.test.ts derives candidates from the real spawn
+// seams (a bare `launchLSP(` call, a `getServerById(` registry spawn, or an
+// import of the fake-LSP fixture) and fails when a spawning test lands
+// outside this list without a documented exemption — or a member here
+// silently goes stale.
 const lspSpawnHeavyInclude = [
 	"tests/clients/ast-grep-rule-precedence-followups.test.ts",
+	// #2344: npm test leaves this real-child integration suite in the default
+	// project unless it is explicitly phased here. `test:integration` still
+	// selects the same file positionally, while `test:unit` excludes it below.
+	"tests/clients/lsp/integration.test.ts",
 	"tests/clients/lsp/workspace-diagnostics-sweep-attribution.integration.test.ts",
+	// #873/#448: the dispatch LSP runner against a real stdio JSON-RPC server
+	// — a real child spawn through the production LSPService plus a
+	// `.pi-lens/lsp.json` custom server, waiting on real first-document
+	// diagnostics. Same #1022/#2332 contention class as its lane siblings.
+	"tests/clients/dispatch/runners/lsp-real-runner.test.ts",
 ];
 
 // #1920: files that assert REAL wall-clock elapsed-time budgets (Date.now()
@@ -392,15 +407,14 @@ export default defineConfig({
 				test: {
 					name: "lsp-spawn-heavy",
 					include: lspSpawnHeavyInclude,
-					exclude: sharedExclude,
+					exclude: [...sharedExclude, ...unitOnlyExclude],
 					globalSetup: sharedGlobalSetup,
 					setupFiles: sharedSetupFiles,
 					execArgv: sharedExecArgv,
-					// Full serialization, not just a cap: this is a single file, so
-					// there are no siblings to share the phase with anyway — the
-					// point is to guarantee zero overlap with the "default" project's
-					// fork storm (the actual contention source, see #1022 above), not
-					// to bound intra-project concurrency.
+					// Full serialization, not just a cap: four files, but the point
+					// is to guarantee zero overlap with the "default" project's
+					// fork storm (the actual contention source, see #1022/#2332
+					// above), not to bound intra-project concurrency.
 					maxWorkers: 1,
 					// Last phase: by the time this runs, "default", "grammar-heavy",
 					// and "timing-sensitive" have all fully drained, so the real

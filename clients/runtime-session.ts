@@ -120,6 +120,7 @@ import { resetPendingAuxiliaryCoverage } from "./lsp/pending-aux-coverage.js";
 import { resetWorkspaceTopology } from "./workspace-topology.js";
 import { resetZizmorTokenAvailability } from "./zizmor-config.js";
 import { resetSpawnTimeoutCooldowns } from "./spawn-timeout-cooldown.js";
+import { resetTestRunnerDelivery } from "./test-runner-delivery.js";
 
 interface SessionStartDeps {
 	ctxCwd?: string;
@@ -1755,6 +1756,7 @@ export async function handleSessionStart(
 	deps: SessionStartDeps,
 ): Promise<void> {
 	resetDegradationLedger();
+	resetTestRunnerDelivery();
 	// #1743: the bounded-telemetry per-turn counters. The rising-edge state is
 	// NOT here — it is the ledger's own tally, reset on the line above. These
 	// counters are keyed by turn index, and a new session restarts turn

@@ -20,9 +20,9 @@ import {
  * gitignored for ad-hoc scratch scripts, same reason `high-fan-out`'s
  * `framework-call-noise.ts` sibling avoided it.)
  *
- * The cache's `content` field is a pre-formatted string for the next-turn
- * context injection; `results` (added alongside it) carries the structured
- * per-file `TestResult`s this adapter needs to emit per-file diagnostics.
+ * The cache's `content` field is a pre-formatted string for pull diagnostics
+ * and the post-agent custom entry; `results` carries the structured per-file
+ * `TestResult`s this adapter needs to emit per-file diagnostics.
  * Older caches written before `results` existed won't have it — treated as
  * "nothing to adapt", not an error.
  */

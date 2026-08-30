@@ -520,6 +520,12 @@ export const DELIVERY_SURFACES: Record<string, DeliverySurfaceEntry> = {
 			"content IS the current state by construction.",
 		"live",
 	),
+	"test-runner-delivery:custom-entry": labeled(
+		"clients/test-runner-delivery.ts",
+		"Post-agent test-runner failures in a non-context custom entry.",
+		"The cache remains authoritative for pull diagnostics and the commit guard; this surface appends only after provenance validation and an idle recheck.",
+		"live",
+	),
 	"project-diagnostics:persisted-snapshot": gated(
 		LENS_DIAGNOSTICS_FILE,
 		"Cross-session persisted project-diagnostics snapshot read.",

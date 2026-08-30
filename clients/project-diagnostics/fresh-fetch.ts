@@ -616,9 +616,10 @@ export async function fetchFreshProjectDiagnostics(
 		// Deliberately never calls `writeCache`: there is nothing fresher to write
 		// back, only what turn_end already produced.
 		//
-		// No double-count / honesty gap (#533): `consumeTestFindings`
-		// (`runtime-context.ts`) reads-and-clears this SAME cache key once, to
-		// inject a one-shot "fix before continuing" message into the NEXT turn.
+		// No double-count / honesty gap (#533): explicit `pilens_turn_end`
+		// delivery may call `consumeTestFindings` (`runtime-context.ts`) to
+		// read-and-clear this SAME cache key once. Automatic Pi delivery uses a
+		// non-context custom entry and never consumes this pull-diagnostics cache.
 		// This task only ever reads (never clears) it, so it can't race that
 		// consumption into re-delivering a message twice — at most it surfaces
 		// the same underlying failures a second time, through a different

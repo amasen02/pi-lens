@@ -59,6 +59,27 @@ describe("quiet-window", () => {
 		expect(order).toEqual(["first", "second"]);
 	});
 
+	it("passes the settled session and activation owner to each task", async () => {
+		const task = vi.fn();
+		registerQuietWindowTask("owner-aware", task);
+		const runtime = new RuntimeCoordinator();
+
+		await runQuietWindow({
+			runtime,
+			dbg: vi.fn(),
+			cwd: "/tmp/proj",
+			sessionId: "session-a",
+			ownerId: "activation-a",
+		});
+
+		expect(task).toHaveBeenCalledWith({
+			runtime,
+			cwd: "/tmp/proj",
+			sessionId: "session-a",
+			ownerId: "activation-a",
+		});
+	});
+
 	it("skips re-entrantly when a run is already in progress, without queuing", async () => {
 		let releaseFirst: (() => void) | undefined;
 		const gate = new Promise<void>((resolve) => {

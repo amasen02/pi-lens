@@ -50,7 +50,17 @@ export interface QuietWindowTaskResult {
 	ok: boolean;
 }
 
-export type QuietWindowTask = () => Promise<void> | void;
+export interface QuietWindowContext {
+	runtime: RuntimeCoordinator;
+	cwd?: string;
+	sessionId?: string;
+	/** Stable activation owner for tasks that outlive an event callback. */
+	ownerId?: string;
+}
+
+export type QuietWindowTask = (
+	context?: QuietWindowContext,
+) => Promise<void> | void;
 
 interface RegisteredTask {
 	name: string;
@@ -100,6 +110,8 @@ export interface QuietWindowDeps {
 	runtime: RuntimeCoordinator;
 	dbg: (msg: string) => void;
 	cwd?: string;
+	sessionId?: string;
+	ownerId?: string;
 }
 
 /**
@@ -145,7 +157,12 @@ export async function runQuietWindow(deps: QuietWindowDeps): Promise<void> {
 			const taskStart = Date.now();
 			let ok = true;
 			try {
-				await task.fn();
+				await task.fn({
+					runtime: deps.runtime,
+					cwd: deps.cwd,
+					sessionId: deps.sessionId,
+					ownerId: deps.ownerId,
+				});
 			} catch (err) {
 				ok = false;
 				// Surface the stack (not just the message) so the next failure is
