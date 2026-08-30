@@ -454,17 +454,27 @@ describe("getFormattersForFile — policy selection", () => {
 		expect(formatters).toEqual([]);
 	});
 
-	it("uses prettier as the smart default for unconfigured HTML files", async () => {
-		const filePath = fileIn(tmpDir, "page.html");
-		const formatters = await getFormattersForFile(filePath, tmpDir);
-		expect(formatters.map((f) => f.name)).toEqual(["prettier"]);
-	});
+	// #2384: unconfigured HTML/YAML commonly carry template markers ({{JS}}
+	// embeds, Helm `{{ .Values.x }}`) that real Prettier corrupts. No
+	// unconfigured formatter may be selected for these extensions.
+	it.each(["page.html", "page.htm", "config.yaml", "config.yml"])(
+		"does not force a formatter for unconfigured %s files (#2384)",
+		async (name) => {
+			const filePath = fileIn(tmpDir, name);
+			const formatters = await getFormattersForFile(filePath, tmpDir);
+			expect(formatters).toEqual([]);
+		},
+	);
 
-	it("uses prettier as the smart default for unconfigured YAML files", async () => {
-		const filePath = fileIn(tmpDir, "config.yaml");
-		const formatters = await getFormattersForFile(filePath, tmpDir);
-		expect(formatters.map((f) => f.name)).toEqual(["prettier"]);
-	});
+	it.each(["page.html", "config.yaml"])(
+		"runs prettier on %s when project has explicit prettier config (#2384)",
+		async (name) => {
+			createTempFile(tmpDir, ".prettierrc", "{}");
+			const filePath = fileIn(tmpDir, name);
+			const formatters = await getFormattersForFile(filePath, tmpDir);
+			expect(formatters.map((f) => f.name)).toEqual(["prettier"]);
+		},
+	);
 
 	it("does not force prettier on unconfigured Markdown files", async () => {
 		// Prettier's markdown defaults reflow lines and normalize emphasis markers,
