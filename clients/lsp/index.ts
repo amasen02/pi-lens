@@ -1922,8 +1922,16 @@ export class LSPService {
 		filePath: string,
 		reason: { consecutiveTimeouts: number },
 	): Promise<void> {
+		// The CPU verdict is asynchronous, but the streak has already committed to
+		// this client's teardown path. Release the TypeScript idle-timer ownership
+		// before sampling so another idle callback cannot target the same client
+		// while the verdict is in flight. A BUSY verdict below re-arms a fresh timer.
+		this.clearTypeScriptIdleTimer(key);
 		const verdict = await this.notifyStallCpuVerdict(entry);
 		if (verdict.cpuVerdict === "busy") {
+			if (this.state.clients.get(key) === entry.client) {
+				this.scheduleTypeScriptIdleEviction(key);
+			}
 			this.logNotifyStallCpuBusy(key, entry, filePath, 0, verdict);
 			return;
 		}

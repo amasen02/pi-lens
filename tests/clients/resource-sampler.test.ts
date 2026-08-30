@@ -49,12 +49,17 @@ vi.mock("node:child_process", async (importOriginal) => {
 		spawn: (...args: unknown[]) => fakeSpawn(...args),
 	};
 });
-vi.mock("../../clients/instance-reaper.js", () => ({
-	terminateScannerChild: async (child: unknown, options: unknown) => {
-		timeoutControl.called = true;
-		return timeoutControl.handler?.(child, options) ?? "gone";
-	},
-}));
+vi.mock("../../clients/instance-reaper.js", async (importOriginal) => {
+	const actual =
+		await importOriginal<typeof import("../../clients/instance-reaper.js")>();
+	return {
+		...actual,
+		terminateScannerChild: async (child: unknown, options: unknown) => {
+			timeoutControl.called = true;
+			return timeoutControl.handler?.(child, options) ?? "gone";
+		},
+	};
+});
 
 const {
 	sampleProcesses,

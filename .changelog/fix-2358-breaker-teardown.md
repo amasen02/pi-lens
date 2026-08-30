@@ -9,3 +9,5 @@ section: Fixed
   torn down; only a flat-CPU or cap-exceeded server is killed, and the teardown
   record names which discriminator fired. Windows CPU sampling now resolves
   `powershell.exe` through `System32`, which was silently missing before.
+  Streak teardown releases TypeScript idle-timer ownership before the asynchronous
+  CPU probe and re-arms it only when the same client remains busy.
