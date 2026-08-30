@@ -1,4 +1,7 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import * as yaml from "js-yaml";
 import { describe, expect, it } from "vitest";
 import {
 	commentMarkerExists,
@@ -46,6 +49,57 @@ import {
 	STALLED_RUN_MINUTES,
 	stalledRunCommentMarker,
 } from "../../scripts/lib/warden-run-health.mjs";
+import { assertNonEmptyScan } from "../support/sweep-kit.js";
+
+const REPO_ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
+const WORKFLOWS_DIR = join(REPO_ROOT, ".github", "workflows");
+const DISPATCH_VALIDATOR = "scripts/lib/merge-train-dispatch-validation.mjs";
+const REPOSITORY_DISPATCH_IF = "github.event_name == 'repository_dispatch'";
+const PAYLOAD_CHECKOUT_REF =
+	"${{ github.event_name == 'repository_dispatch' && github.event.client_payload.sha || github.ref }}";
+const CHECKOUT_ACTION =
+	"actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1";
+
+type RecordValue = Record<string, unknown>;
+
+function recordValue(value: unknown): RecordValue {
+	return value && typeof value === "object" && !Array.isArray(value)
+		? (value as RecordValue)
+		: {};
+}
+
+function workflowDocuments() {
+	return readdirSync(WORKFLOWS_DIR, { withFileTypes: true })
+		.filter((entry) => entry.isFile() && /\.ya?ml$/i.test(entry.name))
+		.map((entry) => {
+			const path = join(WORKFLOWS_DIR, entry.name);
+			return {
+				name: entry.name,
+				document: recordValue(yaml.load(readFileSync(path, "utf8"))),
+			};
+		})
+		.filter(({ document }) => {
+			const dispatch = recordValue(
+				recordValue(document.on).repository_dispatch,
+			);
+			const types = dispatch.types;
+			return Array.isArray(types) && types.includes("merge-train-post-merge");
+		});
+}
+
+function stepsFor(job: unknown): RecordValue[] {
+	const steps = recordValue(job).steps;
+	return Array.isArray(steps) ? steps.map(recordValue) : [];
+}
+
+function needsFor(job: unknown): string[] {
+	const needs = recordValue(job).needs;
+	return Array.isArray(needs)
+		? needs.filter((value): value is string => typeof value === "string")
+		: typeof needs === "string"
+			? [needs]
+			: [];
+}
 
 function pr(overrides: Record<string, unknown> = {}) {
 	return {
@@ -3259,64 +3313,112 @@ describe("merge-lane sweep (#2185)", () => {
 		});
 	});
 
-	it("pins every master-push workflow to post-merge dispatch and SHA concurrency", () => {
-		for (const workflow of [
-			"ci.yml",
-			"lint.yml",
-			"install-smoke.yml",
-			"labels.yml",
-		]) {
-			const source = readFileSync(
-				new URL(`../../.github/workflows/${workflow}`, import.meta.url),
-				"utf8",
+	it("covers every registered post-merge workflow through its parsed contract", () => {
+		const workflows = workflowDocuments();
+		assertNonEmptyScan(
+			"registered post-merge workflows",
+			workflows.length,
+			POST_MERGE_VALIDATION_WORKFLOWS.length,
+		);
+		expect(workflows.map(({ name }) => name).sort()).toEqual(
+			[...POST_MERGE_VALIDATION_WORKFLOWS].sort(),
+		);
+		expect(existsSync(join(REPO_ROOT, DISPATCH_VALIDATOR))).toBe(true);
+
+		for (const { name, document } of workflows) {
+			const triggers = recordValue(document.on);
+			expect(
+				recordValue(triggers.push).branches,
+				`${name} master trigger`,
+			).toContain("master");
+			expect(
+				recordValue(document.concurrency)["cancel-in-progress"],
+				`${name} concurrency`,
+			).toBe(true);
+			const jobs = recordValue(document.jobs);
+			const validatorJob = jobs["validate-merge-train-dispatch"];
+			expect(validatorJob, `${name} validator job`).toBeDefined();
+			const validatorSteps = stepsFor(validatorJob);
+			const validatorIndexes = validatorSteps
+				.map((step, index) =>
+					step.run === `node ${DISPATCH_VALIDATOR}` ? index : -1,
+				)
+				.filter((index) => index >= 0);
+			expect(validatorIndexes, `${name} validator step`).toHaveLength(1);
+			if (validatorIndexes.length !== 1) continue;
+			const validatorStep = validatorSteps[validatorIndexes[0]];
+			expect(validatorStep.if, `${name} validator gate`).toBe(
+				REPOSITORY_DISPATCH_IF,
 			);
-			expect(source).toContain("push:");
-			expect(source).toContain("repository_dispatch:");
-			expect(source).toContain("merge-train-post-merge");
-			expect(source).toContain(
-				"ref: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.sha || github.ref }}",
+			expect(validatorStep.run).toBe(`node ${DISPATCH_VALIDATOR}`);
+			expect(
+				recordValue(validatorStep.env),
+				`${name} validator env`,
+			).toMatchObject({
+				PAYLOAD_REPOSITORY: "${{ github.event.client_payload.repository }}",
+				PAYLOAD_SHA: "${{ github.event.client_payload.sha }}",
+				PAYLOAD_PR_NUMBER: "${{ github.event.client_payload.pr_number }}",
+			});
+
+			const checkoutSteps = validatorSteps.filter((step) =>
+				String(step.uses ?? "").startsWith("actions/checkout@"),
 			);
-			expect(source).not.toContain(
-				"github.event.client_payload.sha || github.sha",
+			expect(checkoutSteps, `${name} validator checkout`).toHaveLength(1);
+			if (checkoutSteps.length !== 1) continue;
+			const checkoutStep = checkoutSteps[0];
+			expect(checkoutStep.if, `${name} checkout gate`).toBe(
+				REPOSITORY_DISPATCH_IF,
 			);
-			expect(source).toContain(
-				"PAYLOAD_REPOSITORY: ${{ github.event.client_payload.repository }}",
+			expect(recordValue(checkoutStep.with).ref, `${name} checkout ref`).toBe(
+				"${{ github.sha }}",
 			);
-			expect(source).toContain(
-				"PAYLOAD_SHA: ${{ github.event.client_payload.sha }}",
+			expect(checkoutStep.uses, `${name} checkout action`).toBe(
+				CHECKOUT_ACTION,
 			);
-			expect(source).toContain(
-				"PAYLOAD_PR_NUMBER: ${{ github.event.client_payload.pr_number }}",
+			expect(validatorSteps.indexOf(checkoutStep)).toBeLessThan(
+				validatorIndexes[0],
 			);
-			expect(source).toContain(
-				"actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-			);
-			expect(source).toContain(
-				"run: node scripts/lib/merge-train-dispatch-validation.mjs",
-			);
-			expect(source).toContain(
-				"run: node scripts/lib/merge-train-dispatch-validation.mjs\n",
-			);
-			const validatorJob = source.slice(
-				source.indexOf("  validate-merge-train-dispatch:"),
-				(() => {
-					const start = source.indexOf("  validate-merge-train-dispatch:");
-					const nextJobOffset = source
-						.slice(start + 3)
-						.search(/\n  [a-z0-9][\w-]*:/);
-					return nextJobOffset < 0 ? source.length : start + 3 + nextJobOffset;
-				})(),
-			);
-			expect(validatorJob).toContain("ref: ${{ github.sha }}");
-			expect(validatorJob.indexOf("ref: ${{ github.sha }}")).toBeLessThan(
-				validatorJob.indexOf(
-					"run: node scripts/lib/merge-train-dispatch-validation.mjs",
+
+			const payloadJobs = Object.entries(jobs).filter(([, job]) =>
+				stepsFor(job).some((step) =>
+					String(recordValue(step.with).ref).includes(
+						"github.event.client_payload.sha",
+					),
 				),
 			);
-			expect(source).toContain("cancel-in-progress: true");
-			expect(source).toContain("needs: validate-merge-train-dispatch");
-			expect(source).toContain("record-post-merge-validation");
-			expect(source).toContain("state=succeeded");
+			expect(
+				payloadJobs.length,
+				`${name} payload checkout population`,
+			).toBeGreaterThan(0);
+			for (const [jobName, job] of payloadJobs)
+				for (const step of stepsFor(job))
+					if (
+						String(recordValue(step.with).ref).includes(
+							"github.event.client_payload.sha",
+						)
+					)
+						expect(
+							recordValue(step.with).ref,
+							`${name} ${jobName} checkout ref`,
+						).toBe(PAYLOAD_CHECKOUT_REF);
+			for (const [jobName, job] of payloadJobs)
+				expect(needsFor(job), `${name} ${jobName} dependency`).toContain(
+					"validate-merge-train-dispatch",
+				);
+
+			const recorderEntries = Object.entries(jobs).filter(([jobName]) =>
+				jobName.includes("record-post-merge-validation"),
+			);
+			expect(recorderEntries, `${name} terminal recorder`).toHaveLength(1);
+			const [recorderName, recorder] = recorderEntries[0];
+			expect(
+				needsFor(recorder),
+				`${name} ${recorderName} dependency`,
+			).toContain("validate-merge-train-dispatch");
+			expect(
+				String(recordValue(recorder).if),
+				`${name} recorder gate`,
+			).toContain("needs.validate-merge-train-dispatch.result == 'success'");
 		}
 	});
 
