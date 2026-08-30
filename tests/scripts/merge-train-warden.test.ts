@@ -55,6 +55,8 @@ const REPO_ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 const WORKFLOWS_DIR = join(REPO_ROOT, ".github", "workflows");
 const DISPATCH_VALIDATOR = "scripts/lib/merge-train-dispatch-validation.mjs";
 const REPOSITORY_DISPATCH_IF = "github.event_name == 'repository_dispatch'";
+const POST_MERGE_RECORDER_IF =
+	"always() && github.event_name == 'repository_dispatch' && needs.validate-merge-train-dispatch.result == 'success'";
 const PAYLOAD_CHECKOUT_REF =
 	"${{ github.event_name == 'repository_dispatch' && github.event.client_payload.sha || github.ref }}";
 const CHECKOUT_ACTION =
@@ -3415,10 +3417,9 @@ describe("merge-lane sweep (#2185)", () => {
 				needsFor(recorder),
 				`${name} ${recorderName} dependency`,
 			).toContain("validate-merge-train-dispatch");
-			expect(
-				String(recordValue(recorder).if),
-				`${name} recorder gate`,
-			).toContain("needs.validate-merge-train-dispatch.result == 'success'");
+			expect(recordValue(recorder).if, `${name} recorder gate`).toBe(
+				POST_MERGE_RECORDER_IF,
+			);
 		}
 	});
 
