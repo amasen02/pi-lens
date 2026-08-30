@@ -1,5 +1,5 @@
 ---
-Added
+section: Fixed
 ---
 
 - **Breaker teardown tells dead from busy (#2358).** The LSP notify-stall breaker
