@@ -33,6 +33,15 @@ import { fetchHeadRunHealth, RUN_HEALTH } from "./warden-run-health.mjs";
 
 export const TRAIN_APPROVED_LABEL = "train:approved";
 export const TRAIN_SQUASH_LABEL = "train:squash";
+export const POST_MERGE_EVENT = "merge-train-post-merge";
+const POST_MERGE_ERROR_CAP = 200;
+
+function boundedError(error) {
+	return String(error instanceof Error ? error.message : error).slice(
+		0,
+		POST_MERGE_ERROR_CAP,
+	);
+}
 
 // How this repository ACTUALLY marks a check advisory: the workflow job name
 // ends in "(advisory)". Probed 2026-08-26 against the live rollups of every
@@ -329,6 +338,30 @@ export async function mergePullRequest(fetcher, owner, repo, pr, method) {
 }
 
 /**
+ * Ask GitHub to replay the master-push validation workflows for the commit
+ * produced by the merge. `GITHUB_TOKEN` suppresses the push event that would
+ * normally start them, but repository_dispatch is explicitly exempt from
+ * that recursion rule. The payload carries both identities so consumers
+ * cannot accidentally validate the default branch at a different commit.
+ */
+export async function dispatchPostMergeValidation(
+	fetcher,
+	owner,
+	repo,
+	mergeSha,
+) {
+	return rest(
+		fetcher,
+		"POST",
+		`https://api.github.com/repos/${owner}/${repo}/dispatches`,
+		{
+			event_type: POST_MERGE_EVENT,
+			client_payload: { repository: `${owner}/${repo}`, sha: mergeSha },
+		},
+	);
+}
+
+/**
  * The strict-protection update kick (review round 1, F1). `expected_head_sha`
  * makes it as head-atomic as the merge call: if the branch moved since the
  * gate read, GitHub refuses rather than updating a head nobody evaluated.
@@ -414,6 +447,51 @@ export async function runMergeLane({
 					gate.method,
 				);
 				merged = response.ok;
+				if (response.ok) {
+					let mergeBody;
+					let mergeBodyReadable = true;
+					try {
+						mergeBody = await response.json();
+					} catch (error) {
+						mergeBodyReadable = false;
+						errors.push({
+							message: `PR #${pr.number}: post-merge validation missing; merge response could not be read (${boundedError(error)})`,
+							benign: false,
+						});
+					}
+					const mergeSha = mergeBody?.sha;
+					if (!mergeBodyReadable) {
+						// The parse failure above already records the missing validation.
+					} else if (
+						typeof mergeSha !== "string" ||
+						mergeSha.length === 0 ||
+						mergeSha.length > 128
+					) {
+						errors.push({
+							message: `PR #${pr.number}: post-merge validation missing; merge response had no exact merge SHA`,
+							benign: false,
+						});
+					} else {
+						try {
+							const dispatch = await dispatchPostMergeValidation(
+								fetcher,
+								owner,
+								repo,
+								mergeSha,
+							);
+							if (!dispatch.ok)
+								errors.push({
+									message: `PR #${pr.number}: post-merge validation dispatch -> HTTP ${dispatch.status} for ${mergeSha.slice(0, 64)}`,
+									benign: false,
+								});
+						} catch (error) {
+							errors.push({
+								message: `PR #${pr.number}: post-merge validation dispatch -> ${boundedError(error)}`,
+								benign: false,
+							});
+						}
+					}
+				}
 				if (!response.ok) {
 					errors.push({
 						message: `PR #${pr.number}: merge -> HTTP ${response.status}`,

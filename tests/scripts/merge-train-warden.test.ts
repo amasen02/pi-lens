@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
 	commentMarkerExists,
@@ -315,6 +316,12 @@ function fakeGithub(routes: Record<string, unknown>) {
 		const key = `${method} ${url.replace("https://api.github.com", "").split("?")[0]}`;
 		const entry = routes[key];
 		if (entry === undefined) {
+			if (key.endsWith("/merge") && method === "PUT")
+				return {
+					ok: true,
+					status: 200,
+					json: async () => ({ sha: MERGE_SHA, merged: true }),
+				};
 			// Default the #2184 run-health reads to well-formed empty payloads, so
 			// a test that only cares about labels/comments does not accidentally
 			// assert on an "unreadable runs list" error.
@@ -1149,6 +1156,7 @@ function headRun(overrides: Record<string, unknown> = {}) {
 }
 
 const NOW = Date.parse("2026-08-26T16:30:00Z");
+const MERGE_SHA = "0123456789abcdef0123456789abcdef01234567";
 
 describe("starved-run detection (#2184)", () => {
 	it("counts only steps GitHub actually executed", () => {
@@ -2621,6 +2629,10 @@ describe("merge-lane sweep (#2185)", () => {
 				lanePrNode({ labels: [TRAIN_APPROVED_LABEL] }),
 			]),
 			"GET /repos/acme/repo/actions/runs": runsRoute(HEALTHY_RUNS),
+			"PUT /repos/acme/repo/pulls/7/merge": {
+				sha: MERGE_SHA,
+				merged: true,
+			},
 		});
 		const results = await runMergeLane({
 			fetcher,
@@ -2634,6 +2646,14 @@ describe("merge-lane sweep (#2185)", () => {
 			url: "https://api.github.com/repos/acme/repo/pulls/7/merge",
 			body: { merge_method: "merge", sha: "deadbeef" },
 		});
+		expect(calls).toContainEqual({
+			method: "POST",
+			url: "https://api.github.com/repos/acme/repo/dispatches",
+			body: {
+				event_type: "merge-train-post-merge",
+				client_payload: { repository: "acme/repo", sha: MERGE_SHA },
+			},
+		});
 		const comments = calls.filter(
 			(c) => c.method === "POST" && c.url.endsWith("/issues/7/comments"),
 		);
@@ -2641,6 +2661,75 @@ describe("merge-lane sweep (#2185)", () => {
 		expect(String((comments[0].body as { body: string }).body)).toContain(
 			"merged",
 		);
+	});
+
+	it("records missing post-merge validation when the merge response has no SHA", async () => {
+		const { fetcher, calls } = fakeGithub({
+			"POST /graphql": graphqlPage([
+				lanePrNode({ labels: [TRAIN_APPROVED_LABEL] }),
+			]),
+			"GET /repos/acme/repo/actions/runs": runsRoute(HEALTHY_RUNS),
+			"PUT /repos/acme/repo/pulls/7/merge": {},
+		});
+		const results = await runMergeLane({
+			fetcher,
+			owner: "acme",
+			repo: "repo",
+			now: NOW,
+		});
+		expect(results[0]).toMatchObject({ merged: true });
+		expect(results[0].errors).toContainEqual({
+			message: expect.stringContaining("post-merge validation missing"),
+			benign: false,
+		});
+		expect(calls.some((c) => c.url.endsWith("/dispatches"))).toBe(false);
+	});
+
+	it("records a failed post-merge dispatch while preserving the landed merge", async () => {
+		const { fetcher, calls } = fakeGithub({
+			"POST /graphql": graphqlPage([
+				lanePrNode({ labels: [TRAIN_APPROVED_LABEL] }),
+			]),
+			"GET /repos/acme/repo/actions/runs": runsRoute(HEALTHY_RUNS),
+			"PUT /repos/acme/repo/pulls/7/merge": { sha: MERGE_SHA },
+			"POST /repos/acme/repo/dispatches": () => ({
+				ok: false,
+				status: 503,
+				json: async () => ({}),
+			}),
+		});
+		const results = await runMergeLane({
+			fetcher,
+			owner: "acme",
+			repo: "repo",
+			now: NOW,
+		});
+		expect(results[0]).toMatchObject({ merged: true });
+		expect(results[0].errors).toContainEqual({
+			message: expect.stringContaining("dispatch -> HTTP 503"),
+			benign: false,
+		});
+		expect(calls.filter((c) => c.url.endsWith("/dispatches"))).toHaveLength(1);
+	});
+
+	it("pins every master-push workflow to post-merge dispatch and SHA concurrency", () => {
+		for (const workflow of [
+			"ci.yml",
+			"lint.yml",
+			"install-smoke.yml",
+			"labels.yml",
+		]) {
+			const source = readFileSync(
+				new URL(`../../.github/workflows/${workflow}`, import.meta.url),
+				"utf8",
+			);
+			expect(source).toContain("repository_dispatch:");
+			expect(source).toContain("merge-train-post-merge");
+			expect(source).toContain(
+				"ref: ${{ github.event.client_payload.sha || github.sha }}",
+			);
+			expect(source).toContain("cancel-in-progress: true");
+		}
 	});
 
 	// AC1's second half, and the mutation screen for the label gate: an
@@ -2857,6 +2946,7 @@ describe("merge-lane sweep (#2185)", () => {
 			url: "https://api.github.com/repos/acme/repo/pulls/7/update-branch",
 			body: { expected_head_sha: "deadbeef" },
 		});
+		expect(calls.some((c) => c.url.endsWith("/dispatches"))).toBe(false);
 	});
 
 	// Review round 2, F1: update-branch's 403 means two different things

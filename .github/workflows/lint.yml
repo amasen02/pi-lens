@@ -9,6 +9,8 @@ name: Lint
 on:
   push:
     branches: [master]
+  repository_dispatch:
+    types: [merge-train-post-merge]
   pull_request:
     branches: [master]
     # Default types omit "edited". Without it, retitling a PR to fix a
@@ -16,6 +18,13 @@ on:
     # "opened" event instead of re-running against the new title (#1917
     # review F3).
     types: [opened, synchronize, reopened, edited]
+
+# A merge made with GITHUB_TOKEN suppresses its push event. Replayed
+# repository_dispatch runs validate the exact merge commit, and duplicate
+# events for that commit must not run concurrently.
+concurrency:
+  group: lint-${{ github.event.client_payload.sha || github.sha }}
+  cancel-in-progress: true
 
 permissions: {}
 
@@ -28,6 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.event.client_payload.sha || github.sha }}
           persist-credentials: false
 
       # Pinned release + checksum verification rather than piping a
@@ -58,6 +68,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.event.client_payload.sha || github.sha }}
           persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
@@ -84,6 +95,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.event.client_payload.sha || github.sha }}
           persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
@@ -105,6 +117,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.event.client_payload.sha || github.sha }}
           persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
@@ -144,6 +157,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.event.client_payload.sha || github.sha }}
           persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
@@ -175,6 +189,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.event.client_payload.sha || github.sha }}
           persist-credentials: false
 
       # Pinned release + checksum verification, matching the actionlint job

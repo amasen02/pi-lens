@@ -3,8 +3,17 @@ name: CI
 on:
   push:
     branches: [master]
+  repository_dispatch:
+    types: [merge-train-post-merge]
   pull_request:
     branches: [master]
+
+# A merge made with GITHUB_TOKEN suppresses its push event. Replayed
+# repository_dispatch runs must validate the exact merge commit, and duplicate
+# events for that commit must not run concurrently.
+concurrency:
+  group: ci-${{ github.event.client_payload.sha || github.sha }}
+  cancel-in-progress: true
 
 jobs:
   dependency-boundaries:
@@ -16,6 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.event.client_payload.sha || github.sha }}
           persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
@@ -40,6 +50,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.event.client_payload.sha || github.sha }}
           persist-credentials: false
 
       - name: Validate per-issue close keywords
@@ -62,6 +73,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.event.client_payload.sha || github.sha }}
           persist-credentials: false
 
       - name: Validate changelog fragments
@@ -76,6 +88,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.event.client_payload.sha || github.sha }}
           persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
@@ -121,6 +134,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.event.client_payload.sha || github.sha }}
           persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
@@ -250,6 +264,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.event.client_payload.sha || github.sha }}
           persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
@@ -377,6 +392,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.event.client_payload.sha || github.sha }}
           persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6

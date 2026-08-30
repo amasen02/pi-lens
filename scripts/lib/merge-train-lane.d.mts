@@ -3,6 +3,7 @@ import type { HeadRunHealth } from "./warden-run-health.d.mts";
 
 export const TRAIN_APPROVED_LABEL: string;
 export const TRAIN_SQUASH_LABEL: string;
+export const POST_MERGE_EVENT: string;
 export const ADVISORY_SUFFIX: string;
 export const ADVISORY_CHECKS: Set<string>;
 export const CONCLUDED_STATUS: string;
@@ -75,6 +76,12 @@ export function mergePullRequest(
 	repo: string,
 	pr: WardenPr,
 	method: string,
+): Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
+export function dispatchPostMergeValidation(
+	fetcher: FetchFn,
+	owner: string,
+	repo: string,
+	mergeSha: string,
 ): Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
 export function runMergeLane(options: {
 	fetcher: FetchFn;

@@ -7,6 +7,12 @@ on:
       - ".github/labels.yml"
       - ".github/workflows/labels.yml"
   workflow_dispatch:
+  repository_dispatch:
+    types: [merge-train-post-merge]
+
+concurrency:
+  group: labels-${{ github.event.client_payload.sha || github.sha }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -19,6 +25,7 @@ jobs:
       # yamllint disable-line rule:line-length
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.event.client_payload.sha || github.sha }}
           persist-credentials: false
 
       # yamllint disable-line rule:line-length

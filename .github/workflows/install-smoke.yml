@@ -39,6 +39,8 @@ on:
   schedule:
     - cron: "0 6 * * *" # nightly 06:00 UTC
   workflow_dispatch: {}
+  repository_dispatch:
+    types: [merge-train-post-merge]
   push:
     branches: [master]
     paths:
@@ -47,6 +49,13 @@ on:
       - "scripts/install-selftest.mjs"
       - "scripts/rpc-load-check.mjs"
       - ".github/workflows/install-smoke.yml"
+
+# A merge made with GITHUB_TOKEN suppresses its push event. Replayed
+# repository_dispatch runs validate the exact merge commit, and duplicate
+# events for that commit must not run concurrently.
+concurrency:
+  group: install-smoke-${{ github.event.client_payload.sha || github.sha }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -63,6 +72,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.event.client_payload.sha || github.sha }}
           persist-credentials: false
 
       - name: Setup Node
@@ -154,6 +164,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 # for the RPC driver
         with:
+          ref: ${{ github.event.client_payload.sha || github.sha }}
           persist-credentials: false
 
       - name: Setup Node
@@ -271,6 +282,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 # RPC driver
         with:
+          ref: ${{ github.event.client_payload.sha || github.sha }}
           persist-credentials: false
 
       - name: Install mise (pinned + checksum-verified)
