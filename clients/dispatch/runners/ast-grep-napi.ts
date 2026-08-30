@@ -600,21 +600,25 @@ export interface HtmlScriptInjection {
 }
 
 /**
- * Budget for embedded-`<script>` evaluation (#2347 review F2). Every nonempty
+ * Budget for embedded-`<script>` evaluation (#2347 review F2/F4). Every nonempty
  * script body is reparsed as JS and EVERY `language: JavaScript` rule runs
  * against it, so the work is `rules * bodies * body-size`, all multiplied by
  * the native addon's per-call overhead. Measured on this seam (full catalog,
- * real addon, 2026-08-30): ~8.5 ms per small body, ~9 s for 500 blocks. A file
- * may legally contain thousands of `<script>` tags, so both the body COUNT and
- * the cumulative body BYTES are capped before any grammar parse. Hand-authored
- * HTML carries a handful of inline scripts, so the caps only ever trip on
- * generated/pathological pages, where a bounded, recorded partial evaluation
- * beats a seconds-long synchronous stall on the per-edit hook. Budget
- * truncation is a coverage loss and is recorded (see
- * `emitHtmlScriptDegradations`).
+ * real addon, 2026-08-30): ~8.5 ms per small body, ~9 s for 500 blocks, and
+ * ~19.5 s for one ~1 MiB dense body (the shape that made the byte axis the
+ * real bound). The caps apply to EVERY body — first one included — so an
+ * oversized single inline script is omitted and recorded like any other
+ * over-budget body. Hand-authored HTML carries a handful of small inline
+ * scripts, so the caps only ever trip on generated/pathological pages, where a
+ * bounded, recorded partial evaluation beats a seconds-long synchronous stall
+ * on the per-edit hook. Budget truncation is a coverage loss and is recorded
+ * (see `emitHtmlScriptDegradations`).
  */
 export const MAX_SCRIPT_BODIES_EVALUATED = 64;
-/** Cumulative parsed script-body size cap; bounds the `rules * bytes` work. */
+/**
+ * Cumulative parsed script-body size cap; bounds the `rules * bytes` work.
+ * Every body — including the first — must fit within the running total.
+ */
 export const MAX_SCRIPT_BODY_BYTES_EVALUATED = 128 * 1024;
 
 /**
@@ -770,16 +774,16 @@ export function collectHtmlScriptInjections(
 	let truncatedBodies = 0;
 	for (const candidate of candidates) {
 		const bytes = Buffer.byteLength(candidate.body, "utf8");
-		// The FIRST body is always admitted: a single over-cap inline script is
-		// the same work as that file's own root evaluation (a plain JS file the
-		// runner already evaluates up to the 1 MiB gate), so dropping it alone
-		// would deny a file its one legitimate script while bounding nothing.
-		// Every further body must fit inside both caps.
-		const firstBody = selected.length === 0;
+		// EVERY body must fit inside both caps — including the first. There is
+		// no "one big script" allowance: a single over-cap body (a ~1 MiB dense
+		// inline script measured 19.5 s of synchronous rule traversal on this
+		// seam) is omitted like any other over-budget body, and the omission is
+		// recorded via `truncatedBodies`, so the bounded
+		// `ast-grep-napi-html-script-budget` degradation record always explains
+		// why that file lost embedded coverage.
 		if (
-			!firstBody &&
-			(selected.length >= MAX_SCRIPT_BODIES_EVALUATED ||
-				budgetedBytes + bytes > MAX_SCRIPT_BODY_BYTES_EVALUATED)
+			selected.length >= MAX_SCRIPT_BODIES_EVALUATED ||
+			budgetedBytes + bytes > MAX_SCRIPT_BODY_BYTES_EVALUATED
 		) {
 			truncatedBodies += 1;
 			continue;

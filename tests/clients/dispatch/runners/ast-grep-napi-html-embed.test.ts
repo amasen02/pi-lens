@@ -372,6 +372,55 @@ describe("embedded <script> evaluation budget (#2347 review F2)", () => {
 		const reason = budgetGroup?.latestReasons[0]?.reason ?? "";
 		expect(reason).toContain("64/71 bodies evaluated");
 	});
+
+	it("omits a single oversized FIRST body and records the budget cut (red on pre-fix, #2347 F4)", () => {
+		// The reviewer's HIGH finding: the first body used to bypass the byte
+		// cap, so a single ~1 MiB inline body under the file gate ran the whole
+		// catalog synchronously (measured 19.5 s on this seam). The byte cap now
+		// binds every body, including the first; the omission follows the
+		// existing budget-record path.
+		const oversized = `const s = '${"a".repeat(
+			MAX_SCRIPT_BODY_BYTES_EVALUATED + 4096,
+		)}';`;
+		const content = `<script>${oversized}</script>\n`;
+
+		const result = collected(content);
+		expect(result.scriptElementCount).toBe(1);
+		expect(result.bodiesEvaluated).toBe(0);
+		expect(result.truncatedBodies).toBe(1);
+		expect(result.injections).toHaveLength(0);
+
+		const diagnostics = evaluateHtml(content);
+		expect(diagnostics).toHaveLength(0);
+
+		const summary = getDegradationSummary();
+		const budgetGroup = summary.find(
+			(g) => g.kind === "ast-grep-napi-html-script-budget",
+		);
+		expect(budgetGroup).toBeDefined();
+		expect(budgetGroup?.count).toBe(1);
+		const reason = budgetGroup?.latestReasons[0]?.reason ?? "";
+		expect(reason).toContain("0/1 bodies evaluated");
+	});
+
+	it("still evaluates a sole body under the byte cap (boundary preserved)", () => {
+		// The hard first-body cap must not over-restrict: a single body that
+		// fits is evaluated in full, and no budget record is emitted.
+		const inBudget = `const s = '${"a".repeat(
+			MAX_SCRIPT_BODY_BYTES_EVALUATED - 4096,
+		)}';`;
+		const content = `<script>${inBudget}</script>\n`;
+
+		const result = collected(content);
+		expect(result.scriptElementCount).toBe(1);
+		expect(result.bodiesEvaluated).toBe(1);
+		expect(result.truncatedBodies).toBe(0);
+		expect(result.injections).toHaveLength(1);
+
+		const diagnostics = evaluateHtml(content);
+		expect(getDegradationSummary()).toEqual([]);
+		expect(diagnostics).toEqual([]);
+	});
 });
 
 describe("embedded <script> failure records (#2347 review F3)", () => {
