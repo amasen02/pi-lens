@@ -1379,19 +1379,21 @@ adversarial-review-first policy is unchanged; removing the label aborts.
 
 After a successful merge, `runMergeLane` reads a strict 40-hex merge SHA and
 sends a `merge-train-post-merge` `repository_dispatch` payload containing
-`{repository, sha}`. The lane uses this event because its `GITHUB_TOKEN` merge
-suppresses the ordinary `push` event. Transient HTTP failures and ambiguous
-timeouts receive one bounded retry with the same SHA; the scheduled lane also
-reconciles recent bot-merged PRs from their durable `merge_commit_sha` and a
-completion marker, so a process exit cannot lose a dispatch. A final failure
-leaves the merge landed but records a fatal post-merge-validation error. The
-master-push validation workflows (`ci.yml`, `lint.yml`, `install-smoke.yml`,
-and `labels.yml`) gate all repository actions behind a dispatch prerequisite
-that validates repository identity, strict SHA shape, exact checkout, and
-ancestry to `master`; they use per-workflow SHA concurrency with cancellation
-so duplicate dispatches cannot validate one commit concurrently. A missing or
-invalid merge SHA means no dispatch, and the lane must never report that
-verification ran.
+`{repository, sha, pr_number}`. The lane uses this event because its
+`GITHUB_TOKEN` merge suppresses the ordinary `push` event. Transient HTTP
+failures and ambiguous timeouts receive one bounded retry with the same SHA;
+the scheduled lane also reconciles recent bot-merged PRs from their durable
+`merge_commit_sha` and requested/terminal state markers. It waits through a
+bounded grace period, retries missing validation across process restarts, and
+accepts completion only from bot-authored exact-SHA terminal markers. A final
+failure leaves the merge landed but records a fatal post-merge-validation
+error. The master-push validation workflows (`ci.yml`, `lint.yml`,
+`install-smoke.yml`, and `labels.yml`) gate all repository actions behind a
+dispatch prerequisite that validates repository identity, strict SHA and PR
+number shape, authenticated exact commit resolution, and ancestry to
+`master`; they use per-workflow SHA concurrency with cancellation so duplicate
+dispatches cannot validate one commit concurrently. A missing or invalid merge
+SHA means no dispatch, and the lane must never report that verification ran.
 
 Four facts about THIS repository the lane must keep matching, each probed live
 rather than assumed (review round 1 on PR #2191, all four were wrong first):

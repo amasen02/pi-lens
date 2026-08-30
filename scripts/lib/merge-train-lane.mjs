@@ -36,6 +36,13 @@ export const TRAIN_SQUASH_LABEL = "train:squash";
 export const POST_MERGE_EVENT = "merge-train-post-merge";
 export const POST_MERGE_DISPATCH_ATTEMPTS = 2;
 export const POST_MERGE_RECONCILE_WINDOW_MS = 24 * 60 * 60 * 1000;
+export const POST_MERGE_RECONCILE_GRACE_MS = 15 * 60 * 1000;
+export const POST_MERGE_VALIDATION_WORKFLOWS = Object.freeze([
+	"ci.yml",
+	"lint.yml",
+	"install-smoke.yml",
+	"labels.yml",
+]);
 const POST_MERGE_ERROR_CAP = 200;
 const POST_MERGE_BOT_LOGIN = "github-actions[bot]";
 
@@ -352,6 +359,7 @@ export async function dispatchPostMergeValidation(
 	owner,
 	repo,
 	mergeSha,
+	prNumber,
 ) {
 	return rest(
 		fetcher,
@@ -359,7 +367,11 @@ export async function dispatchPostMergeValidation(
 		`https://api.github.com/repos/${owner}/${repo}/dispatches`,
 		{
 			event_type: POST_MERGE_EVENT,
-			client_payload: { repository: `${owner}/${repo}`, sha: mergeSha },
+			client_payload: {
+				repository: `${owner}/${repo}`,
+				sha: mergeSha,
+				pr_number: prNumber,
+			},
 		},
 	);
 }
@@ -375,6 +387,7 @@ export async function dispatchPostMergeValidationWithRetry(
 	owner,
 	repo,
 	mergeSha,
+	prNumber,
 ) {
 	let lastResponse;
 	let lastError;
@@ -385,6 +398,7 @@ export async function dispatchPostMergeValidationWithRetry(
 				owner,
 				repo,
 				mergeSha,
+				prNumber,
 			);
 			const retryable =
 				lastResponse.status === 408 ||
@@ -407,8 +421,8 @@ export async function dispatchPostMergeValidationWithRetry(
 	throw lastError ?? new Error("post-merge validation dispatch failed");
 }
 
-function postMergeDispatchMarker(mergeSha) {
-	return `<!-- merge-train-post-merge:sha=${mergeSha}:dispatched -->`;
+function postMergeRequestMarker(mergeSha, attempt, requestedAt) {
+	return `<!-- merge-train-post-merge:sha=${mergeSha}:state=requested:attempt=${attempt}:at=${requestedAt} -->`;
 }
 
 async function readIssueComments(fetcher, owner, repo, number) {
@@ -418,29 +432,64 @@ async function readIssueComments(fetcher, owner, repo, number) {
 	);
 }
 
-async function hasPostMergeDispatchMarker(
+async function readPostMergeState(fetcher, owner, repo, number, mergeSha, now) {
+	const comments = await readIssueComments(fetcher, owner, repo, number);
+	const requestedAttempts = [];
+	let latestRequestedAt = null;
+	const workflows = new Map();
+	const escapedSha = mergeSha.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	const requestPattern = new RegExp(
+		`merge-train-post-merge:sha=${escapedSha}:state=requested:attempt=(\\d+):at=(\\d+)`,
+	);
+	const legacyPattern = new RegExp(
+		`merge-train-post-merge:sha=${escapedSha}:dispatched`,
+	);
+	const validationPattern = new RegExp(
+		`merge-train-post-merge:sha=${escapedSha}:workflow=([^:]+):state=(succeeded|failed)`,
+	);
+	for (const comment of comments) {
+		if (comment?.user?.login !== POST_MERGE_BOT_LOGIN) continue;
+		const body = String(comment?.body ?? "");
+		const request = body.match(requestPattern);
+		if (request) {
+			const attempt = Number(request[1]);
+			const requestedAt = Number(request[2]);
+			if (
+				Number.isSafeInteger(attempt) &&
+				Number.isSafeInteger(requestedAt) &&
+				requestedAt <= now
+			) {
+				requestedAttempts.push(attempt);
+				latestRequestedAt = Math.max(latestRequestedAt ?? 0, requestedAt);
+			}
+		} else if (legacyPattern.test(body)) {
+			requestedAttempts.push(1);
+			latestRequestedAt = 0;
+		}
+		const validation = body.match(validationPattern);
+		if (!validation || !POST_MERGE_VALIDATION_WORKFLOWS.includes(validation[1]))
+			continue;
+		const previous = workflows.get(validation[1]);
+		if (previous !== "failed") workflows.set(validation[1], validation[2]);
+	}
+	return { requestedAttempts, latestRequestedAt, workflows };
+}
+
+async function recordPostMergeDispatch(
 	fetcher,
 	owner,
 	repo,
 	number,
 	mergeSha,
+	attempt,
+	requestedAt,
 ) {
-	const marker = postMergeDispatchMarker(mergeSha);
-	const comments = await readIssueComments(fetcher, owner, repo, number);
-	return comments.some(
-		(comment) =>
-			comment?.user?.login === POST_MERGE_BOT_LOGIN &&
-			String(comment?.body ?? "").includes(marker),
-	);
-}
-
-async function recordPostMergeDispatch(fetcher, owner, repo, number, mergeSha) {
 	return rest(
 		fetcher,
 		"POST",
 		`https://api.github.com/repos/${owner}/${repo}/issues/${number}/comments`,
 		{
-			body: `Post-merge validation dispatch accepted for ${mergeSha}.\n\n${postMergeDispatchMarker(mergeSha)}`,
+			body: `Post-merge validation dispatch requested for ${mergeSha} (attempt ${attempt}).\n\n${postMergeRequestMarker(mergeSha, attempt, requestedAt)}`,
 		},
 	);
 }
@@ -448,8 +497,8 @@ async function recordPostMergeDispatch(fetcher, owner, repo, number, mergeSha) {
 /**
  * Reconcile merge-train dispatches from GitHub's durable merged-PR record.
  * The scan runs on every lane process, so a crash after merge and before the
- * dispatch, or after an accepted dispatch and before its marker, is repaired
- * by a later run. Only merges performed by this workflow's bot are eligible;
+ * dispatch, or after an accepted dispatch and before validation completes, is
+ * repaired by a later run. Only merges performed by this workflow's bot are eligible;
  * ordinary human merges already receive the normal push workflows.
  */
 export async function reconcilePostMergeValidations({
@@ -458,6 +507,7 @@ export async function reconcilePostMergeValidations({
 	repo,
 	now = Date.now(),
 	windowMs = POST_MERGE_RECONCILE_WINDOW_MS,
+	graceMs = POST_MERGE_RECONCILE_GRACE_MS,
 }) {
 	let closedPrs;
 	try {
@@ -492,17 +542,16 @@ export async function reconcilePostMergeValidations({
 			continue;
 		}
 
+		let state;
 		try {
-			if (
-				await hasPostMergeDispatchMarker(
-					fetcher,
-					owner,
-					repo,
-					pr.number,
-					mergeSha,
-				)
-			)
-				continue;
+			state = await readPostMergeState(
+				fetcher,
+				owner,
+				repo,
+				pr.number,
+				mergeSha,
+				now,
+			);
 		} catch (error) {
 			results.push({
 				number: pr.number,
@@ -513,12 +562,69 @@ export async function reconcilePostMergeValidations({
 			continue;
 		}
 
+		const failedWorkflows = POST_MERGE_VALIDATION_WORKFLOWS.filter(
+			(workflow) => state.workflows.get(workflow) === "failed",
+		);
+		if (failedWorkflows.length > 0) {
+			results.push({
+				number: pr.number,
+				sha: mergeSha,
+				dispatched: false,
+				errors: [
+					`post-merge validation failed for ${failedWorkflows.join(", ")} at ${mergeSha}`,
+				],
+			});
+			continue;
+		}
+		if (
+			POST_MERGE_VALIDATION_WORKFLOWS.every(
+				(workflow) => state.workflows.get(workflow) === "succeeded",
+			)
+		)
+			continue;
+		if (
+			state.latestRequestedAt != null &&
+			now - state.latestRequestedAt < graceMs
+		)
+			continue;
+		const attempt = Math.max(0, ...state.requestedAttempts) + 1;
+		if (attempt > POST_MERGE_DISPATCH_ATTEMPTS) {
+			results.push({
+				number: pr.number,
+				sha: mergeSha,
+				dispatched: false,
+				errors: [
+					`post-merge validation missing after ${POST_MERGE_DISPATCH_ATTEMPTS} request attempt(s) for ${mergeSha}`,
+				],
+			});
+			continue;
+		}
+
 		try {
+			const marker = await recordPostMergeDispatch(
+				fetcher,
+				owner,
+				repo,
+				pr.number,
+				mergeSha,
+				attempt,
+				now,
+			);
+			if (!marker.ok) {
+				results.push({
+					number: pr.number,
+					sha: mergeSha,
+					dispatched: false,
+					errors: [`post-merge request marker -> HTTP ${marker.status}`],
+				});
+				continue;
+			}
 			const dispatch = await dispatchPostMergeValidationWithRetry(
 				fetcher,
 				owner,
 				repo,
 				mergeSha,
+				pr.number,
 			);
 			if (!dispatch.response.ok) {
 				results.push({
@@ -529,18 +635,11 @@ export async function reconcilePostMergeValidations({
 				});
 				continue;
 			}
-			const marker = await recordPostMergeDispatch(
-				fetcher,
-				owner,
-				repo,
-				pr.number,
-				mergeSha,
-			);
 			results.push({
 				number: pr.number,
 				sha: mergeSha,
 				dispatched: true,
-				errors: marker.ok ? [] : [`post-merge marker -> HTTP ${marker.status}`],
+				errors: [],
 			});
 		} catch (error) {
 			results.push({
@@ -667,11 +766,28 @@ export async function runMergeLane({
 						});
 					} else {
 						try {
+							const marker = await recordPostMergeDispatch(
+								fetcher,
+								owner,
+								repo,
+								pr.number,
+								mergeSha,
+								1,
+								Date.now(),
+							);
+							if (!marker.ok) {
+								errors.push({
+									message: `PR #${pr.number}: post-merge request marker -> HTTP ${marker.status} for ${mergeSha}`,
+									benign: false,
+								});
+								continue;
+							}
 							const dispatchResult = await dispatchPostMergeValidationWithRetry(
 								fetcher,
 								owner,
 								repo,
 								mergeSha,
+								pr.number,
 							);
 							const dispatch = dispatchResult.response;
 							if (!dispatch.ok)
@@ -680,18 +796,9 @@ export async function runMergeLane({
 									benign: false,
 								});
 							else {
-								const marker = await recordPostMergeDispatch(
-									fetcher,
-									owner,
-									repo,
-									pr.number,
-									mergeSha,
-								);
-								if (!marker.ok)
-									errors.push({
-										message: `PR #${pr.number}: post-merge marker -> HTTP ${marker.status} for ${mergeSha}`,
-										benign: false,
-									});
+								// The requested marker is durable state. HTTP acceptance is
+								// not validation completion; terminal workflow markers are
+								// written by the four repository_dispatch workflows.
 							}
 						} catch (error) {
 							errors.push({
