@@ -282,6 +282,12 @@ const lspSpawnHeavyInclude = [
 	// `.pi-lens/lsp.json` custom server, waiting on real first-document
 	// diagnostics. Same #1022/#2332 contention class as its lane siblings.
 	"tests/clients/dispatch/runners/lsp-real-runner.test.ts",
+	// #2358: the notify-stall CPU-liveness discriminator against REAL wedged
+	// child processes — busy-vs-flat verdicts asserted across real wall-clock
+	// wedge windows and real process-CPU sampling. The wedge timer and the
+	// sampling queries are deschedulable real work; the default project's fork
+	// storm must not own their clocks.
+	"tests/clients/lsp/service-notify-cpu-liveness.test.ts",
 ];
 
 // #1920: files that assert REAL wall-clock elapsed-time budgets (Date.now()

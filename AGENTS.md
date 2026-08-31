@@ -516,7 +516,8 @@ scanner accepts each write in milliseconds, so every file still gets scanned,
 and only a scanner that cannot accept a write inside the budget makes a waiter
 give up. A write that lands after its deadline but inside the wedge window
 retracts the timeout it was charged for (slow is not broken); one nothing
-accepts for the whole wedge window keeps its strike and demotes the server, so
+accepts for the whole wedge window keeps its strike and demotes the server (see
+the #2358 paragraph below for the CPU-liveness guard on that teardown), so
 the gate cannot defer a dead input path forever. Its queue wait uses the
 effective `primaryServerWaitFloorMs`, which includes the caller's
 `maxClientWaitMs` and any primary server `clientWaitTimeoutMs` override, so a
@@ -545,6 +546,49 @@ and deferral open BEFORE any wait, so `auxiliaryCoverageGap` (which reads wait
 outcomes) cannot see them on the `clientScope: "all"` sweep path, which emits no
 outcome rows at all — they are unioned into `unconfirmedServerIds` separately.
 (#1459)
+
+**The notify-stall teardown tells dead from busy before it kills (#2358).** The
+wedge timer armed by `claimAuxNotifySlot` and the #743 streak ladder both call
+the same `demoteForNotifyStall`, and both now decide through the CPU-liveness
+discriminator. The wedged-write window is ADAPTIVE: max(fixed floor, k x EWMA
+per-write drain latency x unacked depth), capped at `notifyWedgedCapMs()`
+(default 60s). The EWMA (`auxNotifyDrainLatencyEwma`, `noteAuxNotifyDrainLatency`)
+is folded only from DRAINED notify barriers — a round-trip that proves the
+server processed its backlog — so a scanner that historically answers slowly
+earns patience instead of dying by construction. Past the window, the server's
+live process tree is sampled twice across `notifyStallCpuSampleMs()`
+(`notifyStallCpuVerdict` -> `sampleProcessTreeCpuPercent`, `clients/
+resource-sampler.ts`); a BUSY server is left alone and the timer re-arms, and
+only a flat or unmeasured one is torn down. The hard cap still kills a server
+whose CPU burns past its deadline: the replacement is the self-heal. The record
+`lsp_notify_backpressure_broken` names which discriminator fired
+(`budget-exceeded-cpu-flat`, `budget-exceeded`, or `cap-exceeded`) and carries
+the measured `budgetMs`, the `ewmaInputMs` input, the `unackedDepth`, and the
+`cpuVerdict`, so a production kill is classifiable from its own log line. A
+write that lands inside the adaptive window retracts the strike it was charged
+(the retraction ceiling matches the wedge window). The unacked ceiling stays
+pure backpressure; only the teardown decision gained discrimination. A busy
+defer emits the bounded `lsp_notify_stall_cpu_busy` record, one per re-arm
+cycle. Clients expose their live pid through the optional `getProcessPid`
+capability; a client without it (a test double, a legacy client) keeps the
+pre-#2358 demote-at-budget behavior. #2358's prerequisite is its own Windows
+fix: `clients/resource-sampler.ts` resolves `powershell.exe` through the shared
+`windowsExe` seam (System32) — the old path omitted `System32`, so every
+Windows CPU sample read as null and the discriminator was blind there.
+
+The notify-stall token is generation-owned: replacement, idle eviction, capacity
+eviction, and reset release its timer before state changes. Async decisions check
+the exact client object before sampling, after sampling, and before demotion or
+re-arm. Windows CPU history includes CIM `CreationDate`, so PID reuse starts a
+fresh rate window. A target missing from either sample or a failed query is
+`unmeasured`; missing descendants remain partial but valid evidence. Busy detail
+telemetry is rising-edge bounded per client/file identity, with repeat counts and
+dropped detail retained by the degradation ledger. The unmeasured verdict maps to
+the supported `budget-exceeded` discriminator, never to a fabricated flat result.
+Windows and POSIX samples validate finite, nonnegative RSS and CPU counters before
+they enter measured evidence; counter resets retire the baseline. Busy decision rows
+are excluded from `lastPhase` attribution because they describe an outcome, not host
+work. CPU identity history is capped at 4096 entries with oldest-entry eviction.
 
 **A touch's `inconclusive` verdict is PRIMARY-scoped; an auxiliary can only
 narrow it.** `resolveTouchVerdict` (`clients/lsp/diagnostic-binding.ts`) owns the
