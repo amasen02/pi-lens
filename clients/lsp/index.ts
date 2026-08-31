@@ -544,6 +544,15 @@ export interface SpawnedServer {
 	info: LSPServerInfo;
 }
 
+type OutstandingAuxNotifyWrite = {
+	startedAt: number;
+	client: LSPClientInfo;
+	settled: Promise<void>;
+	wedgeTimer: ReturnType<typeof setTimeout>;
+	armedBudgetMs: number;
+	resolveSettled: () => void;
+};
+
 /**
  * #1934: what the client pool actually did to serve one selection.
  *
@@ -1419,14 +1428,7 @@ export class LSPService {
 	 */
 	private readonly outstandingAuxNotifyWrites = new Map<
 		string,
-		{
-			startedAt: number;
-			client: LSPClientInfo;
-			settled: Promise<void>;
-			wedgeTimer: ReturnType<typeof setTimeout>;
-			/** #2358: the patience window this write's wedge timer was armed with. */
-			armedBudgetMs: number;
-		}
+		OutstandingAuxNotifyWrite
 	>();
 	/**
 	 * #2356: auxiliary clients removed by the notify-stall breaker are a
@@ -1679,6 +1681,7 @@ export class LSPService {
 		}
 
 		const [victimKey, victimClient] = victim;
+		this.releaseOutstandingAuxNotifyWrite(victimKey, victimClient);
 		await victimClient.shutdown({ reason: "client_ceiling_lru" });
 		this.state.clients.delete(victimKey);
 		this.state.clientSpawnedAt.delete(victimKey);
@@ -1696,6 +1699,18 @@ export class LSPService {
 		const timer = this.typeScriptIdleTimers.get(key);
 		if (timer) clearTimeout(timer);
 		this.typeScriptIdleTimers.delete(key);
+	}
+
+	/** Release a notify token and its timer when its client generation retires. */
+	private releaseOutstandingAuxNotifyWrite(
+		key: string,
+		client?: LSPClientInfo,
+	): void {
+		const token = this.outstandingAuxNotifyWrites.get(key);
+		if (!token || (client !== undefined && token.client !== client)) return;
+		clearTimeout(token.wedgeTimer);
+		this.outstandingAuxNotifyWrites.delete(key);
+		token.resolveSettled();
 	}
 
 	private scheduleTypeScriptIdleEviction(key: string): void {
@@ -1723,6 +1738,7 @@ export class LSPService {
 				// Publish the cold state synchronously before awaiting teardown. A request
 				// arriving while shutdown is in progress therefore waits on the spawn gate
 				// and creates a fresh client; it can never receive this retiring one.
+				this.releaseOutstandingAuxNotifyWrite(key, client);
 				this.state.clients.delete(key);
 				this.state.clientSpawnedAt.delete(key);
 				this.state.demonstratedReady.delete(key);
@@ -1922,6 +1938,7 @@ export class LSPService {
 		filePath: string,
 		reason: { consecutiveTimeouts: number },
 	): Promise<void> {
+		if (this.state.clients.get(key) !== entry.client) return;
 		// The CPU verdict is asynchronous, but the streak has already committed to
 		// this client's teardown path. Release the TypeScript idle-timer ownership
 		// before sampling so another idle callback cannot target the same client
@@ -1966,6 +1983,9 @@ export class LSPService {
 			notifyStallCpuSampleMs(),
 			NOTIFY_STALL_CPU_BUSY_FLOOR_PERCENT,
 		);
+		if (!sample.measured) {
+			return { cpuVerdict: "unmeasured", cpuPercent: null };
+		}
 		if (sample.busy) {
 			return { cpuVerdict: "busy", cpuPercent: sample.cpuPercent };
 		}
@@ -1986,19 +2006,25 @@ export class LSPService {
 		verdict: { cpuPercent: number | null },
 		extra: { budgetMs?: number } = {},
 	): void {
-		logLatency({
-			type: "phase",
-			phase: "lsp_notify_stall_cpu_busy",
-			filePath: normalizeMapKey(filePath),
-			durationMs: 0,
-			metadata: {
-				serverId: entry.info.id,
-				clientKey: key,
-				outstandingMs,
-				cpuPercent: verdict.cpuPercent ?? null,
-				...extra,
+		emitBounded(
+			"lsp_notify_stall_cpu_busy",
+			`${key}:${normalizeMapKey(filePath)}`,
+			{
+				type: "phase",
+				durationMs: outstandingMs,
+				metadata: {
+					serverId: entry.info.id,
+					clientKey: key,
+					outstandingMs,
+					cpuPercent: verdict.cpuPercent ?? null,
+					...extra,
+				},
 			},
-		});
+			{
+				ledgerKind: "lsp-notify-stall-cpu-busy",
+				risingEdgePer: "identity",
+			},
+		);
 	}
 
 	/**
@@ -2033,8 +2059,11 @@ export class LSPService {
 		filePath: string,
 		reason: NotifyStallDemotionReason,
 	): void {
+		// An async verdict belongs to one client generation. Never let a
+		// predecessor's decision delete or cool down its replacement.
+		if (this.state.clients.get(key) !== entry.client) return;
 		this.notifyWriteBackpressureStreak.delete(key);
-		this.outstandingAuxNotifyWrites.delete(key);
+		this.releaseOutstandingAuxNotifyWrite(key, entry.client);
 		// #1714: the demoted client is torn down, so its backlog count describes a
 		// process that no longer exists. Leaving it would make the replacement start
 		// at the ceiling and pay a barrier on its first file.
@@ -2162,11 +2191,17 @@ export class LSPService {
 		key: string,
 		entry: SpawnedServer,
 		filePath: string,
-		token: { startedAt: number; armedBudgetMs: number },
+		token: OutstandingAuxNotifyWrite,
 	): Promise<
 		| { action: "demote"; reason: NotifyStallDemotionReason }
 		| { action: "rearm"; budgetMs: number }
 	> {
+		if (
+			this.state.clients.get(key) !== entry.client ||
+			this.outstandingAuxNotifyWrites.get(key) !== token
+		) {
+			throw new Error("stale notify generation");
+		}
 		const outstandingMs = Date.now() - token.startedAt;
 		const armedBudgetMs = token.armedBudgetMs;
 		if (outstandingMs >= notifyWedgedCapMs()) {
@@ -2180,6 +2215,12 @@ export class LSPService {
 			};
 		}
 		const verdict = await this.notifyStallCpuVerdict(entry);
+		if (
+			this.state.clients.get(key) !== entry.client ||
+			this.outstandingAuxNotifyWrites.get(key) !== token
+		) {
+			throw new Error("stale notify generation");
+		}
 		if (verdict.cpuVerdict === "busy") {
 			this.logNotifyStallCpuBusy(key, entry, filePath, outstandingMs, verdict, {
 				budgetMs: armedBudgetMs,
@@ -2513,7 +2554,7 @@ export class LSPService {
 			// respawned) says nothing about this client's stdin — drop it, so a stale
 			// entry can never starve a healthy server.
 			if (outstanding && outstanding.client !== entry.client) {
-				this.outstandingAuxNotifyWrites.delete(clientKey);
+				this.releaseOutstandingAuxNotifyWrite(clientKey, outstanding.client);
 			} else if (outstanding) {
 				const outstandingMs = Date.now() - outstanding.startedAt;
 				const remainingMs = deadline - Date.now();
@@ -2554,6 +2595,7 @@ export class LSPService {
 				// thereafter only ever written by this token's own fire/release
 				// closures, so the placeholder value is never read by anyone.
 				wedgeTimer: undefined as unknown as ReturnType<typeof setTimeout>,
+				resolveSettled: (): void => resolveSettled?.(),
 			};
 			// A write nothing accepts for the whole wedge window is a dead input
 			// path, not a slow scan. Armed HERE rather than checked by the next
@@ -2570,7 +2612,13 @@ export class LSPService {
 			// token identity after its awaits, so a release or a concurrent
 			// demotion that lands mid-sample aborts the decision.
 			const fireWedge = async (): Promise<void> => {
-				if (this.outstandingAuxNotifyWrites.get(clientKey) !== token) return;
+				if (
+					this.outstandingAuxNotifyWrites.get(clientKey) !== token ||
+					this.state.clients.get(clientKey) !== entry.client
+				) {
+					this.releaseOutstandingAuxNotifyWrite(clientKey, entry.client);
+					return;
+				}
 				let decision:
 					| { action: "demote"; reason: NotifyStallDemotionReason }
 					| { action: "rearm"; budgetMs: number };
@@ -2593,7 +2641,13 @@ export class LSPService {
 						},
 					};
 				}
-				if (this.outstandingAuxNotifyWrites.get(clientKey) !== token) return;
+				if (
+					this.outstandingAuxNotifyWrites.get(clientKey) !== token ||
+					this.state.clients.get(clientKey) !== entry.client
+				) {
+					this.releaseOutstandingAuxNotifyWrite(clientKey, entry.client);
+					return;
+				}
 				if (decision.action === "demote") {
 					this.demoteForNotifyStall(
 						clientKey,
@@ -2619,11 +2673,7 @@ export class LSPService {
 			this.outstandingAuxNotifyWrites.set(clientKey, token);
 			return {
 				release: (): void => {
-					clearTimeout(token.wedgeTimer);
-					if (this.outstandingAuxNotifyWrites.get(clientKey) === token) {
-						this.outstandingAuxNotifyWrites.delete(clientKey);
-					}
-					resolveSettled?.();
+					this.releaseOutstandingAuxNotifyWrite(clientKey, token.client);
 				},
 			};
 		}
@@ -3543,6 +3593,7 @@ export class LSPService {
 			} catch {
 				/* ignore dead client shutdown errors */
 			}
+			this.releaseOutstandingAuxNotifyWrite(key, existing);
 			this.state.clients.delete(key);
 			this.state.clientSpawnedAt.delete(key);
 			this.clientLastUsedAt.delete(key);
@@ -9052,6 +9103,9 @@ export class LSPService {
 		const resetStartedAt = Date.now();
 		if (this.checkDestroyed()) return;
 		this.isDestroyed = true;
+		for (const [key, token] of this.outstandingAuxNotifyWrites) {
+			this.releaseOutstandingAuxNotifyWrite(key, token.client);
+		}
 		for (const key of this.typeScriptIdleTimers.keys()) {
 			this.clearTypeScriptIdleTimer(key);
 		}
@@ -9109,7 +9163,9 @@ export class LSPService {
 		// #1459: every gated client is gone, so no outstanding-write record can
 		// describe a live one. The gate's identity check already neutralises a stale
 		// entry; clearing keeps the map honest rather than relying on that.
-		this.outstandingAuxNotifyWrites.clear();
+		for (const [key, token] of this.outstandingAuxNotifyWrites) {
+			this.releaseOutstandingAuxNotifyWrite(key, token.client);
+		}
 		this.notifyStallDemotions.clear();
 		// #2358: same reasoning — a per-write latency estimate belongs to a client
 		// generation, and every client is gone. `session_start` reaches this

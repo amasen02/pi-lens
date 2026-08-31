@@ -10,4 +10,8 @@ section: Fixed
   record names which discriminator fired. Windows CPU sampling now resolves
   `powershell.exe` through `System32`, which was silently missing before.
   Streak teardown releases TypeScript idle-timer ownership before the asynchronous
-  CPU probe and re-arms it only when the same client remains busy.
+  CPU probe and re-arms it only when the same client remains busy. Notify timers
+  now release with their client generation, and stale decisions cannot demote a
+  replacement. Windows CPU history includes CIM process-creation identity, so
+  PID reuse starts a fresh rate window. Missing targets and failed queries remain
+  unmeasured, while busy-defer detail is bounded per client/file identity.

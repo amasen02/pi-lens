@@ -576,6 +576,16 @@ fix: `clients/resource-sampler.ts` resolves `powershell.exe` through the shared
 `windowsExe` seam (System32) — the old path omitted `System32`, so every
 Windows CPU sample read as null and the discriminator was blind there.
 
+The notify-stall token is generation-owned: replacement, idle eviction, capacity
+eviction, and reset release its timer before state changes. Async decisions check
+the exact client object before sampling, after sampling, and before demotion or
+re-arm. Windows CPU history includes CIM `CreationDate`, so PID reuse starts a
+fresh rate window. A target missing from either sample or a failed query is
+`unmeasured`; missing descendants remain partial but valid evidence. Busy detail
+telemetry is rising-edge bounded per client/file identity, with repeat counts and
+dropped detail retained by the degradation ledger. The unmeasured verdict maps to
+the supported `budget-exceeded` discriminator, never to a fabricated flat result.
+
 **A touch's `inconclusive` verdict is PRIMARY-scoped; an auxiliary can only
 narrow it.** `resolveTouchVerdict` (`clients/lsp/diagnostic-binding.ts`) owns the
 one rule, and both its inputs name primary-role servers only. An auxiliary that

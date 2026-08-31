@@ -231,6 +231,9 @@ describe("#2358 — CPU-liveness discriminator on a real wedged scanner", () => 
 
 		expect(broken()).toBe(false);
 		expect(clientStillRegistered()).toBe(true);
+		// The adaptive timer re-arms while busy, but detail telemetry remains
+		// rising-edge bounded for this server/file identity.
+		expect(rowsFor("lsp_notify_stall_cpu_busy")).toHaveLength(1);
 		expect(rowsFor("lsp_notify_backpressure_broken")).toHaveLength(0);
 	}, 30_000);
 

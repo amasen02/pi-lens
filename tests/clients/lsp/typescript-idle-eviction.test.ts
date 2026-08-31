@@ -185,6 +185,35 @@ describe("TypeScript language-service idle eviction (#1332 b2)", () => {
 		expect(client.shutdown).toHaveBeenCalledTimes(1);
 	});
 
+	it("does not let a stale demotion delete a replacement generation", async () => {
+		const predecessor = fakeClient("predecessor");
+		const replacement = fakeClient("replacement");
+		createLSPClient.mockResolvedValue(predecessor);
+		configureTypeScriptServer();
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const service = new LSPService();
+		const entry = await service.getClientForFile("/repo/main.ts");
+		expect(entry?.client).toBe(predecessor);
+		const harness = service as unknown as {
+			state: { clients: Map<string, typeof predecessor> };
+			demoteForNotifyStall(
+				key: string,
+				entry: unknown,
+				filePath: string,
+				reason: unknown,
+			): void;
+		};
+		const key = [...harness.state.clients.keys()][0];
+		harness.state.clients.set(key as string, replacement);
+		harness.demoteForNotifyStall(key as string, entry, "/repo/main.ts", {
+			outstandingMs: 1,
+			discriminator: "budget-exceeded",
+		});
+		expect(harness.state.clients.get(key as string)).toBe(replacement);
+		expect(predecessor.shutdown).not.toHaveBeenCalled();
+		await service.shutdown();
+	});
+
 	it("unrefs the timer and clears it on service disposal", async () => {
 		const client = fakeClient("lifecycle");
 		createLSPClient.mockResolvedValue(client);

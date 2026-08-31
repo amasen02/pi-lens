@@ -66,6 +66,7 @@ const {
 	UsageAccumulator,
 	walkDescendantPids,
 	startSpawnUsageSampler,
+	sampleProcessTreeCpuPercent,
 	__resetWindowsCpuHistoryForTests,
 } = await import("../../clients/resource-sampler.js");
 
@@ -275,7 +276,11 @@ describe("sampleProcesses (Windows / guarded CIM path)", () => {
 	});
 
 	it("never calls pidusage on Windows — the whole point of the fix", async () => {
-		fakeSpawn = () => makeFakeChild({ stdout: "111,1024,0,0\r\n", code: 0 });
+		fakeSpawn = () =>
+			makeFakeChild({
+				stdout: "111,1024,0,0,2026-08-30T00:00:00Z\r\n",
+				code: 0,
+			});
 		await sampleProcesses([111]);
 		expect(pidusageMock).not.toHaveBeenCalled();
 	});
@@ -283,7 +288,11 @@ describe("sampleProcesses (Windows / guarded CIM path)", () => {
 	it("parses RSS (WorkingSetSize) from the CIM output; first tick reports cpu 0", async () => {
 		// One line: pid,workingSet,kernel100ns,user100ns
 		fakeSpawn = () =>
-			makeFakeChild({ stdout: "111,4096,0,0\r\n222,8192,0,0\r\n", code: 0 });
+			makeFakeChild({
+				stdout:
+					"111,4096,0,0,2026-08-30T00:00:00Z\r\n222,8192,0,0,2026-08-30T00:00:01Z\r\n",
+				code: 0,
+			});
 
 		const result = requireMap(await sampleProcesses([111, 222]));
 		expect(result.get(111)).toEqual({ rssBytes: 4096, cpuPercent: 0 });
@@ -295,7 +304,11 @@ describe("sampleProcesses (Windows / guarded CIM path)", () => {
 		try {
 			vi.setSystemTime(0);
 			// Tick 1: cumulative CPU time = 0 (kernel=0,user=0). Seeds history.
-			fakeSpawn = () => makeFakeChild({ stdout: "111,4096,0,0\r\n", code: 0 });
+			fakeSpawn = () =>
+				makeFakeChild({
+					stdout: "111,4096,0,0,2026-08-30T00:00:00Z\r\n",
+					code: 0,
+				});
 			const first = requireMap(await sampleProcesses([111]));
 			expect(first.get(111)).toEqual({ rssBytes: 4096, cpuPercent: 0 });
 
@@ -303,11 +316,58 @@ describe("sampleProcesses (Windows / guarded CIM path)", () => {
 			// UserModeTime is in 100 ns units → 5000 ms = 5000 * 1e4 = 5e7 units.
 			vi.setSystemTime(10_000);
 			fakeSpawn = () =>
-				makeFakeChild({ stdout: "111,4096,0,50000000\r\n", code: 0 });
+				makeFakeChild({
+					stdout: "111,4096,0,50000000,2026-08-30T00:00:00Z\r\n",
+					code: 0,
+				});
 			const second = requireMap(await sampleProcesses([111]));
 			// 5000 ms CPU / 10000 ms wall * 100 = 50%.
 			expect(second.get(111)?.cpuPercent).toBeCloseTo(50);
 			expect(second.get(111)?.rssBytes).toBe(4096);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("invalidates CPU history when Windows reuses a PID", async () => {
+		vi.useFakeTimers();
+		try {
+			vi.setSystemTime(0);
+			fakeSpawn = () =>
+				makeFakeChild({ stdout: "111,4096,0,0,2026-08-30T00:00:00Z\r\n" });
+			await sampleProcesses([111]);
+			vi.setSystemTime(10_000);
+			fakeSpawn = () =>
+				makeFakeChild({
+					stdout: "111,4096,0,50000000,2026-08-30T00:01:00Z\r\n",
+				});
+			const replacement = requireMap(await sampleProcesses([111]));
+			// The large inherited counter delta belongs to the predecessor. A
+			// replacement starts at zero instead of appearing busy.
+			expect(replacement.get(111)?.cpuPercent).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("marks a missing target unmeasured while tolerating missing descendants", async () => {
+		vi.useFakeTimers();
+		try {
+			vi.setSystemTime(0);
+			const outputs = [
+				"200,0\r\n", // descendant query: one child
+				"111,4096,0,0,2026-08-30T00:00:00Z\r\n", // target only
+				"200,0\r\n",
+				"200,4096,0,50000000,2026-08-30T00:00:00Z\r\n", // target gone
+			];
+			fakeSpawn = () => makeFakeChild({ stdout: outputs.shift() ?? "" });
+			const resultPromise = sampleProcessTreeCpuPercent(111, 1, 10);
+			await vi.runAllTimersAsync();
+			await expect(resultPromise).resolves.toMatchObject({
+				busy: false,
+				measured: false,
+				cpuPercent: null,
+			});
 		} finally {
 			vi.useRealTimers();
 		}
@@ -436,7 +496,10 @@ describe("resource-sampler: fire-and-forget CIM spawns are unref'd (#1155)", () 
 	it("sampleProcesses (sampleProcessesWindows) unrefs its CIM child + stdout", async () => {
 		const spawned: ReturnType<typeof makeFakeChild>[] = [];
 		fakeSpawn = () => {
-			const child = makeFakeChild({ stdout: "111,4096,0,0\r\n", code: 0 });
+			const child = makeFakeChild({
+				stdout: "111,4096,0,0,2026-08-30T00:00:00Z\r\n",
+				code: 0,
+			});
 			spawned.push(child);
 			return child;
 		};
