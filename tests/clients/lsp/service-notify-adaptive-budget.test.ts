@@ -353,6 +353,31 @@ describe("#2358 — adaptive wedge window pricing", () => {
 		expect(raw.auxNotifyDrainLatencyEwma.get(AUX_KEY)).toBe(900);
 	});
 
+	it("does not price a replacement from a retired barrier", async () => {
+		const service = await makeService();
+		const raw = rawService(service);
+		const predecessor = { client: {}, unacked: 2 };
+		const replacement = { client: {}, unacked: 1 };
+		raw.auxNotifyInflight.set(AUX_KEY, predecessor);
+		const note = (record: { client: unknown; unacked: number }): void => {
+			(
+				service as unknown as {
+					noteAuxNotifyDrainLatency: (
+						k: string,
+						d: number,
+						o: number,
+						r?: { client: unknown },
+					) => void;
+				}
+			).noteAuxNotifyDrainLatency(AUX_KEY, 1000, 1, record);
+		};
+		raw.auxNotifyInflight.set(AUX_KEY, replacement);
+		note(predecessor);
+		expect(raw.auxNotifyDrainLatencyEwma.has(AUX_KEY)).toBe(false);
+		note(replacement);
+		expect(raw.auxNotifyDrainLatencyEwma.get(AUX_KEY)).toBe(1000);
+	});
+
 	it("clears the EWMA on service reset so a new session is not priced by the old one", async () => {
 		const aux = makeScanner("ast-grep", {
 			writeLands: false,

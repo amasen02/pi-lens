@@ -202,6 +202,10 @@ export function __resetWindowsCpuHistoryForTests(): void {
 	windowsCpuHistory.clear();
 }
 
+export function __windowsCpuHistorySizeForTests(): number {
+	return windowsCpuHistory.size;
+}
+
 /**
  * Windows-only CPU%/RSS sampling via a FULLY GUARDED `Get-CimInstance
  * Win32_Process` query (mirrors `findDescendantPidsWindows`): a synchronous
@@ -265,7 +269,15 @@ async function sampleProcessesWindows(
 			const user100ns = Number(parts[3]);
 			const processIdentity = parts.slice(4).join(",").trim();
 			if (!Number.isFinite(pid) || pid <= 0) continue;
-			if (!Number.isFinite(workingSet) || processIdentity.length === 0)
+			if (
+				!Number.isFinite(workingSet) ||
+				workingSet < 0 ||
+				!Number.isFinite(kernel100ns) ||
+				kernel100ns < 0 ||
+				!Number.isFinite(user100ns) ||
+				user100ns < 0 ||
+				processIdentity.length === 0
+			)
 				continue;
 
 			const cpuMs = Math.round(kernel100ns / 1e4) + Math.round(user100ns / 1e4);
@@ -281,6 +293,12 @@ async function sampleProcessesWindows(
 				}
 			}
 			const prev = windowsCpuHistory.get(historyKey);
+			if (prev && cpuMs < prev.cpuMs) {
+				// A counter reset is not a flat sample. Retire the baseline so the
+				// next valid observation starts a new rate window.
+				windowsCpuHistory.delete(historyKey);
+				continue;
+			}
 			let cpuPercent = 0;
 			if (prev) {
 				const wallMs = now - prev.ts;
@@ -345,6 +363,13 @@ export async function sampleProcesses(
 		for (const pid of valid) {
 			const stat = stats[String(pid)];
 			if (!stat) continue; // pidusage couldn't resolve this pid — leave absent
+			if (
+				!Number.isFinite(stat.cpu) ||
+				stat.cpu < 0 ||
+				!Number.isFinite(stat.memory) ||
+				stat.memory < 0
+			)
+				continue;
 			result.set(pid, {
 				rssBytes: stat.memory,
 				cpuPercent: stat.cpu,

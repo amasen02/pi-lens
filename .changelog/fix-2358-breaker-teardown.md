@@ -14,4 +14,6 @@ section: Fixed
   now release with their client generation, and stale decisions cannot demote a
   replacement. Windows CPU history includes CIM process-creation identity, so
   PID reuse starts a fresh rate window. Missing targets and failed queries remain
-  unmeasured, while busy-defer detail is bounded per client/file identity.
+  unmeasured, while busy-defer detail is bounded per client/file identity. CPU
+  counters are validated and history is capped; decision rows stay out of
+  last-phase attribution.

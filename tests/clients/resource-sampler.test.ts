@@ -68,6 +68,7 @@ const {
 	startSpawnUsageSampler,
 	sampleProcessTreeCpuPercent,
 	__resetWindowsCpuHistoryForTests,
+	__windowsCpuHistorySizeForTests,
 } = await import("../../clients/resource-sampler.js");
 
 /**
@@ -246,6 +247,15 @@ describe("sampleProcesses (POSIX / pidusage path)", () => {
 		expect(result.has(999)).toBe(false);
 	});
 
+	it("leaves malformed POSIX usage unmeasured", async () => {
+		pidusageMock.mockResolvedValue({
+			"111": { cpu: Number.NaN, memory: 512 },
+			"222": { cpu: 2, memory: -1 },
+		});
+		const result = requireMap(await sampleProcesses([111, 222]));
+		expect(result).toHaveLength(0);
+	});
+
 	it("treats a rejected pidusage query as unknown, not an empty map", async () => {
 		pidusageMock.mockRejectedValue(new Error("boom"));
 
@@ -348,6 +358,42 @@ describe("sampleProcesses (Windows / guarded CIM path)", () => {
 		} finally {
 			vi.useRealTimers();
 		}
+	});
+
+	it("treats a Windows counter reset as unmeasured for that tick", async () => {
+		vi.useFakeTimers();
+		try {
+			vi.setSystemTime(0);
+			fakeSpawn = () =>
+				makeFakeChild({
+					stdout: "111,4096,10000000,0,2026-08-30T00:00:00Z\r\n",
+				});
+			await sampleProcesses([111]);
+			vi.setSystemTime(10_000);
+			fakeSpawn = () =>
+				makeFakeChild({ stdout: "111,4096,0,0,2026-08-30T00:00:00Z\r\n" });
+			expect(requireMap(await sampleProcesses([111])).has(111)).toBe(false);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("rejects malformed Windows counters and missing creation identity", async () => {
+		fakeSpawn = () =>
+			makeFakeChild({
+				stdout: "111,4096,-1,0,2026-08-30T00:00:00Z\r\n222,4096,0,0\r\n",
+			});
+		expect(requireMap(await sampleProcesses([111, 222]))).toHaveLength(0);
+	});
+
+	it("caps dated PID history and evicts the oldest entry", async () => {
+		const rows = Array.from(
+			{ length: 4_097 },
+			(_, index) => `${index + 1},1,0,0,2026-08-30T00:00:${index}Z`,
+		).join("\r\n");
+		fakeSpawn = () => makeFakeChild({ stdout: rows });
+		await sampleProcesses(Array.from({ length: 4_097 }, (_, i) => i + 1));
+		expect(__windowsCpuHistorySizeForTests()).toBeLessThanOrEqual(4_096);
 	});
 
 	it("marks a missing target unmeasured while tolerating missing descendants", async () => {

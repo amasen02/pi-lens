@@ -214,6 +214,30 @@ describe("TypeScript language-service idle eviction (#1332 b2)", () => {
 		await service.shutdown();
 	});
 
+	it("keeps token B when stale token A releases the same client", async () => {
+		vi.useFakeTimers();
+		const client = fakeClient("same-client");
+		createLSPClient.mockResolvedValue(client);
+		configureTypeScriptServer();
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const service = new LSPService();
+		const harness = service as unknown as {
+			outstandingAuxNotifyWrites: Map<string, unknown>;
+			releaseOutstandingAuxNotifyWrite: (key: string, token?: unknown) => void;
+		};
+		const key = "typescript:/repo";
+		const timer = setTimeout(() => undefined, 1000);
+		const tokenA = { client, wedgeTimer: timer, resolveSettled: vi.fn() };
+		const tokenB = { client, wedgeTimer: timer, resolveSettled: vi.fn() };
+		harness.outstandingAuxNotifyWrites.set(key, tokenA);
+		harness.releaseOutstandingAuxNotifyWrite(key, tokenA);
+		harness.outstandingAuxNotifyWrites.set(key, tokenB);
+		harness.releaseOutstandingAuxNotifyWrite(key, tokenA);
+		expect(harness.outstandingAuxNotifyWrites.get(key)).toBe(tokenB);
+		expect(tokenB.resolveSettled).not.toHaveBeenCalled();
+		await service.shutdown();
+	});
+
 	it("unrefs the timer and clears it on service disposal", async () => {
 		const client = fakeClient("lifecycle");
 		createLSPClient.mockResolvedValue(client);

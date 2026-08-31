@@ -585,6 +585,10 @@ fresh rate window. A target missing from either sample or a failed query is
 telemetry is rising-edge bounded per client/file identity, with repeat counts and
 dropped detail retained by the degradation ledger. The unmeasured verdict maps to
 the supported `budget-exceeded` discriminator, never to a fabricated flat result.
+Windows and POSIX samples validate finite, nonnegative RSS and CPU counters before
+they enter measured evidence; counter resets retire the baseline. Busy decision rows
+are excluded from `lastPhase` attribution because they describe an outcome, not host
+work. CPU identity history is capped at 4096 entries with oldest-entry eviction.
 
 **A touch's `inconclusive` verdict is PRIMARY-scoped; an auxiliary can only
 narrow it.** `resolveTouchVerdict` (`clients/lsp/diagnostic-binding.ts`) owns the
