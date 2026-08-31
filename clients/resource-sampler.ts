@@ -191,6 +191,7 @@ interface WindowsCpuHistoryEntry {
 }
 const windowsCpuHistory = new Map<string, WindowsCpuHistoryEntry>();
 const CPU_HISTORY_MAX_AGE_MS = 60_000;
+const CPU_HISTORY_MAX_ENTRIES = 4_096;
 
 /**
  * TEST-ONLY: clear the Windows CPU%-history so a test's two-sample CPU%
@@ -298,6 +299,18 @@ async function sampleProcessesWindows(
 			if (!seen.has(pid) && now - entry.ts > CPU_HISTORY_MAX_AGE_MS) {
 				windowsCpuHistory.delete(key);
 			}
+		}
+		while (windowsCpuHistory.size > CPU_HISTORY_MAX_ENTRIES) {
+			let oldestKey: string | undefined;
+			let oldestTs = Number.POSITIVE_INFINITY;
+			for (const [key, entry] of windowsCpuHistory) {
+				if (entry.ts < oldestTs) {
+					oldestKey = key;
+					oldestTs = entry.ts;
+				}
+			}
+			if (oldestKey === undefined) break;
+			windowsCpuHistory.delete(oldestKey);
 		}
 	} catch {
 		// Parsing must never throw into the caller; best-effort.
