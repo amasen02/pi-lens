@@ -25,8 +25,10 @@ import { biomeConfigArgs } from "../../clients/tool-policy.js";
  * metadata the compiled JS actually emits and reports at runtime.
  *
  * Both binaries are devDependencies, so this runs wherever a development
- * checkout is installed (dev box and CI test job); the skip is explicit and
- * states that reason instead of passing silently.
+ * checkout is installed (dev box and CI test job). When a binary is absent the
+ * suite reports as skipped and its title names the dependency; the guard test
+ * below fails loud in CI so a missing devDependency can never silently
+ * vanish the real-binary proof (#448 convention).
  */
 
 const REPO_ROOT = fileURLToPath(new URL("../..", import.meta.url));
@@ -169,9 +171,18 @@ afterAll(() => {
 	}
 });
 
+// Skipped visibly when the real binaries are absent; the title names them so
+// a skipped report reads as a dependency skip, not a pass.
 describe.skipIf(!BINARIES_PRESENT)(
-	"bundled biome config preserves decorator metadata (refs #2385)",
+	"bundled biome config preserves decorator metadata (real @biomejs/biome + typescript devDeps; refs #2385)",
 	() => {
+		it("real Biome and TypeScript binaries are installed in CI", () => {
+			// #448 convention: the skipped suite must never silently vanish the
+			// real-binary proof in CI. Locally a missing devDependency is fine;
+			// in CI it fails loud.
+			if (process.env.CI) expect(BINARIES_PRESENT).toBe(true);
+		});
+
 		it(
 			"bundled fallback keeps the value import and its design:type metadata",
 			{ timeout: 120_000 },
