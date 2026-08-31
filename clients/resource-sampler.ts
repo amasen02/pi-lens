@@ -206,6 +206,13 @@ export function __windowsCpuHistorySizeForTests(): number {
 	return windowsCpuHistory.size;
 }
 
+export function __windowsCpuHistoryHasForTests(
+	pid: number,
+	processIdentity: string,
+): boolean {
+	return windowsCpuHistory.has(`${pid}:${processIdentity}`);
+}
+
 /**
  * Windows-only CPU%/RSS sampling via a FULLY GUARDED `Get-CimInstance
  * Win32_Process` query (mirrors `findDescendantPidsWindows`): a synchronous
@@ -263,6 +270,7 @@ async function sampleProcessesWindows(
 		for (const line of query.stdout.split(/\r?\n/)) {
 			const parts = line.split(",");
 			if (parts.length < 5) continue;
+			if (parts.slice(0, 5).some((part) => part.trim().length === 0)) continue;
 			const pid = Number(parts[0]);
 			const workingSet = Number(parts[1]);
 			const kernel100ns = Number(parts[2]);

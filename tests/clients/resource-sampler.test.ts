@@ -69,6 +69,7 @@ const {
 	sampleProcessTreeCpuPercent,
 	__resetWindowsCpuHistoryForTests,
 	__windowsCpuHistorySizeForTests,
+	__windowsCpuHistoryHasForTests,
 } = await import("../../clients/resource-sampler.js");
 
 /**
@@ -247,14 +248,18 @@ describe("sampleProcesses (POSIX / pidusage path)", () => {
 		expect(result.has(999)).toBe(false);
 	});
 
-	it("leaves malformed POSIX usage unmeasured", async () => {
-		pidusageMock.mockResolvedValue({
-			"111": { cpu: Number.NaN, memory: 512 },
-			"222": { cpu: 2, memory: -1 },
+	for (const [label, stats] of [
+		["NaN CPU", { cpu: Number.NaN, memory: 512 }],
+		["infinite CPU", { cpu: Number.POSITIVE_INFINITY, memory: 512 }],
+		["negative CPU", { cpu: -1, memory: 512 }],
+		["infinite memory", { cpu: 2, memory: Number.POSITIVE_INFINITY }],
+		["negative memory", { cpu: 2, memory: -1 }],
+	] as const) {
+		it(`leaves ${label} usage unmeasured`, async () => {
+			pidusageMock.mockResolvedValue({ "111": stats });
+			expect(requireMap(await sampleProcesses([111])).has(111)).toBe(false);
 		});
-		const result = requireMap(await sampleProcesses([111, 222]));
-		expect(result).toHaveLength(0);
-	});
+	}
 
 	it("treats a rejected pidusage query as unknown, not an empty map", async () => {
 		pidusageMock.mockRejectedValue(new Error("boom"));
@@ -378,13 +383,21 @@ describe("sampleProcesses (Windows / guarded CIM path)", () => {
 		}
 	});
 
-	it("rejects malformed Windows counters and missing creation identity", async () => {
-		fakeSpawn = () =>
-			makeFakeChild({
-				stdout: "111,4096,-1,0,2026-08-30T00:00:00Z\r\n222,4096,0,0\r\n",
-			});
-		expect(requireMap(await sampleProcesses([111, 222]))).toHaveLength(0);
-	});
+	for (const [label, row] of [
+		["empty kernel", "111,4096,,0,2026-08-30T00:00:00Z"],
+		["empty user", "111,4096,0,,2026-08-30T00:00:00Z"],
+		["nonfinite kernel", "111,4096,NaN,0,2026-08-30T00:00:00Z"],
+		["nonfinite user", "111,4096,0,Infinity,2026-08-30T00:00:00Z"],
+		["negative kernel", "111,4096,-1,0,2026-08-30T00:00:00Z"],
+		["negative user", "111,4096,0,-1,2026-08-30T00:00:00Z"],
+		["negative RSS", "111,-1,0,0,2026-08-30T00:00:00Z"],
+		["missing creation identity", "111,4096,0,0,"],
+	] as const) {
+		it(`leaves ${label} Windows usage unmeasured`, async () => {
+			fakeSpawn = () => makeFakeChild({ stdout: `${row}\r\n` });
+			expect(requireMap(await sampleProcesses([111])).has(111)).toBe(false);
+		});
+	}
 
 	it("caps dated PID history and evicts the oldest entry", async () => {
 		const rows = Array.from(
@@ -394,6 +407,12 @@ describe("sampleProcesses (Windows / guarded CIM path)", () => {
 		fakeSpawn = () => makeFakeChild({ stdout: rows });
 		await sampleProcesses(Array.from({ length: 4_097 }, (_, i) => i + 1));
 		expect(__windowsCpuHistorySizeForTests()).toBeLessThanOrEqual(4_096);
+		expect(__windowsCpuHistoryHasForTests(1, "2026-08-30T00:00:0Z")).toBe(
+			false,
+		);
+		expect(
+			__windowsCpuHistoryHasForTests(4_097, "2026-08-30T00:00:4096Z"),
+		).toBe(true);
 	});
 
 	it("marks a missing target unmeasured while tolerating missing descendants", async () => {
