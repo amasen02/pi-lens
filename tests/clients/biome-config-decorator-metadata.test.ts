@@ -171,18 +171,24 @@ afterAll(() => {
 	}
 });
 
+// Top-level CI guard (#448 convention). It must live OUTSIDE the conditional
+// describe below: a suite-level skip would skip the guard itself — exactly
+// the silent-vanish state it exists to catch. Locally a missing devDependency
+// is fine; in CI a missing binary fails loud.
+it("real Biome and TypeScript binaries are installed in CI", () => {
+	if (process.env.CI) {
+		expect(
+			BINARIES_PRESENT,
+			"real @biomejs/biome and typescript devDeps are required for the real-binary decorator-metadata proof (refs #2385)",
+		).toBe(true);
+	}
+});
+
 // Skipped visibly when the real binaries are absent; the title names them so
 // a skipped report reads as a dependency skip, not a pass.
 describe.skipIf(!BINARIES_PRESENT)(
 	"bundled biome config preserves decorator metadata (real @biomejs/biome + typescript devDeps; refs #2385)",
 	() => {
-		it("real Biome and TypeScript binaries are installed in CI", () => {
-			// #448 convention: the skipped suite must never silently vanish the
-			// real-binary proof in CI. Locally a missing devDependency is fine;
-			// in CI it fails loud.
-			if (process.env.CI) expect(BINARIES_PRESENT).toBe(true);
-		});
-
 		it(
 			"bundled fallback keeps the value import and its design:type metadata",
 			{ timeout: 120_000 },
