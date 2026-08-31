@@ -1182,7 +1182,7 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"disposition-publish.ts": 0,
 	"extension-log.ts": 2,
 	"format-events-publish.ts": 0,
-	"formatters.ts": 5,
+	"formatters.ts": 7,
 	"generated-artifacts.ts": 2,
 	// #2007 hoisted git's global-option table to a module-level `new Set`
 	// (1 → 2). It is an import-time frozen lookup with no session lifetime —

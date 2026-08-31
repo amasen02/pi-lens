@@ -777,7 +777,13 @@ answers a same-cwd lookup from `detectionCache` before it reaches a probe, so
 dropping the latches without the selection cache leaves the previous session's
 verdict standing in the working directory. Formatter selection emits
 `formatter_selected` with `outcome: "hit" | "miss"` on both cache hits and
-re-detections so hit rate is computable from `latency.log`. (#1895, #1940)
+re-detections so hit rate is computable from `latency.log`. The first lookup for
+a cwd computes one session-generation config signature; warm extension lookups
+do no config polling. The write-result seam calls
+`invalidateFormatterCacheForPath` for config create, change, and remove events,
+which clears the signature and selection state together. External editor
+changes remain outside that seam and are rechecked at session reset. (#1895,
+#1940, #1603)
 
 Helm chart linting uses the shared workspace-topology `Chart.yaml` marker. YAML
 and `.tpl` edits inside a chart dispatch one canonical-root-deduplicated,

@@ -22,6 +22,7 @@ import {
 	blackFormatter,
 	clearFormatterRuntimeState,
 	getFormattersForFile,
+	invalidateFormatterCacheForPath,
 	oxfmtFormatter,
 	phpCsFixerFormatter,
 	prettierFormatter,
@@ -501,6 +502,7 @@ describe("getFormattersForFile — policy selection", () => {
 		const filePath = fileIn(tmpDir, "README.md");
 		expect(await getFormattersForFile(filePath, tmpDir)).toEqual([]);
 		createTempFile(tmpDir, ".prettierrc", "{}\n");
+		invalidateFormatterCacheForPath(path.join(tmpDir, ".prettierrc"));
 		expect(
 			(await getFormattersForFile(filePath, tmpDir)).map((f) => f.name),
 		).toEqual(["prettier"]);
@@ -1157,23 +1159,15 @@ describe("getFormattersForFile — policy selection", () => {
 		expect(formatters.map((f) => f.name)).toEqual(["mix"]);
 	});
 
-	// #1572 review F1: `getFormattersForFile` caches its answer per cwd, keyed
-	// by `formatterConfigSignature` — a hash over `FORMATTER_CONFIG_FILES`'
-	// mtimes/sizes. A filename an explicit-config CHECK reads but that list
-	// OMITS is invisible to the signature: adding the file after the first
-	// call for a cwd never invalidates the cache, so the stale (pre-opt-in)
-	// answer sticks for the rest of the session. These tests call
-	// `getFormattersForFile` once with no config (caching `[]`), THEN create
-	// the config, THEN call again in the SAME test/cwd — unlike every test
-	// above, which pre-creates its config in a fresh tmpDir and so can never
-	// observe a signature that fails to move. `stylua` (whose `stylua.toml`
-	// was already listed) is the positive control proving the shape of the
-	// test itself is sound.
-	describe("formatter config signature reacts to config created after the first call", () => {
+	// #1572 review F1: `getFormattersForFile` caches its answer per cwd. Config
+	// create/change/remove events invalidate that cache through the write-result
+	// seam, so these tests report the changed path before the second lookup.
+	describe("formatter config invalidation after the first call", () => {
 		it("control: stylua.toml created after the first call is picked up", async () => {
 			const filePath = fileIn(tmpDir, "init.lua");
 			expect(await getFormattersForFile(filePath, tmpDir)).toEqual([]);
 			createTempFile(tmpDir, "stylua.toml", "column_width = 100\n");
+			invalidateFormatterCacheForPath(path.join(tmpDir, "stylua.toml"));
 			const formatters = await getFormattersForFile(filePath, tmpDir);
 			expect(formatters.map((f) => f.name)).toEqual(["stylua"]);
 		});
@@ -1182,6 +1176,9 @@ describe("getFormattersForFile — policy selection", () => {
 			const filePath = fileIn(tmpDir, "script.ps1");
 			expect(await getFormattersForFile(filePath, tmpDir)).toEqual([]);
 			createTempFile(tmpDir, "PSScriptAnalyzerSettings.psd1", "@{}\n");
+			invalidateFormatterCacheForPath(
+				path.join(tmpDir, "PSScriptAnalyzerSettings.psd1"),
+			);
 			const formatters = await getFormattersForFile(filePath, tmpDir);
 			expect(formatters.map((f) => f.name)).toEqual([
 				"psscriptanalyzer-format",
@@ -1192,6 +1189,7 @@ describe("getFormattersForFile — policy selection", () => {
 			const filePath = fileIn(tmpDir, "Main.java");
 			expect(await getFormattersForFile(filePath, tmpDir)).toEqual([]);
 			createTempFile(tmpDir, ".google-java-format", "{}\n");
+			invalidateFormatterCacheForPath(path.join(tmpDir, ".google-java-format"));
 			await withPathShim("google-java-format", async () => {
 				const formatters = await getFormattersForFile(filePath, tmpDir);
 				expect(formatters.map((f) => f.name)).toEqual(["google-java-format"]);
@@ -1202,6 +1200,7 @@ describe("getFormattersForFile — policy selection", () => {
 			const filePath = fileIn(tmpDir, "CMakeLists.cmake");
 			expect(await getFormattersForFile(filePath, tmpDir)).toEqual([]);
 			createTempFile(tmpDir, ".cmake-format", "# cmake-format config\n");
+			invalidateFormatterCacheForPath(path.join(tmpDir, ".cmake-format"));
 			await withPathShim("cmake-format", async () => {
 				const formatters = await getFormattersForFile(filePath, tmpDir);
 				expect(formatters.map((f) => f.name)).toEqual(["cmake-format"]);
@@ -1212,6 +1211,7 @@ describe("getFormattersForFile — policy selection", () => {
 			const filePath = fileIn(tmpDir, "query.sql");
 			expect(await getFormattersForFile(filePath, tmpDir)).toEqual([]);
 			createTempFile(tmpDir, "setup.cfg", "[sqlfluff]\ndialect = postgres\n");
+			invalidateFormatterCacheForPath(path.join(tmpDir, "setup.cfg"));
 			const formatters = await getFormattersForFile(filePath, tmpDir);
 			expect(formatters.map((f) => f.name)).toEqual(["sqlfluff"]);
 		});
@@ -1228,6 +1228,7 @@ describe("getFormattersForFile — policy selection", () => {
 				(await getFormattersForFile(filePath, tmpDir)).map((f) => f.name),
 			).toEqual(["biome"]);
 			createTempFile(tmpDir, "vite-plus.json", "{}\n");
+			invalidateFormatterCacheForPath(path.join(tmpDir, "vite-plus.json"));
 			const formatters = await getFormattersForFile(filePath, tmpDir);
 			expect(formatters.map((f) => f.name)).toEqual(["oxfmt"]);
 		});
@@ -1240,6 +1241,7 @@ describe("getFormattersForFile — policy selection", () => {
 				"build.gradle.kts",
 				"spotless {\n  kotlin {\n    ktfmt()\n  }\n}\n",
 			);
+			invalidateFormatterCacheForPath(path.join(tmpDir, "build.gradle.kts"));
 			const formatters = await getFormattersForFile(filePath, tmpDir);
 			expect(formatters.map((f) => f.name)).toEqual(["ktfmt"]);
 		});
@@ -1269,6 +1271,7 @@ describe("getFormattersForFile — policy selection", () => {
 				const filePath = fileIn(tmpDir, fileName);
 				expect(await getFormattersForFile(filePath, tmpDir)).toEqual([]);
 				createTempFile(tmpDir, configFile, configContent);
+				invalidateFormatterCacheForPath(path.join(tmpDir, configFile));
 				const formatters = await getFormattersForFile(filePath, tmpDir);
 				expect(formatters.map((f) => f.name)).toEqual([formatterName]);
 			},
