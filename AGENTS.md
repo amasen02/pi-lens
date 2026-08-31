@@ -874,6 +874,8 @@ not make those callbacks async without updating their ordering contract/tests.
 
 **Biome bundled-config decorator-metadata invariant (#2385):** the bundled fallback `config/biome/core.jsonc` disables `style/useImportType`. The rule's safe fix rewrites a value import used only in type positions into `import type`, which erases the runtime binding that `experimentalDecorators` + `emitDecoratorMetadata` still need: verified against real Biome 2.5.9 plus tsc, the emitted `design:type` metadata changes from the imported class to `Function`, breaking decorator-based dependency injection. Biome's own rule docs recommend disabling the rule for such repos. An explicit project `biome.json(c)` remains authoritative: `biomeConfigArgs` passes no flag there, so a user-enabled `useImportType` still applies. Do not re-enable the rule in the bundled config without solving the metadata hazard; the lint and autofix surfaces both lose this one advisory, and no `skipReason` is added because nothing is skipped — the rule simply never fires. `tests/clients/biome-config-decorator-metadata.test.ts` drives the real pinned binary through `BiomeClient.fixFileAsync` and pins the preservation, the intact recommended ruleset, and the user-config authority; removing the override or the fallback flag turns it red. The sibling bundled fallbacks are not members of the hazard class: the ruff fallback selects no flake8-type-checking rules and `ruff-client.ts` never passes `--unsafe-fixes` (verified with real ruff on an annotation-only import), and the markdownlint fallback touches no runtime semantics.
 
+**Template-bearing extensions select no unconfigured formatter (#2384):** `FORMATTER_POLICY_BY_EXTENSION` sets `defaultWhenUnconfigured: false` for `.html`, `.htm`, `.yaml`, and `.yml` (the `.md`/#89 precedent). Real Prettier reinterprets template markers as code — an HTML `<script>{{JS}}</script>` embed became nested JavaScript blocks, and a Helm `{{ .Values.x }}` became `{ { .Values.x } }` (verified against prettier 3.3.3). A project `.prettierrc` or `package.json` `prettier` field opts in through the ordinary explicit-config branch; oxfmt's explicit-config path is unchanged. Do not restore a smart default for these extensions without solving marker preservation; a one-line fixture cannot prove safety because it hits `indentationArgs`/SKIP_FORMATTING before the tool runs.
+
 ### Rules and analyzers
 
 Mechanical ast-grep rules may expose a `fix:` only when one syntax rewrite is
@@ -1202,9 +1204,14 @@ one slot map and flattening each affected token lane once. File removal falls
 back to a full serialization because it changes slot identity; replacements
 retain their previous wire order. `serializeWordIndex` clears dirty markers only
 after it has produced the view, so deleting the dirty mark makes the stale-
-persist test fail. Snapshot stringify and gzip remain in the existing
-project-snapshot worker; do not send a structured-clone object graph to a new
-worker.
+persist test fail. A reload seeds the flat wire cache only when files, numeric
+metadata, postings, and the optional forward lanes are canonical and mutually
+consistent; sanitized or partial snapshots leave it unseeded so the first
+persist publishes `serializeWordIndexFull` output. The reload check keeps the
+valid wire path structural and uses the duplicate and per-file consistency
+accumulators to reserve deep sanitization for suspicious snapshots. Snapshot
+stringify and gzip remain in the existing project-snapshot worker; do not send a
+structured-clone object graph to a new worker.
 
 Memory-sample subsystem records report the axis that grows and at least one
 byte-denominated estimate. `reviewGraph.residentBytes` uses bounded node/edge
@@ -1384,6 +1391,27 @@ re-gates a fix round, so the lane stores no "approved at SHA" state that could
 drift; the merge call passes `sha` so a head that moves mid-cycle 409s instead
 of merging on a stale verdict. Only the maintainer applies the label, so the
 adversarial-review-first policy is unchanged; removing the label aborts.
+
+After a successful merge, `runMergeLane` reads a strict 40-hex merge SHA and
+sends a `merge-train-post-merge` `repository_dispatch` payload containing
+`{repository, sha, pr_number}`. The lane uses this event because its
+`GITHUB_TOKEN` merge suppresses the ordinary `push` event. Transient HTTP
+failures and ambiguous timeouts receive one bounded retry with the same SHA;
+the scheduled lane also reconciles recent bot-merged PRs from their durable
+`merge_commit_sha` and requested/terminal state markers. It waits through a
+bounded grace period, retries missing validation across process restarts, and
+opens a later six-hour retry generation after two attempts exhaust one
+generation, without a hot loop. It accepts completion only from bot-authored
+exact-SHA terminal markers. A final
+failure leaves the merge landed but records a fatal post-merge-validation
+error. The master-push validation workflows (`ci.yml`, `lint.yml`,
+`install-smoke.yml`, and `labels.yml`) gate all repository actions behind a
+dispatch prerequisite that validates repository identity, strict SHA and PR
+number shape, trusted workflow-revision checkout, authenticated commit
+resolution, and ancestry to `master`; downstream jobs then check out the exact
+payload SHA. They use per-workflow SHA concurrency with cancellation so duplicate
+dispatches cannot validate one commit concurrently. A missing or invalid merge
+SHA means no dispatch, and the lane must never report that verification ran.
 
 Four facts about THIS repository the lane must keep matching, each probed live
 rather than assumed (review round 1 on PR #2191, all four were wrong first):
@@ -1737,6 +1765,12 @@ a *second host adapter* alongside `index.ts`. Design rationale + progress: `mcp.
   delayed warmup child phases in `latency.log`; concurrent secondaries emit only
   `concurrent_session_bind`. Keep logging fire-and-forget and preserve contiguous
   top-level timing so quick-start child durations remain within ~10 ms of total.
+  `session_start_total.metadata.classification` carries the accepted start's
+  `primary` or `sequential-replacement` decision, and `sameRoot` carries
+  `true`, `false`, or the explicit bounded value `"unknown"`; never omit the
+  field when root identity was unavailable because NDJSON serialization drops
+  `undefined`. The quick and full writers share this durable shape, and strict
+  readers must accept only those three root values. (#2129)
   #1019: `session_start_log_cleanup` is now emitted from a deferred `setImmediate`
   (its `metadata.deferred:true`), NOT synchronously in the awaited chain, so it is
   no longer a top-level critical-path phase — do not re-add it to the contiguous

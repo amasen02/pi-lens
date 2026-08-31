@@ -544,7 +544,8 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 	{
 		id: "package-manager:availabilityLatches",
 		module: "package-manager.ts",
-		state: "availabilityLatches and package-manager probe flights",
+		state:
+			"availabilityLatches, globalBinDirCache, cache generation, and package-manager probe flights",
 		policy: "session_start",
 		resetName: "_resetPackageManagerCache",
 		reason:
@@ -1228,7 +1229,9 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"mcp/session.ts": 2,
 	"module-report-lsp.ts": 1,
 	"ndjson-logger.ts": 0,
-	"package-manager.ts": 1,
+	// #1602 added `globalBinDirCache` (1 → 2), cleared by the same
+	// `_resetPackageManagerCache` the registry entry above names.
+	"package-manager.ts": 2,
 	// #2319: the verified-guess tally moved behind getProcessSingleton, so the
 	// module-scope scan sees no container here; the getProcessSingleton SIGNAL
 	// is what flags this file now.
