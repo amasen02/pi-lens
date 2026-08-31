@@ -872,6 +872,8 @@ not make those callbacks async without updating their ordering contract/tests.
 
 **Markdownlint default-config invariant (#833):** the Markdown dispatch runner invokes `markdownlint-cli2` with the package-owned `config/markdownlint/core.json` when no project markdownlint config is found; that config disables MD013 and sets MD024 to `siblings_only` so intentional repeated category headings in changelogs are allowed while duplicate sibling headings remain violations. A project config is left to markdownlint-cli2 unchanged (no runner-level rule overrides). `hasMarkdownlintConfig` must recognize every config filename supported by the installed markdownlint-cli2, including the `.markdownlint-cli2.*` and `.markdownlint.{jsonc,json,yaml,yml,cjs,mjs}` families.
 
+**Template-bearing extensions select no unconfigured formatter (#2384):** `FORMATTER_POLICY_BY_EXTENSION` sets `defaultWhenUnconfigured: false` for `.html`, `.htm`, `.yaml`, and `.yml` (the `.md`/#89 precedent). Real Prettier reinterprets template markers as code — an HTML `<script>{{JS}}</script>` embed became nested JavaScript blocks, and a Helm `{{ .Values.x }}` became `{ { .Values.x } }` (verified against prettier 3.3.3). A project `.prettierrc` or `package.json` `prettier` field opts in through the ordinary explicit-config branch; oxfmt's explicit-config path is unchanged. Do not restore a smart default for these extensions without solving marker preservation; a one-line fixture cannot prove safety because it hits `indentationArgs`/SKIP_FORMATTING before the tool runs.
+
 ### Rules and analyzers
 
 Mechanical ast-grep rules may expose a `fix:` only when one syntax rewrite is
