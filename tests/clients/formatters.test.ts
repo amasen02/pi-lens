@@ -1544,8 +1544,9 @@ describe("oxfmt formatter — detection and policy selection", () => {
 	];
 
 	// Cross-product: every supported extension × every oxfmt config file.
-	// Some extensions have defaultWhenUnconfigured:true formatters (yaml, html…),
-	// so we assert oxfmt is included rather than being the sole formatter.
+	// Some extensions keep defaultWhenUnconfigured:true formatters (css/scss,
+	// graphql/gql, less…), so we assert oxfmt is included rather than being
+	// the sole formatter. yaml/html select no unconfigured formatter (#2384).
 	it.each(
 		oxfmtExtensionFiles.flatMap((f) => [
 			[f, "oxfmt.toml", "# oxfmt config\n"] as const,
