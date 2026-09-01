@@ -15,6 +15,7 @@ import {
 	MERGE_GATE_REASON,
 	reconcilePostMergeValidations,
 	POST_MERGE_RECONCILE_GRACE_MS,
+	POST_MERGE_RECONCILE_WINDOW_MS,
 	POST_MERGE_RETRY_GENERATION_MS,
 	POST_MERGE_VALIDATION_WORKFLOWS,
 	resolveApprovalActor,
@@ -438,6 +439,46 @@ function graphqlPage(
 			},
 		},
 	};
+}
+
+function recentMergedPage(
+	records: Array<Record<string, unknown>>,
+	hasNextPage = false,
+	page = 1,
+) {
+	const edges = records.map((record, index) => ({
+		cursor: `recent-${page}-${index}`,
+		node: {
+			number: record.number,
+			state: "MERGED",
+			updatedAt: record.updated_at ?? record.merged_at,
+			mergedAt: record.merged_at,
+			mergedBy: record.merged_by,
+			mergeCommit: { oid: record.merge_commit_sha },
+		},
+	}));
+	return {
+		data: {
+			repository: {
+				pullRequests: {
+					pageInfo: {
+						hasNextPage,
+						endCursor: edges.at(-1)?.cursor ?? null,
+					},
+					edges,
+				},
+			},
+		},
+	};
+}
+
+function recentMergedSequence(pages: unknown[]) {
+	let index = 0;
+	return () => ({
+		ok: true,
+		status: 200,
+		json: async () => pages[Math.min(index++, pages.length - 1)],
+	});
 }
 
 function prNode(overrides: Record<string, unknown> = {}) {
@@ -2884,14 +2925,14 @@ describe("merge-lane sweep (#2185)", () => {
 			user: { login: string };
 		}> = [];
 		const { fetcher, calls } = fakeGithub({
-			"GET /repos/acme/repo/pulls": [
+			"POST /graphql": recentMergedPage([
 				{
 					number: 7,
 					merged_at: "2026-08-26T16:20:00Z",
 					merged_by: { login: "github-actions[bot]" },
 					merge_commit_sha: MERGE_SHA,
 				},
-			],
+			]),
 			"GET /repos/acme/repo/issues/7/comments": () => ({
 				ok: true,
 				status: 200,
@@ -2964,14 +3005,14 @@ describe("merge-lane sweep (#2185)", () => {
 
 	it("does not replay a human merge already covered by push workflows", async () => {
 		const { fetcher, calls } = fakeGithub({
-			"GET /repos/acme/repo/pulls": [
+			"POST /graphql": recentMergedPage([
 				{
 					number: 8,
 					merged_at: "2026-08-26T16:20:00Z",
 					merged_by: { login: "acme" },
 					merge_commit_sha: MERGE_SHA,
 				},
-			],
+			]),
 		});
 		const results = await reconcilePostMergeValidations({
 			fetcher,
@@ -2985,14 +3026,14 @@ describe("merge-lane sweep (#2185)", () => {
 
 	it("does not trust a user-forged completion marker", async () => {
 		const { fetcher, calls } = fakeGithub({
-			"GET /repos/acme/repo/pulls": [
+			"POST /graphql": recentMergedPage([
 				{
 					number: 7,
 					merged_at: "2026-08-26T16:20:00Z",
 					merged_by: { login: "github-actions[bot]" },
 					merge_commit_sha: MERGE_SHA,
 				},
-			],
+			]),
 			"GET /repos/acme/repo/issues/7/comments": () => ({
 				ok: true,
 				status: 200,
@@ -3020,14 +3061,14 @@ describe("merge-lane sweep (#2185)", () => {
 
 	it("surfaces a bot-reported validation failure instead of suppressing recovery", async () => {
 		const { fetcher, calls } = fakeGithub({
-			"GET /repos/acme/repo/pulls": [
+			"POST /graphql": recentMergedPage([
 				{
 					number: 7,
 					merged_at: "2026-08-26T16:20:00Z",
 					merged_by: { login: "github-actions[bot]" },
 					merge_commit_sha: MERGE_SHA,
 				},
-			],
+			]),
 			"GET /repos/acme/repo/issues/7/comments": () => ({
 				ok: true,
 				status: 200,
@@ -3056,14 +3097,14 @@ describe("merge-lane sweep (#2185)", () => {
 
 	it("waits through the grace period after an accepted request", async () => {
 		const { fetcher, calls } = fakeGithub({
-			"GET /repos/acme/repo/pulls": [
+			"POST /graphql": recentMergedPage([
 				{
 					number: 7,
 					merged_at: "2026-08-26T16:20:00Z",
 					merged_by: { login: "github-actions[bot]" },
 					merge_commit_sha: MERGE_SHA,
 				},
-			],
+			]),
 			"GET /repos/acme/repo/issues/7/comments": () => ({
 				ok: true,
 				status: 200,
@@ -3087,14 +3128,14 @@ describe("merge-lane sweep (#2185)", () => {
 
 	it("reports missing validation after bounded request attempts", async () => {
 		const { fetcher, calls } = fakeGithub({
-			"GET /repos/acme/repo/pulls": [
+			"POST /graphql": recentMergedPage([
 				{
 					number: 7,
 					merged_at: "2026-08-26T16:20:00Z",
 					merged_by: { login: "github-actions[bot]" },
 					merge_commit_sha: MERGE_SHA,
 				},
-			],
+			]),
 			"GET /repos/acme/repo/issues/7/comments": () => ({
 				ok: true,
 				status: 200,
@@ -3123,14 +3164,14 @@ describe("merge-lane sweep (#2185)", () => {
 			user: { login: "github-actions[bot]" },
 		}));
 		const { fetcher, calls } = fakeGithub({
-			"GET /repos/acme/repo/pulls": [
+			"POST /graphql": recentMergedPage([
 				{
 					number: 7,
 					merged_at: "2026-08-26T16:20:00Z",
 					merged_by: { login: "github-actions[bot]" },
 					merge_commit_sha: MERGE_SHA,
 				},
-			],
+			]),
 			"GET /repos/acme/repo/issues/7/comments": () => ({
 				ok: true,
 				status: 200,
@@ -3164,14 +3205,14 @@ describe("merge-lane sweep (#2185)", () => {
 	it("reopens a later retry generation after an exhausted no-terminal window", async () => {
 		let requestCount = 0;
 		const { fetcher, calls } = fakeGithub({
-			"GET /repos/acme/repo/pulls": [
+			"POST /graphql": recentMergedPage([
 				{
 					number: 7,
 					merged_at: "2026-08-26T16:20:00Z",
 					merged_by: { login: "github-actions[bot]" },
 					merge_commit_sha: MERGE_SHA,
 				},
-			],
+			]),
 			"GET /repos/acme/repo/issues/7/comments": () => ({
 				ok: true,
 				status: 200,
@@ -3205,6 +3246,366 @@ describe("merge-lane sweep (#2185)", () => {
 		expect(String((request?.body as { body: string }).body)).toContain(
 			"attempt=1:generation=1",
 		);
+	});
+
+	describe("recent merged-PR GraphQL window", () => {
+		const recent = (
+			number: number,
+			updatedAt: number,
+			mergedAt = updatedAt,
+		) => ({
+			number,
+			updated_at: new Date(updatedAt).toISOString(),
+			merged_at: new Date(mergedAt).toISOString(),
+			merged_by: { login: "github-actions[bot]" },
+			merge_commit_sha: MERGE_SHA,
+		});
+
+		it("stops after the first page once its last update is outside the window", async () => {
+			const old = recent(9, NOW - POST_MERGE_RECONCILE_WINDOW_MS - 1);
+			const candidate = recent(7, NOW - 60_000);
+			const { fetcher, calls } = fakeGithub({
+				"POST /graphql": recentMergedPage([candidate, old]),
+			});
+			const result = await reconcilePostMergeValidations({
+				fetcher,
+				owner: "acme",
+				repo: "repo",
+				now: NOW,
+			});
+			expect(result.find((entry) => entry.number === 7)).toMatchObject({
+				number: 7,
+				dispatched: true,
+			});
+			expect(
+				calls.filter((call) => call.url.endsWith("/graphql")),
+			).toHaveLength(1);
+			const query = String((calls[0].body as { query: string }).query);
+			expect(query).toContain("states: [CLOSED, MERGED]");
+			expect(query).toContain(
+				"orderBy: { field: UPDATED_AT, direction: DESC }",
+			);
+		});
+
+		it("continues past a recently updated old merge to find a later candidate", async () => {
+			const old = recent(
+				9,
+				NOW - 60_000,
+				NOW - POST_MERGE_RECONCILE_WINDOW_MS - 60_000,
+			);
+			const candidate = recent(7, NOW - 2 * 60_000);
+			const outside = recent(8, NOW - POST_MERGE_RECONCILE_WINDOW_MS - 1);
+			const { fetcher, calls } = fakeGithub({
+				"POST /graphql": recentMergedSequence([
+					recentMergedPage([old], true, 1),
+					recentMergedPage([candidate, outside], false, 2),
+				]),
+			});
+			const result = await reconcilePostMergeValidations({
+				fetcher,
+				owner: "acme",
+				repo: "repo",
+				now: NOW,
+			});
+			expect(result.find((entry) => entry.number === 7)).toMatchObject({
+				number: 7,
+				dispatched: true,
+			});
+			expect(
+				calls.filter((call) => call.url.endsWith("/graphql")),
+			).toHaveLength(2);
+		});
+
+		it("keeps an update exactly at the cutoff in scope across a page boundary", async () => {
+			const cutoff = NOW - POST_MERGE_RECONCILE_WINDOW_MS;
+			const boundary = recent(9, cutoff, cutoff);
+			const candidate = recent(7, cutoff, cutoff);
+			const outside = recent(8, cutoff - 1);
+			const { fetcher, calls } = fakeGithub({
+				"POST /graphql": recentMergedSequence([
+					recentMergedPage([boundary], true, 1),
+					recentMergedPage([candidate, outside], false, 2),
+				]),
+			});
+			const result = await reconcilePostMergeValidations({
+				fetcher,
+				owner: "acme",
+				repo: "repo",
+				now: NOW,
+			});
+			expect(result.find((entry) => entry.number === 7)).toMatchObject({
+				number: 7,
+				dispatched: true,
+			});
+			expect(
+				calls.filter((call) => call.url.endsWith("/graphql")),
+			).toHaveLength(2);
+		});
+
+		it("rejects non-monotonic updates, repeated cursors, and malformed timestamps", async () => {
+			const malformed = recentMergedPage([recent(7, NOW - 60_000)]);
+			malformed.data.repository.pullRequests.edges[0].node.updatedAt = "bad";
+			const { fetcher } = fakeGithub({ "POST /graphql": malformed });
+			const malformedResult = await reconcilePostMergeValidations({
+				fetcher,
+				owner: "acme",
+				repo: "repo",
+				now: NOW,
+			});
+			expect(malformedResult[0].errors[0]).toContain("invalid updatedAt");
+
+			const nonString = recentMergedPage([recent(7, NOW - 60_000)]);
+			nonString.data.repository.pullRequests.edges[0].node.updatedAt = 0;
+			const nonStringResult = await reconcilePostMergeValidations({
+				fetcher: fakeGithub({ "POST /graphql": nonString }).fetcher,
+				owner: "acme",
+				repo: "repo",
+				now: NOW,
+			});
+			expect(nonStringResult[0].errors[0]).toContain("invalid updatedAt");
+
+			const zero = recentMergedPage([recent(7, NOW - 60_000)]);
+			zero.data.repository.pullRequests.edges[0].node.mergedAt = "0";
+			const zeroResult = await reconcilePostMergeValidations({
+				fetcher: fakeGithub({ "POST /graphql": zero }).fetcher,
+				owner: "acme",
+				repo: "repo",
+				now: NOW,
+			});
+			expect(zeroResult[0].errors[0]).toContain("invalid mergedAt");
+
+			const normalized = recentMergedPage([recent(7, NOW - 60_000)]);
+			normalized.data.repository.pullRequests.edges[0].node.mergedAt =
+				"2026-02-30T00:00:00Z";
+			const normalizedResult = await reconcilePostMergeValidations({
+				fetcher: fakeGithub({ "POST /graphql": normalized }).fetcher,
+				owner: "acme",
+				repo: "repo",
+				now: NOW,
+			});
+			expect(normalizedResult[0].errors[0]).toContain("invalid mergedAt");
+
+			const first = recentMergedPage([recent(7, NOW - 60_000)], true, 1);
+			const second = recentMergedPage([recent(8, NOW - 120_000)], false, 1);
+			const repeated = fakeGithub({
+				"POST /graphql": recentMergedSequence([first, second]),
+			}).fetcher;
+			const repeatedResult = await reconcilePostMergeValidations({
+				fetcher: repeated,
+				owner: "acme",
+				repo: "repo",
+				now: NOW,
+			});
+			expect(repeatedResult[0].errors[0]).toContain("cursor did not advance");
+
+			const descending = recentMergedPage([recent(7, NOW - 120_000)], true, 1);
+			const increasing = recentMergedPage([recent(8, NOW - 60_000)], false, 2);
+			const increasingResult = await reconcilePostMergeValidations({
+				fetcher: fakeGithub({
+					"POST /graphql": recentMergedSequence([descending, increasing]),
+				}).fetcher,
+				owner: "acme",
+				repo: "repo",
+				now: NOW,
+			});
+			expect(increasingResult[0].errors[0]).toContain("ordering increased");
+		});
+
+		it("fails closed on malformed mergedAt, missing cursors, GraphQL errors, and truncation", async () => {
+			const malformed = recentMergedPage([recent(7, NOW - 60_000)]);
+			malformed.data.repository.pullRequests.edges[0].node.mergedAt = "bad";
+			const malformedResult = await reconcilePostMergeValidations({
+				fetcher: fakeGithub({ "POST /graphql": malformed }).fetcher,
+				owner: "acme",
+				repo: "repo",
+				now: NOW,
+			});
+			expect(malformedResult[0].errors[0]).toContain("invalid mergedAt");
+
+			const missingCursor = recentMergedPage([recent(7, NOW - 60_000)]) as {
+				data: {
+					repository: {
+						pullRequests: { pageInfo: { endCursor: string | null } };
+					};
+				};
+			};
+			missingCursor.data.repository.pullRequests.pageInfo.endCursor = null;
+			const missingCursorResult = await reconcilePostMergeValidations({
+				fetcher: fakeGithub({ "POST /graphql": missingCursor }).fetcher,
+				owner: "acme",
+				repo: "repo",
+				now: NOW,
+			});
+			expect(missingCursorResult[0].errors[0]).toContain("no end cursor");
+
+			const nullEdgeCursor = recentMergedPage([recent(7, NOW - 60_000)]);
+			(
+				nullEdgeCursor.data.repository.pullRequests.edges[0] as {
+					cursor: string | null;
+				}
+			).cursor = null;
+			const nullEdgeCursorResult = await reconcilePostMergeValidations({
+				fetcher: fakeGithub({ "POST /graphql": nullEdgeCursor }).fetcher,
+				owner: "acme",
+				repo: "repo",
+				now: NOW,
+			});
+			expect(nullEdgeCursorResult[0].errors[0]).toContain(
+				"malformed edge cursor",
+			);
+
+			const repeatedEdgeCursor = recentMergedPage([
+				recent(7, NOW - 60_000),
+				recent(8, NOW - 120_000),
+			]);
+			repeatedEdgeCursor.data.repository.pullRequests.edges[1].cursor =
+				repeatedEdgeCursor.data.repository.pullRequests.edges[0].cursor;
+			const repeatedEdgeCursorResult = await reconcilePostMergeValidations({
+				fetcher: fakeGithub({ "POST /graphql": repeatedEdgeCursor }).fetcher,
+				owner: "acme",
+				repo: "repo",
+				now: NOW,
+			});
+			expect(repeatedEdgeCursorResult[0].errors[0]).toContain(
+				"repeated edge cursor",
+			);
+
+			const emptyTerminal = await reconcilePostMergeValidations({
+				fetcher: fakeGithub({
+					"POST /graphql": recentMergedPage([]),
+				}).fetcher,
+				owner: "acme",
+				repo: "repo",
+				now: NOW,
+			});
+			expect(emptyTerminal).toEqual([]);
+
+			const invalidEmptyTerminal = recentMergedPage([]);
+			invalidEmptyTerminal.data.repository.pullRequests.pageInfo.endCursor =
+				"unexpected";
+			const invalidEmptyTerminalResult = await reconcilePostMergeValidations({
+				fetcher: fakeGithub({
+					"POST /graphql": invalidEmptyTerminal,
+				}).fetcher,
+				owner: "acme",
+				repo: "repo",
+				now: NOW,
+			});
+			expect(invalidEmptyTerminalResult[0].errors[0]).toContain(
+				"invalid empty terminal cursor",
+			);
+
+			const oversized = recentMergedPage(
+				Array.from({ length: 101 }, (_, index) =>
+					recent(index + 1, NOW - index * 1_000),
+				),
+			);
+			const oversizedResult = await reconcilePostMergeValidations({
+				fetcher: fakeGithub({ "POST /graphql": oversized }).fetcher,
+				owner: "acme",
+				repo: "repo",
+				now: NOW,
+			});
+			expect(oversizedResult[0].errors[0]).toContain("exceeded 100 records");
+
+			const cumulative = recentMergedPage(
+				Array.from({ length: 1_001 }, (_, index) =>
+					recent(
+						index + 1,
+						NOW - index * 1_000,
+						NOW - POST_MERGE_RECONCILE_WINDOW_MS - 1,
+					),
+				),
+			);
+			const cumulativeResult = await reconcilePostMergeValidations({
+				fetcher: fakeGithub({ "POST /graphql": cumulative }).fetcher,
+				owner: "acme",
+				repo: "repo",
+				now: NOW,
+			});
+			expect(cumulativeResult[0].errors[0]).toContain("exceeded 1000 records");
+
+			const graphQlError = {
+				ok: true,
+				status: 200,
+				json: async () => ({ errors: [{ message: "rate limited" }] }),
+			};
+			const graphQlErrorResult = await reconcilePostMergeValidations({
+				fetcher: fakeGithub({ "POST /graphql": () => graphQlError }).fetcher,
+				owner: "acme",
+				repo: "repo",
+				now: NOW,
+			});
+			expect(graphQlErrorResult[0].errors[0]).toContain("rate limited");
+
+			const httpErrorResult = await reconcilePostMergeValidations({
+				fetcher: fakeGithub({
+					"POST /graphql": () => ({
+						ok: false,
+						status: 503,
+						json: async () => ({}),
+					}),
+				}).fetcher,
+				owner: "acme",
+				repo: "repo",
+				now: NOW,
+			});
+			expect(httpErrorResult[0].errors[0]).toContain("HTTP 503");
+
+			const pages = Array.from({ length: 10 }, (_, page) =>
+				recentMergedPage(
+					[recent(page + 1, NOW - page * 60_000)],
+					true,
+					page + 1,
+				),
+			);
+			const truncatedResult = await reconcilePostMergeValidations({
+				fetcher: fakeGithub({
+					"POST /graphql": recentMergedSequence(pages),
+				}).fetcher,
+				owner: "acme",
+				repo: "repo",
+				now: NOW,
+			});
+			expect(truncatedResult[0].errors[0]).toContain("read truncated");
+		});
+
+		it("keeps human merges out of recovery and preserves the bot merge SHA", async () => {
+			const human = recent(8, NOW - 60_000);
+			human.merged_by = { login: "acme" };
+			const { fetcher, calls } = fakeGithub({
+				"POST /graphql": recentMergedPage([human]),
+			});
+			expect(
+				await reconcilePostMergeValidations({
+					fetcher,
+					owner: "acme",
+					repo: "repo",
+					now: NOW,
+				}),
+			).toEqual([]);
+			expect(calls.some((call) => call.url.endsWith("/dispatches"))).toBe(
+				false,
+			);
+		});
+
+		it("accepts valid fractional offset timestamps", async () => {
+			const valid = recentMergedPage([recent(7, NOW - 60_000)]);
+			valid.data.repository.pullRequests.edges[0].node.updatedAt =
+				"2026-08-26T18:29:00.123+02:00";
+			valid.data.repository.pullRequests.edges[0].node.mergedAt =
+				"2026-08-26T18:29:00.123+02:00";
+			const result = await reconcilePostMergeValidations({
+				fetcher: fakeGithub({ "POST /graphql": valid }).fetcher,
+				owner: "acme",
+				repo: "repo",
+				now: NOW,
+			});
+			expect(result.find((entry) => entry.number === 7)).toMatchObject({
+				number: 7,
+				dispatched: true,
+			});
+		});
 	});
 
 	describe("fresh-runner dispatch validation seam", () => {

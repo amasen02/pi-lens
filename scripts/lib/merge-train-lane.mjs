@@ -38,6 +38,10 @@ export const POST_MERGE_DISPATCH_ATTEMPTS = 2;
 export const POST_MERGE_RECONCILE_WINDOW_MS = 24 * 60 * 60 * 1000;
 export const POST_MERGE_RECONCILE_GRACE_MS = 15 * 60 * 1000;
 export const POST_MERGE_RETRY_GENERATION_MS = 6 * 60 * 60 * 1000;
+export const POST_MERGE_RECONCILE_PAGE_SIZE = 100;
+export const POST_MERGE_RECONCILE_MAX_PAGES = 10;
+export const POST_MERGE_RECONCILE_MAX_RECORDS =
+	POST_MERGE_RECONCILE_PAGE_SIZE * POST_MERGE_RECONCILE_MAX_PAGES;
 export const POST_MERGE_VALIDATION_WORKFLOWS = Object.freeze([
 	"ci.yml",
 	"lint.yml",
@@ -46,12 +50,95 @@ export const POST_MERGE_VALIDATION_WORKFLOWS = Object.freeze([
 ]);
 const POST_MERGE_ERROR_CAP = 200;
 const POST_MERGE_BOT_LOGIN = "github-actions[bot]";
+const GRAPHQL_DATETIME_RE =
+	/^(?<year>\d{4})-(?<month>\d{2})-(?<day>\d{2})T(?<hour>\d{2}):(?<minute>\d{2}):(?<second>\d{2})(?:\.(?<fraction>\d{1,9}))?(?<zone>Z|[+-]\d{2}:\d{2})$/;
+
+const RECENT_MERGED_PR_QUERY = `
+query($owner: String!, $name: String!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(
+      states: [CLOSED, MERGED]
+      first: ${POST_MERGE_RECONCILE_PAGE_SIZE}
+      after: $after
+      orderBy: { field: UPDATED_AT, direction: DESC }
+    ) {
+      pageInfo { hasNextPage endCursor }
+      edges {
+        cursor
+        node {
+          number
+          state
+          updatedAt
+          mergedAt
+          mergedBy { login }
+          mergeCommit { oid }
+        }
+      }
+    }
+  }
+}`;
 
 function boundedError(error) {
 	return String(error instanceof Error ? error.message : error).slice(
 		0,
 		POST_MERGE_ERROR_CAP,
 	);
+}
+
+function parseGraphqlDateTime(value, field, page, number) {
+	const prefix = `recent merged-PR page ${page} #${number}`;
+	if (typeof value !== "string")
+		throw new Error(`${prefix} has invalid ${field}`);
+	const match = GRAPHQL_DATETIME_RE.exec(value);
+	if (!match?.groups) throw new Error(`${prefix} has invalid ${field}`);
+	const year = Number(match.groups.year);
+	const month = Number(match.groups.month);
+	const day = Number(match.groups.day);
+	const hour = Number(match.groups.hour);
+	const minute = Number(match.groups.minute);
+	const second = Number(match.groups.second);
+	const fraction = match.groups.fraction ?? "";
+	const zone = match.groups.zone;
+	const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+	const daysInMonth = [
+		31,
+		leapYear ? 29 : 28,
+		31,
+		30,
+		31,
+		30,
+		31,
+		31,
+		30,
+		31,
+		30,
+		31,
+	][month - 1];
+	const offsetHours = zone === "Z" ? 0 : Number(zone.slice(1, 3));
+	const offsetMinutes = zone === "Z" ? 0 : Number(zone.slice(4, 6));
+	if (
+		!daysInMonth ||
+		day < 1 ||
+		day > daysInMonth ||
+		hour > 23 ||
+		minute > 59 ||
+		second > 59 ||
+		offsetHours > 23 ||
+		offsetMinutes > 59
+	)
+		throw new Error(`${prefix} has invalid ${field}`);
+	const timestamp = Date.parse(value);
+	if (!Number.isFinite(timestamp))
+		throw new Error(`${prefix} has invalid ${field}`);
+	const offset =
+		(zone === "Z" ? 1 : zone[0] === "+" ? 1 : -1) *
+		(offsetHours * 60 + offsetMinutes) *
+		60_000;
+	const milliseconds = fraction.padEnd(3, "0").slice(0, 3);
+	const canonical = new Date(timestamp + offset).toISOString();
+	const expected = `${match.groups.year}-${match.groups.month}-${match.groups.day}T${match.groups.hour}:${match.groups.minute}:${match.groups.second}.${milliseconds}Z`;
+	if (canonical !== expected) throw new Error(`${prefix} has invalid ${field}`);
+	return timestamp;
 }
 
 // How this repository ACTUALLY marks a check advisory: the workflow job name
@@ -526,6 +613,150 @@ async function recordPostMergeExhausted(
 }
 
 /**
+ * Read only the recent ordered window. The REST pull-list is exhaustive and
+ * omits mergedBy, so it cannot be shared with comment-marker reads: this
+ * connection carries the identity and uses updatedAt only as its boundary.
+ */
+async function readRecentMergedPullRequests(
+	fetcher,
+	owner,
+	repo,
+	now,
+	windowMs,
+) {
+	const cutoff = now - windowMs;
+	const records = [];
+	const seenNumbers = new Set();
+	const seenCursors = new Set();
+	let after = null;
+	let previousUpdatedAt = Number.POSITIVE_INFINITY;
+
+	for (let page = 1; page <= POST_MERGE_RECONCILE_MAX_PAGES; page++) {
+		const response = await fetcher("https://api.github.com/graphql", {
+			method: "POST",
+			headers: {
+				accept: "application/vnd.github+json",
+				"content-type": "application/json",
+			},
+			body: JSON.stringify({
+				query: RECENT_MERGED_PR_QUERY,
+				variables: { owner, name: repo, after },
+			}),
+		});
+		if (!response.ok)
+			throw new Error(
+				`recent merged-PR page ${page} -> HTTP ${response.status}`,
+			);
+		const payload = await response.json();
+		if (payload?.errors?.length)
+			throw new Error(
+				`recent merged-PR page ${page} -> GraphQL: ${payload.errors.map((error) => error?.message ?? String(error)).join("; ")}`,
+			);
+		const connection = payload?.data?.repository?.pullRequests;
+		if (!connection || !Array.isArray(connection.edges))
+			throw new Error(`recent merged-PR page ${page} returned no edges`);
+		const pageEdges = connection.edges;
+		const pageInfo = connection.pageInfo;
+		if (!pageInfo || typeof pageInfo.hasNextPage !== "boolean")
+			throw new Error(`recent merged-PR page ${page} has malformed page info`);
+		if (pageEdges.length === 0) {
+			if (pageInfo.hasNextPage)
+				throw new Error(
+					`recent merged-PR page ${page} has next page without records`,
+				);
+			if (pageInfo.endCursor !== null)
+				throw new Error(
+					`recent merged-PR page ${page} has invalid empty terminal cursor`,
+				);
+			return records;
+		}
+		if (records.length + pageEdges.length > POST_MERGE_RECONCILE_MAX_RECORDS)
+			throw new Error(
+				`recent merged-PR window exceeded ${POST_MERGE_RECONCILE_MAX_RECORDS} records; read truncated`,
+			);
+		if (pageEdges.length > POST_MERGE_RECONCILE_PAGE_SIZE)
+			throw new Error(
+				`recent merged-PR page ${page} exceeded ${POST_MERGE_RECONCILE_PAGE_SIZE} records`,
+			);
+		if (
+			typeof pageInfo.endCursor !== "string" ||
+			pageInfo.endCursor.length === 0
+		)
+			throw new Error(`recent merged-PR page ${page} has no end cursor`);
+		if (after !== null && pageInfo.endCursor === after)
+			throw new Error(`recent merged-PR page ${page} cursor did not advance`);
+
+		for (const edge of pageEdges) {
+			if (typeof edge?.cursor !== "string" || edge.cursor.length === 0)
+				throw new Error(
+					`recent merged-PR page ${page} has malformed edge cursor`,
+				);
+			if (seenCursors.has(edge.cursor))
+				throw new Error(
+					`recent merged-PR page ${page} has repeated edge cursor`,
+				);
+			seenCursors.add(edge.cursor);
+			const node = edge?.node;
+			if (!node || !Number.isSafeInteger(node.number))
+				throw new Error(`recent merged-PR page ${page} has malformed record`);
+			if (node.state !== "CLOSED" && node.state !== "MERGED")
+				throw new Error(
+					`recent merged-PR page ${page} #${node.number} has invalid state`,
+				);
+			const updatedAt = parseGraphqlDateTime(
+				node.updatedAt,
+				"updatedAt",
+				page,
+				node.number,
+			);
+			if (updatedAt > previousUpdatedAt)
+				throw new Error(
+					`recent merged-PR ordering increased at page ${page} #${node.number}`,
+				);
+			previousUpdatedAt = updatedAt;
+			if (seenNumbers.has(node.number))
+				throw new Error(
+					`recent merged-PR pagination repeated #${node.number} at page ${page}`,
+				);
+			seenNumbers.add(node.number);
+			if (node.state === "MERGED")
+				parseGraphqlDateTime(node.mergedAt, "mergedAt", page, node.number);
+			if (
+				node.state === "MERGED" &&
+				(!node.mergedBy || typeof node.mergedBy.login !== "string")
+			)
+				throw new Error(
+					`recent merged-PR #${node.number} has invalid mergedBy`,
+				);
+			records.push({
+				number: node.number,
+				updated_at: node.updatedAt,
+				merged_at: node.mergedAt,
+				merged_by: node.mergedBy,
+				merge_commit_sha: node.mergeCommit?.oid ?? null,
+			});
+		}
+
+		const lastEdge = pageEdges[pageEdges.length - 1];
+		if (lastEdge.cursor !== pageInfo.endCursor)
+			throw new Error(
+				`recent merged-PR page ${page} cursor does not match its edge`,
+			);
+		const lastUpdatedAt = previousUpdatedAt;
+		if (lastUpdatedAt < cutoff) return records;
+		if (!pageInfo.hasNextPage) return records;
+		if (page === POST_MERGE_RECONCILE_MAX_PAGES)
+			throw new Error(
+				`recent merged-PR window still full at page ${POST_MERGE_RECONCILE_MAX_PAGES}; read truncated`,
+			);
+		after = pageInfo.endCursor;
+	}
+	throw new Error(
+		`recent merged-PR window exceeded ${POST_MERGE_RECONCILE_MAX_RECORDS} records; read truncated`,
+	);
+}
+
+/**
  * Reconcile merge-train dispatches from GitHub's durable merged-PR record.
  * The scan runs on every lane process, so a crash after merge and before the
  * dispatch, or after an accepted dispatch and before validation completes, is
@@ -542,9 +773,12 @@ export async function reconcilePostMergeValidations({
 }) {
 	let closedPrs;
 	try {
-		closedPrs = await paginate(
+		closedPrs = await readRecentMergedPullRequests(
 			fetcher,
-			`https://api.github.com/repos/${owner}/${repo}/pulls?state=closed&sort=updated&direction=desc`,
+			owner,
+			repo,
+			now,
+			windowMs,
 		);
 	} catch (error) {
 		return [
