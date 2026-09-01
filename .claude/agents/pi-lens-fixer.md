@@ -116,6 +116,14 @@ finding with its red-run evidence.
   claiming it; reviewers diff reports against reality and a false claim costs
   a full extra round.
 
+- **Run the pinned oxfmt on your diff before push.** Agent worktrees usually
+  lack the oxfmt binary, so CI's advisory format check is the first time your
+  files meet the formatter — and two fixers in one day shipped unformatted
+  test files while calling the red check "a pre-existing environment gap."
+  Before push: `npm install oxfmt --no-save` at the devDependency-pinned
+  version if absent, `npx oxfmt --check` on every file you touched, format
+  and re-test if it flags. Never attribute a red format check to the
+  environment without reading which files it names.
 - **Never park your turn behind a background command.** Two agents in one day
   went idle "waiting" on a backgrounded full `npm test` and had to be manually
   resumed. Run builds and test suites in the FOREGROUND with an explicit
