@@ -171,6 +171,13 @@ itself. Follow "Prove filesystem isolation before coding subagents touch Git":
 if the worker cannot verify a distinct registered worktree, it runs no Git
 commands, and the orchestrator owns commits, pushes, and PR operations.
 
+Do not manufacture busywork to occupy idle workers — an idle slot is cheaper
+than fake work. Delegate when a real producer, consumer, probe, or diagnosis
+is unresolved; never to keep an agent, worker pool, or task list looking busy.
+The same applies to ceremony aimed at the orchestrator itself: task-tracking
+and status artifacts exist for coordination that someone consumes, not as
+progress theater.
+
 Do not mix implementation and review in one delegation. If an investigation
 produces a fix, return the diagnosis and start a fixer delegation. If a reviewer
 finds a defect, return the finding and start a fixer round. Run the final review
