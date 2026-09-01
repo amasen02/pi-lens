@@ -16,6 +16,14 @@ import {
 	getProjectIgnoreGlobs,
 	isPathIgnoredByProject,
 } from "../file-utils.js";
+import {
+	augmentPythonEnvironment,
+	detectPythonEnvironment,
+	detectPythonVenv,
+	pythonEnvironmentToolCandidates,
+} from "../python-environment.js";
+
+export { detectPythonVenv };
 import { STAGE_TMP_PATTERN } from "../atomic-write-staging.js";
 import {
 	DOTNET_CSHARP_ROOT_MARKERS,
@@ -330,6 +338,13 @@ export interface LSPServerInfo {
 	 * diagnostics path. See clients/dispatch/auxiliary-lsp.ts.
 	 */
 	role?: "language" | "auxiliary";
+	/**
+	 * ID of the preferred language server this server backs up. Primary selection
+	 * already tries language servers in registry order; this marker prevents an
+	 * aggregate `clientScope: "all"` diagnostics pass from launching the fallback
+	 * alongside a working preferred server.
+	 */
+	fallbackFor?: string;
 	/** Simple command name whose absence disables spawn attempts briefly across roots. */
 	availabilityKey?: string;
 	/**
@@ -1161,12 +1176,16 @@ async function resolveAndLaunchTreeBinary(
 	}
 }
 
-function nodeBinCandidates(root: string, baseName: string): string[] {
+function nodeBinLocalCandidates(root: string, baseName: string): string[] {
 	const localBase = path.join(root, "node_modules", ".bin", baseName);
 	if (process.platform === "win32") {
-		return [`${localBase}.cmd`, `${localBase}.exe`, baseName];
+		return [`${localBase}.cmd`, `${localBase}.exe`];
 	}
-	return [localBase, baseName];
+	return [localBase];
+}
+
+function nodeBinCandidates(root: string, baseName: string): string[] {
+	return [...nodeBinLocalCandidates(root, baseName), baseName];
 }
 
 function normalizeSlashKey(value: string): string {
@@ -1243,6 +1262,7 @@ interface InteractiveServerSpec {
 	extensions: readonly string[];
 	root: RootFunction;
 	language: string;
+	fallbackFor?: string;
 	command: string | ((root: string) => string);
 	args?: string[] | ((root: string) => string[]);
 	initialization?:
@@ -1263,6 +1283,7 @@ function createInteractiveServer(spec: InteractiveServerSpec): LSPServerInfo {
 		name: spec.name,
 		extensions: spec.extensions,
 		root: spec.root,
+		fallbackFor: spec.fallbackFor,
 		availabilityKey:
 			typeof spec.command === "string" && isSimpleCommand(spec.command)
 				? spec.command
@@ -1955,36 +1976,6 @@ export function DenoExcludeRoot(primary: RootFunction): RootFunction {
 	};
 }
 
-/**
- * Find the active Python interpreter inside the nearest virtual environment.
- * Search order: VIRTUAL_ENV → CONDA_PREFIX → .venv → venv (all under root).
- * Returns undefined when no venv python binary is found.
- */
-export async function detectPythonVenv(
-	root: string,
-): Promise<string | undefined> {
-	const isWin = process.platform === "win32";
-	const candidates = [
-		process.env.VIRTUAL_ENV,
-		process.env.CONDA_PREFIX,
-		path.join(root, ".venv"),
-		path.join(root, "venv"),
-	].filter((v): v is string => Boolean(v));
-
-	for (const venv of candidates) {
-		const pythonPath = isWin
-			? path.join(venv, "Scripts", "python.exe")
-			: path.join(venv, "bin", "python");
-		try {
-			await access(pythonPath);
-			return pythonPath;
-		} catch {
-			// not found — try next candidate
-		}
-	}
-	return undefined;
-}
-
 // --- Server Definitions ---
 
 const JS_TS_LSP_EXTENSIONS = KIND_EXTENSIONS["jsts"].filter(
@@ -2244,6 +2235,7 @@ export const TypeScriptServer: LSPServerInfo = {
 export const DenoServer: LSPServerInfo = {
 	id: "deno",
 	name: "Deno Language Server",
+	fallbackFor: "typescript",
 	extensions: JS_TS_LSP_EXTENSIONS,
 	autoPropagateDiagnostics: true,
 	root: createRootDetector(["deno.json", "deno.jsonc"]),
@@ -2276,7 +2268,11 @@ export const PythonServer: LSPServerInfo = {
 		]),
 	),
 	async spawn(root, options) {
-		const env = await getToolEnvironment();
+		const pythonEnvironment = await detectPythonEnvironment(root);
+		const env = augmentPythonEnvironment(
+			await getToolEnvironment(),
+			pythonEnvironment,
+		);
 		let source: "direct" | "managed" | "package-manager" = "direct";
 
 		// openFilesOnly: true — analyse only open files rather than the full workspace.
@@ -2288,43 +2284,86 @@ export const PythonServer: LSPServerInfo = {
 			openFilesOnly: true,
 		});
 
-		// Prefer pyright-langserver; basedpyright-langserver is a drop-in fork with
-		// the same --stdio protocol and additional rules (e.g. reportUnusedExpression).
-		const localCandidates = [
-			...nodeBinCandidates(root, "pyright-langserver"),
-			...nodeBinCandidates(root, "basedpyright-langserver"),
-		];
-		const direct = await resolveAndLaunch(
-			{ candidates: localCandidates, args: ["--stdio"], cwd: root, env },
+		// Project ownership outranks checker preference: exhaust explicit project
+		// candidates before a bare command can resolve to pi-lens's managed bin or
+		// the host PATH. Within the project tier, preserve the established
+		// pyright → basedpyright → ty preference.
+		const projectPyright = await resolveAndLaunch(
+			{
+				candidates: [
+					...pythonEnvironmentToolCandidates(
+						pythonEnvironment,
+						"pyright-langserver",
+					),
+					...nodeBinLocalCandidates(root, "pyright-langserver"),
+					...pythonEnvironmentToolCandidates(
+						pythonEnvironment,
+						"basedpyright-langserver",
+					),
+					...nodeBinLocalCandidates(root, "basedpyright-langserver"),
+				],
+				args: ["--stdio"],
+				cwd: root,
+				env,
+			},
 			false,
 		);
-		if (direct) {
-			const pythonPath = await detectPythonVenv(root);
+		if (projectPyright) {
 			return {
-				process: direct.process,
-				source: direct.source,
-				initialization: pyrightInit(pythonPath),
+				process: projectPyright.process,
+				source: projectPyright.source,
+				initialization: pyrightInit(pythonEnvironment?.pythonPath),
 			};
 		}
 
-		// ty (astral-sh/ty, #717) — an alternative Python checker/language server,
-		// tried ONLY when neither pyright nor basedpyright was found locally, and
-		// ONLY on PATH (allowInstall: false below — no managed/auto-install, unlike
-		// pyright's fallback right after this block). That keeps ty strictly
-		// opt-in: it never displaces an already-installed pyright/basedpyright,
-		// and it's never silently auto-installed as a default — a user only gets
-		// it by having installed `ty` themselves (e.g. `uv tool install ty` /
-		// `pip install ty`). Unlike pyright-langserver's `--stdio` flag, ty's CLI
-		// launches its language server via the `server` subcommand; it has no
-		// stable initializationOptions equivalent to pyright's `pythonPath` yet
-		// (astral-sh/ty#2032) — it auto-discovers `.venv`/`VIRTUAL_ENV` from cwd,
-		// so no `initialization` payload is sent.
-		const ty = await resolveAndLaunch(
-			{ candidates: ["ty"], args: ["server"], cwd: root, env },
+		// ty uses `ty server`, so it needs a separate launch phase from the
+		// Pyright-compatible servers. It has no stable initializationOptions
+		// equivalent to pyright's `pythonPath` (astral-sh/ty#2032); the child
+		// environment and cwd provide interpreter discovery instead.
+		const projectTy = await resolveAndLaunch(
+			{
+				candidates: pythonEnvironmentToolCandidates(pythonEnvironment, "ty"),
+				args: ["server"],
+				cwd: root,
+				env,
+			},
 			false,
 		);
-		if (ty) {
-			return { process: ty.process, source: ty.source };
+		if (projectTy) {
+			return { process: projectTy.process, source: projectTy.source };
+		}
+
+		// With no project-owned checker, retain the existing PATH preference and
+		// keep ty opt-in: pyright, then basedpyright, then ty. The augmented child
+		// PATH includes pi-lens-managed bins before the inherited global PATH.
+		const pathPyright = await resolveAndLaunch(
+			{
+				candidates: ["pyright-langserver", "basedpyright-langserver"],
+				args: ["--stdio"],
+				cwd: root,
+				env,
+			},
+			false,
+		);
+		if (pathPyright) {
+			return {
+				process: pathPyright.process,
+				source: pathPyright.source,
+				initialization: pyrightInit(pythonEnvironment?.pythonPath),
+			};
+		}
+
+		const pathTy = await resolveAndLaunch(
+			{
+				candidates: ["ty"],
+				args: ["server"],
+				cwd: root,
+				env,
+			},
+			false,
+		);
+		if (pathTy) {
+			return { process: pathTy.process, source: pathTy.source };
 		}
 
 		// Discover a globally-installed pyright even when install is disabled;
@@ -2351,11 +2390,10 @@ export const PythonServer: LSPServerInfo = {
 		);
 		if (!resolved) return undefined;
 
-		const pythonPath = await detectPythonVenv(root);
 		return {
 			process: resolved.process,
 			source,
-			initialization: pyrightInit(pythonPath),
+			initialization: pyrightInit(pythonEnvironment?.pythonPath),
 		};
 	},
 };
@@ -2363,6 +2401,7 @@ export const PythonServer: LSPServerInfo = {
 export const PythonJediServer: LSPServerInfo = {
 	id: "python-jedi",
 	name: "Jedi Language Server",
+	fallbackFor: "python",
 	extensions: KIND_EXTENSIONS["python"],
 	root: RootWithFallback(
 		createRootDetector([
@@ -2946,6 +2985,7 @@ export const CSharpServer: LSPServerInfo = {
 export const OmniSharpServer = createInteractiveServer({
 	id: "omnisharp",
 	name: "OmniSharp",
+	fallbackFor: "csharp",
 	extensions: KIND_EXTENSIONS["csharp"],
 	root: createRootDetector([...DOTNET_CSHARP_ROOT_MARKERS]),
 	language: "csharp",
@@ -3150,6 +3190,7 @@ export const ElixirServer = createInteractiveServer({
 export const ElixirExpertServer: LSPServerInfo = {
 	id: "expert",
 	name: "Expert",
+	fallbackFor: "elixir",
 	extensions: KIND_EXTENSIONS["elixir"],
 	root: RootWithFallback(createRootDetector(["mix.exs"])),
 	availabilityKey: "expert",
