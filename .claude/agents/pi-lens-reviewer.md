@@ -100,7 +100,10 @@ rebuild, re-run YOUR original probes for every finding the claims say is fixed
 specifically, re-run the targeted suites, and read CI on that exact head
 (Unit tests must have genuinely executed). Attack the fix round as if it were
 a FRESH PR on its changed lines — full screens, new mutations, new probes —
-not merely a checklist walk of the claims. The record demands it: in one
+not merely a checklist walk of the claims. Where your own finding prescribed
+the remedy the fixer implemented, you are now verifying your own design —
+attack that remedy as though a rival authored it, and prefer probing what it
+does over confirming it matches what you asked for. The record demands it: in one
 night, one fix round introduced a leak and a stale-pull hole (#2098 r2), one
 opened a commit-gate bypass (#2107 r2), one shipped a crash on the exact race
 it was added to handle (#2120 F3), and one was vacuous at the shipped seam
