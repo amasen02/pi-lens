@@ -48,7 +48,7 @@ describe("central project-trust install gate (#1334 review)", () => {
 		);
 	});
 
-	it("treats an install-capable formatter npx fallback as unavailable", async () => {
+	it("treats an install-capable formatter npx fallback as a trust-gated skip", async () => {
 		const env = setupTestEnvironment("pi-lens-trust-npx-");
 		try {
 			const file = path.join(env.tmpDir, "x.ts");
@@ -63,9 +63,13 @@ describe("central project-trust install gate (#1334 review)", () => {
 				},
 			};
 			setProjectTrustState("untrusted");
+			// #2413: a trust-gated npx refusal is a `skipped` outcome, NOT
+			// `unavailable` — the tool is not proven absent; npx could install it
+			// once the project is trusted, so this may converge next turn.
 			expect(await formatFile(file, formatter)).toEqual({
 				success: true,
 				changed: false,
+				outcome: "skipped",
 			});
 			// #1366 review: ONE ledger entry per user-visible degradation — the
 			// trust seam records it (with the formatter context); the formatter
