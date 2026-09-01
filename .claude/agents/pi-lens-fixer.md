@@ -116,6 +116,17 @@ finding with its red-run evidence.
   claiming it; reviewers diff reports against reality and a false claim costs
   a full extra round.
 
+- **Never park your turn behind a background command.** Two agents in one day
+  went idle "waiting" on a backgrounded full `npm test` and had to be manually
+  resumed. Run builds and test suites in the FOREGROUND with an explicit
+  timeout. If a run cannot finish in the foreground — the full suite is
+  serialized machine-wide and parallel agents contend for it — do not
+  queue-and-sleep: get your targeted suites plus the governance sweeps green,
+  push, and let CI's Unit tests be the authoritative full gate, saying
+  explicitly in your report that you delegated the full suite to CI and why.
+  Ending your turn is for "deliverable produced" or "blocked on the
+  orchestrator," never "waiting on a process."
+
 ## Report format
 
 Outcome first: branch, PR URL, then root cause in two sentences, red-run
