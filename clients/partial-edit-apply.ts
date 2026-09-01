@@ -1,10 +1,15 @@
 import type { EditToolInput } from "@earendil-works/pi-coding-agent";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
+import { writeFileAtomic } from "./atomic-write.js";
+import { createFileTime } from "./file-time.js";
 import {
 	detectLineEnding,
 	normalizeToLF,
 	restoreLineEndings,
 } from "./host-edit-normalize.js";
+import { PathKeyedMap } from "./path-keyed-map.js";
+import { normalizeMapKey } from "./path-utils.js";
 import {
 	boundedEditIndexes,
 	createReadGuardEditBatchSummary,
@@ -18,49 +23,264 @@ import {
 // compile error here rather than a silent runtime mismatch (#257 / refs #2).
 type HostEdit = EditToolInput["edits"][number];
 
+/**
+ * Identity of the file content the preflight resolved the batch against
+ * (#1053). The apply step re-reads the file and rejects the whole batch when
+ * this identity no longer holds, so spans resolved against one snapshot are
+ * never re-interpreted against changed bytes. The hash covers byte identity
+ * completely; no length or mtime sibling is needed alongside it.
+ */
+export interface EditSnapshotIdentity {
+	/** sha256 of the UTF-8-decoded file content the preflight read. */
+	hash: string;
+}
+
 export interface PartiallyApplicableEdit {
+	/** The submitted (post-autopatch) old text, as the preflight received it. */
 	oldText: HostEdit["oldText"];
+	/**
+	 * The exact LF text the preflight located at the span — what this module
+	 * replaces. Differs from `oldText` only when a normalization tier (host
+	 * match-space folding, lone-CR fold) recovered the real file bytes.
+	 */
+	appliedSpanText: string;
 	// Widened vs the host: pi-lens models a pure deletion as an absent newText.
 	newText: HostEdit["newText"] | undefined;
 	originalIndex: number;
+	/** Snapshot the span was resolved against (#1053). */
+	snapshot: EditSnapshotIdentity;
+	/** Inclusive start offset of the span in the snapshot's LF view. */
+	spanStart: number;
+	/** Exclusive end offset of the span in the snapshot's LF view. */
+	spanEnd: number;
+}
+
+export type PartialApplyRejectionReason =
+	| "stale_snapshot"
+	| "span_changed"
+	| "span_overlap"
+	| "invalid_batch";
+
+export interface PartialApplyRejection {
+	reason: PartialApplyRejectionReason;
+	/** Bounded, agent-actionable detail for the block reason. */
+	detail: string;
 }
 
 export interface PartialEditApplyResult {
 	appliedCount: number;
-	appliedTotal?: number;
+	appliedTotal: number;
 	appliedIndices: string;
 	postEditOutput?: string;
-	/** Present for the instrumented read-guard path. */
-	skippedCount?: number;
-	skippedTotal?: number;
-	skippedIndices?: string;
-	indexesTruncated?: boolean;
-	postEditStatus?: "not_run" | "succeeded" | "failed";
+	postEditStatus: "not_run" | "succeeded" | "failed";
 	summary?: ReadGuardEditBatchSummary;
+	/**
+	 * Set when the batch was rejected BEFORE any write (stale, drifted, or
+	 * overlapping spans). No bytes changed, no post-edit dispatch ran.
+	 */
+	rejected?: PartialApplyRejection;
 }
 
-function replaceOnce(
-	content: string,
-	oldText: string,
-	newText: string,
-): {
-	content: string;
-	changed: boolean;
-} {
-	const idx = content.indexOf(oldText);
-	if (idx === -1) return { content, changed: false };
-	return {
-		content:
-			content.slice(0, idx) + newText + content.slice(idx + oldText.length),
-		changed: true,
-	};
+export interface AppliedPartialEditRecord {
+	/** Canonical (LF + trailing-whitespace-stripped) submitted old text. */
+	oldKey: string;
+	/** Canonical applied new text ("" models a pure deletion). */
+	newKey: string;
+	/** Hash of the complete file state immediately after this edit committed. */
+	contentHash?: string;
+	appliedAtMs: number;
+}
+
+const MAX_APPLIED_RECORDS_PER_FILE = 8;
+const MAX_APPLIED_RECORD_FILES = 64;
+
+/**
+ * Canonical key for an applied edit: LF-normalized, per-line trailing
+ * whitespace stripped, trailing empty lines dropped. Retry payloads go through
+ * the same normalization, so an identical resubmission matches its record even
+ * when the two passes' autopatch results diverged on trailing whitespace
+ * (deterministic given identical payloads; the strip removes the only
+ * payload-dependent axis that survives to the retry).
+ */
+export function stripOldTextTrailingWhitespace(value: string): string {
+	const lines = value
+		.replace(/\r\n/g, "\n")
+		.split("\n")
+		.map((l) => l.trimEnd());
+	while (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
+	return lines.join("\n");
+}
+
+function countLfOccurrences(content: string, needle: string): number {
+	if (!needle) return 0;
+	let count = 0;
+	let pos = 0;
+	while (pos < content.length) {
+		const idx = content.indexOf(needle, pos);
+		if (idx === -1) break;
+		count += 1;
+		pos = idx + needle.length;
+	}
+	return count;
 }
 
 /**
- * Applies already-resolved oldText edits from the preflight path, then invokes
- * the caller's normal post-edit bookkeeping/pipeline hook. The edits are exact
- * LF-normalized replacements; entries that no longer match are skipped rather
- * than logged as applied.
+ * Evidence check for an exact-retry recognition (#2402): the recorded pair was
+ * applied by this process; the content evidence answers whether that state is
+ * still the file's state. Deliberately NOT a global heuristic — it only runs
+ * for an edit whose exact (oldText, newText) pair is on record.
+ *
+ * - oldText not contained in newText: the applied state holds when oldText is
+ *   gone and newText is present.
+ * - oldText contained in newText (e.g. an extended import line): the applied
+ *   state holds when every remaining oldText occurrence lies inside a newText
+ *   occurrence. Re-applying would duplicate newText — the exact #2402 loop.
+ */
+export function isExactAppliedRetry(args: {
+	contentLf: string;
+	oldKey: string;
+	newKey: string;
+	/** Current raw file hash, when the caller can provide it. */
+	contentHash?: string;
+	/** Raw file hash recorded immediately after the original commit. */
+	expectedContentHash?: string;
+}): boolean {
+	const { contentLf, oldKey, newKey, contentHash, expectedContentHash } = args;
+	if (expectedContentHash !== undefined && contentHash !== expectedContentHash)
+		return false;
+	if (!oldKey) return false;
+	if (newKey === "") return countLfOccurrences(contentLf, oldKey) === 0;
+	if (!newKey.includes(oldKey)) {
+		return (
+			countLfOccurrences(contentLf, oldKey) === 0 &&
+			countLfOccurrences(contentLf, newKey) >= 1
+		);
+	}
+	const newOccurrences: Array<[number, number]> = [];
+	let pos = 0;
+	while (pos < contentLf.length) {
+		const idx = contentLf.indexOf(newKey, pos);
+		if (idx === -1) break;
+		newOccurrences.push([idx, idx + newKey.length]);
+		pos = idx + newKey.length;
+	}
+	if (newOccurrences.length === 0) return false;
+	pos = 0;
+	while (pos < contentLf.length) {
+		const idx = contentLf.indexOf(oldKey, pos);
+		if (idx === -1) break;
+		const end = idx + oldKey.length;
+		if (!newOccurrences.some(([s, e]) => s <= idx && e >= end)) return false;
+		pos = end;
+	}
+	return true;
+}
+
+/**
+ * Session-scoped store of applied partial/full edits, keyed by normalized file
+ * path. `RuntimeCoordinator.resetForSession` clears it, so an applied record
+ * never outlives the session whose edit produced it. Records are bounded on
+ * both axes (per-file entries, and files) with oldest-entry eviction.
+ */
+export class PartialApplyRecordStore {
+	private readonly files = new PathKeyedMap<AppliedPartialEditRecord[]>(
+		normalizeMapKey,
+	);
+
+	find(
+		filePath: string,
+		oldText: string | undefined,
+		newText: string | undefined,
+	): AppliedPartialEditRecord | undefined {
+		if (!oldText) return undefined;
+		const oldKey = stripOldTextTrailingWhitespace(oldText);
+		const newKey = stripOldTextTrailingWhitespace(newText ?? "");
+		const records = this.files.get(filePath) ?? [];
+		return records.find((r) => r.oldKey === oldKey && r.newKey === newKey);
+	}
+
+	record(
+		filePath: string,
+		oldText: string,
+		newText: string | undefined,
+		contentHash?: string,
+	): void {
+		const oldKey = stripOldTextTrailingWhitespace(oldText);
+		if (!oldKey) return;
+		const newKey = stripOldTextTrailingWhitespace(newText ?? "");
+		const records = this.files.get(filePath) ?? [];
+		const existing = records.findIndex(
+			(r) => r.oldKey === oldKey && r.newKey === newKey,
+		);
+		if (existing >= 0) records.splice(existing, 1);
+		const entry: AppliedPartialEditRecord = {
+			oldKey,
+			newKey,
+			contentHash: contentHash ?? hashFile(filePath),
+			appliedAtMs: Date.now(),
+		};
+		if (records.length >= MAX_APPLIED_RECORDS_PER_FILE) records.shift();
+		records.push(entry);
+		if (this.files.size >= MAX_APPLIED_RECORD_FILES) {
+			const oldest = this.files.keys().next().value;
+			if (oldest !== undefined) this.files.delete(oldest);
+		}
+		this.files.set(filePath, records);
+	}
+
+	clear(): void {
+		this.files.clear();
+	}
+
+	get fileCount(): number {
+		return this.files.size;
+	}
+}
+
+// Locks are process-global in FileTime (module-global map keyed by resolved
+// path), so one instance here serializes against every other FileTime user.
+const fileLock = createFileTime("partial-edit-apply");
+
+function hashContent(content: string): string {
+	return createHash("sha256").update(content, "utf8").digest("hex");
+}
+
+function hashFile(filePath: string): string | undefined {
+	try {
+		return createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Internal rejection signal: raised only BEFORE any bytes are written, so a
+ * rejection can never be confused with a commit failure.
+ */
+class PartialApplyRejectionError extends Error {
+	constructor(
+		public readonly reason: PartialApplyRejectionReason,
+		public readonly detail: string,
+	) {
+		super(detail);
+		this.name = "PartialApplyRejectionError";
+	}
+}
+
+/**
+ * Applies preflight-approved spans from the original snapshot, then invokes the
+ * caller's normal post-edit bookkeeping/pipeline hook (#1053, #2402).
+ *
+ * Contract:
+ * - Spans are consumed as resolved; oldText is never re-searched against a
+ *   changed buffer.
+ * - The whole batch is validated (snapshot identity, span bounds, span text,
+ *   pairwise non-overlap) BEFORE any write; a rejection writes nothing and
+ *   dispatches no post-edit pipeline.
+ * - The commit goes through the shared atomic writer under the file lock.
+ * - A committed write and a post-edit analysis failure are separate outcomes;
+ *   the caller decides the message, and committed bytes are never reported as
+ *   a retryable oldText miss.
  */
 export async function applyPartiallyApplicableEdits(args: {
 	filePath: string;
@@ -69,61 +289,173 @@ export async function applyPartiallyApplicableEdits(args: {
 	/** Read-guard preflight summary, reused rather than re-shaped here. */
 	summary?: ReadGuardEditBatchSummary;
 	correlationId?: string;
+	/** Session-scoped applied-edit records for exact-retry recognition. */
+	recordStore?: PartialApplyRecordStore;
 }): Promise<PartialEditApplyResult> {
 	const startedAt = Date.now();
-	const raw = fs.readFileSync(args.filePath, "utf-8");
-	// Detect + restore line endings the way the host edit tool does:
-	// first-occurrence-wins detection (not "any CRLF present") and lone-CR -> LF
-	// normalization, so this self-apply path can't diverge from how the host
-	// would have written the same edits (#257).
-	const ending = detectLineEnding(raw);
-	let content = normalizeToLF(raw);
-	const applied: number[] = [];
-	const skipped: number[] = [];
+	const summaryRef = args.summary;
+	const correlationId = args.correlationId;
+	const logBatchEvent = (
+		entry: Parameters<typeof logReadGuardEvent>[0],
+	): void => logReadGuardEvent({ ...entry, correlationId });
 
-	for (const edit of args.edits) {
-		const oldText = normalizeToLF(edit.oldText);
-		const newText = normalizeToLF(edit.newText ?? "");
-		const replaced = replaceOnce(content, oldText, newText);
-		if (!replaced.changed) {
-			skipped.push(edit.originalIndex);
-			continue;
-		}
-		content = replaced.content;
-		applied.push(edit.originalIndex);
+	const reject = (
+		reason: PartialApplyRejectionReason,
+		detail: string,
+	): PartialEditApplyResult => {
+		logBatchEvent({
+			event: "edit_partial_apply_rejected",
+			filePath: args.filePath,
+			metadata: {
+				tool: "edit",
+				rejectionReason: reason,
+				detail,
+				editCount: args.edits.length,
+			},
+		});
+		return {
+			appliedCount: 0,
+			appliedTotal: 0,
+			appliedIndices: "",
+			postEditStatus: "not_run",
+			rejected: { reason, detail },
+		};
+	};
+	if (args.edits.length === 0) {
+		return reject(
+			"invalid_batch",
+			"no preflight-approved edits were carried into the apply step",
+		);
 	}
-
-	let commitStatus: ReadGuardEditBatchSummary["commitStatus"] =
-		applied.length > 0 ? "committed" : "no_changes";
-	try {
-		if (applied.length > 0) {
-			fs.writeFileSync(
-				args.filePath,
-				restoreLineEndings(content, ending),
-				"utf-8",
+	const snapshot = args.edits[0].snapshot;
+	for (const edit of args.edits) {
+		if (edit.snapshot.hash !== snapshot.hash) {
+			return reject(
+				"invalid_batch",
+				"carried edits reference different snapshot identities; the batch must be rebuilt from one preflight",
 			);
 		}
+	}
+
+	// Validate + commit inside the file lock so a concurrent same-file writer
+	// (formatter, LSP edit, another session's partial apply) cannot interleave
+	// between the identity re-check and the rename.
+	const commit = (): string => {
+		const raw = fs.readFileSync(args.filePath, "utf-8");
+		if (hashContent(raw) !== snapshot.hash) {
+			throw new PartialApplyRejectionError(
+				"stale_snapshot",
+				"the file changed since the preflight resolved these edits; rebuild the edit from the current content",
+			);
+		}
+		const ending = detectLineEnding(raw);
+		const lf = normalizeToLF(raw);
+
+		// The span-text equality is the single span guard: `slice` clamps to the
+		// buffer, so an out-of-bounds, inverted, or drifted span cannot produce
+		// the approved text and is rejected here as one rejection class. A
+		// separate bounds check would only re-label the same failure.
+		const ordered = [...args.edits].sort((a, b) => a.spanStart - b.spanStart);
+		for (let i = 0; i < ordered.length; i += 1) {
+			const edit = ordered[i];
+			if (lf.slice(edit.spanStart, edit.spanEnd) !== edit.appliedSpanText) {
+				throw new PartialApplyRejectionError(
+					"span_changed",
+					`edits[${edit.originalIndex}] span no longer holds the text the preflight approved; the batch must be rebuilt from a fresh preflight`,
+				);
+			}
+			if (i > 0) {
+				const prev = ordered[i - 1];
+				if (edit.spanStart < prev.spanEnd) {
+					throw new PartialApplyRejectionError(
+						"span_overlap",
+						`edits[${prev.originalIndex}] and edits[${edit.originalIndex}] resolved to overlapping spans; extend one oldText to disambiguate the location`,
+					);
+				}
+			}
+		}
+
+		let committed = lf;
+		for (let i = ordered.length - 1; i >= 0; i -= 1) {
+			const edit = ordered[i];
+			const newText = normalizeToLF(edit.newText ?? "");
+			committed =
+				committed.slice(0, edit.spanStart) +
+				newText +
+				committed.slice(edit.spanEnd);
+		}
+
+		const output = restoreLineEndings(committed, ending);
+		writeFileAtomic(args.filePath, output, {
+			bestEffort: false,
+		});
+		return hashContent(output);
+	};
+
+	let commitStatus: ReadGuardEditBatchSummary["commitStatus"] = "committed";
+	let committedContentHash: string | undefined;
+	try {
+		await fileLock.withLock(args.filePath, async () => {
+			committedContentHash = commit();
+			for (const edit of args.edits) {
+				args.recordStore?.record(
+					args.filePath,
+					edit.oldText,
+					edit.newText,
+					committedContentHash,
+				);
+			}
+		});
 	} catch (error) {
-		commitStatus = "failed";
-		if (args.summary || args.correlationId) {
-			const summary = createReadGuardEditBatchSummary({
-				...(args.summary ?? {
+		if (error instanceof PartialApplyRejectionError) {
+			commitStatus = "not_attempted";
+			const baseSummary =
+				summaryRef ??
+				createReadGuardEditBatchSummary({
 					requestedIndexes: boundedEditIndexes(
-						args.edits.slice(0, 100).map((edit) => edit.originalIndex),
+						args.edits.map((edit) => edit.originalIndex),
+					),
+					requestedTotal: args.edits.length,
+				});
+			const summary = createReadGuardEditBatchSummary({
+				...baseSummary,
+				participantIds: correlationId
+					? [...baseSummary.participantIds, correlationId]
+					: baseSummary.participantIds,
+				participantTotal: correlationId
+					? baseSummary.participantTotal + 1
+					: baseSummary.participantTotal,
+				commitStatus,
+				postEditStatus: "not_run",
+				terminalStatus: "blocked",
+				durationMs: Date.now() - startedAt,
+			});
+			logBatchEvent({
+				event: "edit_batch_summary",
+				filePath: args.filePath,
+				metadata: { tool: "edit", editBatchSummary: summary },
+			});
+			return reject(error.reason, error.detail);
+		}
+		commitStatus = "failed";
+		if (summaryRef || correlationId) {
+			const summary = createReadGuardEditBatchSummary({
+				...(summaryRef ?? {
+					requestedIndexes: boundedEditIndexes(
+						args.edits.map((edit) => edit.originalIndex),
 					),
 					requestedTotal: args.edits.length,
 				}),
 				appliedIndexes: [],
 				appliedTotal: 0,
-				participantIds: args.correlationId ? [args.correlationId] : undefined,
-				participantTotal: args.correlationId ? 1 : undefined,
+				participantIds: correlationId ? [correlationId] : undefined,
+				participantTotal: correlationId ? 1 : undefined,
 				commitStatus,
 				terminalStatus: "failed",
 				durationMs: Date.now() - startedAt,
 			});
-			logReadGuardEvent({
+			logBatchEvent({
 				event: "edit_batch_summary",
-				correlationId: args.correlationId,
 				filePath: args.filePath,
 				metadata: { tool: "edit", editBatchSummary: summary },
 			});
@@ -133,7 +465,7 @@ export async function applyPartiallyApplicableEdits(args: {
 
 	let postEditOutput: string | undefined;
 	let postEditStatus: ReadGuardEditBatchSummary["postEditStatus"] = "not_run";
-	if (applied.length > 0 && args.afterWrite) {
+	if (args.afterWrite) {
 		try {
 			postEditOutput = await args.afterWrite();
 			postEditStatus = "succeeded";
@@ -141,86 +473,69 @@ export async function applyPartiallyApplicableEdits(args: {
 			// The write is committed. Preserve the existing caller behavior for
 			// uninstrumented callers; the read-guard path records and handles it.
 			postEditStatus = "failed";
-			if (!args.summary && !args.correlationId) throw error;
+			if (!summaryRef && !correlationId) throw error;
 		}
 	}
-	if (!args.summary && !args.correlationId) {
+	const appliedIndexes = boundedEditIndexes(
+		args.edits.map((edit) => edit.originalIndex),
+	);
+	if (!summaryRef && !correlationId) {
 		return {
-			appliedCount: applied.length,
-			appliedIndices: formatBoundedEditIndexes(applied),
+			appliedCount: args.edits.length,
+			appliedTotal: args.edits.length,
+			appliedIndices: formatBoundedEditIndexes(appliedIndexes),
 			postEditOutput,
+			postEditStatus,
 		};
 	}
 	const baseSummary =
-		args.summary ??
+		summaryRef ??
 		createReadGuardEditBatchSummary({
-			requestedIndexes: boundedEditIndexes(
-				args.edits.slice(0, 100).map((edit) => edit.originalIndex),
-			),
+			requestedIndexes: appliedIndexes,
 			requestedTotal: args.edits.length,
-			resolvedIndexes: boundedEditIndexes(
-				args.edits.slice(0, 100).map((edit) => edit.originalIndex),
-			),
+			resolvedIndexes: appliedIndexes,
 			resolvedTotal: args.edits.length,
 		});
 	const summary = createReadGuardEditBatchSummary({
 		...baseSummary,
-		rejectedReasons: [
-			...baseSummary.rejectedReasons,
-			...skipped.slice(0, 100).map((index) => ({
-				index,
-				code: "replace_once_skipped" as const,
-			})),
-		],
-		rejectedTotal: baseSummary.rejectedTotal + skipped.length,
-		appliedIndexes: applied,
-		appliedTotal: applied.length,
-		participantIds: args.correlationId
-			? [...baseSummary.participantIds, args.correlationId]
+		appliedIndexes,
+		appliedTotal: args.edits.length,
+		participantIds: correlationId
+			? [...baseSummary.participantIds, correlationId]
 			: baseSummary.participantIds,
-		participantTotal: args.correlationId
+		participantTotal: correlationId
 			? baseSummary.participantTotal + 1
 			: baseSummary.participantTotal,
 		commitStatus,
 		postEditStatus,
-		terminalStatus:
-			postEditStatus === "failed"
-				? "failed"
-				: applied.length === 0
-					? "skipped"
-					: "success",
+		// Commit failures rethrow above, so reaching here means the commit
+		// landed; only the post-edit analysis can fail from this point on.
+		terminalStatus: postEditStatus === "failed" ? "failed" : "success",
 		durationMs: Date.now() - startedAt,
 	});
 	if (postEditStatus === "failed") {
-		logReadGuardEvent({
+		logBatchEvent({
 			event: "edit_post_edit_pipeline_failed",
-			correlationId: args.correlationId,
 			filePath: args.filePath,
 			metadata: {
 				tool: "edit",
 				commitStatus,
-				appliedCount: applied.length,
-				appliedIndexes: applied.slice(0, 100),
-				appliedTotal: applied.length,
+				appliedCount: args.edits.length,
+				appliedIndexes,
+				appliedTotal: args.edits.length,
 			},
 		});
 	}
-	logReadGuardEvent({
+	logBatchEvent({
 		event: "edit_batch_summary",
-		correlationId: args.correlationId,
 		filePath: args.filePath,
 		metadata: { tool: "edit", editBatchSummary: summary },
 	});
 	return {
-		appliedCount: applied.length,
-		appliedTotal: applied.length,
-		appliedIndices: formatBoundedEditIndexes(applied),
+		appliedCount: args.edits.length,
+		appliedTotal: args.edits.length,
+		appliedIndices: formatBoundedEditIndexes(appliedIndexes),
 		postEditOutput,
-		skippedCount: skipped.length,
-		skippedTotal: skipped.length,
-		skippedIndices: formatBoundedEditIndexes(skipped),
-		indexesTruncated:
-			applied.length > 100 || skipped.length > 100 || summary.indexesTruncated,
 		postEditStatus,
 		summary,
 	};

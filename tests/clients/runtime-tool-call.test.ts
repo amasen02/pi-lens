@@ -30,9 +30,37 @@ vi.mock("../../clients/bootstrap.js", () => ({
 		biomeClient: {},
 		ruffClient: {},
 		metricsClient: {},
-		agentBehaviorClient: { recordToolCall: () => {}, formatWarnings: () => "" },
+		agentBehaviorClient: { recordToolCall: () => [], formatWarnings: () => "" },
 	}),
 }));
+
+// #2402: the partial-apply afterWrite routes through handleToolResult, whose
+// dispatch pipeline is a real subprocess surface. The mock keeps the test at
+// the contract seam (post-edit analysis succeeded/failed) without spawning
+// formatters or runners; runPipeline's isError is exactly what the afterWrite
+// callback reads to classify postEditStatus.
+const runPipelineMock = vi.hoisted(() => vi.fn());
+vi.mock("../../clients/pipeline.js", () => ({
+	runPipeline: runPipelineMock,
+}));
+
+function mockPipelineSucceeds(output = ""): void {
+	runPipelineMock.mockResolvedValue({
+		output,
+		hasBlockers: false,
+		isError: false,
+		fileModified: false,
+	});
+}
+
+function mockPipelineFails(output = "post-edit pipeline blocked"): void {
+	runPipelineMock.mockResolvedValue({
+		output,
+		hasBlockers: true,
+		isError: true,
+		fileModified: false,
+	});
+}
 
 function baseDeps(
 	overrides: Partial<Parameters<typeof handleToolCall>[0]> = {},
@@ -261,6 +289,253 @@ describe("handleToolCall", () => {
 
 			expect(result).toMatchObject({ block: true });
 			expect((result as { reason: string }).reason).toContain("shared");
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+// ── #2402: mixed-validity preflight → partial apply contract ────────────────
+// Drives the REAL handleToolCall path (preflight → partial apply → synthetic
+// post-edit dispatch) with only the process boundary mocked (runPipeline).
+describe("#2402 partial-apply contract (mixed-validity preflight)", () => {
+	// The canonical #2402 batch: edits[0] is valid and oldText is contained in
+	// its own newText (an extended import line); edits[1] genuinely misses.
+	function mixedBatchEvent(filePath: string) {
+		return {
+			toolName: "edit",
+			input: {
+				path: filePath,
+				edits: [
+					{
+						oldText: "import { A } from 'm';",
+						newText: "import { A } from 'm';\nimport { B } from 'm';",
+					},
+					{ oldText: "function gone() {}", newText: "noop" },
+				],
+			},
+		};
+	}
+
+	it("commits the valid subset once and reports PARTIAL APPLY on first attempt", async () => {
+		const env = setupTestEnvironment("pi-lens-2402-first-");
+		try {
+			mockPipelineSucceeds("post-edit analysis ok");
+			const filePath = createTempFile(
+				env.tmpDir,
+				"src/first.ts",
+				"import { A } from 'm';\nconst tail = 1;\n",
+			);
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+
+			const result = await handleToolCall(
+				baseDeps({
+					runtime,
+					ctx: { cwd: env.tmpDir },
+					event: mixedBatchEvent(filePath),
+				}),
+			);
+
+			expect(result).toMatchObject({ block: true });
+			const reason = (result as { reason: string }).reason;
+			expect(reason.startsWith("⚠️ PARTIAL APPLY")).toBe(true);
+			expect(reason).toContain("edits[0]");
+			expect(reason).toContain("Post-apply analysis");
+			expect(fs.readFileSync(filePath, "utf-8")).toBe(
+				"import { A } from 'm';\nimport { B } from 'm';\nconst tail = 1;\n",
+			);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("labels committed partial-apply bytes as applied even when post-edit analysis fails", async () => {
+		const env = setupTestEnvironment("pi-lens-2402-committed-");
+		try {
+			mockPipelineFails();
+			const filePath = createTempFile(
+				env.tmpDir,
+				"src/committed.ts",
+				"import { A } from 'm';\nconst tail = 1;\n",
+			);
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+
+			const result = await handleToolCall(
+				baseDeps({
+					runtime,
+					ctx: { cwd: env.tmpDir },
+					event: mixedBatchEvent(filePath),
+				}),
+			);
+
+			expect(result).toMatchObject({ block: true });
+			const reason = (result as { reason: string }).reason;
+			// The bytes are on disk; the message must lead with that fact and must
+			// never relabel them as a retryable oldText miss.
+			expect(reason.startsWith("⚠️ PARTIAL APPLY")).toBe(true);
+			expect(reason).not.toContain("RETRYABLE");
+			expect(reason).toContain("committed bytes stand");
+			expect(fs.readFileSync(filePath, "utf-8")).toContain(
+				"import { B } from 'm';",
+			);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("recognizes an exact retry of an already-applied edit instead of re-applying it", async () => {
+		const env = setupTestEnvironment("pi-lens-2402-retry-");
+		try {
+			mockPipelineSucceeds("post-edit analysis ok");
+			const filePath = createTempFile(
+				env.tmpDir,
+				"src/retry.ts",
+				"import { A } from 'm';\nconst tail = 1;\n",
+			);
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			const event = mixedBatchEvent(filePath);
+
+			await handleToolCall(
+				baseDeps({ runtime, ctx: { cwd: env.tmpDir }, event }),
+			);
+			const afterFirst = fs.readFileSync(filePath, "utf-8");
+			expect(afterFirst).toBe(
+				"import { A } from 'm';\nimport { B } from 'm';\nconst tail = 1;\n",
+			);
+
+			// Identical retry: edits[0]'s oldText still occurs exactly once
+			// (inside its own applied newText). The retry must recognize the
+			// applied record, not re-execute the write.
+			const retry = await handleToolCall(
+				baseDeps({ runtime, ctx: { cwd: env.tmpDir }, event }),
+			);
+
+			expect(retry).toMatchObject({ block: true });
+			// Duplication is the #2402 defect: the file must be byte-identical.
+			expect(fs.readFileSync(filePath, "utf-8")).toBe(afterFirst);
+			const reason = (retry as { reason: string }).reason;
+			expect(reason).toContain("already applied");
+			// edits[0] is never reported as an oldText miss: the applied record
+			// resolves it before the failure ladder runs.
+			expect(reason).not.toMatch(/edits\[0\]\.oldText/);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("answers an exact retry of a fully-applied edit with an already-applied verdict", async () => {
+		const env = setupTestEnvironment("pi-lens-2402-full-retry-");
+		try {
+			mockPipelineSucceeds();
+			const filePath = createTempFile(
+				env.tmpDir,
+				"src/full-retry.ts",
+				"const a = 1;\nconst b = 2;\n",
+			);
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			const editEvent = {
+				toolName: "edit",
+				input: {
+					path: filePath,
+					edits: [{ oldText: "const b = 2;", newText: "const b = 20;" }],
+				},
+			};
+
+			// Simulate the host having applied the edit: write the result, then
+			// run the real tool_result handler so the full-success record lands.
+			fs.writeFileSync(filePath, "const a = 1;\nconst b = 20;\n");
+			const { handleToolResult } =
+				await import("../../clients/runtime-tool-result.js");
+			await handleToolResult({
+				event: {
+					...editEvent,
+					content: [],
+				},
+				getFlag: () => false,
+				dbg: () => {},
+				runtime,
+				cacheManager: new CacheManager(false),
+				biomeClient: {},
+				ruffClient: {},
+				metricsClient: {},
+				resetLSPService: () => {},
+				agentBehaviorRecord: () => [],
+				formatBehaviorWarnings: () => "",
+			} as never);
+
+			// Identical retry through the real tool_call path.
+			const retry = await handleToolCall(
+				baseDeps({ runtime, ctx: { cwd: env.tmpDir }, event: editEvent }),
+			);
+
+			expect(retry).toMatchObject({ block: true });
+			const reason = (retry as { reason: string }).reason;
+			expect(reason.startsWith("✅ ALREADY APPLIED")).toBe(true);
+			expect(reason).toContain("edits[0]");
+			expect(reason).not.toMatch(/RETRYABLE|attempt #/);
+			expect(fs.readFileSync(filePath, "utf-8")).toBe(
+				"const a = 1;\nconst b = 20;\n",
+			);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("keeps one mutation receipt, change-log entry, and read-guard stamp per partial apply", async () => {
+		const env = setupTestEnvironment("pi-lens-2402-bookkeeping-");
+		try {
+			mockPipelineSucceeds("post-edit analysis ok");
+			const filePath = createTempFile(
+				env.tmpDir,
+				"src/bookkeeping.ts",
+				"const a = 1;\nconst b = 2;\n",
+			);
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			const recordWritten = vi.spyOn(runtime.readGuard, "recordWritten");
+			const seqBefore = runtime.projectSeq;
+
+			const result = await handleToolCall(
+				baseDeps({
+					runtime,
+					ctx: { cwd: env.tmpDir },
+					event: {
+						toolName: "edit",
+						input: {
+							path: filePath,
+							edits: [
+								{ oldText: "const b = 2;", newText: "const b = 20;" },
+								{ oldText: "function gone() {}", newText: "noop" },
+							],
+						},
+					},
+				}),
+			);
+
+			expect(result).toMatchObject({ block: true });
+			// One mutation: the partial apply's committed write, attributed to
+			// source `partial-apply` through the single mutation seam (#2000).
+			const receipts = runtime.getMutationsSince(seqBefore);
+			expect(receipts).toHaveLength(1);
+			expect(receipts[0].source).toBe("partial-apply");
+			expect(runtime.projectSeq).toBeGreaterThan(seqBefore);
+
+			// The durable change log carries the same single entry.
+			const { readProjectChanges } =
+				await import("../../clients/project-changes.js");
+			const entries = readProjectChanges(env.tmpDir).filter(
+				(entry) => entry.filePath === filePath,
+			);
+			expect(entries).toHaveLength(1);
+			expect(entries[0].source).toBe("partial-apply");
+
+			// The synthetic post-edit dispatch stamps the read guard so a
+			// follow-up edit is not judged stale against our own commit.
+			expect(recordWritten).toHaveBeenCalledWith(filePath);
 		} finally {
 			env.cleanup();
 		}

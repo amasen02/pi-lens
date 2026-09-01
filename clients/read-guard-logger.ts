@@ -36,7 +36,7 @@ export const MAX_EDIT_BATCH_ITEMS = 100;
 export type EditBatchRejectionCode =
 	| "oldtext_not_found"
 	| "oldtext_duplicate"
-	| "replace_once_skipped"
+	| "span_overlap"
 	| "preflight_blocked"
 	| "write_failed"
 	| "pipeline_failed";
@@ -61,6 +61,10 @@ export interface ReadGuardEditBatchSummary {
 	appliedCount: number;
 	appliedTotal: number;
 	appliedIndexes: number[];
+	/** Edits recognized as exact retries of already-applied pairs (#2402). */
+	alreadyAppliedCount: number;
+	alreadyAppliedTotal: number;
+	alreadyAppliedIndexes: number[];
 	/** Correlations participating in a coalesced terminal outcome. */
 	participantIds: string[];
 	participantTotal: number;
@@ -133,6 +137,8 @@ export function createReadGuardEditBatchSummary(args: {
 	rejectedTotal?: number;
 	appliedIndexes?: number[];
 	appliedTotal?: number;
+	alreadyAppliedIndexes?: number[];
+	alreadyAppliedTotal?: number;
 	participantIds?: string[];
 	participantTotal?: number;
 	commitStatus?: ReadGuardEditBatchSummary["commitStatus"];
@@ -146,6 +152,7 @@ export function createReadGuardEditBatchSummary(args: {
 		(entry) => Number.isInteger(entry.index) && entry.index >= 0,
 	);
 	const appliedSource = validIndexes(args.appliedIndexes ?? []);
+	const alreadyAppliedSource = validIndexes(args.alreadyAppliedIndexes ?? []);
 	const requestedIndexes = boundedEditIndexes(requestedSource);
 	const resolvedIndexes = boundedEditIndexes(resolvedSource);
 	const rejectedReasons = rejectedSource.slice(0, MAX_EDIT_BATCH_ITEMS);
@@ -153,6 +160,7 @@ export function createReadGuardEditBatchSummary(args: {
 		rejectedSource.map((entry) => entry.index),
 	);
 	const appliedIndexes = boundedEditIndexes(appliedSource);
+	const alreadyAppliedIndexes = boundedEditIndexes(alreadyAppliedSource);
 	const participantSource = (args.participantIds ?? []).filter(
 		(id): id is string => typeof id === "string" && id.length > 0,
 	);
@@ -185,6 +193,10 @@ export function createReadGuardEditBatchSummary(args: {
 		appliedCount: appliedSource.length,
 		appliedTotal: args.appliedTotal ?? appliedSource.length,
 		appliedIndexes,
+		alreadyAppliedCount: alreadyAppliedSource.length,
+		alreadyAppliedTotal:
+			args.alreadyAppliedTotal ?? alreadyAppliedSource.length,
+		alreadyAppliedIndexes,
 		participantIds,
 		participantTotal: args.participantTotal ?? participantSource.length,
 		participantIdsTruncated:
@@ -195,7 +207,9 @@ export function createReadGuardEditBatchSummary(args: {
 				requestedIndexes.length ||
 			(args.resolvedTotal ?? resolvedSource.length) > resolvedIndexes.length ||
 			(args.rejectedTotal ?? rejectedSource.length) > rejectedIndexes.length ||
-			(args.appliedTotal ?? appliedSource.length) > appliedIndexes.length,
+			(args.appliedTotal ?? appliedSource.length) > appliedIndexes.length ||
+			(args.alreadyAppliedTotal ?? alreadyAppliedSource.length) >
+				alreadyAppliedIndexes.length,
 		commitStatus,
 		postEditStatus,
 		terminalStatus,
@@ -237,6 +251,10 @@ export function shouldLogEvent(event: string): boolean {
 		event === "edit_preflight_blocked" ||
 		event === "edit_partial_apply" ||
 		event === "edit_partial_apply_skipped" ||
+		// #2402: pre-write batch rejections and recognized exact retries are the
+		// two new partial-apply outcomes; each is rare by construction.
+		event === "edit_partial_apply_rejected" ||
+		event === "edit_already_applied_retry" ||
 		event === "edit_post_edit_pipeline_failed" ||
 		event === "edit_batch_summary" ||
 		event === "edit_batch_summary_overflow" ||

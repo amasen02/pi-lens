@@ -940,6 +940,35 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		return { content: event.content, isError: true };
 	}
 
+	// #2402: a fully-applied native edit is also an applied record, so an
+	// identical retry is recognized as already-applied instead of escalating
+	// through the oldText-not-found ladder. `event.input` carries the EXECUTED
+	// args (post-autopatch), the same text the preflight resolves against.
+	if (event.toolName === "edit") {
+		const appliedInput = event.input as {
+			oldText?: string;
+			newText?: string;
+			edits?: Array<{ oldText?: string; newText?: string }>;
+		};
+		const record = (oldText?: string, newText?: string): void => {
+			if (typeof oldText === "string" && oldText.length > 0) {
+				runtime.partialApplyRecords.record(
+					filePath,
+					oldText,
+					newText,
+					getFileStateHash(filePath),
+				);
+			}
+		};
+		if (Array.isArray(appliedInput.edits)) {
+			for (const edit of appliedInput.edits) {
+				record(edit.oldText, edit.newText);
+			}
+		} else {
+			record(appliedInput.oldText, appliedInput.newText);
+		}
+	}
+
 	// Must happen before debounce admission: latestDeps intentionally retains only
 	// the latest event, but write -> edit is a sticky turn transition.
 	const receipt = (runtime as Partial<RuntimeCoordinator>)
