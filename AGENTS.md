@@ -1146,6 +1146,12 @@ immediate `ctx.isIdle()` recheck. The durable `test-runner-findings` cache stays
 available to pull diagnostics and the commit guard; unavailable or failed host
 entry capabilities never fall back to `sendMessage`. (#2366)
 
+Pytest aggregate counts come only from pytest's final outcome summary line
+(#2408), never from a whole-output search. Tracebacks, service errors, assertion
+messages, and captured logs can contain unrelated phrases such as `port 55432
+failed`; summary detection and count extraction must remain bound to the same
+line.
+
 Host-ready delay is a process-lifetime measurement from load-complete to the
 first real `session_start`. The extension consumes that anchor once at the
 entry point; later sessions emit no host-ready phase because no clean
@@ -1447,8 +1453,13 @@ sends a `merge-train-post-merge` `repository_dispatch` payload containing
 `{repository, sha, pr_number}`. The lane uses this event because its
 `GITHUB_TOKEN` merge suppresses the ordinary `push` event. Transient HTTP
 failures and ambiguous timeouts receive one bounded retry with the same SHA;
-the scheduled lane also reconciles recent bot-merged PRs from their durable
-`merge_commit_sha` and requested/terminal state markers. It waits through a
+the scheduled lane also reconciles recent bot-merged PRs from a dedicated
+GraphQL connection ordered by `UPDATED_AT` descending. That reader follows
+cursors only until the last `updatedAt` is strictly older than its merge window,
+preserves equality at the cutoff, and fails closed on ordering, cursor, shape,
+or page-cap violations. It reads `mergedAt`, `mergedBy`, and the exact merge
+OID in the same record, rather than relying on the REST pull-list's incomplete
+merge identity. It waits through a
 bounded grace period, retries missing validation across process restarts, and
 opens a later six-hour retry generation after two attempts exhaust one
 generation, without a hot loop. It accepts completion only from bot-authored
@@ -2491,7 +2502,7 @@ seq/hash/range validation → atomic apply → read-guard stamp → seq/change-l
 
 Use it first for partial apply, then LSP workspace edits/actionable autofix. It must not bypass read guard for normal agent edits, replace oldText autopatch, guess stale ranges, or apply project-wide edits by default.
 
-**Partial apply consumes preflight-approved spans, never re-searches (#2402).** `resolveOldTextEdits` (`clients/read-guard-tool-lines.ts`) resolves each oldText against one snapshot and carries `EditSnapshotIdentity` (content hash) plus exact `spanStart`/`spanEnd` offsets and the approved `appliedSpanText` on every `PartiallyApplicableEdit`. `applyPartiallyApplicableEdits` (`clients/partial-edit-apply.ts`) validates the WHOLE batch before any write — snapshot hash re-checked under `FileTime.withLock`, span text, pairwise non-overlap — and rejects stale/overlapping input with a structured rejection and zero disk/sequence/pipeline effects. The commit routes through the shared `writeFileAtomic` seam (the file graduated out of `EXEMPT_RAW_WRITE_FILES`), applied bottom-up from the snapshot's LF view. A committed write and a post-edit analysis failure are separate outcomes: the composed block reason leads with the committed indexes (`composePartialApplyReason`), never with the preflight 🔄/🛑 header, so committed bytes are never re-labelled as a retryable oldText miss. Every applied pair — partial-apply commits AND successful native edits (`runtime-tool-result.ts` records them at `tool_result`) — lands in `RuntimeCoordinator.partialApplyRecords` (bounded per-file/per-store, `normalizeMapKey`, cleared in `resetForSession`). Before declaring an oldText miss, the preflight consults that record with `isExactAppliedRetry`: content evidence, not a global newText-present heuristic — oldText must be gone (or, when oldText is contained in its own newText, every remaining occurrence must lie inside an applied newText occurrence) for an identical retry to answer `✅ ALREADY APPLIED` instead of escalating or re-executing the write.
+**Partial apply consumes preflight-approved spans, never re-searches (#2402).** `resolveOldTextEdits` (`clients/read-guard-tool-lines.ts`) resolves each oldText against one snapshot and carries `EditSnapshotIdentity` (content hash) plus exact `spanStart`/`spanEnd` offsets and the approved `appliedSpanText` on every `PartiallyApplicableEdit`. `applyPartiallyApplicableEdits` (`clients/partial-edit-apply.ts`) validates the WHOLE batch before any write — snapshot hash re-checked under `FileTime.withLock`, span text, pairwise non-overlap — and rejects stale/overlapping input with a structured rejection and zero disk/sequence/pipeline effects. The commit routes through the shared `writeFileAtomic` seam (the file graduated out of `EXEMPT_RAW_WRITE_FILES`), applied bottom-up from the snapshot's LF view. A committed write and a post-edit analysis failure are separate outcomes: the composed block reason leads with the committed indexes (`composePartialApplyReason`), never with the preflight 🔄/🛑 header, so committed bytes are never re-labelled as a retryable oldText miss. Every applied pair — partial-apply commits AND successful native edits (`runtime-tool-result.ts` records them at `tool_result`) — lands in `RuntimeCoordinator.partialApplyRecords` (bounded per-file/per-store, `normalizeMapKey`, cleared in `resetForSession`) with the complete post-commit file hash. Before declaring an oldText miss, the preflight consults that record with `isExactAppliedRetry`: session provenance and unchanged file content must agree, and the check never falls back to a global newText-present heuristic. Only then does an identical retry answer `✅ ALREADY APPLIED` instead of escalating or re-executing the write.
 
 Workspace edits (`clients/lsp/edits.ts`) are strict and confined: shape/URI/resource preconditions, document versions, text bounds, and all text reads are preflighted before mutation; only an unexpected filesystem failure after that preflight retains the documented no-rollback boundary. Incoming server positions are normalized from the negotiated encoding against the same virtual post-resource content/path model used by application, so ordered rename/create/delete followed by descendant text edits works before destinations exist on disk; a failed range remains fail-closed. Rename notification state preserves the original opened URI plus its authority/encoding spelling for the destination; a failed `didClose` aborts/resynchronizes instead of sending `didRenameFiles`. `rename_file` validates both resource paths and preconditions through a read-only call to this same apply/confinement seam before soliciting any `willRenameFiles` edits (including previews), then routes its disk resource operation back through the seam (never a direct mkdir/rename). Preflight lazily maps renamed directory descendants and tracks subtree tombstones so ordered edits after rename/delete chains cannot resurrect deleted children without walking the whole tree. Mutation telemetry describes normalized edits; each solicited request gets one bounded, sequence-tagged summary under its outer correlation ID, with an explicit aggregate overflow marker after the 100-summary cap.
 
