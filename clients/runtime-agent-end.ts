@@ -87,6 +87,14 @@ export interface AgentEndFormatSummary {
 	changed: string[];
 	failed: Array<{ filePath: string; errors: string[] }>;
 	skipped: Array<{ filePath: string; reason: string }>;
+	/**
+	 * Files whose selected formatter had no executable (#2413). Held apart from
+	 * `failed`: these are NOT requeued (durable unavailability is not transient)
+	 * and NOT surfaced to the user as code errors — the drain records them once
+	 * and drops them so the same files never re-fail on every subsequent
+	 * agent_end.
+	 */
+	unavailable: Array<{ filePath: string; formatter: string; reason: string }>;
 }
 
 function recordProjectChange(args: {
@@ -306,6 +314,7 @@ export async function handleAgentEnd({
 		changed: [],
 		failed: [],
 		skipped: [],
+		unavailable: [],
 	};
 	// #502 fix provenance: per-path {tool, kind} entries accumulated across the
 	// deferred-format loop below, passed as `fixes` on the batch
@@ -618,6 +627,19 @@ export async function handleAgentEnd({
 				);
 			}
 
+			// #2413: an unavailable formatter is durable, not transient — record it
+			// once and DO NOT requeue. Requeuing here is exactly what made
+			// `spawn oxfmt ENOENT` re-fire on every agent_end for the same files.
+			if (result.formatUnavailable.length > 0) {
+				for (const u of result.formatUnavailable) {
+					summary.unavailable.push({
+						filePath,
+						formatter: u.formatter,
+						reason: u.reason,
+					});
+				}
+			}
+
 			if (result.formatChanged) {
 				summary.changed.push(filePath);
 				for (const tool of result.formattersUsed) {
@@ -919,6 +941,7 @@ export async function handleAgentEnd({
 			changed: summary.changed.length,
 			failed: summary.failed.length,
 			skipped: summary.skipped.length,
+			unavailable: summary.unavailable.length,
 		},
 	});
 	logLatency({
@@ -932,10 +955,11 @@ export async function handleAgentEnd({
 			changed: summary.changed.length,
 			failed: summary.failed.length,
 			skipped: summary.skipped.length,
+			unavailable: summary.unavailable.length,
 		},
 	});
 	dbg(
-		`agent_end deferred_format complete: formatted=${summary.formatted} changed=${summary.changed.length} failed=${summary.failed.length} skipped=${summary.skipped.length}`,
+		`agent_end deferred_format complete: formatted=${summary.formatted} changed=${summary.changed.length} failed=${summary.failed.length} skipped=${summary.skipped.length} unavailable=${summary.unavailable.length}`,
 	);
 
 	if (summary.failed.length > 0) {

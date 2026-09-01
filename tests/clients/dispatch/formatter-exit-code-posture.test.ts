@@ -263,7 +263,11 @@ describe("formatFile is strict by default at the seam (#1337)", () => {
 			const { formatFile, gofmtFormatter } = await loadFormatters();
 			const result = await formatFile(filePath, gofmtFormatter);
 
-			expect(result).toEqual({ success: true, changed: false });
+			expect(result).toEqual({
+				success: true,
+				changed: false,
+				outcome: "unchanged",
+			});
 		} finally {
 			env.cleanup();
 		}

@@ -160,7 +160,11 @@ describe("formatFile honors SKIP_FORMATTING (#1144)", () => {
 			const mod = await import("../../clients/formatters.js");
 			const result = await mod.formatFile(filePath, mod.prettierFormatter);
 
-			expect(result).toEqual({ success: true, changed: false });
+			expect(result).toEqual({
+				success: true,
+				changed: false,
+				outcome: "skipped",
+			});
 			expect(safeSpawnAsync).not.toHaveBeenCalled();
 		} finally {
 			env.cleanup();
@@ -220,7 +224,11 @@ describe("formatFile honors SKIP_FORMATTING (#1144)", () => {
 
 			const result = await mod.formatFile(filePath, formatter);
 
-			expect(result).toEqual({ success: true, changed: false });
+			expect(result).toEqual({
+				success: true,
+				changed: false,
+				outcome: "skipped",
+			});
 			expect(safeSpawnAsync).not.toHaveBeenCalledWith(
 				"npx",
 				expect.anything(),
@@ -245,7 +253,11 @@ describe("formatFile honors SKIP_FORMATTING (#1144)", () => {
 
 			const result = await mod.formatFile(filePath, formatter);
 
-			expect(result).toEqual({ success: true, changed: false });
+			expect(result).toEqual({
+				success: true,
+				changed: false,
+				outcome: "unchanged",
+			});
 			expect(safeSpawnAsync).toHaveBeenCalledWith(
 				"npx",
 				["prettier", "--write", filePath],

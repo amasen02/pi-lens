@@ -15,7 +15,11 @@ import { logExtension } from "./extension-log.js";
 import * as path from "node:path";
 import { recordFormatter } from "./widget-state.js";
 import { FileTime } from "./file-time.js";
-import type { FormatterInfo, FormatterResult } from "./formatters.js";
+import type {
+	FormatterInfo,
+	FormatterOutcomeKind,
+	FormatterResult,
+} from "./formatters.js";
 import { loadFormatters } from "./formatters-lazy.js";
 
 // --- Configuration ---
@@ -39,6 +43,8 @@ export interface FormatSummary {
 		success: boolean;
 		changed: boolean;
 		error?: string;
+		/** Typed outcome kind (#2413) — separates `unavailable` from `failed`. */
+		outcome: FormatterOutcomeKind;
 	}>;
 	anyChanged: boolean;
 	allSucceeded: boolean;
@@ -120,6 +126,7 @@ export class FormatService {
 				formatters[index]?.name ?? "unknown",
 				result.changed,
 				result.success,
+				result.outcome,
 			);
 		}
 
@@ -134,6 +141,7 @@ export class FormatService {
 				success: r.success,
 				changed: r.changed,
 				error: r.error,
+				outcome: r.outcome,
 			})),
 			anyChanged,
 			allSucceeded,
@@ -179,9 +187,13 @@ export class FormatService {
 				]);
 				results.push(result);
 			} catch (error) {
+				// A timeout or thrown error here is a real failure (#2413): the
+				// formatter ran and did not complete, distinct from an unavailable
+				// executable (which formatFile classifies before spawning).
 				results.push({
 					success: false,
 					changed: false,
+					outcome: "failed",
 					error: error instanceof Error ? error.message : String(error),
 				});
 			} finally {

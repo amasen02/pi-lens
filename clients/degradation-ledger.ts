@@ -96,6 +96,15 @@ export type DegradationKind =
 	/** Automatic test-result delivery could not reach the host entry surface. */
 	| "test-runner-delivery"
 	| "formatter-failure"
+	/**
+	 * A selected formatter's executable was proven absent (#2413): its
+	 * `resolveCommand` probed every install location and PATH and found nothing,
+	 * or the static fallback spawn returned a typed `tool-not-found`. Distinct
+	 * from `formatter-failure` (a tool that ran and failed) precisely so durable
+	 * unavailability is never counted, requeued, or surfaced as a code error.
+	 * Subject is `<formatter>:<basename>`.
+	 */
+	| "formatter-unavailable"
 	| "wasm-abort"
 	| "lsp-diagnostics-timeout"
 	| "lsp-scanner-coverage-gap"
