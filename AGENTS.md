@@ -1447,8 +1447,13 @@ sends a `merge-train-post-merge` `repository_dispatch` payload containing
 `{repository, sha, pr_number}`. The lane uses this event because its
 `GITHUB_TOKEN` merge suppresses the ordinary `push` event. Transient HTTP
 failures and ambiguous timeouts receive one bounded retry with the same SHA;
-the scheduled lane also reconciles recent bot-merged PRs from their durable
-`merge_commit_sha` and requested/terminal state markers. It waits through a
+the scheduled lane also reconciles recent bot-merged PRs from a dedicated
+GraphQL connection ordered by `UPDATED_AT` descending. That reader follows
+cursors only until the last `updatedAt` is strictly older than its merge window,
+preserves equality at the cutoff, and fails closed on ordering, cursor, shape,
+or page-cap violations. It reads `mergedAt`, `mergedBy`, and the exact merge
+OID in the same record, rather than relying on the REST pull-list's incomplete
+merge identity. It waits through a
 bounded grace period, retries missing validation across process restarts, and
 opens a later six-hour retry generation after two attempts exhaust one
 generation, without a hot loop. It accepts completion only from bot-authored
