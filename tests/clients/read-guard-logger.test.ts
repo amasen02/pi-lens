@@ -3,6 +3,7 @@
  * gate at DEFAULT verbosity (PI_LENS_READ_GUARD_VERBOSE unset), while the
  * per-read `read_recorded` event stays gated as before.
  */
+import * as fs from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { shouldLogEvent } from "../../clients/read-guard-logger.js";
 
@@ -28,6 +29,43 @@ describe("shouldLogEvent", () => {
 
 	it("still logs the pre-existing always-on events", () => {
 		expect(shouldLogEvent("edit_blocked")).toBe(true);
+	});
+
+	it("writes partial-apply outcomes to the real sink at default verbosity", async () => {
+		const previous = process.env.PI_LENS_TEST_MODE;
+		process.env.PI_LENS_TEST_MODE = "0";
+		vi.resetModules();
+		try {
+			const logger = await import("../../clients/read-guard-logger.js");
+			for (const event of [
+				"edit_partial_apply_rejected",
+				"edit_already_applied_retry",
+				"edit_post_edit_pipeline_failed",
+			]) {
+				logger.logReadGuardEvent({
+					event,
+					filePath: "C:\\workspace\\sample.ts",
+					metadata: { editIndex: 2 },
+				});
+			}
+			await logger.flushReadGuardLog();
+			const lines = fs
+				.readFileSync(logger.getReadGuardLogPath(), "utf8")
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line) as { event: string });
+			expect(lines.map((line) => line.event)).toEqual(
+				expect.arrayContaining([
+					"edit_partial_apply_rejected",
+					"edit_already_applied_retry",
+					"edit_post_edit_pipeline_failed",
+				]),
+			);
+		} finally {
+			if (previous === undefined) delete process.env.PI_LENS_TEST_MODE;
+			else process.env.PI_LENS_TEST_MODE = previous;
+			vi.resetModules();
+		}
 	});
 });
 

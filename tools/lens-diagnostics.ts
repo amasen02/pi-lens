@@ -79,6 +79,7 @@ import type {
 import type { ActionableWarningsReport } from "../clients/actionable-warnings.js";
 import type { CodeQualityWarningsReport } from "../clients/code-quality-warnings.js";
 import {
+	classifyDiagnosticTier,
 	getFileDiagnosticSummaries,
 	type FileDiagnosticSummary,
 	reconcileCorrelatedScanDiagnostics,
@@ -287,6 +288,7 @@ export function createLensDiagnosticsTool(
 			totalBlocking?: number;
 			totalErrors?: number;
 			totalWarnings?: number;
+			totalAdvisories?: number;
 			coldRunners?: string[];
 			failedAnalyzers?: { id: string; summary: string }[];
 		}>(({ details, args, isError, text }) => {
@@ -333,9 +335,16 @@ export function createLensDiagnosticsTool(
 			const b = details?.totalBlocking ?? 0;
 			const e = details?.totalErrors ?? 0;
 			const w = details?.totalWarnings ?? 0;
+			// #2414: hint/info tier never contributes to `b + e + w` — a session
+			// with only style opinions is genuinely "clean" of code defects, but
+			// the one-line summary still names the advisory count so it isn't
+			// indistinguishable from a session with zero findings at all.
+			const adv = details?.totalAdvisories ?? 0;
 			const files = details?.filesWithIssues ?? details?.filesChecked ?? 0;
 			if (b + e + w === 0) {
-				return `lens_diagnostics ${mode} — clean (${files} files)${coldSuffix}${failedSuffix}`;
+				const advisorySuffix =
+					adv > 0 ? `, ${adv} hint${adv === 1 ? "" : "s"}` : "";
+				return `lens_diagnostics ${mode} — clean${advisorySuffix} (${files} files)${coldSuffix}${failedSuffix}`;
 			}
 			const parts = [`${b} blocking`];
 			if (b === 0 && e > 0) parts.push(`${e} errors`);
@@ -1231,30 +1240,31 @@ function summarizeDiagnostics(
 	let blocking = 0;
 	let errors = 0;
 	let warnings = 0;
+	let advisories = 0;
 	for (const diagnostic of diagnostics) {
 		// #1641: a demoted past-EOF entry keeps its severity for display but
 		// drops out of the tallies — same reasoning as widget-state's `isBlocking`.
 		if (diagnostic.stale) continue;
 		if (diagnostic.semantic === "blocking") blocking++;
-		if (diagnostic.severity === "error") errors++;
-		// #1777: `hint` and `info` tally alongside `warning`, matching
-		// `countDiagnostics` in `clients/widget-state.ts` — mode=all reads that
-		// tally and mode=full reads this one, so the two must agree. An exact
-		// `=== "warning"` test scored a hint-only file 0/0/0, the `withIssues`
-		// filter below then dropped it, and mode=full rendered "No issues" for a
-		// file whose own `details` still carried the diagnostic.
-		else if (
-			diagnostic.severity === "warning" ||
-			diagnostic.severity === "hint" ||
-			diagnostic.severity === "info"
-		)
-			warnings++;
+		// #2414: severity → tier classification is shared with
+		// `countDiagnostics`/`countAdvisories` in `clients/widget-state.ts` via
+		// `classifyDiagnosticTier` — mode=all reads that store's tally and
+		// mode=full reads this one, so the two must agree. `hint`/`info` no
+		// longer inflate `warnings` (they used to, matching a pre-#2414
+		// `countDiagnostics`, so a hint-only file scored 0/0/0 there too and the
+		// `withIssues` filter below dropped it — that gap is now closed via
+		// `advisories`, not by re-folding hints into `warnings`).
+		const tier = classifyDiagnosticTier(diagnostic);
+		if (tier === "error") errors++;
+		else if (tier === "warning") warnings++;
+		else if (tier === "advisory") advisories++;
 	}
 	return {
 		filePath,
 		blocking,
 		errors,
 		warnings,
+		advisories,
 		hasFinalSnapshot,
 		diagnostics,
 	};
@@ -2494,11 +2504,18 @@ function formatAllMode(
 	// how those filters already treat any other non-matching severity.
 	const withIssues = visibleSummaries.filter((s) => {
 		if (severity === "error") return s.blocking > 0 || s.errors > 0;
+		// #2414: a "warning" filter must not admit hint/info — that is exactly
+		// the "present hints as warnings" defect this issue exists to close.
 		if (severity === "warning") return s.warnings > 0;
+		// severity: "all" — a hint/info-only file (`advisories > 0`,
+		// warnings === 0) must still surface here, or the #2414 fix that stops
+		// hints inflating `warnings` would silently drop that file from the
+		// detailed listing instead of just from the compact warning tally.
 		return (
 			s.blocking > 0 ||
 			s.errors > 0 ||
 			s.warnings > 0 ||
+			s.advisories > 0 ||
 			(s.diagnostics ?? []).some((d) => d.stale)
 		);
 	});
@@ -2532,6 +2549,7 @@ function formatAllMode(
 	let totalBlocking = 0;
 	let totalErrors = 0;
 	let totalWarnings = 0;
+	let totalAdvisories = 0;
 
 	for (const s of sorted) {
 		const rel = path.relative(cwd, s.filePath);
@@ -2539,6 +2557,11 @@ function formatAllMode(
 		if (s.blocking > 0) parts.push(`🔴 ${s.blocking} blocking`);
 		if (s.errors > 0 && s.blocking === 0) parts.push(`${s.errors}E`);
 		if (s.warnings > 0) parts.push(`${s.warnings}W`);
+		// #2414: hint/info never inflate `warnings`, but a hint-only row still
+		// needs a reason to be listed — otherwise it shows a bare filename with
+		// no count at all.
+		if (s.advisories > 0)
+			parts.push(`${s.advisories} hint${s.advisories === 1 ? "" : "s"}`);
 		if (!s.hasFinalSnapshot) parts.push(`(pending)`);
 		const staleCount = (s.diagnostics ?? []).filter((d) => d.stale).length;
 		if (staleCount > 0) {
@@ -2587,6 +2610,7 @@ function formatAllMode(
 		totalBlocking += s.blocking;
 		totalErrors += s.errors;
 		totalWarnings += s.warnings;
+		totalAdvisories += s.advisories;
 	}
 
 	// #1799: `totalBlocking` and `totalErrors` count the same findings UNLESS a
@@ -2608,6 +2632,11 @@ function formatAllMode(
 		totalWarnings > 0
 			? `  ${totalWarnings} warning${totalWarnings === 1 ? "" : "s"}`
 			: null,
+		// #2414: reported separately from `warnings` — hint/info are style
+		// opinions, not defects, and must not read as unresolved code issues.
+		totalAdvisories > 0
+			? `  ${totalAdvisories} hint/info (style — not counted as warnings)`
+			: null,
 	]
 		.filter(Boolean)
 		.join("\n");
@@ -2622,6 +2651,7 @@ function formatAllMode(
 			totalBlocking,
 			totalErrors,
 			totalWarnings,
+			totalAdvisories,
 			staleDropped,
 		},
 	};

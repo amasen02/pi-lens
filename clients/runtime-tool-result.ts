@@ -940,6 +940,46 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		return { content: event.content, isError: true };
 	}
 
+	// One post-result raw-byte hash, reused for the applied-edit records below and
+	// for the pipeline dedup key (`initialStateHash`) further down (finding 3):
+	// nothing between here and that point rewrites the file, so a second read
+	// would only re-derive the same digest.
+	const postWriteStateHash = getFileStateHash(filePath);
+
+	// #2402: a fully-applied native edit is also an applied record, so an
+	// identical retry is recognized as already-applied instead of escalating
+	// through the oldText-not-found ladder. `event.input` carries the EXECUTED
+	// args (post-autopatch), the same text the preflight resolves against.
+	const nativeAppliedPairs: Array<{
+		oldText: string;
+		newText: string | undefined;
+	}> = [];
+	if (event.toolName === "edit") {
+		const appliedInput = event.input as {
+			oldText?: string;
+			newText?: string;
+			edits?: Array<{ oldText?: string; newText?: string }>;
+		};
+		const record = (oldText?: string, newText?: string): void => {
+			if (typeof oldText === "string" && oldText.length > 0) {
+				runtime.partialApplyRecords.record(
+					filePath,
+					oldText,
+					newText,
+					postWriteStateHash,
+				);
+				nativeAppliedPairs.push({ oldText, newText });
+			}
+		};
+		if (Array.isArray(appliedInput.edits)) {
+			for (const edit of appliedInput.edits) {
+				record(edit.oldText, edit.newText);
+			}
+		} else {
+			record(appliedInput.oldText, appliedInput.newText);
+		}
+	}
+
 	// Must happen before debounce admission: latestDeps intentionally retains only
 	// the latest event, but write -> edit is a sticky turn transition.
 	const receipt = (runtime as Partial<RuntimeCoordinator>)
@@ -995,7 +1035,9 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		}
 	}
 
-	const initialStateHash = getFileStateHash(filePath);
+	// Reuse the hash taken right after the write landed (finding 3): the file is
+	// unchanged between that read and here, so this is byte-identical.
+	const initialStateHash = postWriteStateHash;
 
 	// Deduplicate concurrent calls for the same final file state (pi can fire one
 	// tool_result per edit hunk). Do not dedupe by file alone: a distinct later
@@ -1316,10 +1358,27 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		});
 	}
 
+	const finalStateHash = getFileStateHash(filePath);
 	lastAnalyzedStateByFile.set(filePath, {
 		turnIndex: runtime.turnIndex,
-		stateHash: getFileStateHash(filePath),
+		stateHash: finalStateHash,
 	});
+
+	// #2402: pi-lens' own immediate format/autofix may have rewritten the file
+	// after the native edit was recorded above. Stamp the post-pipeline state so
+	// an identical retry against the formatted bytes is still recognized as
+	// already-applied. Only the pairs recorded this invocation are stamped, and
+	// only when the pipeline actually changed the bytes.
+	if (finalStateHash !== postWriteStateHash) {
+		for (const pair of nativeAppliedPairs) {
+			runtime.partialApplyRecords.noteAfterWriteHash(
+				filePath,
+				pair.oldText,
+				pair.newText,
+				finalStateHash,
+			);
+		}
+	}
 
 	// The model's write/edit and pi-lens' own immediate format/autofix are now
 	// reflected on disk. Refresh read-guard staleness stamps so a follow-up edit

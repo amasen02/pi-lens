@@ -50,6 +50,7 @@ import {
 } from "./read-guard-logger.js";
 import {
 	countFileLines,
+	formatAlreadyAppliedNotes,
 	getTouchedLinesForGuard,
 	relocateEditRange,
 	tryCorrectIndentationMismatch,
@@ -76,6 +77,39 @@ const LSP_TOOLCALL_TOUCH_BUDGET_MS = Math.max(
 	0,
 	Number.parseInt(process.env.PI_LENS_TOOLCALL_TOUCH_MS ?? "750", 10) || 750,
 );
+
+/**
+ * Composes the final block reason for a partial apply whose commit landed
+ * (#2402). The committed bytes lead the message; the preflight's per-edit
+ * failure bodies follow UNCHANGED, so they still describe exactly the edits
+ * that were NOT applied. The preflight header (🔄/🛑) is never reused here —
+ * relabelling committed edits as a retryable oldText miss is the #2402 defect.
+ */
+function composePartialApplyReason(args: {
+	appliedCount: number;
+	appliedIndices: string;
+	postEditStatus: "succeeded" | "failed";
+	postEditOutput?: string;
+	preflightDetails?: string[];
+	alreadyAppliedEdits?: number[];
+}): string {
+	const parts: string[] = [];
+	const editSuffix = args.appliedCount === 1 ? "" : "s";
+	parts.push(
+		args.postEditStatus === "failed"
+			? `⚠️ PARTIAL APPLY — ${args.appliedCount} edit${editSuffix} committed (${args.appliedIndices}). Post-edit analysis failed after the commit; the committed bytes stand and were not reverted. Do NOT resubmit the applied edits.`
+			: `⚠️ PARTIAL APPLY — ${args.appliedCount} edit${editSuffix} committed (${args.appliedIndices}). Do NOT resubmit the applied edits.`,
+	);
+	if (args.preflightDetails && args.preflightDetails.length > 0) {
+		parts.push(args.preflightDetails.join("\n\n"));
+	}
+	const alreadyNotes = formatAlreadyAppliedNotes(args.alreadyAppliedEdits);
+	if (alreadyNotes) parts.push(alreadyNotes.trimStart());
+	if (args.postEditOutput && args.postEditStatus === "succeeded") {
+		parts.push(`Post-apply analysis:\n${args.postEditOutput}`);
+	}
+	return parts.join("\n\n");
+}
 
 function getToolCallRawFilePath(
 	toolName: string,
@@ -1217,6 +1251,8 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 				touchedLines,
 				editRanges,
 				preflightError,
+				preflightDetails,
+				alreadyAppliedEdits,
 				partiallyApplicable,
 				contentMatchValidated,
 				editBatchSummary,
@@ -1225,6 +1261,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 				filePath,
 				runtime.telemetrySessionId,
 				readGuardCorrelationId,
+				runtime.partialApplyRecords,
 			);
 			if (preflightError) {
 				if (partiallyApplicable && partiallyApplicable.length > 0) {
@@ -1234,6 +1271,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 							edits: partiallyApplicable,
 							summary: editBatchSummary,
 							correlationId: readGuardCorrelationId,
+							recordStore: runtime.partialApplyRecords,
 							afterWrite: async () => {
 								const {
 									biomeClient,
@@ -1284,10 +1322,31 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 									.join("\n\n");
 							},
 						});
-						if (partial.postEditStatus === "failed") {
+						if (partial.rejected) {
+							// Nothing was written and no post-edit dispatch ran. The
+							// preflight verdict still describes the whole batch; append
+							// the structured rejection so the agent rebuilds from a
+							// fresh read instead of retrying the stale payload.
+							if (!editBatchSummary) logBlockedEditSummary("preflight");
 							return {
 								block: true,
-								reason: `${preflightError}\n\nPartial apply pipeline failed after ${partial.appliedCount} edit${partial.appliedCount === 1 ? "" : "s"} committed.`,
+								reason: `${preflightError}\n\n🛑 Batch not applied: ${partial.rejected.detail}`,
+							};
+						}
+						if (partial.postEditStatus === "failed") {
+							// The commit stands; the post-edit analysis does not. The
+							// committed bytes must never be re-labelled by the preflight
+							// header (a RETRYABLE/RE-READ line here sends the agent into
+							// the #2402 retry loop against already-applied edits).
+							return {
+								block: true,
+								reason: composePartialApplyReason({
+									appliedCount: partial.appliedCount,
+									appliedIndices: partial.appliedIndices,
+									postEditStatus: "failed",
+									preflightDetails,
+									alreadyAppliedEdits,
+								}),
 							};
 						}
 						if (partial.appliedCount > 0) {
@@ -1299,25 +1358,24 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 									appliedCount: partial.appliedCount,
 									appliedTotal: partial.appliedTotal,
 									appliedIndices: partial.appliedIndices,
-									skippedCount: partial.skippedCount ?? 0,
-									skippedTotal: partial.skippedTotal ?? 0,
-									skippedIndices: partial.skippedIndices ?? "",
-									indexesTruncated: partial.indexesTruncated ?? false,
 									editBatchSummary: partial.summary,
 									routedThroughPostEditPipeline: true,
 								},
 							});
-							let reason = preflightError.replace(
-								"🔄 RETRYABLE — Edit target not found",
-								`⚠️ PARTIAL APPLY — ${partial.appliedCount} edit${partial.appliedCount !== 1 ? "s" : ""} applied (${partial.appliedIndices})`,
-							);
-							if (partial.postEditOutput) {
-								reason += `\n\nPost-apply analysis:\n${partial.postEditOutput}`;
-							}
-							return { block: true, reason };
+							return {
+								block: true,
+								reason: composePartialApplyReason({
+									appliedCount: partial.appliedCount,
+									appliedIndices: partial.appliedIndices,
+									postEditStatus: "succeeded",
+									postEditOutput: partial.postEditOutput,
+									preflightDetails,
+									alreadyAppliedEdits,
+								}),
+							};
 						}
 					} catch {
-						// fall through to full block
+						// commit write failure — fall through to the full preflight block
 					}
 				}
 				if (!editBatchSummary) logBlockedEditSummary("preflight");

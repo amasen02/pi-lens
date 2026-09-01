@@ -387,6 +387,7 @@ describe("lens_diagnostics rule policy — delta mode carried-over tally", () =>
 			blocking: 0,
 			errors: 0,
 			warnings: 2,
+			advisories: 0,
 			hasFinalSnapshot: true,
 			diagnostics: [
 				{
@@ -426,6 +427,7 @@ describe("lens_diagnostics rule policy — mode=all (cache-only)", () => {
 			blocking: 0,
 			errors: 0,
 			warnings: 2,
+			advisories: 0,
 			hasFinalSnapshot: true,
 			diagnostics: [
 				{
@@ -465,6 +467,7 @@ describe("lens_diagnostics rule policy — mode=all (cache-only)", () => {
 			blocking: 0,
 			errors: 0,
 			warnings: 2,
+			advisories: 0,
 			hasFinalSnapshot: true,
 			diagnostics: [
 				{
@@ -497,6 +500,7 @@ describe("lens_diagnostics rule policy — mode=all (cache-only)", () => {
 			blocking: 0,
 			errors: 0,
 			warnings: 1,
+			advisories: 0,
 			hasFinalSnapshot: true,
 			diagnostics: [
 				{

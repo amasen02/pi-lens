@@ -584,9 +584,13 @@ export const DELIVERY_SURFACES: Record<string, DeliverySurfaceEntry> = {
 	),
 	"read-guard-tool-lines:preflight-errors": labeled(
 		"clients/read-guard-tool-lines.ts",
-		"Read-guard hashline BLOCKED / RE-READ REQUIRED preflight errors.",
+		"Read-guard hashline BLOCKED / RE-READ REQUIRED / PARTIAL APPLY / " +
+			"ALREADY APPLIED preflight errors (#2402).",
 		"Computed fresh per edit attempt and returned as that attempt's rejection — " +
-			"no cached findings are replayed, so there is no staleness window.",
+			"no cached findings are replayed, so there is no staleness window. The " +
+			"PARTIAL APPLY and ALREADY APPLIED variants describe the same attempt's " +
+			"commit outcome; applied-edit recognition reads RuntimeCoordinator's " +
+			"session-scoped record, which resets with the session.",
 		"live",
 	),
 	"tool-call:duplicate-export-blocker": labeled(

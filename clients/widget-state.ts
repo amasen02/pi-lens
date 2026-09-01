@@ -589,7 +589,42 @@ function commitDiagnostics(
 	requestRender();
 }
 
-/** Recompute the {blocking, errors, warnings} tally for a diagnostic set. */
+/**
+ * A diagnostic's compact-count tier (#2414). THE one place every compact
+ * finding-count surface classifies severity into a tally bucket — do not
+ * re-fold tiers per renderer (widget footer, `lens_diagnostics`' `withIssues`
+ * listing/summary, and any future compact surface all import this instead of
+ * hand-rolling the same branch).
+ *
+ * `error`/`warning` are real code defects with a known, bounded
+ * false-positive rate (see "Severity policy" in AGENTS.md, #1777) — they
+ * drive the footer's ●/! chips and block-worthy counts. `advisory` (`hint` +
+ * `info`) is a style opinion: an unaudited authorship rule (complexity,
+ * `no-runtime-typeof`, ...) must never present with the same weight as a
+ * warning. Before #1777 the dispatch path collapsed all three into
+ * `"warning"` at the runner; after #1777 preserved the four LSP/ast-grep
+ * tiers end to end, but this classifier still folded `hint`/`info` into the
+ * `warnings` tally so a file with only style opinions didn't silently vanish
+ * from the footer. #2414 corrects that: advisories no longer inflate
+ * `warnings`, but every consumer must still ask "does this file have ANY
+ * live finding" via `advisories`, not just `warnings`, so a hint-only file
+ * still surfaces in a detailed listing (mode=all's `withIssues`).
+ */
+export type DiagnosticTier = "error" | "warning" | "advisory";
+
+export function classifyDiagnosticTier(
+	d: WidgetDiagnostic,
+): DiagnosticTier | undefined {
+	if (d.severity === "error") return "error";
+	if (d.severity === "warning") return "warning";
+	if (d.severity === "hint" || d.severity === "info") return "advisory";
+	return undefined;
+}
+
+/** Recompute the {blocking, errors, warnings} tally for a diagnostic set.
+ * `hint`/`info` tier findings are tallied separately — see
+ * {@link classifyDiagnosticTier} and {@link countAdvisories} — and never
+ * inflate `warnings` (#2414). */
 function countDiagnostics(diags: WidgetDiagnostic[]): {
 	blocking: number;
 	errors: number;
@@ -611,22 +646,33 @@ function countDiagnostics(diags: WidgetDiagnostic[]): {
 			(diagnostic.staleReason ?? "past-eof") === "past-eof"
 		)
 			continue;
-		if (diagnostic.severity === "error") errors++;
-		// #1777: `hint` and `info` tally alongside `warning`. The dispatch path
-		// now preserves all four ast-grep tiers; before, the runner collapsed
-		// them to "warning" here. An exact `=== "warning"` test would drop those
-		// findings out of the footer entirely, so a file with real findings would
-		// render clean. The footer stays a blocking/error/warning summary on
-		// purpose — the tier distinction is rendered by the code-quality-warnings
-		// advisory, not by these counters.
-		else if (
-			diagnostic.severity === "warning" ||
-			diagnostic.severity === "hint" ||
-			diagnostic.severity === "info"
-		)
-			warnings++;
+		const tier = classifyDiagnosticTier(diagnostic);
+		if (tier === "error") errors++;
+		else if (tier === "warning") warnings++;
+		// tier === "advisory" (hint/info): intentionally excluded from the
+		// footer's warning tally (#2414) — see `countAdvisories` for the
+		// parallel count `getFileDiagnosticSummaries` exposes to
+		// `lens_diagnostics` so a hint-only file still shows up as "has issues".
 	}
 	return { blocking, errors, warnings };
+}
+
+/** Count `hint`/`info` tier findings using the same past-EOF exclusion as
+ * {@link countDiagnostics} (#2414). Kept as a standalone accessor rather than
+ * a new `FileRecord.diagnosticCounts` field — the footer never renders this
+ * number, only `getFileDiagnosticSummaries` (mode=all) needs it, to keep a
+ * hint-only file from being silently dropped from a detailed listing. */
+function countAdvisories(diags: WidgetDiagnostic[]): number {
+	let advisories = 0;
+	for (const diagnostic of diags) {
+		if (
+			diagnostic.stale &&
+			(diagnostic.staleReason ?? "past-eof") === "past-eof"
+		)
+			continue;
+		if (classifyDiagnosticTier(diagnostic) === "advisory") advisories++;
+	}
+	return advisories;
 }
 
 /**
@@ -1150,6 +1196,10 @@ export interface FileDiagnosticSummary {
 	blocking: number;
 	errors: number;
 	warnings: number;
+	/** `hint`/`info` tier findings — style opinions, never folded into
+	 * `warnings` (#2414). A file whose only findings are advisories still has
+	 * `advisories > 0` so it is not silently dropped from a detailed listing. */
+	advisories: number;
 	hasFinalSnapshot: boolean;
 	/**
 	 * The full, uncapped diagnostics for this file (not limited by the TUI's
@@ -1174,6 +1224,7 @@ export function getFileDiagnosticSummaries(): FileDiagnosticSummary[] {
 			blocking: rec.diagnosticCounts.blocking,
 			errors: rec.diagnosticCounts.errors,
 			warnings: rec.diagnosticCounts.warnings,
+			advisories: countAdvisories(rec.allDiagnostics),
 			hasFinalSnapshot: rec.hasFinalDiagnosticsSnapshot,
 			diagnostics: rec.allDiagnostics.map((d) => ({ ...d })),
 		};
