@@ -1801,10 +1801,7 @@ describe("getTouchedLinesForGuard — preflight spans and exact-retry recognitio
 				// trailing newline, changing the raw bytes (and thus the file hash)
 				// while leaving the applied line intact.
 				afterWrite: async () => {
-					fs.writeFileSync(
-						filePath,
-						`${fs.readFileSync(filePath, "utf-8")}\n`,
-					);
+					fs.writeFileSync(filePath, `${fs.readFileSync(filePath, "utf-8")}\n`);
 					return undefined;
 				},
 			});
