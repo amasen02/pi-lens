@@ -256,11 +256,13 @@ describe("#2358 — CPU-liveness discriminator on a real wedged scanner", () => 
 			cpuVerdict: "flat",
 			budgetMs: FIXED_WEDGE_MS,
 		});
-		// `outstandingMs` is sampled with Date.now() when a millisecond timer fires.
-		// Node's timer clock and Date.now() can straddle a millisecond boundary, so
-		// a callback at the armed deadline can legitimately report one millisecond
-		// less than `budgetMs`. The discriminator and armed budget above are the
-		// logical contract; this test does not impose a second wall-clock budget.
+		const outstandingMs = (
+			demotions[0]?.metadata as { outstandingMs?: number } | undefined
+		)?.outstandingMs;
+		// `outstandingMs` is sampled with Date.now() when the wedge timer fires.
+		// Windows and Node can quantize the timer and wall clock on adjacent
+		// millisecond boundaries, so allow a two-millisecond lower-bound margin.
+		expect(outstandingMs).toBeGreaterThanOrEqual(FIXED_WEDGE_MS - 2);
 	}, 30_000);
 
 	it("applies the hard cap even to a burning server, naming cap-exceeded (AC3)", async () => {
