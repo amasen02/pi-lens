@@ -22,6 +22,22 @@ describe("RuntimeCoordinator", () => {
 		expect(runtime.takeToolCallAttribution("call-reused-id")).toBeUndefined();
 	});
 
+	it("resetForSession clears applied-edit retry records (#2402)", () => {
+		const runtime = new RuntimeCoordinator();
+		const filePath = path.resolve("src/applied-session-file.ts");
+		runtime.partialApplyRecords.record(filePath, "old text", "new text");
+
+		expect(
+			runtime.partialApplyRecords.find(filePath, "old text", "new text"),
+		).toBeDefined();
+
+		runtime.resetForSession();
+
+		expect(
+			runtime.partialApplyRecords.find(filePath, "old text", "new text"),
+		).toBeUndefined();
+	});
+
 	it("makes edit autofix deferral sticky after a write until beginTurn", () => {
 		const runtime = new RuntimeCoordinator();
 		const filePath = path.resolve("src/sticky.ts");

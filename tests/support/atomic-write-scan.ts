@@ -194,15 +194,15 @@ export const EXEMPT_RAW_WRITE_FILES: Readonly<Record<string, string>> = {
 	"lens-map.ts":
 		"writes a human-facing HTML report for a browser, never re-read by pi-lens itself as state",
 
-	// --- Edits to the USER's own source files (LSP applyEdit / partial-edit
-	// apply), not pi-lens's own persisted state. A crash mid-write here is a
-	// normal editor/VCS-recoverable risk (the user's own editor/undo history,
-	// not pi-lens's session_start loaders, is the recovery path) — a
-	// different class from the umbrella issue's scope (probe-cache,
-	// registries, worklog); tracked separately rather than silently folded
-	// into this sweep's "fixed" count. ---
-	"partial-edit-apply.ts":
-		"writes the user's own source file being edited (LSP-driven partial edit), not pi-lens's persisted state — recovery is the user's editor/VCS, out of this issue's scope, not silently declared fixed",
+	// --- Edits to the USER's own source files (LSP applyEdit), not pi-lens's
+	// own persisted state. A crash mid-write here is a normal
+	// editor/VCS-recoverable risk (the user's own editor/undo history, not
+	// pi-lens's session_start loaders, is the recovery path) — a different
+	// class from the umbrella issue's scope (probe-cache, registries,
+	// worklog); tracked separately rather than silently folded into this
+	// sweep's "fixed" count. partial-edit-apply.ts graduated out of this
+	// exemption in #2402: its commit now routes through the shared
+	// writeFileAtomic seam under the FileTime lock. ---
 	"lsp/edits.ts":
 		"writes the user's own source file(s) via applyEdit, same class as partial-edit-apply.ts",
 };

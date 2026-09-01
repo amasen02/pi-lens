@@ -138,10 +138,17 @@ export class FileTime {
 		const lockPromise = fn().finally(() => {
 			globalState.locks.delete(absolutePath);
 		});
-
+		// The STORED lock promise must never reject unhandled: a rejecting fn
+		// (e.g. partial-apply's pre-write rejection, #2402) would otherwise leave
+		// an orphaned rejected promise on every withLock caller. Waiters awaiting
+		// the stored copy still resume — the finally above already deleted the
+		// lock entry by the time the rejection settles.
 		globalState.locks.set(
 			absolutePath,
-			lockPromise.then(() => {}),
+			lockPromise.then(
+				() => {},
+				() => {},
+			),
 		);
 		return lockPromise;
 	}

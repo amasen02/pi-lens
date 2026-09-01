@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -8,6 +9,11 @@ import {
 	stripOldTextTrailingWhitespace,
 	tryCorrectIndentationMismatch,
 } from "../../clients/read-guard-tool-lines.js";
+import {
+	applyPartiallyApplicableEdits,
+	PartialApplyRecordStore,
+	type PartiallyApplicableEdit,
+} from "../../clients/partial-edit-apply.js";
 import { logReadGuardEvent } from "../../clients/read-guard-logger.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
@@ -580,19 +586,30 @@ describe("read-guard tool line helpers", () => {
 			expect(result.preflightError).toMatch(/RETRYABLE/);
 			expect(result.preflightError).toMatch(/edits\[1\]/);
 			expect(result.preflightError).toMatch(/was not found/);
-			expect(result.partiallyApplicable).toEqual([
-				{
-					oldText: "function bar() {\n  return 2;\n}",
-					newText: "ok",
-					originalIndex: 0,
-				},
-			]);
+			expect(result.partiallyApplicable).toHaveLength(1);
+			expect(result.partiallyApplicable?.[0]).toMatchObject({
+				oldText: "function bar() {\n  return 2;\n}",
+				appliedSpanText: "function bar() {\n  return 2;\n}",
+				newText: "ok",
+				originalIndex: 0,
+			});
+			// #1053: the carried span and snapshot identity point at the exact
+			// preflight-approved region.
+			const lf = fs.readFileSync(filePath, "utf-8").replace(/\r\n/g, "\n");
+			const start = lf.indexOf("function bar() {\n  return 2;\n}");
+			expect(result.partiallyApplicable?.[0]).toMatchObject({
+				spanStart: start,
+				spanEnd: start + "function bar() {\n  return 2;\n}".length,
+			});
+			expect(result.partiallyApplicable?.[0].snapshot.hash).toMatch(
+				/^[0-9a-f]{64}$/,
+			);
 		} finally {
 			env.cleanup();
 		}
 	});
 
-	it("does not mark normalized-only matches as partially applicable", () => {
+	it("carries a normalized-only match as its raw span during partial apply", () => {
 		const env = setupTestEnvironment("read-guard-lines-partial-not-exact-");
 		try {
 			const filePath = path.join(env.tmpDir, "file.ts");
@@ -616,11 +633,55 @@ describe("read-guard tool line helpers", () => {
 			);
 
 			expect(result.preflightError).toMatch(/RETRYABLE/);
-			expect(result.partiallyApplicable).toBeUndefined();
+			expect(result.partiallyApplicable).toHaveLength(1);
+			expect(result.partiallyApplicable?.[0].appliedSpanText).toBe(
+				"const a = 1;   \nconst b = 2;",
+			);
 		} finally {
 			env.cleanup();
 		}
 	});
+
+	it.each([
+		["lone-CR line endings", "const a = 1;\rconst b = 2;\r", "const b = 2;"],
+		[
+			"Unicode dash matching",
+			"const a = x–y;\nconst b = 2;\n",
+			"const a = x-y;",
+		],
+		[
+			"Unicode quote matching",
+			"const a = ‘value’;\nconst b = 2;\n",
+			"const a = 'value';",
+		],
+	])(
+		"carries %s as a raw span beside a missing edit",
+		(_label, raw, oldText) => {
+			const env = setupTestEnvironment("read-guard-lines-normalized-partial-");
+			try {
+				const filePath = path.join(env.tmpDir, "file.ts");
+				fs.writeFileSync(filePath, raw);
+				const result = getTouchedLinesForGuard(
+					{
+						toolName: "edit",
+						input: {
+							path: filePath,
+							edits: [
+								{ oldText, newText: "replacement" },
+								{ oldText: "const missing = true;", newText: "noop" },
+							],
+						},
+					},
+					filePath,
+				);
+				expect(result.preflightError).toMatch(/RETRYABLE/);
+				expect(result.partiallyApplicable).toHaveLength(1);
+				expect(result.partiallyApplicable?.[0].oldText).toBe(oldText);
+			} finally {
+				env.cleanup();
+			}
+		},
+	);
 
 	it("blocks mixed range + oldText edits when an oldText target is unresolved", () => {
 		const env = setupTestEnvironment("read-guard-lines-mixed-");
@@ -1488,5 +1549,324 @@ describe("getTouchedLinesForGuard — confusable Unicode hyphen normalization (#
 		);
 		expect(result.preflightError).toMatch(/RETRYABLE|RE-READ REQUIRED/);
 		expect(result.touchedLines).toBeUndefined();
+	});
+});
+
+// ── #1053/#2402: preflight carries spans + snapshot identity; exact retries ──
+describe("getTouchedLinesForGuard — preflight spans and exact-retry recognition (#2402)", () => {
+	it("carries spans resolved in the snapshot's LF view on a CRLF file", () => {
+		const env = setupTestEnvironment("rg-spans-crlf-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			const raw = "const a = 1;\r\nconst b = 2;\r\n";
+			fs.writeFileSync(filePath, raw);
+
+			const result = getTouchedLinesForGuard(
+				{
+					toolName: "edit",
+					input: {
+						path: filePath,
+						edits: [
+							{ oldText: "const b = 2;", newText: "const b = 20;" },
+							{ oldText: "missing line", newText: "noop" },
+						],
+					},
+				},
+				filePath,
+			);
+
+			const edit = result.partiallyApplicable?.[0];
+			expect(edit).toBeDefined();
+			// The span offsets are LF-view offsets (CRLF never inflates them).
+			const lf = raw.replace(/\r\n/g, "\n");
+			expect(edit!.spanStart).toBe(lf.indexOf("const b = 2;"));
+			expect(edit!.spanEnd).toBe(edit!.spanStart + "const b = 2;".length);
+			expect(edit!.appliedSpanText).toBe("const b = 2;");
+			expect(edit!.snapshot.hash).toMatch(/^[0-9a-f]{64}$/);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("marks an exact retry of an applied pair as already-applied, not a miss", () => {
+		const env = setupTestEnvironment("rg-exact-retry-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(filePath, "const a = 1;\nconst b = 20;\n");
+			const records = new PartialApplyRecordStore();
+			records.record(filePath, "const b = 2;", "const b = 20;");
+
+			const result = getTouchedLinesForGuard(
+				{
+					toolName: "edit",
+					input: {
+						path: filePath,
+						edits: [
+							{ oldText: "const b = 2;", newText: "const b = 20;" },
+							{ oldText: "function gone() {}", newText: "noop" },
+						],
+					},
+				},
+				filePath,
+				undefined,
+				undefined,
+				records,
+			);
+
+			expect(result.alreadyAppliedEdits).toEqual([0]);
+			expect(result.partiallyApplicable).toBeUndefined();
+			expect(result.preflightError).toMatch(/edits\[1\]/);
+			expect(result.preflightError).toContain("already applied");
+			// edit[0] is never counted as a failure.
+			expect(result.preflightError).not.toMatch(/edits\[0\]\.oldText/);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("keeps an oldText-in-newText retry out of partiallyApplicable", () => {
+		const env = setupTestEnvironment("rg-contained-retry-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(
+				filePath,
+				"import { A } from 'm';\nimport { B } from 'm';\n",
+			);
+			const records = new PartialApplyRecordStore();
+			records.record(
+				filePath,
+				"import { A } from 'm';",
+				"import { A } from 'm';\nimport { B } from 'm';",
+			);
+
+			const result = getTouchedLinesForGuard(
+				{
+					toolName: "edit",
+					input: {
+						path: filePath,
+						edits: [
+							{
+								oldText: "import { A } from 'm';",
+								newText: "import { A } from 'm';\nimport { B } from 'm';",
+							},
+							{ oldText: "function gone() {}", newText: "noop" },
+						],
+					},
+				},
+				filePath,
+				undefined,
+				undefined,
+				records,
+			);
+
+			// The applied record resolves the retry BEFORE the oldText matches
+			// again inside its own newText — re-applying would duplicate it.
+			expect(result.alreadyAppliedEdits).toEqual([0]);
+			expect(result.partiallyApplicable).toBeUndefined();
+			expect(result.preflightError).toContain("already applied");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("answers a fully already-applied batch with the ✅ verdict", () => {
+		const env = setupTestEnvironment("rg-pure-retry-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(filePath, "const a = 1;\nconst b = 20;\n");
+			const records = new PartialApplyRecordStore();
+			records.record(filePath, "const b = 2;", "const b = 20;");
+
+			const result = getTouchedLinesForGuard(
+				{
+					toolName: "edit",
+					input: {
+						path: filePath,
+						edits: [{ oldText: "const b = 2;", newText: "const b = 20;" }],
+					},
+				},
+				filePath,
+				undefined,
+				undefined,
+				records,
+			);
+
+			expect(result.preflightError?.startsWith("✅ ALREADY APPLIED")).toBe(
+				true,
+			);
+			expect(result.preflightError).toContain("edits[0]");
+			expect(result.alreadyAppliedEdits).toEqual([0]);
+			expect(result.partiallyApplicable).toBeUndefined();
+			expect(result.editBatchSummary).toMatchObject({
+				terminalStatus: "skipped",
+				alreadyAppliedTotal: 1,
+			});
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("falls back to normal resolution when the applied state no longer holds", () => {
+		const env = setupTestEnvironment("rg-reverted-retry-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			// The pair was recorded applied, but the file was reverted: oldText is
+			// back and newText is gone. The record must NOT claim already-applied.
+			fs.writeFileSync(filePath, "const a = 1;\nconst b = 2;\n");
+			const records = new PartialApplyRecordStore();
+			records.record(filePath, "const b = 2;", "const b = 20;");
+
+			const result = getTouchedLinesForGuard(
+				{
+					toolName: "edit",
+					input: {
+						path: filePath,
+						edits: [{ oldText: "const b = 2;", newText: "const b = 20;" }],
+					},
+				},
+				filePath,
+				undefined,
+				undefined,
+				records,
+			);
+
+			expect(result.alreadyAppliedEdits).toBeUndefined();
+			expect(result.touchedLines).toEqual([2, 2]);
+			expect(result.contentMatchValidated).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("rejects overlapping resolved spans with an explicit message", () => {
+		const env = setupTestEnvironment("rg-overlap-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(filePath, "const abcdef = 1;\nconst tail = 1;\n");
+
+			const result = getTouchedLinesForGuard(
+				{
+					toolName: "edit",
+					input: {
+						path: filePath,
+						edits: [
+							{ oldText: "abcdef", newText: "X" },
+							{ oldText: "cdef", newText: "Y" },
+							{ oldText: "const tail = 1;", newText: "const tail = 2;" },
+							{ oldText: "function gone() {}", newText: "noop" },
+						],
+					},
+				},
+				filePath,
+			);
+
+			expect(result.preflightError).toMatch(/overlapping spans/);
+			expect(result.preflightError).toMatch(/edits\[0\] and edits\[1\]/);
+			// An unrelated valid candidate is excluded too: overlap is a batch-level
+			// safety failure, so no subset may commit.
+			expect(result.partiallyApplicable).toBeUndefined();
+			expect(result.editBatchSummary).toMatchObject({
+				terminalStatus: "blocked",
+			});
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("recognizes an identical retry after a formatter rewrote the file post-commit", async () => {
+		const env = setupTestEnvironment("rg-formatter-retry-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			const raw = "const a = 1;\nconst b = 2;\n";
+			fs.writeFileSync(filePath, raw);
+			const spanStart = raw.indexOf("const b = 2;");
+			const edit: PartiallyApplicableEdit = {
+				oldText: "const b = 2;",
+				appliedSpanText: "const b = 2;",
+				newText: "const b = 20;",
+				originalIndex: 0,
+				snapshot: {
+					hash: createHash("sha256").update(raw, "utf8").digest("hex"),
+				},
+				spanStart,
+				spanEnd: spanStart + "const b = 2;".length,
+			};
+			const records = new PartialApplyRecordStore();
+
+			await applyPartiallyApplicableEdits({
+				filePath,
+				edits: [edit],
+				recordStore: records,
+				// A formatter rewrites the file after the commit: it appends a
+				// trailing newline, changing the raw bytes (and thus the file hash)
+				// while leaving the applied line intact.
+				afterWrite: async () => {
+					fs.writeFileSync(filePath, `${fs.readFileSync(filePath, "utf-8")}\n`);
+					return undefined;
+				},
+			});
+
+			// The post-afterWrite state was recorded alongside the post-commit one.
+			expect(
+				records.find(filePath, "const b = 2;", "const b = 20;")
+					?.afterWriteContentHash,
+			).toBeDefined();
+
+			// The identical retry, resolved against the formatter-rewritten file, is
+			// recognized as already-applied instead of falling back to oldText
+			// resolution and re-applying (#2402).
+			const result = getTouchedLinesForGuard(
+				{
+					toolName: "edit",
+					input: {
+						path: filePath,
+						edits: [{ oldText: "const b = 2;", newText: "const b = 20;" }],
+					},
+				},
+				filePath,
+				undefined,
+				undefined,
+				records,
+			);
+
+			expect(result.alreadyAppliedEdits).toEqual([0]);
+			expect(result.partiallyApplicable).toBeUndefined();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("does not recognize a retry when the payload's newText differs", () => {
+		const env = setupTestEnvironment("rg-different-newtext-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(filePath, "const a = 1;\nconst b = 20;\n");
+			const records = new PartialApplyRecordStore();
+			records.record(filePath, "const b = 2;", "const b = 20;");
+
+			const result = getTouchedLinesForGuard(
+				{
+					toolName: "edit",
+					input: {
+						path: filePath,
+						edits: [
+							{ oldText: "const b = 2;", newText: "const b = 300;" },
+							{ oldText: "function gone() {}", newText: "noop" },
+						],
+					},
+				},
+				filePath,
+				undefined,
+				undefined,
+				records,
+			);
+
+			// A different newText is NOT the applied pair; the retry fails
+			// honestly instead of being absorbed by the record.
+			expect(result.alreadyAppliedEdits).toBeUndefined();
+			expect(result.preflightError).toMatch(/edits\[0\]\.oldText/);
+		} finally {
+			env.cleanup();
+		}
 	});
 });

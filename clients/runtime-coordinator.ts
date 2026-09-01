@@ -16,6 +16,7 @@ import type { FileComplexity } from "./complexity-client.js";
 import { normalizeMapKey, pathsEqual } from "./path-utils.js";
 import { PathKeyedMap } from "./path-keyed-map.js";
 import { BoundedLruCache } from "./bounded-cache.js";
+import { PartialApplyRecordStore } from "./partial-edit-apply.js";
 import { ReadGuard } from "./read-guard.js";
 import type { RuleScanResult } from "./rules-scanner.js";
 import { RUNTIME_CONFIG } from "./runtime-config.js";
@@ -349,6 +350,11 @@ export class RuntimeCoordinator {
 	// (cheap, empty Map) but callers gate recording behind the
 	// `lens-turn-summary` flag so it's a true no-op when the feature is off.
 	private readonly _turnSummary = new TurnSummaryCollector();
+	// #2402/#1053: session-scoped applied-edit records for exact-retry
+	// recognition. Both producers (partial-apply commit, full native-edit
+	// success) write here; the preflight consults it before declaring an
+	// oldText miss, so an identical retry never re-executes a committed write.
+	readonly partialApplyRecords = new PartialApplyRecordStore();
 
 	resetForSession(startedAt = Date.now()): void {
 		this._sessionGeneration += 1;
@@ -398,6 +404,9 @@ export class RuntimeCoordinator {
 		this._actionableWarningsThisTurn.clear();
 		this._codeQualityWarningsThisTurn.clear();
 		this._turnSummary.clear();
+		// #2402: an applied-edit record is a fact about the session that applied
+		// it; a new session must re-resolve identical payloads from content.
+		this.partialApplyRecords.clear();
 	}
 
 	get sessionStartedAt(): number {
