@@ -280,7 +280,14 @@ describe("Pipeline", () => {
 					fs.writeFileSync(filePath, "const x = 1;\n");
 					return {
 						filePath: fp,
-						formatters: [{ name: "biome", success: true, changed: true, outcome: "formatted" as const }],
+						formatters: [
+							{
+								name: "biome",
+								success: true,
+								changed: true,
+								outcome: "formatted" as const,
+							},
+						],
 						anyChanged: true,
 						allSucceeded: true,
 					};
@@ -429,7 +436,14 @@ describe("Pipeline", () => {
 					fs.writeFileSync(filePath, "const x = 1;\n");
 					return {
 						filePath: fp,
-						formatters: [{ name: "biome", success: true, changed: true, outcome: "formatted" as const }],
+						formatters: [
+							{
+								name: "biome",
+								success: true,
+								changed: true,
+								outcome: "formatted" as const,
+							},
+						],
 						anyChanged: true,
 						allSucceeded: true,
 					};
@@ -552,7 +566,14 @@ describe("Pipeline", () => {
 					fs.writeFileSync(filePath, "const x = 1;\n");
 					return {
 						filePath: fp,
-						formatters: [{ name: "biome", success: true, changed: true, outcome: "formatted" as const }],
+						formatters: [
+							{
+								name: "biome",
+								success: true,
+								changed: true,
+								outcome: "formatted" as const,
+							},
+						],
 						anyChanged: true,
 						allSucceeded: true,
 					};

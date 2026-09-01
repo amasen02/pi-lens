@@ -24,10 +24,10 @@ vi.mock("../../clients/safe-spawn.js", () => ({
 }));
 
 const WHICH_COMMANDS = new Set(["where", "which"]);
-const isWhichProbe = (call: unknown[]) =>
-	WHICH_COMMANDS.has(call[0] as string);
+const isWhichProbe = (call: unknown[]) => WHICH_COMMANDS.has(call[0] as string);
 /** Every real format spawn (i.e. not a `where`/`which` availability probe). */
-const formatSpawns = () => safeSpawnAsync.mock.calls.filter((c) => !isWhichProbe(c));
+const formatSpawns = () =>
+	safeSpawnAsync.mock.calls.filter((c) => !isWhichProbe(c));
 
 async function loadFormatters() {
 	return import("../../clients/formatters.js");
@@ -176,10 +176,8 @@ describe("runFormatPhase feeds the deferred drain (#2413)", () => {
 
 	it("routes unavailable out of formatFailures and records it once, distinctly", async () => {
 		const { runFormatPhase } = await import("../../clients/pipeline.js");
-		const {
-			getDegradationSummary,
-			resetDegradationLedger,
-		} = await import("../../clients/degradation-ledger.js");
+		const { getDegradationSummary, resetDegradationLedger } =
+			await import("../../clients/degradation-ledger.js");
 		resetDegradationLedger();
 
 		const filePath = path.join(process.cwd(), "unavailable-fixture.ts");
@@ -249,7 +247,9 @@ describe("runFormatPhase feeds the deferred drain (#2413)", () => {
 		);
 
 		expect(result.formatUnavailable).toEqual([]);
-		expect(result.formatFailures).toEqual(["biome: biome exited with status 2"]);
+		expect(result.formatFailures).toEqual([
+			"biome: biome exited with status 2",
+		]);
 	});
 });
 
@@ -261,9 +261,8 @@ describe("widget footer never marks an unavailable tool as failed (#2413)", () =
 	const theme = { fg: (_color: string, s: string) => s };
 
 	it("never marks an unavailable formatter fmt-failed, even when success is false", async () => {
-		const { recordFormatter, renderWidget, clearWidgetState } = await import(
-			"../../clients/widget-state.js"
-		);
+		const { recordFormatter, renderWidget, clearWidgetState } =
+			await import("../../clients/widget-state.js");
 		clearWidgetState();
 
 		// The production combo (success:true) already avoids the marker, so to
