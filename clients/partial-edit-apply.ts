@@ -86,6 +86,14 @@ export interface AppliedPartialEditRecord {
 	pairDigest: string;
 	/** Hash of the complete file state immediately after this edit committed. */
 	contentHash?: string;
+	/**
+	 * Hash of the file state after the post-commit pipeline (a formatter) rewrote
+	 * it, when that rewrite changed the bytes (#2402). Recognition accepts EITHER
+	 * this or `contentHash`: a deterministic formatter pass between commit and an
+	 * identical retry no longer defeats already-applied recognition, while an
+	 * unknown third-party state still matches neither and stays fail-safe.
+	 */
+	afterWriteContentHash?: string;
 	appliedAtMs: number;
 }
 
@@ -148,10 +156,35 @@ export function isExactAppliedRetry(args: {
 	contentHash?: string;
 	/** Raw file hash recorded immediately after the original commit. */
 	expectedContentHash?: string;
+	/**
+	 * Raw file hash recorded after the post-commit pipeline (a formatter) rewrote
+	 * the file, when it changed the bytes (#2402). When present it is an
+	 * additional accepted state alongside `expectedContentHash`.
+	 */
+	expectedAfterWriteHash?: string;
 }): boolean {
-	const { contentLf, oldKey, newKey, contentHash, expectedContentHash } = args;
-	if (expectedContentHash !== undefined && contentHash !== expectedContentHash)
-		return false;
+	const {
+		contentLf,
+		oldKey,
+		newKey,
+		contentHash,
+		expectedContentHash,
+		expectedAfterWriteHash,
+	} = args;
+	// Hash gate (fail-safe): when the caller recorded any file-state hash, the
+	// current file must match one of the states THIS process produced — the
+	// post-commit bytes or the post-afterWrite (formatter) bytes. A file in any
+	// other state is an unrecognized third-party change; we refuse rather than
+	// re-resolve against it. The gate is skipped only when no hash was recorded.
+	const haveExpectedHash =
+		expectedContentHash !== undefined || expectedAfterWriteHash !== undefined;
+	if (haveExpectedHash) {
+		const matchesKnownState =
+			contentHash !== undefined &&
+			(contentHash === expectedContentHash ||
+				contentHash === expectedAfterWriteHash);
+		if (!matchesKnownState) return false;
+	}
 	if (!oldKey) return false;
 	if (newKey === "") return countLfOccurrences(contentLf, oldKey) === 0;
 	if (!newKey.includes(oldKey)) {
@@ -225,6 +258,25 @@ export class PartialApplyRecordStore {
 			if (oldest !== undefined) this.files.delete(oldest);
 		}
 		this.files.set(filePath, records);
+	}
+
+	/**
+	 * Stamps the post-afterWrite file hash onto an existing record so a later
+	 * identical retry against the formatter-rewritten file is still recognized as
+	 * already-applied (#2402). No-op when the pair was never recorded.
+	 */
+	noteAfterWriteHash(
+		filePath: string,
+		oldText: string,
+		newText: string | undefined,
+		afterWriteContentHash: string,
+	): void {
+		if (!oldText) return;
+		const pairDigest = editPairDigest(oldText, newText);
+		const record = this.files
+			.get(filePath)
+			?.find((r) => r.pairDigest === pairDigest);
+		if (record) record.afterWriteContentHash = afterWriteContentHash;
 	}
 
 	clear(): void {
@@ -474,6 +526,28 @@ export async function applyPartiallyApplicableEdits(args: {
 		try {
 			postEditOutput = await args.afterWrite();
 			postEditStatus = "succeeded";
+			// #2402: the afterWrite pipeline (a formatter) may have rewritten the
+			// file. Record the new state so an identical retry against the
+			// formatted bytes is still recognized as already-applied instead of
+			// falling back to oldText resolution and re-applying. Only stamped when
+			// the pipeline actually changed the bytes; the post-commit hash already
+			// covers a no-op pass.
+			if (args.recordStore) {
+				const afterWriteHash = hashFile(args.filePath);
+				if (
+					afterWriteHash !== undefined &&
+					afterWriteHash !== committedContentHash
+				) {
+					for (const edit of args.edits) {
+						args.recordStore.noteAfterWriteHash(
+							args.filePath,
+							edit.oldText,
+							edit.newText,
+							afterWriteHash,
+						);
+					}
+				}
+			}
 		} catch (error) {
 			// The write is committed. Preserve the existing caller behavior for
 			// uninstrumented callers; the read-guard path records and handles it.

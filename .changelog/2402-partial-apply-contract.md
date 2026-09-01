@@ -21,6 +21,11 @@ section: Fixed
   plus content evidence (oldText gone, or every remaining occurrence inside
   its own applied newText), never from a global newText-presence heuristic.
   Retry identity uses a fixed-size digest of the exact submitted pair, while
-  snapshot identity hashes raw file bytes. Normalized matches carry raw spans,
-  mixed batches close when a span cannot be represented, and atomic writes
-  preserve the existing mode and leaf-symlink behavior.
+  snapshot identity hashes raw file bytes. Recognition accepts either the
+  post-commit file state or the post-afterWrite state, so a deterministic
+  formatter pass between the commit and an identical retry no longer defeats
+  it; a file left in any other (unrecognized third-party) state matches
+  neither and falls back to normal resolution rather than being silently
+  accepted. Normalized matches carry raw spans, mixed batches close when a span
+  cannot be represented, and atomic writes preserve the existing mode and
+  leaf-symlink behavior.

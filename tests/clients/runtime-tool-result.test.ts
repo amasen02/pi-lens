@@ -474,7 +474,11 @@ describe("bash grep searchReads registration", () => {
 			const rawHashReads = readFileSyncSpy.mock.calls.filter(
 				(args) => args.length === 1,
 			);
-			expect(rawHashReads).toHaveLength(3);
+			// Two raw-byte hashes total across three applied records: one post-write
+			// hash (shared by all three record() calls AND reused as the pipeline
+			// dedup key, finding 3) and one post-pipeline hash. record() never
+			// re-reads per edit.
+			expect(rawHashReads).toHaveLength(2);
 			const records = [
 				runtime.partialApplyRecords.find(
 					filePath,

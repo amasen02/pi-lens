@@ -621,6 +621,35 @@ describe("PartialApplyRecordStore", () => {
 		expect(store.find("/f.ts", "old  ", "new")).toBeUndefined();
 	});
 
+	it("finds a record keyed under the other path separator (path-key invariant)", () => {
+		// Record with one separator form, look up with the other. The store keys
+		// through normalizeMapKey, so a retry whose path arrives back-slashed must
+		// still resolve a record written slash-formed (read-guard path-key
+		// invariant, #210).
+		const forward = new PartialApplyRecordStore();
+		forward.record("C:/proj/src/file.ts", "old", "new");
+		expect(forward.find("C:\\proj\\src\\file.ts", "old", "new")).toBeDefined();
+
+		const backward = new PartialApplyRecordStore();
+		backward.record("C:\\proj\\src\\file.ts", "old", "new");
+		expect(backward.find("C:/proj/src/file.ts", "old", "new")).toBeDefined();
+	});
+
+	it("stamps an afterWrite hash under the other path separator (path-key invariant)", () => {
+		const store = new PartialApplyRecordStore();
+		store.record("C:/proj/src/file.ts", "old", "new", "commit-hash");
+		// Stamp with the back-slashed spelling; read back the slash spelling.
+		store.noteAfterWriteHash(
+			"C:\\proj\\src\\file.ts",
+			"old",
+			"new",
+			"format-hash",
+		);
+		expect(
+			store.find("C:/proj/src/file.ts", "old", "new")?.afterWriteContentHash,
+		).toBe("format-hash");
+	});
+
 	it("bounded per-file and per-store eviction keeps the newest records", () => {
 		const store = new PartialApplyRecordStore();
 		for (let i = 0; i < 10; i += 1) {
@@ -681,6 +710,53 @@ describe("isExactAppliedRetry", () => {
 				contentLf: currentContent,
 				contentHash: currentHash,
 				expectedContentHash: recordedHash,
+				oldKey: "const b = 2;",
+				newKey: "const b = 20;",
+			}),
+		).toBe(false);
+	});
+
+	it("accepts the post-afterWrite formatter state as a known applied state", () => {
+		// A formatter rewrote the file after the commit, so the current bytes match
+		// neither the submitted content nor the post-commit hash — but they DO match
+		// the recorded post-afterWrite hash, so recognition holds (#2402).
+		const formattedContent = "const b = 20;\nconst tail = 1;\n\n";
+		const postCommitHash = createHash("sha256")
+			.update("const b = 20;\nconst tail = 1;\n", "utf8")
+			.digest("hex");
+		const afterWriteHash = createHash("sha256")
+			.update(formattedContent, "utf8")
+			.digest("hex");
+		expect(
+			isExactAppliedRetry({
+				contentLf: formattedContent,
+				contentHash: afterWriteHash,
+				expectedContentHash: postCommitHash,
+				expectedAfterWriteHash: afterWriteHash,
+				oldKey: "const b = 2;",
+				newKey: "const b = 20;",
+			}),
+		).toBe(true);
+	});
+
+	it("still refuses an unknown third state even with an afterWrite hash on record", () => {
+		// Neither the post-commit nor the post-afterWrite hash matches the current
+		// bytes: this is an unrecognized third-party change, and the guard stays
+		// fail-safe by refusing rather than re-resolving against it.
+		const currentContent = "const b = 20;\nconst tail = 2;\n";
+		const currentHash = createHash("sha256")
+			.update(currentContent, "utf8")
+			.digest("hex");
+		expect(
+			isExactAppliedRetry({
+				contentLf: currentContent,
+				contentHash: currentHash,
+				expectedContentHash: createHash("sha256")
+					.update("const b = 20;\nconst tail = 1;\n", "utf8")
+					.digest("hex"),
+				expectedAfterWriteHash: createHash("sha256")
+					.update("const b = 20;\nconst tail = 1;\n\n", "utf8")
+					.digest("hex"),
 				oldKey: "const b = 2;",
 				newKey: "const b = 20;",
 			}),

@@ -608,6 +608,7 @@ function resolveOldTextEdits(
 					newKey: normalizeContent(edits[i].newText ?? ""),
 					contentHash: snapshot.hash,
 					expectedContentHash: record.contentHash,
+					expectedAfterWriteHash: record.afterWriteContentHash,
 				})
 			) {
 				if (alreadyAppliedEdits.length < 100)

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -8,7 +9,11 @@ import {
 	stripOldTextTrailingWhitespace,
 	tryCorrectIndentationMismatch,
 } from "../../clients/read-guard-tool-lines.js";
-import { PartialApplyRecordStore } from "../../clients/partial-edit-apply.js";
+import {
+	applyPartiallyApplicableEdits,
+	PartialApplyRecordStore,
+	type PartiallyApplicableEdit,
+} from "../../clients/partial-edit-apply.js";
 import { logReadGuardEvent } from "../../clients/read-guard-logger.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
@@ -1763,6 +1768,72 @@ describe("getTouchedLinesForGuard — preflight spans and exact-retry recognitio
 			expect(result.editBatchSummary).toMatchObject({
 				terminalStatus: "blocked",
 			});
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("recognizes an identical retry after a formatter rewrote the file post-commit", async () => {
+		const env = setupTestEnvironment("rg-formatter-retry-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			const raw = "const a = 1;\nconst b = 2;\n";
+			fs.writeFileSync(filePath, raw);
+			const spanStart = raw.indexOf("const b = 2;");
+			const edit: PartiallyApplicableEdit = {
+				oldText: "const b = 2;",
+				appliedSpanText: "const b = 2;",
+				newText: "const b = 20;",
+				originalIndex: 0,
+				snapshot: {
+					hash: createHash("sha256").update(raw, "utf8").digest("hex"),
+				},
+				spanStart,
+				spanEnd: spanStart + "const b = 2;".length,
+			};
+			const records = new PartialApplyRecordStore();
+
+			await applyPartiallyApplicableEdits({
+				filePath,
+				edits: [edit],
+				recordStore: records,
+				// A formatter rewrites the file after the commit: it appends a
+				// trailing newline, changing the raw bytes (and thus the file hash)
+				// while leaving the applied line intact.
+				afterWrite: async () => {
+					fs.writeFileSync(
+						filePath,
+						`${fs.readFileSync(filePath, "utf-8")}\n`,
+					);
+					return undefined;
+				},
+			});
+
+			// The post-afterWrite state was recorded alongside the post-commit one.
+			expect(
+				records.find(filePath, "const b = 2;", "const b = 20;")
+					?.afterWriteContentHash,
+			).toBeDefined();
+
+			// The identical retry, resolved against the formatter-rewritten file, is
+			// recognized as already-applied instead of falling back to oldText
+			// resolution and re-applying (#2402).
+			const result = getTouchedLinesForGuard(
+				{
+					toolName: "edit",
+					input: {
+						path: filePath,
+						edits: [{ oldText: "const b = 2;", newText: "const b = 20;" }],
+					},
+				},
+				filePath,
+				undefined,
+				undefined,
+				records,
+			);
+
+			expect(result.alreadyAppliedEdits).toEqual([0]);
+			expect(result.partiallyApplicable).toBeUndefined();
 		} finally {
 			env.cleanup();
 		}
