@@ -247,6 +247,64 @@ describe("getFileDiagnosticSummaries", () => {
 			.files.find((f) => f.filePath === filePath);
 		expect(snap?.storedDiagnostics).toBe(12);
 	});
+
+	// #2414: hint/info tier findings are style opinions, not code defects. The
+	// footer's `warnings` tally must not inflate on them, while a genuine
+	// `warning`-tier finding must still count — and the hint/info findings must
+	// still be visible via a separate `advisories` count so a hint-only file
+	// isn't silently dropped from a detailed listing.
+	describe("severity projection (#2414)", () => {
+		it("does not fold hint/info into warnings, but still counts real warnings", () => {
+			const filePath = `${process.cwd()}/severity-projection.ts`;
+			recordDiagnostics(filePath, [
+				{ severity: "hint", line: 1, rule: "long-parameter-list", message: "h" },
+				{ severity: "info", line: 2, rule: "complexity", message: "i" },
+				{ severity: "warning", line: 3, rule: "no-console", message: "w" },
+			]);
+			const entry = getFileDiagnosticSummaries().find(
+				(s) => s.filePath === filePath,
+			);
+			expect(entry?.warnings).toBe(1);
+			expect(entry?.advisories).toBe(2);
+			// All three findings still reach the detailed diagnostics list.
+			expect(entry?.diagnostics).toHaveLength(3);
+		});
+
+		it("a hint/info-only file reports zero warnings but a nonzero advisory count", () => {
+			const filePath = `${process.cwd()}/hints-only.ts`;
+			recordDiagnostics(filePath, [
+				{ severity: "hint", line: 1, rule: "no-runtime-typeof", message: "h1" },
+				{ severity: "info", line: 2, rule: "no-unknown-parameters", message: "h2" },
+			]);
+			const entry = getFileDiagnosticSummaries().find(
+				(s) => s.filePath === filePath,
+			);
+			expect(entry?.blocking).toBe(0);
+			expect(entry?.errors).toBe(0);
+			expect(entry?.warnings).toBe(0);
+			expect(entry?.advisories).toBe(2);
+		});
+
+		it("the TUI footer's warning chip does not fire for a hint/info-only file", () => {
+			const filePath = `${process.cwd()}/hints-only-footer.ts`;
+			recordDiagnostics(filePath, [
+				{ severity: "hint", line: 1, rule: "long-parameter-list", message: "h" },
+				{ severity: "info", line: 2, rule: "complexity", message: "i" },
+			]);
+			const rendered = renderWidget(120, theme).join("\n");
+			expect(rendered).not.toMatch(/\d+W\b/);
+			expect(rendered).toContain("clean");
+		});
+
+		it("the TUI footer's warning chip DOES fire for a real warning", () => {
+			const filePath = `${process.cwd()}/real-warning-footer.ts`;
+			recordDiagnostics(filePath, [
+				{ severity: "warning", line: 1, rule: "no-console", message: "w" },
+			]);
+			const rendered = renderWidget(120, theme).join("\n");
+			expect(rendered).toMatch(/\d+W\b/);
+		});
+	});
 });
 
 describe("widget-state renderWidget", () => {
