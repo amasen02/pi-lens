@@ -950,13 +950,14 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			newText?: string;
 			edits?: Array<{ oldText?: string; newText?: string }>;
 		};
+		const appliedContentHash = getFileStateHash(filePath);
 		const record = (oldText?: string, newText?: string): void => {
 			if (typeof oldText === "string" && oldText.length > 0) {
 				runtime.partialApplyRecords.record(
 					filePath,
 					oldText,
 					newText,
-					getFileStateHash(filePath),
+					appliedContentHash,
 				);
 			}
 		};

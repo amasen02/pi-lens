@@ -35,6 +35,7 @@ export const MAX_EDIT_BATCH_ITEMS = 100;
 
 export type EditBatchRejectionCode =
 	| "oldtext_not_found"
+	| "oldtext_unrepresentable"
 	| "oldtext_duplicate"
 	| "span_overlap"
 	| "preflight_blocked"

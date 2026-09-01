@@ -604,7 +604,7 @@ describe("read-guard tool line helpers", () => {
 		}
 	});
 
-	it("does not mark normalized-only matches as partially applicable", () => {
+	it("carries a normalized-only match as its raw span during partial apply", () => {
 		const env = setupTestEnvironment("read-guard-lines-partial-not-exact-");
 		try {
 			const filePath = path.join(env.tmpDir, "file.ts");
@@ -628,11 +628,55 @@ describe("read-guard tool line helpers", () => {
 			);
 
 			expect(result.preflightError).toMatch(/RETRYABLE/);
-			expect(result.partiallyApplicable).toBeUndefined();
+			expect(result.partiallyApplicable).toHaveLength(1);
+			expect(result.partiallyApplicable?.[0].appliedSpanText).toBe(
+				"const a = 1;   \nconst b = 2;",
+			);
 		} finally {
 			env.cleanup();
 		}
 	});
+
+	it.each([
+		["lone-CR line endings", "const a = 1;\rconst b = 2;\r", "const b = 2;"],
+		[
+			"Unicode dash matching",
+			"const a = x–y;\nconst b = 2;\n",
+			"const a = x-y;",
+		],
+		[
+			"Unicode quote matching",
+			"const a = ‘value’;\nconst b = 2;\n",
+			"const a = 'value';",
+		],
+	])(
+		"carries %s as a raw span beside a missing edit",
+		(_label, raw, oldText) => {
+			const env = setupTestEnvironment("read-guard-lines-normalized-partial-");
+			try {
+				const filePath = path.join(env.tmpDir, "file.ts");
+				fs.writeFileSync(filePath, raw);
+				const result = getTouchedLinesForGuard(
+					{
+						toolName: "edit",
+						input: {
+							path: filePath,
+							edits: [
+								{ oldText, newText: "replacement" },
+								{ oldText: "const missing = true;", newText: "noop" },
+							],
+						},
+					},
+					filePath,
+				);
+				expect(result.preflightError).toMatch(/RETRYABLE/);
+				expect(result.partiallyApplicable).toHaveLength(1);
+				expect(result.partiallyApplicable?.[0].oldText).toBe(oldText);
+			} finally {
+				env.cleanup();
+			}
+		},
+	);
 
 	it("blocks mixed range + oldText edits when an oldText target is unresolved", () => {
 		const env = setupTestEnvironment("read-guard-lines-mixed-");

@@ -453,18 +453,69 @@ function countRawOccurrences(content: string, needle: string): number {
 
 function exactOldTextForApply(
 	rawContentLf: string,
+	normalizedContent: string,
 	oldText: string,
 	candidate: string,
-): string | undefined {
+): { text: string; start: number; end: number } | undefined {
 	const oldTextLf = oldText.replace(/\r\n/g, "\n");
-	if (countRawOccurrences(rawContentLf, oldTextLf) === 1) return oldTextLf;
+	if (countRawOccurrences(rawContentLf, oldTextLf) === 1) {
+		const start = rawContentLf.indexOf(oldTextLf);
+		return { text: oldTextLf, start, end: start + oldTextLf.length };
+	}
 	if (
 		candidate !== oldTextLf &&
 		countRawOccurrences(rawContentLf, candidate) === 1
 	) {
-		return candidate;
+		const start = rawContentLf.indexOf(candidate);
+		return { text: candidate, start, end: start + candidate.length };
 	}
-	return undefined;
+	if (candidate !== oldTextLf) return undefined;
+	const matchStart = normalizedContent.indexOf(candidate);
+	if (matchStart < 0) return undefined;
+	const rawLines = rawContentLf.split("\n");
+	const normalizedLines = normalizedContent.split("\n");
+	const rawLineStarts: number[] = [];
+	let rawOffset = 0;
+	for (const line of rawLines) {
+		rawLineStarts.push(rawOffset);
+		rawOffset += line.length + 1;
+	}
+	const normalizedLineStarts: number[] = [];
+	let normalizedOffset = 0;
+	for (const line of normalizedLines) {
+		normalizedLineStarts.push(normalizedOffset);
+		normalizedOffset += line.length + 1;
+	}
+	const mapOffset = (offset: number, preferEnd: boolean): number => {
+		const line = Math.min(
+			normalizedLines.length - 1,
+			normalizedContent.slice(0, offset).split("\n").length - 1,
+		);
+		const rawLine = rawLines[line] ?? "";
+		const bomOffset = line === 0 && rawLine.startsWith("\uFEFF") ? 1 : 0;
+		const rawMatchLine = rawLine.slice(bomOffset);
+		const target = offset - normalizedLineStarts[line];
+		const normalizedLine = normalizedLines[line] ?? "";
+		if (target >= normalizedLine.length) {
+			if (preferEnd) return rawLineStarts[line] + rawLine.length;
+			return rawLineStarts[line] + bomOffset + rawMatchLine.length;
+		}
+		let lower = 0;
+		let upper = rawMatchLine.length;
+		for (let boundary = 0; boundary <= rawMatchLine.length; boundary += 1) {
+			const length = normalizeContent(rawMatchLine.slice(0, boundary)).length;
+			if (length === target) return rawLineStarts[line] + bomOffset + boundary;
+			if (length < target) lower = boundary;
+			else if (upper === rawMatchLine.length) upper = boundary;
+		}
+		return rawLineStarts[line] + bomOffset + (preferEnd ? upper : lower);
+	};
+	const start = mapOffset(matchStart, false);
+	const end = mapOffset(matchStart + candidate.length, true);
+	const text = rawContentLf.slice(start, end);
+	return normalizeContent(text) === candidate
+		? { text, start, end }
+		: undefined;
 }
 
 function resolveOldTextEdits(
@@ -479,9 +530,9 @@ function resolveOldTextEdits(
 	const logBatchEvent = (
 		entry: Parameters<typeof logReadGuardEvent>[0],
 	): void => logReadGuardEvent({ ...entry, correlationId });
-	let rawContent: string;
+	let rawBytes: Buffer;
 	try {
-		rawContent = nodeFs.readFileSync(filePath, "utf-8");
+		rawBytes = nodeFs.readFileSync(filePath);
 	} catch {
 		const editBatchSummary = createReadGuardEditBatchSummary({
 			requestedIndexes: edits.map((edit, index) => edit.originalIndex ?? index),
@@ -507,15 +558,16 @@ function resolveOldTextEdits(
 		});
 		return { touchedLines: undefined, editBatchSummary };
 	}
+	const rawContent = rawBytes.toString("utf8");
 
-	const rawContentLf = rawContent.replace(/\r\n/g, "\n");
+	const rawContentLf = normalizeToLF(rawContent);
 	const content = normalizeContent(rawContent);
 	// #1053: the identity the spans below are resolved against. The apply step
 	// re-reads the file and rejects the whole batch when this no longer holds,
 	// so spans are never re-interpreted against changed bytes. The hash covers
 	// byte identity; spans carry their own bounds checks.
 	const snapshot: EditSnapshotIdentity = {
-		hash: createHash("sha256").update(rawContent, "utf8").digest("hex"),
+		hash: createHash("sha256").update(rawBytes).digest("hex"),
 	};
 	const errors: string[] = [];
 	const failureKinds: string[] = [];
@@ -552,8 +604,8 @@ function resolveOldTextEdits(
 				record &&
 				isExactAppliedRetry({
 					contentLf: rawContentLf,
-					oldKey: record.oldKey,
-					newKey: record.newKey,
+					oldKey: normalizeContent(oldText),
+					newKey: normalizeContent(edits[i].newText ?? ""),
 					contentHash: snapshot.hash,
 					expectedContentHash: record.contentHash,
 				})
@@ -705,35 +757,64 @@ function resolveOldTextEdits(
 		} else if (occurrenceLines.length === 1) {
 			const startLine = occurrenceLines[0];
 			const endLine = startLine + needle.split("\n").length - 1;
-			resolvedRanges.push([startLine, endLine]);
-			if (resolvedIndexes.length < 100) resolvedIndexes.push(editIndex);
-			const applyOldText = exactOldTextForApply(rawContentLf, oldText, needle);
-			if (applyOldText !== undefined) {
+			const applySpan = exactOldTextForApply(
+				rawContentLf,
+				content,
+				oldText,
+				needle,
+			);
+			if (applySpan !== undefined) {
 				// #1053: carry the exact span the preflight approved, plus the
 				// snapshot identity it was resolved against. The apply step
 				// consumes these instead of re-searching oldText.
-				const spanStart = rawContentLf.indexOf(applyOldText);
 				candidateEdits.push({
 					oldText,
-					appliedSpanText: applyOldText,
+					appliedSpanText: applySpan.text,
 					newText: edits[i].newText,
 					originalIndex: editIndex,
 					snapshot,
-					spanStart,
-					spanEnd: spanStart + applyOldText.length,
+					spanStart: applySpan.start,
+					spanEnd: applySpan.end,
+				});
+				resolvedRanges.push([startLine, endLine]);
+				if (resolvedIndexes.length < 100) resolvedIndexes.push(editIndex);
+			} else {
+				failureKinds.push("oldtext_unrepresentable");
+				if (failedEditIndexes.length < 100) failedEditIndexes.push(editIndex);
+				if (rejectedReasons.length < 100) {
+					rejectedReasons.push({
+						index: editIndex,
+						code: "oldtext_unrepresentable",
+					});
+				}
+				errors.push(
+					`edits[${editIndex}].oldText matched normalized content but could not be mapped to one raw file span; the whole batch must be rebuilt from the current file content.`,
+				);
+				logBatchEvent({
+					event: "edit_preflight_blocked",
+					sessionId,
+					filePath,
+					metadata: {
+						tool: "edit",
+						source: "edits_without_ranges",
+						reasonKind: "oldtext_unrepresentable",
+						editIndex,
+					},
 				});
 			}
-			logBatchEvent({
-				event: "oldtext_resolved",
-				sessionId,
-				filePath,
-				metadata: {
-					tool: "edit",
-					source: "edits_without_ranges",
-					editIndex,
-					touchedLines: [startLine, endLine],
-				},
-			});
+			if (applySpan !== undefined) {
+				logBatchEvent({
+					event: "oldtext_resolved",
+					sessionId,
+					filePath,
+					metadata: {
+						tool: "edit",
+						source: "edits_without_ranges",
+						editIndex,
+						touchedLines: [startLine, endLine],
+					},
+				});
+			}
 		} else {
 			const preview = oldText.trimStart().substring(0, 60).replace(/\n/g, "↵");
 			failureKinds.push("oldtext_duplicate");
@@ -921,7 +1002,11 @@ function resolveOldTextEdits(
 			preflightError: `${header}\n\n${failureDetails.join("\n\n")}${formatAlreadyAppliedNotes(alreadyAppliedEdits)}`,
 			preflightHeader: header,
 			preflightDetails: failureDetails,
-			partiallyApplicable: passedEdits.length > 0 ? passedEdits : undefined,
+			partiallyApplicable:
+				passedEdits.length > 0 &&
+				!failureKinds.includes("oldtext_unrepresentable")
+					? passedEdits
+					: undefined,
 			alreadyAppliedEdits:
 				alreadyAppliedEdits.length > 0 ? alreadyAppliedEdits : undefined,
 			editBatchSummary,
@@ -1499,7 +1584,15 @@ export function getTouchedLinesForGuard(
 					partialApplyRecords,
 				);
 				if (resolved.preflightError) {
-					return resolved;
+					// A mixed range/oldText request is one host operation. If any
+					// oldText edit cannot be represented as a carried raw span,
+					// close the whole batch instead of letting the host apply only
+					// the native ranges.
+					return {
+						...resolved,
+						partiallyApplicable: undefined,
+						touchedLines: undefined,
+					};
 				}
 				oldTextTouchedLines = resolved.touchedLines;
 				oldTextEditRanges = resolved.editRanges;

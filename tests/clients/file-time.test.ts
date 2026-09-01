@@ -13,39 +13,28 @@ describe("FileTime.withLock rejection handling", () => {
 		};
 		process.on("unhandledRejection", onUnhandled);
 		try {
-			await expect(
-				fileTime.withLock("/locked/file.ts", async () => {
-					throw new Error("rejection inside the lock");
-				}),
-			).rejects.toThrow("rejection inside the lock");
-
-			// The stored lock promise settles without crashing a waiter, and a
-			// same-path waiter resumes only after the holder releases (both ran;
-			// microtask ordering between the holder's own continuation and the
-			// waiter's fn is not pinned).
-			await new Promise<void>((resolve) => setImmediate(resolve));
-			const waiterOrder: string[] = [];
-			await Promise.all([
-				fileTime
-					.withLock("/locked/file.ts", async () => {
-						waiterOrder.push("first");
-					})
-					.then(() => waiterOrder.push("first-done")),
-				fileTime
-					.withLock("/locked/file.ts", async () => {
-						waiterOrder.push("second");
-					})
-					.then(() => waiterOrder.push("second-done")),
-			]);
-			expect([...waiterOrder].sort()).toEqual([
-				"first",
-				"first-done",
-				"second",
-				"second-done",
-			]);
-			expect(waiterOrder.indexOf("first")).toBeLessThan(
-				waiterOrder.indexOf("second"),
-			);
+			let holderStarted!: () => void;
+			let releaseHolder!: () => void;
+			const holderReady = new Promise<void>((resolve) => {
+				holderStarted = resolve;
+			});
+			const release = new Promise<void>((resolve) => {
+				releaseHolder = resolve;
+			});
+			const holder = fileTime.withLock("/locked/file.ts", async () => {
+				holderStarted();
+				await release;
+				throw new Error("rejection inside the lock");
+			});
+			await holderReady;
+			let waiterRan = false;
+			const waiter = fileTime.withLock("/locked/file.ts", async () => {
+				waiterRan = true;
+			});
+			releaseHolder();
+			await expect(holder).rejects.toThrow("rejection inside the lock");
+			await waiter;
+			expect(waiterRan).toBe(true);
 			expect(unhandled).toBe(false);
 		} finally {
 			process.off("unhandledRejection", onUnhandled);

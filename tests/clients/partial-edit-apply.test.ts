@@ -1,25 +1,16 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
 	applyPartiallyApplicableEdits,
 	type EditSnapshotIdentity,
 	isExactAppliedRetry,
 	PartialApplyRecordStore,
 	type PartiallyApplicableEdit,
-	stripOldTextTrailingWhitespace,
 } from "../../clients/partial-edit-apply.js";
 import { createReadGuardEditBatchSummary } from "../../clients/read-guard-logger.js";
 import { setupTestEnvironment } from "./test-utils.js";
-
-// The commit goes through the shared atomic writer (#1053). The mock proves
-// the seam call and lets the commit-failure test inject a real write failure
-// at the process boundary.
-const writeFileAtomic = vi.hoisted(() => vi.fn());
-vi.mock("../../clients/atomic-write.js", () => ({
-	writeFileAtomic,
-}));
 
 function snapshotOf(rawContent: string): EditSnapshotIdentity {
 	return {
@@ -47,16 +38,6 @@ function spanEdit(args: {
 		spanEnd: spanStart + spanText.length,
 	};
 }
-
-beforeEach(() => {
-	writeFileAtomic.mockReset();
-	// The default behavior mirrors the real writer for non-failure tests.
-	writeFileAtomic.mockImplementation(
-		(target: string, data: string | Uint8Array) => {
-			fs.writeFileSync(target, data);
-		},
-	);
-});
 
 describe("applyPartiallyApplicableEdits", () => {
 	it("applies preflight-approved spans and routes through the post-edit callback", async () => {
@@ -97,8 +78,6 @@ describe("applyPartiallyApplicableEdits", () => {
 				postEditOutput: "pipeline output",
 				postEditStatus: "succeeded",
 			});
-			expect(writeFileAtomic).toHaveBeenCalledTimes(1);
-			expect(writeFileAtomic.mock.calls[0][0]).toBe(filePath);
 		} finally {
 			env.cleanup();
 		}
@@ -288,21 +267,42 @@ describe("applyPartiallyApplicableEdits", () => {
 		}
 	});
 
-	it("commit write failure throws and writes no applied-edit record", async () => {
-		const env = setupTestEnvironment("partial-apply-commit-fail-");
+	it("preserves the existing file mode through the atomic replacement", async () => {
+		const env = setupTestEnvironment("partial-apply-mode-");
 		try {
 			const filePath = path.join(env.tmpDir, "file.ts");
 			const raw = "const a = 1;\n";
 			fs.writeFileSync(filePath, raw);
-			writeFileAtomic.mockImplementation(() => {
-				throw new Error("EACCES: simulated write failure");
+			fs.chmodSync(filePath, 0o640);
+			const before = fs.statSync(filePath).mode & 0o7777;
+			await applyPartiallyApplicableEdits({
+				filePath,
+				edits: [
+					spanEdit({
+						rawContent: raw,
+						oldText: "const a = 1;",
+						newText: "const a = 2;",
+					}),
+				],
 			});
-			const recordStore = new PartialApplyRecordStore();
-			const afterWrite = vi.fn(async () => "pipeline output");
+			expect(fs.statSync(filePath).mode & 0o7777).toBe(before);
+		} finally {
+			env.cleanup();
+		}
+	});
 
-			await expect(
-				applyPartiallyApplicableEdits({
-					filePath,
+	it.skipIf(process.platform === "win32")(
+		"follows a leaf symlink and keeps the link in place",
+		async () => {
+			const env = setupTestEnvironment("partial-apply-symlink-");
+			try {
+				const targetPath = path.join(env.tmpDir, "target.ts");
+				const linkPath = path.join(env.tmpDir, "link.ts");
+				const raw = "const a = 1;\n";
+				fs.writeFileSync(targetPath, raw);
+				fs.symlinkSync(targetPath, linkPath, "file");
+				await applyPartiallyApplicableEdits({
+					filePath: linkPath,
 					edits: [
 						spanEdit({
 							rawContent: raw,
@@ -310,10 +310,94 @@ describe("applyPartiallyApplicableEdits", () => {
 							newText: "const a = 2;",
 						}),
 					],
-					afterWrite,
-					recordStore,
-				}),
-			).rejects.toThrow("simulated write failure");
+				});
+				expect(fs.lstatSync(linkPath).isSymbolicLink()).toBe(true);
+				expect(fs.readFileSync(targetPath, "utf8")).toBe("const a = 2;\n");
+			} finally {
+				env.cleanup();
+			}
+		},
+	);
+
+	it("rejects a same-text invalid UTF-8 mutation as snapshot drift", async () => {
+		const env = setupTestEnvironment("partial-apply-invalid-utf8-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			const rawBytes = Buffer.from([
+				...Buffer.from("const a = 1;\n"),
+				0xff,
+				...Buffer.from("const b = 2;\n"),
+			]);
+			fs.writeFileSync(filePath, rawBytes);
+			const rawText = rawBytes.toString("utf8");
+			const spanText = "const b = 2;";
+			const spanStart = rawText.indexOf(spanText);
+			const edit: PartiallyApplicableEdit = {
+				oldText: spanText,
+				appliedSpanText: spanText,
+				newText: "const b = 20;",
+				originalIndex: 0,
+				snapshot: { hash: createHash("sha256").update(rawBytes).digest("hex") },
+				spanStart,
+				spanEnd: spanStart + spanText.length,
+			};
+			const mutated = Buffer.from([
+				...Buffer.from("const a = 1;\n"),
+				0xfe,
+				...Buffer.from("const b = 2;\n"),
+			]);
+			fs.writeFileSync(filePath, mutated);
+			const result = await applyPartiallyApplicableEdits({
+				filePath,
+				edits: [edit],
+			});
+			expect(result.rejected).toMatchObject({ reason: "stale_snapshot" });
+			expect(fs.readFileSync(filePath)).toEqual(mutated);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("commit write failure throws and writes no applied-edit record", async () => {
+		const env = setupTestEnvironment("partial-apply-commit-fail-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			const raw = "const a = 1;\n";
+			fs.writeFileSync(filePath, raw);
+			vi.resetModules();
+			vi.doMock("node:fs", async () => {
+				const actual =
+					await vi.importActual<typeof import("node:fs")>("node:fs");
+				return {
+					...actual,
+					renameSync: vi.fn(() => {
+						throw new Error("EACCES: simulated write failure");
+					}),
+				};
+			});
+			const recordStore = new PartialApplyRecordStore();
+			const afterWrite = vi.fn(async () => "pipeline output");
+			try {
+				const { applyPartiallyApplicableEdits: applyWithFailure } =
+					await import("../../clients/partial-edit-apply.js");
+				await expect(
+					applyWithFailure({
+						filePath,
+						edits: [
+							spanEdit({
+								rawContent: raw,
+								oldText: "const a = 1;",
+								newText: "const a = 2;",
+							}),
+						],
+						afterWrite,
+						recordStore,
+					}),
+				).rejects.toThrow("simulated write failure");
+			} finally {
+				vi.doUnmock("node:fs");
+				vi.resetModules();
+			}
 
 			expect(fs.readFileSync(filePath, "utf-8")).toBe(raw);
 			expect(afterWrite).not.toHaveBeenCalled();
@@ -529,6 +613,14 @@ describe("applyPartiallyApplicableEdits", () => {
 });
 
 describe("PartialApplyRecordStore", () => {
+	it("requires exact submitted whitespace in the retry pair", () => {
+		const store = new PartialApplyRecordStore();
+		store.record("/f.ts", "old  ", "new\n");
+		expect(store.find("/f.ts", "old  ", "new\n")).toBeDefined();
+		expect(store.find("/f.ts", "old", "new\n")).toBeUndefined();
+		expect(store.find("/f.ts", "old  ", "new")).toBeUndefined();
+	});
+
 	it("bounded per-file and per-store eviction keeps the newest records", () => {
 		const store = new PartialApplyRecordStore();
 		for (let i = 0; i < 10; i += 1) {
@@ -626,13 +718,5 @@ describe("isExactAppliedRetry", () => {
 				newKey: "",
 			}),
 		).toBe(true);
-	});
-});
-
-describe("stripOldTextTrailingWhitespace (canonical record keys)", () => {
-	it("keys survive CRLF and trailing-whitespace divergence between attempts", () => {
-		const first = stripOldTextTrailingWhitespace("const b = 2;  \r\n");
-		const retry = stripOldTextTrailingWhitespace("const b = 2;");
-		expect(first).toBe(retry);
 	});
 });

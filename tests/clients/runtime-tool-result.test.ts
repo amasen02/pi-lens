@@ -22,6 +22,18 @@ import {
 } from "../../clients/path-attribution-telemetry.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 
+const readFileSyncSpy = vi.hoisted(() => vi.fn());
+vi.mock("node:fs", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:fs")>();
+	return {
+		...actual,
+		readFileSync: (...args: any[]) => {
+			readFileSyncSpy(...args);
+			return (actual.readFileSync as any)(...args);
+		},
+	};
+});
+
 const logLatency = vi.hoisted(() => vi.fn());
 vi.mock("node:fs/promises", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("node:fs/promises")>();
@@ -369,6 +381,122 @@ describe("bash grep searchReads registration", () => {
 				},
 			});
 			expect(recordRead).not.toHaveBeenCalled();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("does not record or deliver a failed native edit result", async () => {
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		vi.mocked(runPipeline).mockClear();
+		const env = setupTestEnvironment("pi-lens-native-edit-failed-");
+		try {
+			const filePath = path.join(env.tmpDir, "sample.ts");
+			fs.writeFileSync(filePath, "const a = 1;\n");
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			const result = await handleToolResult({
+				event: {
+					toolName: "edit",
+					isError: true,
+					input: {
+						path: filePath,
+						edits: [{ oldText: "const a = 1;", newText: "const a = 2;" }],
+					},
+					content: [{ type: "text", text: "edit failed" }],
+				},
+				getFlag: () => false,
+				dbg: () => {},
+				runtime,
+				cacheManager: new CacheManager(false),
+				biomeClient: {},
+				ruffClient: {},
+				metricsClient: {},
+				resetLSPService: () => {},
+				agentBehaviorRecord: () => [],
+				formatBehaviorWarnings: () => "",
+			} as any);
+			expect(result).toMatchObject({ isError: true });
+			expect(
+				runtime.partialApplyRecords.find(
+					filePath,
+					"const a = 1;",
+					"const a = 2;",
+				),
+			).toBeUndefined();
+			expect(readChangesSince(env.tmpDir, 0)).toEqual([]);
+			expect(runPipeline).not.toHaveBeenCalled();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("hashes a native multi-edit result once for all applied records", async () => {
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		vi.mocked(runPipeline).mockResolvedValue({
+			output: "",
+			hasBlockers: false,
+			isError: false,
+			fileModified: false,
+		});
+		const env = setupTestEnvironment("pi-lens-native-edit-hash-");
+		try {
+			const filePath = path.join(env.tmpDir, "sample.ts");
+			fs.writeFileSync(filePath, "const a = 1;\nconst b = 2;\nconst c = 3;\n");
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			readFileSyncSpy.mockClear();
+			await handleToolResult({
+				event: {
+					toolName: "edit",
+					input: {
+						path: filePath,
+						edits: [
+							{ oldText: "const a = 1;", newText: "const a = 10;" },
+							{ oldText: "const b = 2;", newText: "const b = 20;" },
+							{ oldText: "const c = 3;", newText: "const c = 30;" },
+						],
+					},
+					content: [],
+				},
+				_bypassDebounce: true,
+				getFlag: () => false,
+				dbg: () => {},
+				runtime,
+				cacheManager: new CacheManager(false),
+				biomeClient: {},
+				ruffClient: {},
+				metricsClient: {},
+				resetLSPService: () => {},
+				agentBehaviorRecord: () => [],
+				formatBehaviorWarnings: () => "",
+			} as any);
+			const rawHashReads = readFileSyncSpy.mock.calls.filter(
+				(args) => args.length === 1,
+			);
+			expect(rawHashReads).toHaveLength(3);
+			const records = [
+				runtime.partialApplyRecords.find(
+					filePath,
+					"const a = 1;",
+					"const a = 10;",
+				),
+				runtime.partialApplyRecords.find(
+					filePath,
+					"const b = 2;",
+					"const b = 20;",
+				),
+				runtime.partialApplyRecords.find(
+					filePath,
+					"const c = 3;",
+					"const c = 30;",
+				),
+			];
+			expect(
+				records.every(
+					(record) => record?.contentHash === records[0]?.contentHash,
+				),
+			).toBe(true);
 		} finally {
 			env.cleanup();
 		}

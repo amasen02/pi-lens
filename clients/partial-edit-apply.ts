@@ -31,7 +31,7 @@ type HostEdit = EditToolInput["edits"][number];
  * completely; no length or mtime sibling is needed alongside it.
  */
 export interface EditSnapshotIdentity {
-	/** sha256 of the UTF-8-decoded file content the preflight read. */
+	/** sha256 of the raw file bytes the preflight read. */
 	hash: string;
 }
 
@@ -82,10 +82,8 @@ export interface PartialEditApplyResult {
 }
 
 export interface AppliedPartialEditRecord {
-	/** Canonical (LF + trailing-whitespace-stripped) submitted old text. */
-	oldKey: string;
-	/** Canonical applied new text ("" models a pure deletion). */
-	newKey: string;
+	/** Fixed-size digest of the exact submitted oldText/newText pair. */
+	pairDigest: string;
 	/** Hash of the complete file state immediately after this edit committed. */
 	contentHash?: string;
 	appliedAtMs: number;
@@ -109,6 +107,12 @@ export function stripOldTextTrailingWhitespace(value: string): string {
 		.map((l) => l.trimEnd());
 	while (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
 	return lines.join("\n");
+}
+
+function editPairDigest(oldText: string, newText: string | undefined): string {
+	return createHash("sha256")
+		.update(JSON.stringify([oldText, newText ?? ""]), "utf8")
+		.digest("hex");
 }
 
 function countLfOccurrences(content: string, needle: string): number {
@@ -193,10 +197,9 @@ export class PartialApplyRecordStore {
 		newText: string | undefined,
 	): AppliedPartialEditRecord | undefined {
 		if (!oldText) return undefined;
-		const oldKey = stripOldTextTrailingWhitespace(oldText);
-		const newKey = stripOldTextTrailingWhitespace(newText ?? "");
+		const pairDigest = editPairDigest(oldText, newText);
 		const records = this.files.get(filePath) ?? [];
-		return records.find((r) => r.oldKey === oldKey && r.newKey === newKey);
+		return records.find((r) => r.pairDigest === pairDigest);
 	}
 
 	record(
@@ -205,17 +208,13 @@ export class PartialApplyRecordStore {
 		newText: string | undefined,
 		contentHash?: string,
 	): void {
-		const oldKey = stripOldTextTrailingWhitespace(oldText);
-		if (!oldKey) return;
-		const newKey = stripOldTextTrailingWhitespace(newText ?? "");
+		if (!oldText) return;
+		const pairDigest = editPairDigest(oldText, newText);
 		const records = this.files.get(filePath) ?? [];
-		const existing = records.findIndex(
-			(r) => r.oldKey === oldKey && r.newKey === newKey,
-		);
+		const existing = records.findIndex((r) => r.pairDigest === pairDigest);
 		if (existing >= 0) records.splice(existing, 1);
 		const entry: AppliedPartialEditRecord = {
-			oldKey,
-			newKey,
+			pairDigest,
 			contentHash: contentHash ?? hashFile(filePath),
 			appliedAtMs: Date.now(),
 		};
@@ -241,8 +240,8 @@ export class PartialApplyRecordStore {
 // path), so one instance here serializes against every other FileTime user.
 const fileLock = createFileTime("partial-edit-apply");
 
-function hashContent(content: string): string {
-	return createHash("sha256").update(content, "utf8").digest("hex");
+function hashBytes(content: Uint8Array): string {
+	return createHash("sha256").update(content).digest("hex");
 }
 
 function hashFile(filePath: string): string | undefined {
@@ -341,13 +340,14 @@ export async function applyPartiallyApplicableEdits(args: {
 	// (formatter, LSP edit, another session's partial apply) cannot interleave
 	// between the identity re-check and the rename.
 	const commit = (): string => {
-		const raw = fs.readFileSync(args.filePath, "utf-8");
-		if (hashContent(raw) !== snapshot.hash) {
+		const rawBytes = fs.readFileSync(args.filePath);
+		if (hashBytes(rawBytes) !== snapshot.hash) {
 			throw new PartialApplyRejectionError(
 				"stale_snapshot",
 				"the file changed since the preflight resolved these edits; rebuild the edit from the current content",
 			);
 		}
+		const raw = rawBytes.toString("utf8");
 		const ending = detectLineEnding(raw);
 		const lf = normalizeToLF(raw);
 
@@ -386,10 +386,15 @@ export async function applyPartiallyApplicableEdits(args: {
 		}
 
 		const output = restoreLineEndings(committed, ending);
-		writeFileAtomic(args.filePath, output, {
+		const targetPath = fs.lstatSync(args.filePath).isSymbolicLink()
+			? fs.realpathSync(args.filePath)
+			: args.filePath;
+		const mode = fs.statSync(args.filePath).mode & 0o7777;
+		writeFileAtomic(targetPath, output, {
 			bestEffort: false,
+			mode,
 		});
-		return hashContent(output);
+		return hashBytes(Buffer.from(output, "utf8"));
 	};
 
 	let commitStatus: ReadGuardEditBatchSummary["commitStatus"] = "committed";

@@ -350,6 +350,45 @@ describe("#2402 partial-apply contract (mixed-validity preflight)", () => {
 		}
 	});
 
+	it("commits a normalized raw span in a mixed-validity batch", async () => {
+		const env = setupTestEnvironment("pi-lens-2402-normalized-");
+		try {
+			mockPipelineSucceeds("post-edit analysis ok");
+			const filePath = createTempFile(
+				env.tmpDir,
+				"src/normalized.ts",
+				"const total = a–b;   \nconst tail = 1;\n",
+			);
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			const result = await handleToolCall(
+				baseDeps({
+					runtime,
+					ctx: { cwd: env.tmpDir },
+					event: {
+						toolName: "edit",
+						input: {
+							path: filePath,
+							edits: [
+								{
+									oldText: "const total = a-b;",
+									newText: "const total = a+b;",
+								},
+								{ oldText: "const missing = true;", newText: "noop" },
+							],
+						},
+					},
+				}),
+			);
+			expect(result).toMatchObject({ block: true });
+			expect(fs.readFileSync(filePath, "utf8")).toBe(
+				"const total = a+b;\nconst tail = 1;\n",
+			);
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("labels committed partial-apply bytes as applied even when post-edit analysis fails", async () => {
 		const env = setupTestEnvironment("pi-lens-2402-committed-");
 		try {
