@@ -230,20 +230,33 @@ describe("actionable warnings accept a fix from any non-error tier (#1777)", () 
 	});
 });
 
-describe("widget tally keeps hint and info visible (#1777)", () => {
+// #1777 made hint/info survive the dispatch path (previously collapsed to
+// "warning" at the runner) and, at the time, folded them into the widget's
+// `warnings` tally so they weren't dropped from the footer entirely. #2414
+// found that fold itself was the defect: a hint-tier style opinion (e.g.
+// `no-runtime-typeof`, a complexity hint) presented with the same `!NW`
+// warning-icon weight as a real, bounded-false-positive-rate warning. The
+// tally now keeps hint/info VISIBLE (via `advisories`, not dropped) without
+// inflating `warnings`.
+describe("widget tally separates the advisory tier from warnings (#1777 -> #2414)", () => {
 	beforeEach(() => clearWidgetState());
 
-	it("counts hint and info in the non-error tally rather than dropping them", () => {
+	it("counts hint and info as advisories, not warnings", () => {
 		recordDiagnostics(filePath, [
 			{ severity: "hint", semantic: "warning", message: "hint finding" },
 			{ severity: "info", semantic: "warning", message: "info finding" },
 			{ severity: "warning", semantic: "warning", message: "warning finding" },
 		]);
 		const summary = getFileDiagnosticSummaries()[0];
-		expect(summary).toMatchObject({ blocking: 0, errors: 0, warnings: 3 });
+		expect(summary).toMatchObject({
+			blocking: 0,
+			errors: 0,
+			warnings: 1,
+			advisories: 2,
+		});
 	});
 
-	it("still counts errors separately", () => {
+	it("still counts errors separately, and a lone hint stays out of warnings", () => {
 		recordDiagnostics(filePath, [
 			{ severity: "error", semantic: "blocking", message: "boom" },
 			{ severity: "hint", semantic: "warning", message: "hint finding" },
@@ -251,7 +264,8 @@ describe("widget tally keeps hint and info visible (#1777)", () => {
 		expect(getFileDiagnosticSummaries()[0]).toMatchObject({
 			blocking: 1,
 			errors: 1,
-			warnings: 1,
+			warnings: 0,
+			advisories: 1,
 		});
 	});
 });
