@@ -59,7 +59,9 @@ async function readStdin(): Promise<string> {
 function formatReport(result: McpAnalyzeResult, cwd: string): string {
 	const rel = path.relative(cwd, result.filePath) || result.filePath;
 	const lines = [
-		`🔎 pi-lens: ${rel} — ${result.counts.blockers} blocking, ${result.counts.warnings} warning(s)`,
+		// #2420: advisories (hint/info-tier style opinions) reported under their
+		// own label — no longer folded into the warning count on this surface.
+		`🔎 pi-lens: ${rel} — ${result.counts.blockers} blocking, ${result.counts.warnings} warning(s), ${result.counts.advisories} advisory(ies)`,
 	];
 	for (const d of result.diagnostics.slice(0, 30)) {
 		const marker = d.semantic === "blocking" ? "🔴" : "⚠";
