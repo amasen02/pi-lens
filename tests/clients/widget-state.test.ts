@@ -257,7 +257,12 @@ describe("getFileDiagnosticSummaries", () => {
 		it("does not fold hint/info into warnings, but still counts real warnings", () => {
 			const filePath = `${process.cwd()}/severity-projection.ts`;
 			recordDiagnostics(filePath, [
-				{ severity: "hint", line: 1, rule: "long-parameter-list", message: "h" },
+				{
+					severity: "hint",
+					line: 1,
+					rule: "long-parameter-list",
+					message: "h",
+				},
 				{ severity: "info", line: 2, rule: "complexity", message: "i" },
 				{ severity: "warning", line: 3, rule: "no-console", message: "w" },
 			]);
@@ -274,7 +279,12 @@ describe("getFileDiagnosticSummaries", () => {
 			const filePath = `${process.cwd()}/hints-only.ts`;
 			recordDiagnostics(filePath, [
 				{ severity: "hint", line: 1, rule: "no-runtime-typeof", message: "h1" },
-				{ severity: "info", line: 2, rule: "no-unknown-parameters", message: "h2" },
+				{
+					severity: "info",
+					line: 2,
+					rule: "no-unknown-parameters",
+					message: "h2",
+				},
 			]);
 			const entry = getFileDiagnosticSummaries().find(
 				(s) => s.filePath === filePath,
@@ -288,7 +298,12 @@ describe("getFileDiagnosticSummaries", () => {
 		it("the TUI footer's warning chip does not fire for a hint/info-only file", () => {
 			const filePath = `${process.cwd()}/hints-only-footer.ts`;
 			recordDiagnostics(filePath, [
-				{ severity: "hint", line: 1, rule: "long-parameter-list", message: "h" },
+				{
+					severity: "hint",
+					line: 1,
+					rule: "long-parameter-list",
+					message: "h",
+				},
 				{ severity: "info", line: 2, rule: "complexity", message: "i" },
 			]);
 			const rendered = renderWidget(120, theme).join("\n");
