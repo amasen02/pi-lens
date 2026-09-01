@@ -1182,6 +1182,13 @@ export interface FormatPhaseResult {
 	formatChanged: boolean;
 	formattersUsed: string[];
 	formatFailures: string[];
+	/**
+	 * Formatters whose executable was proven absent this run (#2413). Kept apart
+	 * from `formatFailures` so the deferred drain never requeues durable
+	 * unavailability as a transient `format-failed`, and so the user is never
+	 * shown unavailable infrastructure as a code error.
+	 */
+	formatUnavailable: Array<{ formatter: string; reason: string }>;
 	fileContent: string | undefined;
 }
 
@@ -1193,13 +1200,29 @@ export async function runFormatPhase(
 	let formatChanged = false;
 	let formattersUsed: string[] = [];
 	const formatFailures: string[] = [];
+	const formatUnavailable: Array<{ formatter: string; reason: string }> = [];
 	let fileContent: string | undefined;
 
 	const formatService = getFormatService();
 	try {
 		formatService.recordRead(filePath);
 		const result = await formatService.formatFile(filePath);
-		formattersUsed = result.formatters.map((f) => f.name);
+		// An unavailable tool is NOT a formatter that ran (#2413): keep it out of
+		// `formattersUsed` (which drives change bookkeeping / turn summaries) and
+		// out of `formatFailures` (which requeues). Record it once, distinctly.
+		for (const f of result.formatters) {
+			if (f.outcome !== "unavailable") continue;
+			const reason = f.error ?? "formatter executable not found";
+			formatUnavailable.push({ formatter: f.name, reason });
+			recordDegradationOnce({
+				kind: "formatter-unavailable",
+				subject: `${f.name}:${path.basename(filePath)}`,
+				reason,
+			});
+		}
+		formattersUsed = result.formatters
+			.filter((f) => f.outcome !== "unavailable")
+			.map((f) => f.name);
 		if (result.anyChanged) {
 			formatChanged = true;
 			dbg(
@@ -1247,7 +1270,13 @@ export async function runFormatPhase(
 		fileContent = undefined;
 	}
 
-	return { formatChanged, formattersUsed, formatFailures, fileContent };
+	return {
+		formatChanged,
+		formattersUsed,
+		formatFailures,
+		formatUnavailable,
+		fileContent,
+	};
 }
 
 /**

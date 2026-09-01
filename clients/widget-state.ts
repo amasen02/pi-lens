@@ -13,6 +13,7 @@ import { collectForwardImportMtimes } from "./blocker-freshness.js";
 import { freshnessFromMtime } from "./freshness.js";
 import { PAST_EOF_STALE_MARKER } from "./diagnostic-line-freshness.js";
 import { STALE_LINE_MARKER } from "./stale-marker.js";
+import type { FormatterOutcomeKind } from "./formatters.js";
 
 /**
  * Canonical key for the `files` map (and `diagnosticsWriteGuard`) — #1020.
@@ -121,7 +122,10 @@ export function isBlocking(d: WidgetDiagnostic): boolean {
 interface FileRecord {
 	filePath: string;
 	runners: Map<string, { status: string; count: number; durationMs?: number }>;
-	formatters: Map<string, { changed: boolean; success: boolean }>;
+	formatters: Map<
+		string,
+		{ changed: boolean; success: boolean; outcome?: FormatterOutcomeKind }
+	>;
 	/** Capped to MAX_STORED_DIAGNOSTICS_PER_FILE — drives the TUI widget. */
 	diagnostics: WidgetDiagnostic[];
 	/**
@@ -245,7 +249,12 @@ export interface PersistedWidgetState {
 		runners: Array<
 			[string, { status: string; count: number; durationMs?: number }]
 		>;
-		formatters: Array<[string, { changed: boolean; success: boolean }]>;
+		formatters: Array<
+			[
+				string,
+				{ changed: boolean; success: boolean; outcome?: FormatterOutcomeKind },
+			]
+		>;
 		diagnostics: WidgetDiagnostic[];
 		allDiagnostics: WidgetDiagnostic[];
 		diagnosticCounts: { blocking: number; errors: number; warnings: number };
@@ -414,9 +423,10 @@ export function recordFormatter(
 	formatter: string,
 	changed: boolean,
 	success: boolean,
+	outcome?: FormatterOutcomeKind,
 ): void {
 	const rec = getOrCreate(filePath);
-	rec.formatters.set(formatter, { changed, success });
+	rec.formatters.set(formatter, { changed, success, outcome });
 	rec.touchedAt = Date.now();
 	files.set(fileMapKey(filePath), rec);
 	requestRender();
@@ -1438,7 +1448,10 @@ function formatFileRowVertical(
 		.filter(([, f]) => f.changed && f.success)
 		.map(([name]) => name);
 	const failedFormatters = [...rec.formatters.entries()]
-		.filter(([, f]) => !f.success)
+		// An `unavailable` tool is not a code failure (#2413): it never earns a red
+		// `fmt-failed` marker. Its result already carries success:true, so this
+		// guard is a belt that keeps the intent explicit at the render seam.
+		.filter(([, f]) => !f.success && f.outcome !== "unavailable")
 		.map(([name]) => name);
 	const formatMark =
 		(failedFormatters.length > 0
@@ -1595,7 +1608,11 @@ function hasChangedFormatter(rec: FileRecord): boolean {
 }
 
 function hasFailedFormatter(rec: FileRecord): boolean {
-	return [...rec.formatters.values()].some((f) => !f.success);
+	// `unavailable` (#2413) is success:true and must never count as a failure —
+	// the explicit guard keeps that true even if a future path mislabels it.
+	return [...rec.formatters.values()].some(
+		(f) => !f.success && f.outcome !== "unavailable",
+	);
 }
 
 function shouldRenderFile(rec: FileRecord): boolean {
