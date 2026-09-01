@@ -82,6 +82,7 @@ describe("FormatService", () => {
 		vi.mocked(formatFile).mockResolvedValue({
 			success: true,
 			changed: true,
+			outcome: "formatted",
 		});
 
 		const service = new FormatService("test", true);
@@ -113,6 +114,7 @@ describe("FormatService", () => {
 		vi.mocked(formatFile).mockResolvedValue({
 			success: false,
 			changed: false,
+			outcome: "failed",
 			error: "spawn error",
 		});
 

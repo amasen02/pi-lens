@@ -217,6 +217,73 @@ describe("runtime-agent-end deferred formatting", () => {
 		}
 	});
 
+	it("does not requeue or fail an unavailable formatter; records it distinctly (#2413)", async () => {
+		const env = setupTestEnvironment("pi-lens-agent-end-unavailable-");
+		try {
+			const logSpy = vi.spyOn(latencyLogger, "logLatency");
+			const filePath = createTempFile(env.tmpDir, "src/app.ts", "const x=1\n");
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			runtime.deferFormat(filePath, env.tmpDir, "edit", env.tmpDir);
+
+			// The FormatService reports the selected formatter as unavailable — the
+			// oxfmt ENOENT trap after the fix. Pre-fix this arrived as a failed file,
+			// was requeued as format-failed, and re-fired on every subsequent
+			// agent_end. It must now drain once, distinctly, and never requeue.
+			const formatFile = vi.fn(async (fp: string) => ({
+				filePath: fp,
+				formatters: [
+					{
+						name: "oxfmt",
+						success: true,
+						changed: false,
+						outcome: "unavailable" as const,
+						error: "oxfmt: formatter executable not found",
+					},
+				],
+				anyChanged: false,
+				allSucceeded: true,
+			}));
+
+			// `vi.spyOn(logLatency)` shares accumulated history across this file's
+			// tests (spies are never restored), so scope the negative requeue
+			// assertion to only the calls this handleAgentEnd makes.
+			logSpy.mockClear();
+
+			const summary = await handleAgentEnd({
+				ctxCwd: env.tmpDir,
+				getFlag: (name) => name === "no-lsp",
+				notify: vi.fn(),
+				dbg: () => {},
+				runtime,
+				cacheManager: { addModifiedRange: vi.fn() } as any,
+				getFormatService: () => ({ recordRead: () => {}, formatFile }) as any,
+			});
+
+			// Not a failed file, and surfaced under its own bucket.
+			expect(summary?.failed).toEqual([]);
+			expect(summary?.unavailable).toEqual([
+				{
+					filePath,
+					formatter: "oxfmt",
+					reason: "oxfmt: formatter executable not found",
+				},
+			]);
+			// Durable unavailability is NOT requeued — the queue is drained.
+			expect(runtime.pendingDeferredFormatCount).toBe(0);
+			expect(runtime.consumeDeferredFormatFiles()).toEqual([]);
+			// And no `format-failed` requeue record was ever emitted for it.
+			expect(logSpy).not.toHaveBeenCalledWith(
+				expect.objectContaining({
+					phase: "agent_end_deferred_mutation_requeue",
+					metadata: expect.objectContaining({ reason: "format-failed" }),
+				}),
+			);
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("runs deferred autofix before format on the final edit state", async () => {
 		const env = setupTestEnvironment("pi-lens-agent-end-mutation-order-");
 		try {

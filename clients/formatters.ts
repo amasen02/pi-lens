@@ -100,7 +100,25 @@ export async function tryLazyInstallFormatterTool(
  * stock command there is exactly the stock-style imposition the fix bans.
  */
 export const SKIP_FORMATTING = "skip-formatting" as const;
-export type ResolvedFormatterCommand = string[] | null | typeof SKIP_FORMATTING;
+
+/**
+ * Sentinel a `resolveCommand` returns when it has PROVEN the selected
+ * formatter has no executable — the binary is absent from every place the
+ * resolver probed (node_modules/.bin, a venv, a managed install dir, PATH) and
+ * no alternative resolved (#2413). Distinct from `null` ("no override, fall
+ * back to the static `command`") and from SKIP_FORMATTING ("style-preserving
+ * refusal"): the static fallback for these formatters is the SAME bare binary
+ * the resolver just proved missing, so spawning it only re-triggers the ENOENT
+ * the resolver already observed — and reporting that as a formatting failure is
+ * the exact defect this fixes (recurring defect shape 10: an unavailable
+ * producer collapsed into an ordinary failed result).
+ */
+export const FORMATTER_UNAVAILABLE = "formatter-unavailable" as const;
+export type ResolvedFormatterCommand =
+	| string[]
+	| null
+	| typeof SKIP_FORMATTING
+	| typeof FORMATTER_UNAVAILABLE;
 
 /**
  * #1940: what formatter selection actually did to answer one file.
@@ -158,10 +176,40 @@ export interface FormatterInfo {
 	lenientStatuses?: number[];
 }
 
+/**
+ * Bounded outcome discriminator for one formatter run (#2413).
+ *
+ * `success`/`changed` alone cannot separate "the tool is not installed" from
+ * "the tool ran and failed" — both used to arrive as `success: false`, so an
+ * unavailable formatter was counted as a failed file, requeued on every
+ * agent_end, and left a red `fmt-failed` footer marker. This field is the
+ * single typed seam every downstream consumer (widget footer, deferred drain,
+ * latency logs) reads to keep the two apart.
+ *
+ *   - `formatted`   — ran, rewrote the file.
+ *   - `unchanged`   — ran, file already conformant.
+ *   - `skipped`     — style-preserving refusal or trust-gated npx fallback.
+ *   - `unavailable` — the executable is absent; NOT a code failure.
+ *   - `failed`      — a real failure (timeout, bad config, parse error,
+ *                     undocumented nonzero exit).
+ */
+export type FormatterOutcomeKind =
+	| "formatted"
+	| "unchanged"
+	| "skipped"
+	| "unavailable"
+	| "failed";
+
 export interface FormatterResult {
 	success: boolean;
 	changed: boolean;
 	error?: string;
+	/**
+	 * Typed outcome kind (#2413). Required so every producer must declare which
+	 * bucket a run fell into — an `unavailable` result can never silently
+	 * masquerade as a `failed` one.
+	 */
+	outcome: FormatterOutcomeKind;
 }
 
 // --- Utility Functions ---
@@ -982,7 +1030,11 @@ export const oxfmtFormatter: FormatterInfo = {
 		if (local) return [local, OXFMT_NO_ERROR_ON_UNMATCHED, filePath];
 		const found = await which("oxfmt");
 		if (found) return [found, OXFMT_NO_ERROR_ON_UNMATCHED, filePath];
-		return null;
+		// #2413: neither node_modules/.bin nor PATH has oxfmt, and `detect()` is
+		// config-only (it never probes the binary), so selection can reach here
+		// with nothing installed. The static command is bare `oxfmt` — spawning it
+		// only reproduces the reported `spawn oxfmt ENOENT`. Prove it unavailable.
+		return FORMATTER_UNAVAILABLE;
 	},
 	// Single source of truth: OXFMT_SUPPORTED_EXTENSIONS in tool-policy.ts.
 	// Do not hand-maintain a second copy of this list (#1134 — previously two
@@ -1018,7 +1070,12 @@ export const ruffFormatter: FormatterInfo = {
 		const { ensureTool } = await import("./installer/index.js");
 		const installed = await ensureTool(toolId);
 		if (installed) return [installed, ...args, filePath];
-		return null;
+		// #2413: `ensureTool` already resolves PATH, global bins and the managed
+		// dir (and attempts an install) before returning falsy, so reaching here
+		// means ruff is genuinely nowhere. `detect()`'s `hasRuffConfig` branch has
+		// no binary check, so a config-only project selects ruff with nothing
+		// installed; the static bare `ruff` would then ENOENT. Prove it unavailable.
+		return FORMATTER_UNAVAILABLE;
 	},
 	async detect(cwd: string) {
 		if (hasRuffConfig(cwd)) return true;
@@ -1211,7 +1268,11 @@ export const ktfmtFormatter: FormatterInfo = {
 		if (inPath) return [inPath, filePath];
 		const { ensureTool } = await import("./installer/index.js");
 		const installed = await ensureTool("ktfmt");
-		return installed ? [installed, filePath] : null;
+		// #2413: which() and ensureTool (PATH/global/managed + install) both
+		// failed, and `detect()` gates only on hasKtfmtConfig — no binary probe —
+		// so a config-only project reaches here with ktfmt absent. The static
+		// command is bare `ktfmt`; spawning it reproduces the ENOENT class.
+		return installed ? [installed, filePath] : FORMATTER_UNAVAILABLE;
 	},
 	async detect(cwd: string) {
 		// Opt-in only: ktfmt becomes the formatter when the project elects it,
@@ -2078,11 +2139,16 @@ async function resolveFormatterCommand(
 	formatter: FormatterInfo,
 	absolutePath: string,
 	cwd: string,
-): Promise<string[] | typeof SKIP_FORMATTING> {
+): Promise<string[] | typeof SKIP_FORMATTING | typeof FORMATTER_UNAVAILABLE> {
 	const resolved = formatter.resolveCommand
 		? await formatter.resolveCommand(absolutePath, cwd)
 		: null;
 	if (resolved === SKIP_FORMATTING) return SKIP_FORMATTING;
+	// The resolver proved the executable absent — DO NOT fall through to the
+	// static bare command, which is the same binary it just probed and missing
+	// (#2413). The caller turns this into a typed `unavailable` outcome, never a
+	// spawn and never a failure.
+	if (resolved === FORMATTER_UNAVAILABLE) return FORMATTER_UNAVAILABLE;
 	if (resolved !== null) return resolved;
 	const fallback = formatter.command.map((c) =>
 		c.replace("$FILE", absolutePath),
@@ -2118,13 +2184,41 @@ export async function formatFile(
 		if (cmd === SKIP_FORMATTING) {
 			// Style-preserving refusal (#1144): no repo config and no detectable
 			// indentation to pin — formatting would impose the tool's stock style.
-			return { success: true, changed: false };
+			return { success: true, changed: false, outcome: "skipped" };
+		}
+		if (cmd === FORMATTER_UNAVAILABLE) {
+			// The resolver proved the executable absent (#2413): the oxfmt ENOENT
+			// trap and its siblings. This is unavailable infrastructure, not a code
+			// failure — success stays true so it is never counted as a failed file
+			// or requeued, and the typed outcome keeps it out of the failure bucket.
+			return {
+				success: true,
+				changed: false,
+				outcome: "unavailable",
+				error: `${formatter.name}: formatter executable not found`,
+			};
 		}
 		// Run formatter without blocking the event loop.
 		const result = await safeSpawnAsync(cmd[0], cmd.slice(1), {
 			timeout: 15000,
 			cwd,
 		});
+
+		// A resolver that could NOT prove absence (it never probed PATH — e.g.
+		// black/sqlfluff, which only look in a venv) legitimately falls back to the
+		// bare static command. When that bare command is missing, the spawn boundary
+		// reports a typed `tool-not-found` failure — never a nonzero exit. Treat it
+		// as unavailable, not a formatting failure, closing the same #2413 class for
+		// the formatters whose `null` correctly means "static untried" (no
+		// oxfmt-specific string matching — this reads the typed spawn-failure kind).
+		if (result.spawnFailure?.kind === "tool-not-found") {
+			return {
+				success: true,
+				changed: false,
+				outcome: "unavailable",
+				error: result.spawnFailure.message,
+			};
+		}
 
 		// Strict by default (#1337): only a formatter with a documented
 		// benign-nonzero mode (`lenientExitCode`) may exit nonzero and still be
@@ -2139,6 +2233,7 @@ export async function formatFile(
 			return {
 				success: false,
 				changed: false,
+				outcome: "failed",
 				error:
 					result.error?.message ||
 					firstDiagnosticLine(result.stderr) ||
@@ -2157,11 +2252,13 @@ export async function formatFile(
 		return {
 			success: true,
 			changed,
+			outcome: changed ? "formatted" : "unchanged",
 		};
 	} catch (err) {
 		return {
 			success: false,
 			changed: false,
+			outcome: "failed",
 			error: err instanceof Error ? err.message : String(err),
 		};
 	}
