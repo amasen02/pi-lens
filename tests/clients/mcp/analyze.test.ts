@@ -153,6 +153,10 @@ describe("analyzeFile", () => {
 			diagnostics: 2,
 			blockers: 1,
 			warnings: 1,
+			// #2420: counts now carry the advisories split. `noUnusedImports`
+			// (severity/semantic "warning") classifies as a real warning, not an
+			// advisory, so the warning count is unchanged and advisories is 0.
+			advisories: 0,
 			fixed: 0,
 		});
 		const warn = result.diagnostics.find((d) => d.rule === "noUnusedImports");

@@ -118,16 +118,24 @@ function runBinWithOpenStdin(
 	});
 }
 
+// #2420: a file whose only finding is the hint-tier `no-any-type` rule. Before
+// #2420 this rendered "0 blocking, 1 warning(s)" — a style opinion folded into
+// the model-facing warning count via the dispatch semantic axis.
+const HINT_ONLY = "export const y: any = 1;\n";
+
 let tmpDir: string;
 let smellyFile: string;
 let cleanFile: string;
+let hintFile: string;
 
 beforeAll(() => {
 	tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-cli-"));
 	smellyFile = path.join(tmpDir, "smelly.ts");
 	cleanFile = path.join(tmpDir, "clean.ts");
+	hintFile = path.join(tmpDir, "hinty.ts");
 	fs.writeFileSync(smellyFile, SMELLY);
 	fs.writeFileSync(cleanFile, "export const x = 1;\n");
+	fs.writeFileSync(hintFile, HINT_ONLY);
 });
 
 afterAll(() => {
@@ -149,6 +157,21 @@ describe("pi-lens-analyze bin", { retry: 2 }, () => {
 		expect(code).toBe(0);
 		expect(stdout).toContain("pi-lens:");
 		expect(stdout).toMatch(/deep-nesting|console-statement/);
+	}, 45_000);
+
+	// #2420: a hint-only file must report 0 warnings and its findings under the
+	// `advisory(ies)` label, never folded into the warning count.
+	it("reports hint-tier findings as advisories, not warnings, in the CLI header", async () => {
+		const { stdout, code } = await runBin([
+			`--file=${hintFile}`,
+			`--cwd=${tmpDir}`,
+		]);
+		expect(code).toBe(0);
+		const header = stdout.split("\n")[0];
+		// The only findings are hint-tier: zero warnings, at least one advisory.
+		expect(header).toMatch(/0 warning\(s\)/);
+		expect(header).toMatch(/[1-9]\d* advisory\(ies\)/);
+		expect(header).toMatch(/0 blocking/);
 	}, 45_000);
 
 	it("emits a PostToolUse JSON envelope with --hook", async () => {

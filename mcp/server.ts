@@ -1031,6 +1031,9 @@ function formatAnalyze(
 	const summary =
 		`${path.relative(cwd, result.filePath) || result.filePath} [${mode}] — ` +
 		`${result.counts.blockers} blocking, ${result.counts.warnings} warning(s), ` +
+		// #2420: advisories (hint/info-tier style opinions) are reported under
+		// their own label so they are no longer folded into the warning count.
+		`${result.counts.advisories} advisory(ies), ` +
 		`${result.counts.diagnostics} total` +
 		(result.latency ? ` · ${result.latency.totalDurationMs}ms` : "") +
 		lspNote +

@@ -29,7 +29,7 @@ import { PathKeyedMap } from "../path-keyed-map.js";
 import { normalizeMapKey } from "../path-utils.js";
 import { loadProjectSnapshot } from "../project-snapshot.js";
 import { buildOrUpdateGraph } from "../review-graph/service.js";
-import { recordDiagnostics } from "../widget-state.js";
+import { classifyDiagnosticTier, recordDiagnostics } from "../widget-state.js";
 import {
 	deserializeWordIndex,
 	removeWordIndexDocumentAsync,
@@ -226,6 +226,30 @@ const WARMUP_CLIENT_WAIT_MS = 10_000;
 const WARMUP_DIAGNOSTICS_WAIT_MS = 6_000;
 
 /** One diagnostic, flattened to the fields an MCP consumer needs. */
+/**
+ * Split the dispatch `warnings` bucket into real warnings vs advisories using
+ * the ONE severity-projection policy ({@link classifyDiagnosticTier}, #2414/
+ * #2417) so the model-facing counts never present a `hint`/`info`-tier finding
+ * as a warning (#2420, remainder of #2414). The dispatch `semantic` axis (which
+ * also drives blocking) is intentionally NOT consulted or mutated here: this is
+ * a display-count split, not a blocking-decision change. `blockers`
+ * (`semantic:"blocking"`) are computed upstream and never enter this bucket, so
+ * nothing that blocks can stop blocking through this seam. A non-advisory entry
+ * in the bucket (an `error`/`warning`-tier finding routed here as
+ * `semantic:"warning"`/`"none"`) stays counted as a warning exactly as before,
+ * so a mixed file's real warning count is unchanged.
+ */
+export function summarizeWarningTiers(warnings: readonly Diagnostic[]): {
+	warnings: number;
+	advisories: number;
+} {
+	let advisories = 0;
+	for (const w of warnings) {
+		if (classifyDiagnosticTier(w) === "advisory") advisories++;
+	}
+	return { warnings: warnings.length - advisories, advisories };
+}
+
 export interface McpAnalyzeDiagnostic {
 	line?: number;
 	column?: number;
@@ -258,6 +282,18 @@ export interface McpAnalyzeResult {
 		diagnostics: number;
 		blockers: number;
 		warnings: number;
+		/**
+		 * `hint`/`info`-tier findings split OUT of `warnings` (#2420) via the one
+		 * severity-projection policy ({@link classifyDiagnosticTier}). Before
+		 * #2420 the dispatch `semantic` axis folded every non-error tier into the
+		 * warnings bucket, so a file whose only findings were style opinions
+		 * (`no-runtime-typeof`, complexity hints) reported "N warning(s)" on every
+		 * model-facing surface. Advisories are counted here — and still listed in
+		 * `diagnostics` under their own severity — so they stay visible without
+		 * being misrepresented as warnings. The `semantic` axis (which drives
+		 * blocking) is deliberately untouched: this is a display-count split only.
+		 */
+		advisories: number;
 		fixed: number;
 	};
 	diagnostics: McpAnalyzeDiagnostic[];
@@ -555,7 +591,12 @@ export async function analyzeFile(
 		counts: {
 			diagnostics: result.diagnostics.length,
 			blockers: result.blockers.length,
-			warnings: result.warnings.length,
+			// #2420: `result.warnings` is the dispatch warnings bucket
+			// (`semantic:"warning"|"none"`), which still carries `hint`/`info`-tier
+			// findings folded in by the runner's severity→semantic map. Project
+			// them out through the shared tier policy so the model sees real
+			// warnings and advisories separately.
+			...summarizeWarningTiers(result.warnings),
 			fixed: result.fixed.length,
 		},
 		lsp,
