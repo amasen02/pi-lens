@@ -57,8 +57,7 @@ concurrency:
   group: install-smoke-${{ github.event_name == 'repository_dispatch' && github.event.client_payload.sha || github.ref }}
   cancel-in-progress: true
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   validate-merge-train-dispatch:
@@ -124,6 +123,8 @@ jobs:
     name: ${{ matrix.os }} · ${{ matrix.pm }}
     needs: validate-merge-train-dispatch
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -239,6 +240,8 @@ jobs:
     name: pi-load · ${{ matrix.os }} · ${{ matrix.pi_install }}
     needs: validate-merge-train-dispatch
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -379,6 +382,8 @@ jobs:
     name: mise repro (#285) · ${{ matrix.os }} · ${{ matrix.pi_via }}
     needs: validate-merge-train-dispatch
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     continue-on-error: true
     strategy:
       fail-fast: false
