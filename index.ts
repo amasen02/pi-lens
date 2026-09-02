@@ -75,11 +75,8 @@ import { classifyMutatingTool } from "./clients/mutating-tool.js";
 import { resolveLanguageRootForFile } from "./clients/language-profile.js";
 import { countFileLines } from "./clients/read-guard-tool-lines.js";
 import { registerReadBridge } from "./clients/read-bridge.js";
-import {
-	isExternalOrVendorFile,
-	normalizeFilePath,
-} from "./clients/path-utils.js";
-import { isPathIgnoredByProject } from "./clients/file-utils.js";
+import { normalizeFilePath } from "./clients/path-utils.js";
+import { isRecordableProjectPath } from "./clients/file-utils.js";
 import {
 	dropStaleFiles,
 	loadSessionState,
@@ -897,10 +894,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 			peekWriteIndex: () => runtime.peekWriteIndex(),
 			isRecordable(filePath: string): boolean {
 				if (_readBridgeGetFlag?.("no-read-guard")) return false;
-				if (isPathIgnoredByProject(filePath, runtime.projectRoot, false))
-					return false;
-				if (isExternalOrVendorFile(filePath, runtime.projectRoot)) return false;
-				return true;
+				return isRecordableProjectPath(filePath, runtime.projectRoot);
 			},
 		});
 	}
@@ -923,10 +917,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 			countFileLines,
 			isRecordable(filePath: string): boolean {
 				if (_mutationBridgeGetFlag?.("no-read-guard")) return false;
-				if (isPathIgnoredByProject(filePath, runtime.projectRoot, false))
-					return false;
-				if (isExternalOrVendorFile(filePath, runtime.projectRoot)) return false;
-				return true;
+				return isRecordableProjectPath(filePath, runtime.projectRoot);
 			},
 			dbg,
 		});
@@ -2557,9 +2548,14 @@ function activateExtension(hostPi: ExtensionAPI) {
 				record: replayThroughMutationBridge,
 				getStoredLineHashes: (candidate) =>
 					storedLineHashesFor(runtime.readGuard, candidate),
+				// Merge of #2449 into #2450: #2449 wrote this gate as the
+				// hand-spelled `isPathIgnoredByProject` + `isExternalOrVendorFile`
+				// pair, which is the duplication #2450's review round 2 (F4)
+				// consolidated into `isRecordableProjectPath`. Routed through the
+				// helper so the settled sweep, the read bridge, the mutation
+				// bridge and the direct LSP path all ask ONE question.
 				isRecordable: (candidate) =>
-					!isPathIgnoredByProject(candidate, runtime.projectRoot, false) &&
-					!isExternalOrVendorFile(candidate, runtime.projectRoot),
+					isRecordableProjectPath(candidate, runtime.projectRoot),
 				signal: ctx?.signal,
 				dbg,
 			});
