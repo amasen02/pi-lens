@@ -41,7 +41,11 @@ import {
 	selectStaleBranches,
 	toComparablePath,
 	verifySnapshotIntegrity,
+	worktreeActivityFromSignals,
+	parseReflogLastEntryMs,
 	MAX_RECORDED_COMMAND_CHARS,
+	WORKTREE_ACTIVITY_BANNED_SIGNALS,
+	WORKTREE_ACTIVITY_SIGNALS,
 } from "../../scripts/lib/worktree-hygiene.mjs";
 
 // A SYNTHETIC repo root, deliberately not `process.cwd()`: this suite may
@@ -435,12 +439,15 @@ describe("selectOrphanFixtureProcesses — the orphan predicate", () => {
 		expect(orphans.map((o) => o.row.pid)).not.toContain(200);
 	});
 
-	it("treats a missing/zero ppid as no live parent", () => {
+	it("treats a missing/zero ppid as UNANSWERED, therefore keep (review round 3, F5)", () => {
+		// This test used to assert the opposite, and asserting it is how the
+		// fail-open shipped: `ppid 0` is what parseProcessTable writes for a row
+		// whose parent column it could not read, so the case with the LEAST
+		// evidence was the one that authorized a kill.
 		const orphans = selectOrphanFixtureProcesses([
 			{ pid: 400, ppid: 0, command: "node /repo/tests/fixtures/fake.mjs" },
 		]);
-		expect(orphans.map((o) => o.row.pid)).toEqual([400]);
-		expect(orphans[0].reason).toContain("no live parent recorded");
+		expect(orphans).toEqual([]);
 	});
 
 	it("never kills itself or a protected pid", () => {
@@ -1054,5 +1061,241 @@ describe("snapshot integrity — stale ppid vs truncated listing (review S5)", (
 			isPidAlive: () => false,
 		});
 		expect(plan.orphans.map((o) => o.row.pid)).toEqual([6000]);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// PR #2438 review round 3 (F1, F3, F4, F5)
+// ---------------------------------------------------------------------------
+
+describe("worktree activity signals (review round 3, F1)", () => {
+	// The defect this pins made the whole sweep inert. `git status --porcelain`
+	// — how the dirty rail is answered — rewrites `<admin>/index` and bumps the
+	// admin directory holding it, so an activity reading that included either
+	// signal returned "now" for every tree the sweep looked at, `too-young`
+	// rejected all of them, and nothing was ever removed.
+
+	it("admits only signals git status leaves alone", () => {
+		expect([...WORKTREE_ACTIVITY_SIGNALS]).toEqual([
+			"checkout",
+			"head",
+			"reflog",
+		]);
+	});
+
+	it("names the banned signals as a value, not a comment", () => {
+		expect([...WORKTREE_ACTIVITY_BANNED_SIGNALS].sort()).toEqual([
+			"admin",
+			"index",
+		]);
+		for (const banned of WORKTREE_ACTIVITY_BANNED_SIGNALS) {
+			expect(WORKTREE_ACTIVITY_SIGNALS).not.toContain(banned);
+		}
+	});
+
+	it("ignores a freshly-bumped admin dir and index — the mutation guard", () => {
+		// This is the exact table `git status` leaves behind: the two signals it
+		// writes read as NOW, the two it does not still read as an hour ago.
+		// Re-admitting either banned key to WORKTREE_ACTIVITY_SIGNALS reds here.
+		const activity = worktreeActivityFromSignals(
+			{ checkout: OLD, head: OLD, reflog: OLD, admin: NOW, index: NOW },
+			NOW,
+		);
+		expect(activity).toBe(OLD);
+		expect(NOW - activity).toBe(60 * 60_000);
+	});
+
+	it("takes the newest admissible signal", () => {
+		expect(
+			worktreeActivityFromSignals(
+				{ checkout: OLD, head: YOUNG, reflog: OLD },
+				NOW,
+			),
+		).toBe(YOUNG);
+	});
+
+	it("reports now — therefore too young, therefore KEPT — when nothing is readable", () => {
+		expect(worktreeActivityFromSignals({}, NOW)).toBe(NOW);
+		expect(worktreeActivityFromSignals(null, NOW)).toBe(NOW);
+		expect(
+			worktreeActivityFromSignals(
+				{ checkout: null, head: undefined, reflog: 0 },
+				NOW,
+			),
+		).toBe(NOW);
+	});
+
+	it("ignores unusable numbers rather than trusting them", () => {
+		expect(
+			worktreeActivityFromSignals(
+				{ checkout: OLD, head: Number.NaN, reflog: Number.POSITIVE_INFINITY },
+				NOW,
+			),
+		).toBe(OLD);
+	});
+});
+
+describe("parseReflogLastEntryMs (review round 3, F1)", () => {
+	// Vector generated from real `git worktree add` + two checkouts on
+	// git 2.55.0.windows.3, not from the format's prose description. The FIRST
+	// line of a fresh worktree's logs/HEAD carries no tab and no message.
+	const REAL_REFLOG =
+		"0000000000000000000000000000000000000000 9de083153b131d52de10bb25e4e4843ea10e3bdd Probe Person <p@example.com> 1788351065 +0300\n" +
+		"9de083153b131d52de10bb25e4e4843ea10e3bdd 9de083153b131d52de10bb25e4e4843ea10e3bdd Probe Person <p@example.com> 1788351065 +0300\treset: moving to HEAD\n" +
+		"9de083153b131d52de10bb25e4e4843ea10e3bdd 9de083153b131d52de10bb25e4e4843ea10e3bdd Probe Person <p@example.com> 1788351066 +0300\tcheckout: moving from worktree-agent-deadbeef to HEAD\n";
+
+	it("reads the timestamp of the LAST entry", () => {
+		expect(parseReflogLastEntryMs(REAL_REFLOG)).toBe(1_788_351_066_000);
+	});
+
+	it("reads an entry that carries no message — the first line git writes", () => {
+		expect(parseReflogLastEntryMs(REAL_REFLOG.split("\n")[0])).toBe(
+			1_788_351_065_000,
+		);
+	});
+
+	it("tolerates a committer name containing the delimiters", () => {
+		expect(
+			parseReflogLastEntryMs(
+				"0000000000000000000000000000000000000000 9de083153b131d52de10bb25e4e4843ea10e3bdd A B <a@b.c> 1788351065 +0300\tcheckout: moving from a to b\n",
+			),
+		).toBe(1_788_351_065_000);
+	});
+
+	it("returns null rather than a wrong number for unparseable text", () => {
+		expect(parseReflogLastEntryMs("")).toBeNull();
+		expect(parseReflogLastEntryMs("not a reflog at all\n")).toBeNull();
+		expect(parseReflogLastEntryMs(null as never)).toBeNull();
+	});
+});
+
+describe("enclosingAgentWorktree — nesting resolves inward (review round 3, F3)", () => {
+	it("maps a nested agent worktree to the INNER tree, not the outer one", () => {
+		// An agent that cuts a worktree from inside another agent's tree.
+		// `indexOf` answered the outer path, so the self rail protected a tree
+		// the sweep was not running in and left the one it WAS running in
+		// eligible for `git worktree remove --force`.
+		const nested = `${wt("agent-outer")}/.claude/worktrees/agent-inner`;
+		expect(enclosingAgentWorktree(`${nested}/scripts`)).toBe(
+			toComparablePath(nested),
+		);
+		expect(enclosingAgentWorktree(nested)).toBe(toComparablePath(nested));
+	});
+
+	it("keeps the self rail on the inner tree of a nested pair", () => {
+		const outer = wt("agent-outer");
+		const inner = `${outer}/.claude/worktrees/agent-inner`;
+		const plan = planWorktreePrune({
+			worktrees: [
+				{
+					path: outer,
+					head: "deadbeef",
+					branch: "refs/heads/pr-1",
+					dirty: false,
+					pushed: true,
+					mtimeMs: OLD,
+					locked: false,
+					lockPid: null,
+				},
+				{
+					path: inner,
+					head: "deadbeef",
+					branch: "refs/heads/pr-2",
+					dirty: false,
+					pushed: true,
+					mtimeMs: OLD,
+					locked: false,
+					lockPid: null,
+				},
+			] as never,
+			nowMs: NOW,
+			selfPath: [`${inner}/scripts`],
+		});
+		expect(
+			plan.keep.find((k: { path: string }) => k.path === inner)?.reason,
+		).toBe("self");
+		expect(plan.remove.map((r: { path: string }) => r.path)).toEqual([outer]);
+	});
+});
+
+describe("capRemovals — zero means zero (review round 3, F4)", () => {
+	const row = (name: string, ageMs: number) => ({
+		path: wt(name),
+		branch: null,
+		ageMs,
+		locked: false,
+		selected: false,
+	});
+	const rows = [row("agent-a", 1000), row("agent-b", 9000)];
+
+	it("removes NOTHING at a cap of 0", () => {
+		// HOOK_POLICIES["subagent-stop"].maxRemovals is 0 and reads as "never".
+		// The old `max <= 0 => uncapped` branch made it mean "remove them all".
+		expect(capRemovals(rows, 0)).toEqual([]);
+	});
+
+	it("treats Infinity as uncapped", () => {
+		expect(capRemovals(rows, Number.POSITIVE_INFINITY)).toHaveLength(2);
+	});
+
+	it("still treats an absent cap as uncapped", () => {
+		expect(capRemovals(rows, null)).toHaveLength(2);
+		expect(capRemovals(rows, undefined)).toHaveLength(2);
+	});
+
+	it("removes nothing for a cap it cannot read, because this gates a delete", () => {
+		expect(capRemovals(rows, Number.NaN)).toEqual([]);
+		expect(capRemovals(rows, -1)).toEqual([]);
+		expect(capRemovals(rows, "two" as never)).toEqual([]);
+	});
+});
+
+describe("selectOrphanFixtureProcesses — no parent pid is not evidence (review round 3, F5)", () => {
+	const helper = (pid: number, ppid: number | undefined) => ({
+		pid,
+		...(ppid === undefined ? {} : { ppid }),
+		command: "node /repo/tests/fixtures/fake-lsp-server.mjs",
+	});
+
+	it("never reaps a row whose ppid is 0", () => {
+		// `parseProcessTable` writes ppid 0 for any row whose parent column it
+		// could not read. The predicate used to fall through both liveness
+		// gates on that row and report it as `no live parent recorded` — a kill
+		// authorized by the total absence of evidence.
+		const orphans = selectOrphanFixtureProcesses([helper(6000, 0)] as never, {
+			selfPid: 5000,
+			isPidAlive: () => false,
+		});
+		expect(orphans).toEqual([]);
+	});
+
+	it("never reaps a row with no ppid field at all", () => {
+		expect(
+			selectOrphanFixtureProcesses([helper(6000, undefined)] as never, {
+				selfPid: 5000,
+				isPidAlive: () => false,
+			}),
+		).toEqual([]);
+	});
+
+	it("never reaps a row whose ppid is negative", () => {
+		expect(
+			selectOrphanFixtureProcesses([helper(6000, -1)] as never, {
+				selfPid: 5000,
+				isPidAlive: () => false,
+			}),
+		).toEqual([]);
+	});
+
+	it("still reaps a helper whose parent pid is real, absent and confirmed gone", () => {
+		// The rail above must not disable the sweep the issue asked for.
+		const orphans = selectOrphanFixtureProcesses(
+			[helper(6000, 5900)] as never,
+			{ selfPid: 5000, isPidAlive: () => false },
+		);
+		expect(orphans.map((o: { row: { pid: number } }) => o.row.pid)).toEqual([
+			6000,
+		]);
+		expect(orphans[0]?.reason).toContain("parent pid 5900 is gone");
 	});
 });

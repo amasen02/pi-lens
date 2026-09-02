@@ -65,7 +65,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	diffSurvivingLspProcesses,
-	isLspServerCommand,
+	snapshotProcesses,
 } from "./lib/process-scan.mjs";
 import {
 	noPhasesLogged,
@@ -233,81 +233,14 @@ function runPiRpc({ piBin, extensionPath, cwd, env, timeoutMs = 45000 }) {
 }
 
 // --- Process snapshot (Windows CIM / POSIX ps), narrow LSP markers only ---
+//
+// The listing itself is scripts/lib/process-scan.mjs (PR #2438 review round
+// 3, F2). This script asks only for pid + command: it diffs two snapshots by
+// pid and matches LSP markers on the command line, and has no use for a
+// parent pid.
 
-function windowsExe(name) {
-	return path.join(
-		process.env.SystemRoot ?? String.raw`C:\Windows`,
-		"System32",
-		name,
-	);
-}
-
-async function snapshotProcesses() {
-	if (isWindows) {
-		return new Promise((resolve) => {
-			try {
-				const powershell = windowsExe(
-					"WindowsPowerShell\\v1.0\\powershell.exe",
-				);
-				const script =
-					"Get-CimInstance Win32_Process " +
-					`| Where-Object { $_.ProcessId -ne ${process.pid} } ` +
-					'| ForEach-Object { "$($_.ProcessId)`t$($_.CommandLine)" }';
-				const child = spawn(
-					powershell,
-					["-NoProfile", "-NonInteractive", "-Command", script],
-					{
-						shell: false,
-						windowsHide: true,
-						stdio: ["ignore", "pipe", "ignore"],
-					},
-				);
-				let out = "";
-				child.stdout.on("data", (d) => (out += d.toString()));
-				child.once("error", () => resolve([]));
-				child.once("close", () => {
-					const rows = [];
-					for (const line of out.split(/\r?\n/)) {
-						const tab = line.indexOf("\t");
-						if (tab <= 0) continue;
-						const pid = Number(line.slice(0, tab).trim());
-						if (Number.isFinite(pid) && pid > 0) {
-							rows.push({ pid, command: line.slice(tab + 1) });
-						}
-					}
-					resolve(rows);
-				});
-			} catch {
-				resolve([]);
-			}
-		});
-	}
-	return new Promise((resolve) => {
-		try {
-			const child = spawn("/bin/ps", ["-eo", "pid=,args="], {
-				stdio: ["ignore", "pipe", "ignore"],
-			});
-			let out = "";
-			child.stdout.on("data", (d) => (out += d.toString()));
-			child.once("error", () => resolve([]));
-			child.once("close", () => {
-				const rows = [];
-				for (const line of out.split(/\r?\n/)) {
-					const trimmed = line.trim();
-					if (!trimmed) continue;
-					const sp = trimmed.indexOf(" ");
-					if (sp <= 0) continue;
-					const pid = Number(trimmed.slice(0, sp));
-					if (Number.isFinite(pid) && pid > 0 && pid !== process.pid) {
-						rows.push({ pid, command: trimmed.slice(sp + 1) });
-					}
-				}
-				resolve(rows);
-			});
-		} catch {
-			resolve([]);
-		}
-	});
+function snapshotLspCandidates() {
+	return snapshotProcesses(["pid", "command"]).then((scan) => scan.rows);
 }
 
 function readLatencyLogEntries() {
@@ -449,7 +382,7 @@ async function main() {
 	// --- Assertion 3: zero surviving LSP-server processes after clean exit ---
 	{
 		try {
-			const before = await snapshotProcesses();
+			const before = await snapshotLspCandidates();
 			await runPiRpc({
 				piBin,
 				extensionPath,
@@ -461,7 +394,7 @@ async function main() {
 			// the parent process exits, not synchronously with it (verified
 			// empirically — see docs/subagent-compat.md).
 			await new Promise((r) => setTimeout(r, 3000));
-			const after = await snapshotProcesses();
+			const after = await snapshotLspCandidates();
 			const surviving = diffSurvivingLspProcesses(before, after);
 			results.push({
 				id: "no-surviving-lsp-processes",

@@ -42,6 +42,110 @@ import path from "node:path";
 /** Default minimum worktree age before an unnamed tree is eligible (30m). */
 export const DEFAULT_MIN_AGE_MS = 30 * 60_000;
 
+/**
+ * Filesystem signals admissible as "someone touched this worktree", and the
+ * ones that are BANNED from that answer. Values rather than prose, so the
+ * ban is something a test can read.
+ *
+ * PR #2438 review round 3 (F1) -- the defect that made the whole sweep inert.
+ * `worktreeActivityMs` took the max over four signals, two of which the
+ * sweep's OWN inspection writes: `git status --porcelain` (how `isDirty`
+ * answers the dirty rail) rewrites `<admin>/index` and therefore bumps both
+ * that file and the admin DIRECTORY holding it. Every candidate came back
+ * `age 0ms`, `too-young` rejected all of them, and nothing was ever removed.
+ * Measured on the #2435 box (git 2.55.0.windows.3) with a throwaway worktree
+ * whose four signals were all backdated to now-3h:
+ *
+ *   signal           before git status   after git status
+ *   checkout dir     age 10800s          age 10800s   unchanged
+ *   adminDir         age 10800s          age     0s   BUMPED
+ *   adminDir/HEAD    age 10800s          age 10800s   unchanged
+ *   adminDir/index   age 10800s          age     0s   BUMPED
+ *
+ * So the admissible set is the two proven-unchanged signals plus the HEAD
+ * reflog's last ENTRY timestamp: git appends to `<admin>/logs/HEAD` only
+ * when HEAD actually moves (checkout, commit, reset), and the same probe
+ * confirmed `git status --porcelain` changes neither its size nor its mtime.
+ * The reflog is the one signal that survives a tool copying or re-touching
+ * the checkout directory, which is why it is worth reading a file for.
+ */
+export const WORKTREE_ACTIVITY_SIGNALS = Object.freeze([
+	"checkout",
+	"head",
+	"reflog",
+]);
+
+/**
+ * Signals that must never contribute to worktree activity, because the sweep
+ * writes them while inspecting. Re-admitting either one re-creates the
+ * inert-sweep defect above, so it is pinned as a value.
+ */
+export const WORKTREE_ACTIVITY_BANNED_SIGNALS = Object.freeze([
+	"admin",
+	"index",
+]);
+
+/**
+ * Newest admissible activity timestamp for one worktree, in epoch ms.
+ *
+ * Reads ONLY the keys named in `WORKTREE_ACTIVITY_SIGNALS`; any other key on
+ * the input -- notably `admin` and `index` -- is ignored no matter how recent
+ * it is. Pure, so the rail is provable without a git repo.
+ *
+ * An empty answer means every signal was unreadable, and 0 ("infinitely
+ * old") is the WRONG default for a rail guarding a destructive step, so an
+ * unreadable tree reports `nowMs`: too young, therefore kept.
+ *
+ * @param {Record<string, number|null|undefined>|null|undefined} signals
+ * @param {number} nowMs
+ * @returns {number}
+ */
+export function worktreeActivityFromSignals(signals, nowMs) {
+	let newest = 0;
+	for (const name of WORKTREE_ACTIVITY_SIGNALS) {
+		const value = signals?.[name];
+		if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+			newest = Math.max(newest, value);
+		}
+	}
+	return newest === 0 ? nowMs : newest;
+}
+
+/**
+ * Epoch-ms timestamp of the LAST entry in a git reflog file, or null when the
+ * text holds no parseable entry.
+ *
+ * The line shape is pinned against real output from git 2.55.0.windows.3
+ * rather than from the format's description -- the first entry of a fresh
+ * worktree's `logs/HEAD` carries NO tab and NO message, which a
+ * message-requiring parser silently drops:
+ *
+ *   "0000...0000 9de0...3bdd Probe Person <p@example.com> 1788351065 +0300\n"
+ *   "9de0...3bdd 9de0...3bdd Probe Person <p@example.com> 1788351065 +0300\treset: moving to HEAD\n"
+ *
+ * So: split the message off at the first tab, then read the trailing
+ * `<unix-seconds> <±hhmm>` pair off what remains. The committer name is free
+ * text and may contain anything, which is why this anchors on the END of the
+ * header rather than trying to tokenize the middle.
+ *
+ * @param {string} text
+ * @returns {number|null}
+ */
+export function parseReflogLastEntryMs(text) {
+	const lines = String(text ?? "").split(/\r?\n/);
+	for (let index = lines.length - 1; index >= 0; index--) {
+		const line = lines[index];
+		if (!line || !line.trim()) continue;
+		const header = line.split("\t", 1)[0];
+		const match = /\s(\d{1,15})\s[+-]\d{4}\s*$/.exec(header);
+		if (!match) continue;
+		const seconds = Number(match[1]);
+		if (!Number.isFinite(seconds) || seconds <= 0) continue;
+		return seconds * 1000;
+	}
+	return null;
+}
+
 /** Max records retained in the hygiene ledger (bounded telemetry). */
 export const DEFAULT_LOG_MAX_LINES = 500;
 
@@ -135,13 +239,21 @@ export function isAgentWorktreePath(p) {
  * is a prefix walk to the first separator AFTER the `agent-` segment so a
  * sibling (`agent-abc2`) resolves to itself rather than to `agent-abc`.
  *
+ * PR #2438 review round 3 (F3): the walk starts at the LAST occurrence of the
+ * segment, not the first. An agent that cuts a worktree from inside another
+ * agent's tree produces a NESTED path -- `<outer agent tree>/.claude/
+ * worktrees/agent-<inner>/scripts` -- and `indexOf` resolved that to the
+ * OUTER tree. The self rail then protected a tree the sweep was not running
+ * in and left the one it WAS running in eligible. The enclosing worktree of
+ * a nested path is always the innermost one.
+ *
  * @param {string} p
  * @returns {string|null}
  */
 export function enclosingAgentWorktree(p) {
 	const key = toComparablePath(p);
 	if (!key) return null;
-	const at = key.indexOf(AGENT_WORKTREE_SEGMENT);
+	const at = key.lastIndexOf(AGENT_WORKTREE_SEGMENT);
 	if (at === -1) return null;
 	const afterSegment = at + AGENT_WORKTREE_SEGMENT.length;
 	const nextSeparator = key.indexOf("/", afterSegment);
@@ -576,6 +688,16 @@ export function selectProcessesUnderPath(rows, targetPath, options = {}) {
  * authorizes a kill (review S5). On a truncated listing the parent is absent
  * but still running, and the probe keeps the helper alive.
  *
+ * PR #2438 review round 3 (F5): a row with NO usable parent pid -- `ppid`
+ * absent, 0, or negative -- is never an orphan candidate. It used to be the
+ * opposite: `ppid <= 0` failed every liveness gate (there is no pid to look
+ * up in the table and none to send signal 0 to), fell through both
+ * `continue`s, and was reported as `no live parent recorded` -- a KILL
+ * authorized by the total ABSENCE of evidence. `ppid` 0 is what
+ * `parseProcessTable` writes for any row whose parent column it could not
+ * read, and what Windows reports for a reparented process, so the fail-open
+ * case was the unparseable one. Unanswered is KEEP.
+ *
  * @param {ProcRow[]} rows
  * @param {{ selfPid?: number, protectedPids?: Set<number>, isPidAlive?: (pid: number) => boolean }} [options]
  * @returns {{ row: ProcRow, reason: string }[]}
@@ -592,25 +714,16 @@ export function selectOrphanFixtureProcesses(rows, options = {}) {
 		if (row.pid === selfPid || protectedPids.has(row.pid)) continue;
 		if (!isFixtureHelperCommand(row.command)) continue;
 		const ppid = row.ppid;
-		const parentAlive =
-			typeof ppid === "number" && ppid > 0 && livePids.has(ppid);
-		if (parentAlive) continue;
+		// No usable parent pid => the question "has the parent exited?" was
+		// never ANSWERED, and an unanswered question is a keep (F5).
+		if (!Number.isInteger(ppid) || ppid <= 0) continue;
+		if (livePids.has(ppid)) continue;
 		// Absent from the table AND still answering a signal 0 => the table is
 		// missing rows, not the parent missing from the box.
-		if (
-			isPidAlive !== null &&
-			typeof ppid === "number" &&
-			ppid > 0 &&
-			isPidAlive(ppid)
-		) {
-			continue;
-		}
+		if (isPidAlive !== null && isPidAlive(ppid)) continue;
 		orphans.push({
 			row,
-			reason:
-				typeof ppid === "number" && ppid > 0
-					? `orphan test fixture (parent pid ${ppid} is gone)`
-					: "orphan test fixture (no live parent recorded)",
+			reason: `orphan test fixture (parent pid ${ppid} is gone)`,
 		});
 	}
 	return orphans;
@@ -733,14 +846,28 @@ export function planOrphanSweep({
  * sane hook timeout; a manual `npm run hygiene` passes no cap and clears the
  * backlog in one go.
  *
+ * PR #2438 review round 3 (F4): `0` now means ZERO. It used to be swallowed
+ * by a `max <= 0 => uncapped` branch, so `HOOK_POLICIES["subagent-stop"]`'s
+ * `maxRemovals: 0` -- which reads as "this hook removes nothing" -- actually
+ * spelled "this hook removes as many trees as it likes". Nothing shipped
+ * through that hole (`removeWorktrees: false` gates the same call site), but
+ * a value whose plain reading is the OPPOSITE of its behaviour is one
+ * refactor away from being the bug. Uncapped is now spelled by an absent cap
+ * (`null`/`undefined`) or `Infinity`, never by a falsy number.
+ *
  * @template {{ ageMs: number }} T
  * @param {T[]} removals
- * @param {number|null|undefined} max Null/absent/non-positive = uncapped.
+ * @param {number|null|undefined} max `null`/absent/`Infinity` = uncapped;
+ *   `0` = remove nothing; any other unreadable value = remove nothing, since
+ *   this gates a destructive step.
  * @returns {T[]}
  */
 export function capRemovals(removals, max) {
 	const list = [...(removals ?? [])];
-	if (typeof max !== "number" || !Number.isFinite(max) || max <= 0) return list;
+	if (max === null || max === undefined || max === Number.POSITIVE_INFINITY) {
+		return list;
+	}
+	if (typeof max !== "number" || !Number.isFinite(max) || max <= 0) return [];
 	if (list.length <= max) return list;
 	return list
 		.slice()

@@ -2,6 +2,18 @@
 // tests). Mirrors the JSDoc in the implementation; keep the two in sync.
 
 export const DEFAULT_MIN_AGE_MS: number;
+
+export type WorktreeActivitySignal = "checkout" | "head" | "reflog";
+
+export const WORKTREE_ACTIVITY_SIGNALS: readonly WorktreeActivitySignal[];
+export const WORKTREE_ACTIVITY_BANNED_SIGNALS: readonly string[];
+
+export function worktreeActivityFromSignals(
+	signals: Record<string, number | null | undefined> | null | undefined,
+	nowMs: number,
+): number;
+
+export function parseReflogLastEntryMs(text: string): number | null;
 export const DEFAULT_LOG_MAX_LINES: number;
 export const MAX_RECORDED_COMMAND_CHARS: number;
 export const AGENT_WORKTREE_SEGMENT: string;

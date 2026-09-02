@@ -4,8 +4,10 @@
  * The destructive logic lives in scripts/lib/worktree-hygiene.mjs and is
  * covered by worktree-hygiene.test.ts. What is left here is the surface that
  * decides HOW that logic is invoked — argument parsing, the SubagentStop
- * payload mapping, the platform process-table parsers, and the ledger
- * location. Importing the module runs no sweep: its `isEntryPoint()` guard
+ * payload mapping, the worktree-activity rail that decides age, and the
+ * ledger location. The platform process-table parsers moved to
+ * tests/scripts/process-scan.test.ts with the listing itself (review round
+ * 3, F2). Importing the module runs no sweep: its `isEntryPoint()` guard
  * is false under vitest.
  */
 
@@ -19,11 +21,15 @@ import {
 	REMOVE_TIMEOUT_MS,
 	getHygieneLogPath,
 	parseArgs,
-	parseProcessTable,
 	resolveHookPolicy,
+	worktreeActivityMs,
 	worktreePathFromHookPayload,
 } from "../../scripts/prune-agent-worktrees.mjs";
-import { DEFAULT_MIN_AGE_MS } from "../../scripts/lib/worktree-hygiene.mjs";
+import {
+	DEFAULT_MIN_AGE_MS,
+	planWorktreePrune,
+} from "../../scripts/lib/worktree-hygiene.mjs";
+import { gitExecFileSync } from "../support/git-fixture-env.js";
 
 describe("parseArgs", () => {
 	it("defaults to a non-destructive-by-omission configuration", () => {
@@ -127,52 +133,6 @@ describe("worktreePathFromHookPayload", () => {
 	});
 });
 
-describe("parseProcessTable", () => {
-	it("parses the Windows CIM tab-joined layout, command lines with tabs included", () => {
-		const rows = parseProcessTable(
-			[
-				"1234\t5678\tnode C:\\repo\\tests\\fixtures\\fake-lsp-server.mjs",
-				"4\t0\tSystem",
-				"", // trailing blank line
-			].join("\n"),
-			true,
-		);
-		expect(rows).toEqual([
-			{
-				pid: 1234,
-				ppid: 5678,
-				command: "node C:\\repo\\tests\\fixtures\\fake-lsp-server.mjs",
-			},
-			{ pid: 4, ppid: 0, command: "System" },
-		]);
-	});
-
-	it("parses the POSIX `ps -eo pid,ppid,args` layout, keeping spaces in args", () => {
-		const rows = parseProcessTable(
-			[
-				"  1234  5678 node /repo/tests/fixtures/fake-lsp-server.mjs --port 0",
-			].join("\n"),
-			false,
-		);
-		expect(rows).toEqual([
-			{
-				pid: 1234,
-				ppid: 5678,
-				command: "node /repo/tests/fixtures/fake-lsp-server.mjs --port 0",
-			},
-		]);
-	});
-
-	it("drops unparseable lines rather than inventing pid 0 or NaN", () => {
-		// A row with a bogus pid that survived here would be handed to
-		// process.kill.
-		expect(parseProcessTable("header line\n\nnot-a-pid\tx\ty", true)).toEqual(
-			[],
-		);
-		expect(parseProcessTable("", true)).toEqual([]);
-	});
-});
-
 describe("getHygieneLogPath", () => {
 	const saved = {
 		data: process.env.PILENS_DATA_DIR,
@@ -249,11 +209,14 @@ describe("resolveHookPolicy (review S1/S8)", () => {
 	});
 
 	it("leaves a manual run uncapped", () => {
+		// Uncapped is Infinity, not a falsy number (review round 3, F4):
+		// capRemovals now reads 0 as ZERO, so uncapped had to stop being
+		// spelled by anything that could be confused with it.
 		expect(resolveHookPolicy(null)).toMatchObject({
 			removeWorktrees: true,
 			deleteBranches: true,
 			scopedToAgentTree: false,
-			maxRemovals: null,
+			maxRemovals: Number.POSITIVE_INFINITY,
 		});
 	});
 
@@ -277,11 +240,211 @@ describe(".claude/settings.json hook registration (review S8/S9)", () => {
 		expect(timeoutS * 1000).toBeGreaterThanOrEqual(REMOVE_TIMEOUT_MS + 10_000);
 	});
 
+	it("runs the sweep on startup and resume only (review round 3, F1c)", () => {
+		// Without a matcher, SessionStart fires for `clear`, `compact` and
+		// `fork` too — so a long session re-ran the whole sweep every time it
+		// auto-compacted, roughly every 20 minutes, for no hygiene gain.
+		// Matcher semantics, from the settings schema at
+		// json.schemastore.org/claude-code-settings.json and
+		// code.claude.com/docs/en/hooks#matcher-patterns: a value of only
+		// letters, digits, `_`, `-`, spaces, `,` and `|` is an exact-string
+		// list separated by `|` or `,`; the SessionStart matcher filters on
+		// `source`, whose values are startup | resume | clear | compact | fork.
+		const group = settings.hooks.SessionStart[0];
+		expect(group.matcher).toBe("startup|resume");
+		expect(group.matcher).toMatch(/^[A-Za-z0-9_\-, |]+$/);
+		const sources = String(group.matcher).split("|");
+		expect(sources).toEqual(["startup", "resume"]);
+		for (const noisy of ["clear", "compact", "fork"]) {
+			expect(sources).not.toContain(noisy);
+		}
+	});
+
 	it("keeps SubagentStop short, because it never removes a tree", () => {
 		const timeoutS = settings.hooks.SubagentStop[0].hooks[0].timeout;
 		expect(timeoutS).toBeLessThanOrEqual(15);
 		expect(settings.hooks.SubagentStop[0].hooks[0].command).toContain(
 			"--hook subagent-stop",
 		);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// PR #2438 review round 3 (F1) — the sweep must survive its own inspection
+// ---------------------------------------------------------------------------
+
+describe("worktreeActivityMs across a real `git status` (review round 3, F1)", () => {
+	// The pure half of this rail is covered by worktree-hygiene.test.ts. What
+	// only a REAL worktree can prove is the premise it rests on: that
+	// `git status --porcelain` — the command the dirty rail runs inside the
+	// tree — bumps `<admin>` and `<admin>/index` while leaving the checkout
+	// directory, `<admin>/HEAD` and `<admin>/logs/HEAD` alone. Reading the
+	// bumped signals collapsed every candidate to `age 0ms`, so `too-young`
+	// rejected all of them and the sweep removed nothing, ever.
+
+	let fixtureRoot = "";
+	let repo = "";
+	let worktree = "";
+	const BACKDATE_MS = 3 * 60 * 60_000;
+
+	const git = (args: string[], cwd: string) =>
+		gitExecFileSync("git", args, {
+			cwd,
+			encoding: "utf8",
+			stdio: "pipe",
+		}) as string;
+
+	function adminDirOf(worktreePath: string): string {
+		const dotGit = path.join(worktreePath, ".git");
+		if (fs.statSync(dotGit).isDirectory()) return dotGit;
+		const match = /^gitdir:\s*(.+)$/m.exec(
+			fs.readFileSync(dotGit, "utf8").trim(),
+		);
+		expect(match, "worktree .git file must name its admin dir").toBeTruthy();
+		return path.resolve(worktreePath, (match as RegExpExecArray)[1].trim());
+	}
+
+	beforeEach(() => {
+		fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-f1-"));
+		repo = path.join(fixtureRoot, "repo");
+		fs.mkdirSync(repo);
+		git(["init", "-q", "-b", "master"], repo);
+		// Identities from tests/support/git-config-guard.ts KNOWN_FIXTURE_*; a
+		// literal this repo does not already register reds git-fixture-governance.
+		git(["config", "user.email", "test@example.com"], repo);
+		git(["config", "user.name", "pi-lens test"], repo);
+		fs.writeFileSync(path.join(repo, "a.txt"), "hello\n");
+		git(["add", "a.txt"], repo);
+		git(["commit", "-qm", "init"], repo);
+		// Shaped like a real agent worktree, so isAgentWorktreePath holds and
+		// the plan below is the production one rather than a synthetic path.
+		worktree = path.join(repo, ".claude", "worktrees", "agent-deadbeef");
+		git(
+			["worktree", "add", "-q", "-b", "worktree-agent-deadbeef", worktree],
+			repo,
+		);
+	});
+
+	afterEach(() => {
+		try {
+			git(["worktree", "remove", "--force", worktree], repo);
+		} catch {
+			/* an assertion already failed; cleanup is best-effort */
+		}
+		fs.rmSync(fixtureRoot, { recursive: true, force: true });
+	});
+
+	/**
+	 * Age the worktree by BACKDATE_MS the way three hours of wall clock would:
+	 * every mtime moves back, AND the reflog's recorded entry timestamps move
+	 * back with them. Rewriting only mtimes would leave a reflog that still
+	 * says "HEAD moved just now", which is a genuinely young tree — the rail
+	 * would be right to keep it, and the test would prove nothing.
+	 */
+	function backdateEverySignal(nowMs: number): void {
+		const admin = adminDirOf(worktree);
+		const reflog = path.join(admin, "logs", "HEAD");
+		if (fs.existsSync(reflog)) {
+			const shifted = fs
+				.readFileSync(reflog, "utf8")
+				.replace(
+					/(\s)(\d{9,12})(\s[+-]\d{4})/g,
+					(_all, before, seconds, after) =>
+						`${before}${Number(seconds) - Math.round(BACKDATE_MS / 1000)}${after}`,
+				);
+			fs.writeFileSync(reflog, shifted);
+		}
+		const past = new Date(nowMs - BACKDATE_MS);
+		for (const target of [
+			worktree,
+			admin,
+			path.join(admin, "HEAD"),
+			path.join(admin, "index"),
+			reflog,
+		]) {
+			if (fs.existsSync(target)) fs.utimesSync(target, past, past);
+		}
+	}
+
+	it("still reports the tree as hours old after the dirty rail has run", () => {
+		const nowMs = Date.now();
+		backdateEverySignal(nowMs);
+
+		// Exactly the call isDirty() makes, and the reason the tree looked new.
+		expect(git(["status", "--porcelain"], worktree).trim()).toBe("");
+
+		const ageMs = nowMs - worktreeActivityMs(worktree, nowMs);
+		expect(
+			ageMs,
+			`activity read ${ageMs}ms old; the sweep's own git status reset it`,
+		).toBeGreaterThan(BACKDATE_MS - 60_000);
+	});
+
+	it("plans a backdated clean, pushed tree for REMOVAL after isDirty ran", () => {
+		// The acceptance shape: age measured, dirtiness measured, verdict
+		// `remove`. On the pre-fix reading this tree came back `too-young`
+		// with `age 0ms`.
+		const nowMs = Date.now();
+		backdateEverySignal(nowMs);
+		const dirty = git(["status", "--porcelain"], worktree).trim() !== "";
+		const mtimeMs = worktreeActivityMs(worktree, nowMs);
+
+		const plan = planWorktreePrune({
+			worktrees: [
+				{
+					path: worktree,
+					head: "deadbeef",
+					branch: "refs/heads/worktree-agent-deadbeef",
+					dirty,
+					pushed: true,
+					mtimeMs,
+					locked: false,
+					lockPid: null,
+				},
+			] as never,
+			nowMs,
+			minAgeMs: DEFAULT_MIN_AGE_MS,
+		});
+
+		expect(
+			plan.keep.map((k: { reason: string; detail: string | null }) => [
+				k.reason,
+				k.detail,
+			]),
+		).toEqual([]);
+		expect(plan.remove.map((r: { path: string }) => r.path)).toEqual([
+			worktree,
+		]);
+	});
+
+	it("keeps reading a tree whose HEAD genuinely moved as recent", () => {
+		// The rail must still SEE real activity, or it would reap live trees.
+		const nowMs = Date.now();
+		backdateEverySignal(nowMs);
+		git(["checkout", "-q", "--detach"], worktree);
+		expect(nowMs - worktreeActivityMs(worktree, nowMs)).toBeLessThan(60_000);
+	});
+});
+
+describe("candidate enrichment order (review round 3, F1b)", () => {
+	// Defense in depth for the rail above: object-literal properties evaluate
+	// in source order, and the shipped version read activity AFTER running
+	// `git status` inside the tree. The admissible signals now refuse that
+	// write, so the order is no longer load-bearing — but a signal added to
+	// the gatherer later would make it load-bearing again, silently.
+	const source = fs.readFileSync(
+		path.resolve(__dirname, "../../scripts/prune-agent-worktrees.mjs"),
+		"utf8",
+	);
+
+	it("reads worktree activity before anything that runs git in the tree", () => {
+		const activityAt = source.indexOf("worktreeActivityMs(row.path, nowMs)");
+		const dirtyAt = source.indexOf("isDirty(row.path,");
+		expect(
+			activityAt,
+			"worktreeActivityMs(row.path, …) call site",
+		).toBeGreaterThan(-1);
+		expect(dirtyAt, "isDirty(row.path, …) call site").toBeGreaterThan(-1);
+		expect(activityAt).toBeLessThan(dirtyAt);
 	});
 });

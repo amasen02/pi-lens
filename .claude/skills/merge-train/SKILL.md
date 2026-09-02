@@ -19,10 +19,16 @@ reviewed, zero unreviewed merges). Apply it to each PR in the queue.
    worktrees may be pruned after their report; **fixer worktrees stay until
    the PR merges** (pruning breaks resume).
    The hygiene sweep (#2435) respects this: `SubagentStop` never removes a
-   worktree. Fixer and reviewer trees are reaped by the `SessionStart` sweep
-   once they have been idle ≥30m and are clean and pushed — by which point a
-   resume is no longer live, and a fresh fixer simply checks the branch out
-   again for the next fix round.
+   worktree. Fixer and reviewer trees are reaped by the `SessionStart` sweep —
+   which runs on `startup` and `resume` only, not on `/clear`, compaction or a
+   fork — once they have been idle ≥30m and are clean and pushed. Idle is
+   measured from the checkout directory and the worktree's HEAD (and its
+   reflog), never from the git index, so the sweep's own dirty check cannot
+   make a finished tree look busy. By that point a resume is no longer live,
+   and a fresh fixer simply checks the branch out again for the next round.
+   A tree with uncommitted work, or with work not yet on an `origin/*` ref, is
+   never removed at any age — so a fix round in flight is safe by its own
+   state, not by the clock.
 3. **Verify.** The SAME reviewer verifies each fix round with its own probes.
    Do not take the fixer's word; do not swap reviewers mid-PR.
 4. **Merge gate.** Merge only when: verdict is merge-ready; Unit tests and

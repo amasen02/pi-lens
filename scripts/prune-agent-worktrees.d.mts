@@ -2,8 +2,6 @@
 // from .ts tests). Only the pure, exported seams are declared — the CLI body
 // is not importable surface.
 
-import type { ProcRow } from "./lib/worktree-hygiene.d.mts";
-
 export const DEFAULT_HOOK_BUDGET_MS: number;
 export const DEFAULT_MANUAL_BUDGET_MS: number;
 export const DEFAULT_SCAN_TIMEOUT_MS: number;
@@ -32,7 +30,8 @@ export interface HookPolicy {
 	deleteBranches: boolean;
 	orphanSweep: boolean;
 	scopedToAgentTree: boolean;
-	maxRemovals: number | null;
+	/** `Infinity` = uncapped, `0` = never, `n` = at most n per run. */
+	maxRemovals: number;
 }
 
 export const HOOK_POLICIES: Readonly<Record<string, HookPolicy>>;
@@ -44,9 +43,6 @@ export function worktreePathFromHookPayload(
 	repoRoot: string,
 ): string | null;
 
-export function parseProcessTable(
-	out: string,
-	tabSeparated: boolean,
-): ProcRow[];
+export function worktreeActivityMs(worktreePath: string, nowMs: number): number;
 
 export function getHygieneLogPath(): string;

@@ -26,9 +26,15 @@
  *   - never a tree younger than --min-age, and never one whose git lock
  *     names a live pid, UNLESS --only names it;
  *   - never this process, and never any ancestor of it;
- *   - never a fixture helper whose parent is still alive;
+ *   - never a fixture helper whose parent is still alive, and never one whose
+ *     parent pid is unreadable — unanswered is keep, not kill;
  *   - kills are always by pid after a command-line/cwd match, never
  *     `taskkill`-by-name.
+ *
+ * A worktree's AGE is read only from signals this sweep does not itself
+ * write — see `WORKTREE_ACTIVITY_SIGNALS` in the library. Reading the git
+ * index made every tree `age 0ms` the moment the dirty rail looked at it, and
+ * the sweep removed nothing at all for its whole first life.
  *
  * WHO REMOVES WHAT (PR #2438 review S1 -- see resolveHookPolicy):
  *   `--hook subagent-stop` NEVER removes a worktree. Resume-by-SendMessage
@@ -57,7 +63,7 @@
  * "bounded on one axis, unbounded on another" leak this repo keeps finding).
  */
 
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -75,13 +81,16 @@ import {
 	orderBySelection,
 	parseDuration,
 	parseLockPid,
+	parseReflogLastEntryMs,
 	parseWorktreeList,
 	planBranchDeletions,
 	planOrphanSweep,
 	planWorktreePrune,
 	pruneLogLines,
 	selectProcessesUnderPath,
+	worktreeActivityFromSignals,
 } from "./lib/worktree-hygiene.mjs";
+import { snapshotProcesses } from "./lib/process-scan.mjs";
 
 const isWindows = process.platform === "win32";
 
@@ -118,9 +127,14 @@ export const DEFAULT_GIT_TIMEOUT_MS = 5_000;
 /** Floor for any per-`git`-call bound; below this even a warm call fails. */
 export const MIN_GIT_TIMEOUT_MS = 250;
 /**
- * Bound for `git worktree remove` / `prune` — generous and NOT tied to the
- * sweep budget. Aborting a recursive delete midway is strictly worse than
- * overrunning: it leaves a half-removed tree and a stale admin directory.
+ * Bound for `git worktree remove` / `prune` — generous, and deliberately not
+ * tied to the sweep budget, but a real bound: `git()` enforces it with
+ * killSignal SIGKILL. Aborting a recursive delete midway is strictly worse
+ * than overrunning (it leaves a half-removed tree and a stale admin
+ * directory), so 60s is set far above any real removal and only ever fires on
+ * a wedged git — and it sits inside the 90s SessionStart hook timeout, which
+ * is sized to cover one full removal plus the sweep around it (review S8, and
+ * review round 3 F7 for the comment that used to claim no bound at all).
  */
 export const REMOVE_TIMEOUT_MS = 60_000;
 /** Grace period between SIGTERM and the hard kill (ms). */
@@ -244,10 +258,12 @@ export function parseArgs(argv) {
  * "SubagentStop must not remove worktrees" is a value a test can read rather
  * than a branch buried in main() (PR #2438 review S1/S8).
  *
- * `maxRemovals`: null = uncapped (a human ran it and is watching); 1 = one
- * tree per SessionStart, because `git worktree remove` is bounded at
+ * `maxRemovals`: `Infinity` = uncapped (a human ran it and is watching);
+ * 1 = one tree per SessionStart, because `git worktree remove` is bounded at
  * REMOVE_TIMEOUT_MS and more than one cannot fit inside the hook's own
- * timeout; 0 = never, for SubagentStop.
+ * timeout; 0 = never, for SubagentStop -- and since review round 3 (F4)
+ * `capRemovals` reads that 0 as the zero it looks like, instead of folding it
+ * into a "non-positive means uncapped" branch that said the opposite.
  */
 export const HOOK_POLICIES = Object.freeze({
 	"subagent-stop": Object.freeze({
@@ -269,7 +285,7 @@ export const HOOK_POLICIES = Object.freeze({
 		deleteBranches: true,
 		orphanSweep: true,
 		scopedToAgentTree: false,
-		maxRemovals: null,
+		maxRemovals: Number.POSITIVE_INFINITY,
 	}),
 });
 
@@ -400,34 +416,58 @@ function readWorktreeAdminDir(worktreePath) {
 }
 
 /**
- * Newest observed activity for a worktree. `--min-age` is about "has anyone
- * touched this recently", so this takes the max of the checkout directory's
- * own mtime and the git admin directory's HEAD mtime (which moves on every
- * checkout/commit/reset even when the top-level directory listing does not).
- * Unreadable => 0 => "infinitely old" is WRONG for a safety rail, so an
- * unreadable tree reports `now` instead: too young, therefore kept.
+ * Newest observed activity for a worktree. `--min-age` asks "has anyone
+ * touched this recently", so the only admissible answers are signals the
+ * sweep's own inspection does not write -- see `WORKTREE_ACTIVITY_SIGNALS`
+ * for the measured table and why `<admin>` and `<admin>/index` are banned
+ * (PR #2438 review round 3, F1). Gathering happens here because it touches
+ * the filesystem; the decision is the pure `worktreeActivityFromSignals`.
+ *
+ * Unreadable => `nowMs` => too young => kept, which is the safe direction.
+ *
+ * Exported for tests: the rail this feeds is the difference between a sweep
+ * that removes finished trees and one that can never remove anything, and
+ * proving it needs a REAL worktree that a real `git status` has run inside.
  *
  * @param {string} worktreePath
  * @param {number} nowMs
  * @returns {number}
  */
-function worktreeActivityMs(worktreePath, nowMs) {
-	let newest = 0;
-	const consider = (file) => {
+export function worktreeActivityMs(worktreePath, nowMs) {
+	const mtimeOf = (file) => {
 		try {
-			newest = Math.max(newest, fs.statSync(file).mtimeMs);
+			return fs.statSync(file).mtimeMs;
 		} catch {
 			/* missing input just doesn't contribute */
+			return null;
 		}
 	};
-	consider(worktreePath);
 	const adminDir = readWorktreeAdminDir(worktreePath);
-	if (adminDir) {
-		consider(adminDir);
-		consider(path.join(adminDir, "HEAD"));
-		consider(path.join(adminDir, "index"));
+	/** @type {Record<string, number|null>} */
+	const signals = {
+		checkout: mtimeOf(worktreePath),
+		head: adminDir ? mtimeOf(path.join(adminDir, "HEAD")) : null,
+		reflog: adminDir
+			? reflogLastEntryMs(path.join(adminDir, "logs", "HEAD"))
+			: null,
+	};
+	return worktreeActivityFromSignals(signals, nowMs);
+}
+
+/**
+ * Last entry time of a reflog file, or null when it is absent or unparseable.
+ * Reads only the tail: a long-lived worktree's `logs/HEAD` is small, but a
+ * bounded read keeps the sweep's per-tree cost flat regardless.
+ *
+ * @param {string} file
+ * @returns {number|null}
+ */
+function reflogLastEntryMs(file) {
+	try {
+		return parseReflogLastEntryMs(fs.readFileSync(file, "utf8"));
+	} catch {
+		return null;
 	}
-	return newest === 0 ? nowMs : newest;
 }
 
 /**
@@ -496,126 +536,12 @@ function isDirty(worktreePath, timeoutMs = DEFAULT_GIT_TIMEOUT_MS) {
 // ---------------------------------------------------------------------------
 // Process table
 // ---------------------------------------------------------------------------
-
-function windowsExe(name) {
-	return path.join(
-		process.env.SystemRoot ?? path.join("C:", "Windows"),
-		"System32",
-		name,
-	);
-}
-
-/**
- * Snapshot the process table as `{ pid, ppid, command, cwd? }` rows.
- *
- * Windows uses `Get-CimInstance` through `powershell -NoProfile` with an
- * explicit WQL projection (measured ~316ms for the query vs ~570ms for the
- * unprojected form on the #2435 box, plus ~208ms powershell startup) —
- * `tasklist` exposes no parent pid and no command line, and `wmic` is gone
- * from Windows 11. POSIX uses `ps -eo pid,ppid,args`.
- *
- * Never rejects. Returns `{ rows, ok }`: `ok` is false when the listing
- * failed, timed out, never spawned, or EXITED NON-ZERO -- the last of which
- * used to be ignored (PR #2438 review S5), so a `ps` that printed a partial
- * table and then died read as a complete one. Bounded by `timeoutMs` so a
- * hook can never hang a session on a wedged WMI service.
- *
- * @param {number} timeoutMs
- * @returns {Promise<{ rows: import("./lib/worktree-hygiene.mjs").ProcRow[], ok: boolean }>}
- */
-function snapshotProcesses(timeoutMs) {
-	const command = isWindows
-		? windowsExe("WindowsPowerShell\\v1.0\\powershell.exe")
-		: "ps";
-	const args = isWindows
-		? [
-				"-NoProfile",
-				"-NonInteractive",
-				"-Command",
-				'Get-CimInstance -Query "SELECT ProcessId,ParentProcessId,CommandLine FROM Win32_Process" ' +
-					'| ForEach-Object { "$($_.ProcessId)`t$($_.ParentProcessId)`t$($_.CommandLine)" }',
-			]
-		: ["-eo", "pid=,ppid=,args="];
-
-	return new Promise((resolve) => {
-		let settled = false;
-		const finish = (rows, ok) => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timer);
-			resolve({ rows, ok });
-		};
-		let child;
-		const timer = setTimeout(() => {
-			try {
-				child?.kill();
-			} catch {
-				/* already gone */
-			}
-			finish([], false);
-		}, timeoutMs);
-		try {
-			child = spawn(command, args, {
-				shell: false,
-				windowsHide: true,
-				stdio: ["ignore", "pipe", "ignore"],
-			});
-		} catch {
-			finish([], false);
-			return;
-		}
-		let out = "";
-		child.stdout.on("data", (chunk) => {
-			out += chunk.toString();
-		});
-		child.once("error", () => finish([], false));
-		// A non-zero exit (or a signal) means the listing is PARTIAL at best.
-		// Whatever it printed is not evidence of what is NOT running, which is
-		// exactly the question the orphan predicate asks of it.
-		child.once("close", (code, signal) =>
-			finish(parseProcessTable(out, isWindows), code === 0 && !signal),
-		);
-	});
-}
-
-/**
- * Parse the platform listing into rows. Exported so the two column layouts
- * can be pinned by a test without spawning anything.
- *
- * @param {string} out
- * @param {boolean} tabSeparated Windows CIM emits tab-joined fields; `ps`
- *   emits whitespace-aligned columns whose third field (args) contains
- *   spaces.
- * @returns {import("./lib/worktree-hygiene.mjs").ProcRow[]}
- */
-export function parseProcessTable(out, tabSeparated) {
-	const rows = [];
-	for (const line of String(out ?? "").split(/\r?\n/)) {
-		if (!line.trim()) continue;
-		let pidText;
-		let ppidText;
-		let command;
-		if (tabSeparated) {
-			const parts = line.split("\t");
-			if (parts.length < 2) continue;
-			[pidText, ppidText] = parts;
-			command = parts.slice(2).join("\t");
-		} else {
-			const match = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
-			if (!match) continue;
-			[, pidText, ppidText, command] = match;
-		}
-		const pid = Number(pidText);
-		const ppid = Number(ppidText);
-		if (!Number.isInteger(pid) || pid <= 0) continue;
-		rows.push({
-			pid,
-			ppid: Number.isInteger(ppid) && ppid > 0 ? ppid : 0,
-			command: command ?? "",
-		});
-	}
-	return rows;
-}
+//
+// The listing itself lives in scripts/lib/process-scan.mjs (review round 3,
+// F2): this script and scripts/compat-smoke-behavioral.mjs each carried a
+// windowsExe + snapshotProcesses pair differing only in the columns they
+// asked for, so the exit-code hardening from review S5 landed in one and not
+// the other. This file now asks for the projection it needs and nothing else.
 
 /**
  * Best-effort cwd enrichment on procfs platforms (Linux). A process holding
@@ -817,7 +743,12 @@ async function readProcessTable({ budgetMs, budgetLeft }) {
 			],
 		};
 	}
-	const { rows, ok } = await snapshotProcesses(scanBudgetMs);
+	// The sweep needs the parent pid (the orphan predicate) and the command
+	// line (both the fixture matcher and the occupant matcher).
+	const { rows, ok } = await snapshotProcesses(
+		["pid", "ppid", "command"],
+		scanBudgetMs,
+	);
 	const table = enrichCwd(rows);
 	const records = [];
 	if (!ok) {
@@ -1082,15 +1013,23 @@ async function main(argv) {
 			};
 		}
 		evaluated++;
+		// Activity is READ BEFORE anything that runs git inside the tree
+		// (F1b). `worktreeActivityFromSignals` already refuses the signals
+		// `git status` writes, so this ordering is belt-and-braces rather than
+		// the fix -- but object-literal properties evaluate in source order,
+		// and the version that read activity LAST is precisely how a sweep
+		// that removes nothing shipped. Reading first means no future signal
+		// added to the gatherer can quietly re-open the hole.
+		const mtimeMs = worktreeActivityMs(row.path, nowMs);
 		return {
 			path: row.path,
 			head: row.head,
 			branch: row.branch,
 			locked: row.locked,
 			lockPid: parseLockPid(row.lockedReason),
+			mtimeMs,
 			dirty: isDirty(row.path, enrichBudget()),
 			pushed: isContainedInOrigin(row.head, REPO_ROOT, enrichBudget()),
-			mtimeMs: worktreeActivityMs(row.path, nowMs),
 		};
 	});
 
@@ -1244,11 +1183,18 @@ async function main(argv) {
 			for (const link of unlinked) say(`    unlinked reparse point ${link}`);
 			// A locked worktree needs --force twice; passing it unconditionally
 			// is harmless for the unlocked case.
-			// Deliberately NOT budget-bound: this is the actual work, and
-			// SIGKILLing git partway through a recursive delete leaves a
-			// half-removed worktree plus a stale admin directory. The sweep's
-			// budget gates whether removal STARTS, never whether it finishes —
-			// and the hook timeout is sized to cover one of these (review S8).
+			// Outside the SWEEP budget, but not unbounded: `git()` applies
+			// REMOVE_TIMEOUT_MS (60s) with killSignal SIGKILL, so a wedged
+			// removal is eventually killed rather than hanging the hook
+			// forever (review round 3, F7 — the comment here used to claim
+			// otherwise). The tradeoff that 60s buys, inside the 90s
+			// SessionStart hook timeout: SIGKILLing git partway through a
+			// recursive delete leaves a half-removed worktree plus a stale
+			// admin directory, so the bound is set generously enough that a
+			// normal removal never reaches it, and the hook timeout is sized
+			// to cover one full 60s removal with 30s to spare (review S8).
+			// The sweep's own enrichment budget gates whether a removal
+			// STARTS, never how long it may take once it has.
 			const removed = git(
 				["worktree", "remove", "--force", "--force", removal.path],
 				REPO_ROOT,
@@ -1410,7 +1356,7 @@ function deleteStaleBranches(gitBudget, removedBranchRefs) {
 }
 
 // Only run the CLI when this file is the entry point — not when a test
-// imports parseArgs/parseProcessTable. Mirrors with-test-lock.mjs's own
+// imports parseArgs/worktreeActivityMs. Mirrors with-test-lock.mjs's own
 // isEntryPoint, win32 case-insensitive fallback included (a differently-cased
 // invocation path still resolves to this file on NTFS).
 function isEntryPoint() {
