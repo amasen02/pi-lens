@@ -98,6 +98,13 @@ function decodeFrames(buffer) {
 let readBuffer = Buffer.alloc(0);
 let applyEditIdCounter = 9000;
 let pendingExec = null;
+// #2479: the edit spec held back by "fake.applyEditDeferred" until a later
+// "fake.releaseDeferredApplyEdit" call sends it. Lets a test open an
+// executeCommand window, run an UNRELATED nested executeCommand to completion
+// inside it, and only THEN have the outer call's server-initiated applyEdit
+// arrive - the ordering the depth-unwind bug lives in, with no reliance on
+// message-arrival timing.
+let deferredApplyEdit = null;
 const openDocuments = new Map();
 
 // #1714: a single-threaded scanner with a finite intake ceiling, for the
@@ -311,7 +318,12 @@ function handle(raw) {
 						? { workspace: { fileOperations: workspaceFileOperations } }
 						: {}),
 					executeCommandProvider: {
-						commands: ["fake.doThing", "fake.applyEdit"],
+						commands: [
+							"fake.doThing",
+							"fake.applyEdit",
+							"fake.applyEditDeferred",
+							"fake.releaseDeferredApplyEdit",
+						],
 					},
 					diagnosticProvider: {
 						interFileDependencies: false,
@@ -737,53 +749,79 @@ function handle(raw) {
 		return;
 	}
 
-	// Execute command. "fake.applyEdit" exercises the server-initiated edit path:
+	// #2450 review round 2 (F2): the target line/columns/replacement text are
+// overridable via a second `arguments[1]` object so callers can exercise a real
+// non-{1,1} range - a fixed line-0 edit made every caller's "real range" collide
+// with the {1,1} resource-op/whole-file default, so a test asserting {1,1}
+// passed whether or not the actual range plumbing worked. Omitted fields keep
+// the original line-0/0-5 default, so the pre-existing "applies a
+// server-initiated edit..." tests are unaffected.
+function buildApplyEditSpec(commandArguments) {
+	const uri = commandArguments?.[0];
+	const editOpts = commandArguments?.[1] ?? {};
+	const line = typeof editOpts.line === "number" ? editOpts.line : 0;
+	const startCharacter =
+		typeof editOpts.startCharacter === "number" ? editOpts.startCharacter : 0;
+	const endCharacter =
+		typeof editOpts.endCharacter === "number" ? editOpts.endCharacter : 5;
+	const newText =
+		typeof editOpts.newText === "string" ? editOpts.newText : "EDITED";
+	return { uri, line, startCharacter, endCharacter, newText };
+}
+
+function sendApplyEdit(spec) {
+	send({
+		jsonrpc: "2.0",
+		id: ++applyEditIdCounter,
+		method: "workspace/applyEdit",
+		params: {
+			edit: {
+				changes: {
+					[spec.uri]: [
+						{
+							range: {
+								start: { line: spec.line, character: spec.startCharacter },
+								end: { line: spec.line, character: spec.endCharacter },
+							},
+							newText: spec.newText,
+						},
+					],
+				},
+			},
+		},
+	});
+}
+
+// Execute command. "fake.applyEdit" exercises the server-initiated edit path:
 	// it sends a workspace/applyEdit request and only returns the executeCommand
 	// result once the client has responded (so tests are race-free).
 	if (data.method === "workspace/executeCommand") {
 		const cmd = data.params?.command;
-		if (cmd === "fake.applyEdit") {
-			const uri = data.params?.arguments?.[0];
-			// #2450 review round 2 (F2): the target line/columns/replacement text
-			// are overridable via a second `arguments[1]` object so callers can
-			// exercise a real non-{1,1} range — a fixed line-0 edit made every
-			// caller's "real range" collide with the {1,1} resource-op/whole-file
-			// default, so a test asserting {1,1} passed whether or not the actual
-			// range plumbing worked. Omitted fields keep the original line-0/0-5
-			// default, so the pre-existing "applies a server-initiated edit..."
-			// test above is unaffected.
-			const editOpts = data.params?.arguments?.[1] ?? {};
-			const line = typeof editOpts.line === "number" ? editOpts.line : 0;
-			const startCharacter =
-				typeof editOpts.startCharacter === "number"
-					? editOpts.startCharacter
-					: 0;
-			const endCharacter =
-				typeof editOpts.endCharacter === "number" ? editOpts.endCharacter : 5;
-			const newText =
-				typeof editOpts.newText === "string" ? editOpts.newText : "EDITED";
-			const applyId = ++applyEditIdCounter;
+		if (cmd === "fake.applyEdit" || cmd === "fake.applyEditDeferred") {
+			const spec = buildApplyEditSpec(data.params?.arguments);
 			pendingExec = { execId: data.id, command: cmd };
+			// #2479: hold the edit until released, so the client-side
+			// executeCommand window stays open across an unrelated nested call.
+			if (cmd === "fake.applyEditDeferred") {
+				deferredApplyEdit = spec;
+				return;
+			}
+			sendApplyEdit(spec);
+			return;
+		}
+		if (cmd === "fake.releaseDeferredApplyEdit") {
+			// Answered immediately; the held edit then rides the STILL-OPEN
+			// window of whichever call armed it (#2479).
 			send({
 				jsonrpc: "2.0",
-				id: applyId,
-				method: "workspace/applyEdit",
-				params: {
-					edit: {
-						changes: {
-							[uri]: [
-								{
-									range: {
-										start: { line, character: startCharacter },
-										end: { line, character: endCharacter },
-									},
-									newText,
-								},
-							],
-						},
-					},
-				},
+				id: data.id,
+				result: { ran: cmd, released: deferredApplyEdit !== null },
 			});
+			if (deferredApplyEdit) {
+				const spec = deferredApplyEdit;
+				deferredApplyEdit = null;
+				sendApplyEdit(spec);
+			}
 			return;
 		}
 		send({ jsonrpc: "2.0", id: data.id, result: { ran: cmd } });

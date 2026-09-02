@@ -1112,7 +1112,11 @@ export interface LSPClientState {
 	 */
 	serverEditsAllowed: number;
 	/** One active command context is safe to associate with a nested applyEdit.
-	 * Concurrent commands deliberately clear this rather than cross-correlate. */
+	 * Concurrent commands deliberately clear this rather than cross-correlate.
+	 * Maintained as a save/restore stack by `runServerCommand` (each frame keeps
+	 * its predecessor in a local and puts it back on unwind), so an inner call
+	 * borrows the slot for its own lifetime only — never for the remainder of
+	 * the outer call's window (#2479). */
 	activeMutationContext?: LspMutationContext;
 	activeMutationDepth?: number;
 	readonly serverId: string;
@@ -2526,13 +2530,16 @@ export function setupIncomingHandlers(
 			// #2450 fix round 3 (F3): no `depth === 1` re-check here — dead code.
 			// `state.activeMutationContext` is set ONLY by `runServerCommand`
 			// (below in this file), which already enforces exactly that
-			// invariant: it stores `mutationContext` when `activeMutationDepth`
-			// becomes 1, and forces `activeMutationContext = undefined` for every
-			// OTHER depth (including back to 0 on unwind). By the time this
-			// handler reads it, `state.activeMutationContext` can therefore only
-			// ever be the outermost call's context (depth === 1) or `undefined` —
-			// re-testing the depth here was redundant with that invariant, not an
-			// independent gate.
+			// invariant: it stores `mutationContext` only for the frame that
+			// takes `activeMutationDepth` to 1, stores `undefined` for every
+			// deeper frame, and clears the slot outright once depth is back to 0.
+			// By the time this handler reads it, `state.activeMutationContext`
+			// can therefore only ever be the outermost call's context (depth === 1)
+			// or `undefined` — re-testing the depth here was redundant with that
+			// invariant, not an independent gate. #2479: each frame also RESTORES
+			// the context it saved, so a nested call unwinding to depth 1 hands
+			// the outer call's own context back rather than leaving the slot
+			// cleared for the rest of the outer window.
 			const context = state.activeMutationContext;
 			// `workspace/applyEdit` is only ever honored inside the
 			// `serverEditsAllowed` window this handler just checked, which is
@@ -4829,9 +4836,22 @@ export async function runServerCommand(
 	}
 	state.serverEditsAllowed += 1;
 	state.activeMutationDepth = (state.activeMutationDepth ?? 0) + 1;
-	if (state.activeMutationDepth === 1)
-		state.activeMutationContext = mutationContext;
-	else state.activeMutationContext = undefined;
+	// #2479: THIS frame's saved predecessor, restored in the `finally` below —
+	// a per-call save/restore, not a depth-0 special case. The old shape only
+	// ever cleared the slot (and only once depth returned to 0), so when a
+	// NESTED `executeCommand` unwound from depth 2 back to depth 1 the outer
+	// call's own context was gone for the rest of its window: every remaining
+	// server-initiated `applyEdit` it solicited read `undefined`, fell to the
+	// mutation bridge, and got the generic `agent-tool:lsp-workspace-applyEdit`
+	// receipt instead of the outer operation's own (`lsp-rename` /
+	// `lsp-execute-command`). Only the OUTERMOST frame stores a context —
+	// concurrent/nested commands deliberately do not cross-correlate — so the
+	// slot the `workspace/applyEdit` handler reads is still only ever the
+	// outermost call's context or `undefined`, now for the WHOLE of that
+	// call's window rather than only up to its first nested call.
+	const previousMutationContext = state.activeMutationContext;
+	state.activeMutationContext =
+		state.activeMutationDepth === 1 ? mutationContext : undefined;
 	try {
 		let result: unknown;
 		try {
@@ -4862,8 +4882,16 @@ export async function runServerCommand(
 			0,
 			(state.activeMutationDepth ?? 0) - 1,
 		);
-		if (state.activeMutationDepth === 0)
-			state.activeMutationContext = undefined;
+		// Back to 0 clears unconditionally rather than restoring: the depth
+		// counter cannot tell true nesting from two OVERLAPPING calls on the
+		// same client, and those can settle out of order (the outer one first),
+		// which would leave the last frame restoring a context whose window has
+		// already closed. Clearing at 0 keeps "no command in flight" == "no
+		// context" exact — the invariant `workspace/applyEdit`'s
+		// `serverEditsAllowed` gate is paired with. Above 0, restore the frame's
+		// own saved predecessor (#2479).
+		state.activeMutationContext =
+			state.activeMutationDepth === 0 ? undefined : previousMutationContext;
 	}
 }
 
