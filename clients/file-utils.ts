@@ -116,7 +116,7 @@ export function getGlobalPiLensDir(): string {
 }
 
 // A REGEX LITERAL, not a module-scope `const`: `file-utils.ts` sits on a
-// pre-existing import cycle (`file-utils.js → …​ → log-cleanup.js →
+// pre-existing import cycle (`file-utils.js -> ... -> log-cleanup.js ->
 // file-utils.js`, already in `.dependency-cruiser-known-violations.json`),
 // so `log-cleanup.ts`'s own top-level `getGlobalPiLensDir()` call can reach
 // this function WHILE `file-utils.ts`'s own module body is still mid-init —
@@ -167,7 +167,10 @@ function redirectGlobalDirToProbeHome(cwd: string): string {
  * have finished their own top-level evaluation. Fire-and-forget: telemetry
  * must never gate or fail the caller that just wants its directory back.
  */
-function recordProbeHomeRedirectDegradation(probeHome: string, cwd: string): void {
+function recordProbeHomeRedirectDegradation(
+	probeHome: string,
+	cwd: string,
+): void {
 	import("./degradation-ledger.js")
 		.then(({ recordDegradationOnce }) => {
 			recordDegradationOnce({
