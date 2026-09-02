@@ -133,10 +133,16 @@ function warnInvalidLSPConfig(configPath: string, error: unknown): void {
 	// warn-once latch, the extension.log line, the durable `config-ignored`
 	// ledger row, and the stable-coded user notification. The rendered prose is
 	// unchanged — `ignoring invalid LSP config <path>: <reason>`.
+	//
+	// `{ parseError: error }`, not a pre-stringified message: `error` here is
+	// either a caught `JSON.parse` `SyntaxError` (whose message embeds a
+	// snippet of the source file being parsed on Node >=20, #2431) or a caught
+	// `fs.readFile` error, and `warnIgnoredConfigOnce` is the one seam that
+	// decides how much of either survives into the three sinks it owns.
 	warnIgnoredConfigOnce({
 		subsystem: "lsp-config",
 		file: configPath,
-		reason: error instanceof Error ? error.message : String(error),
+		reason: { parseError: error },
 	});
 }
 
