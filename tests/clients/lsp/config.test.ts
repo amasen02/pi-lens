@@ -161,10 +161,7 @@ describe("loadLSPConfig global configuration (#870)", () => {
 		const projectDir = tmpDir("pi-lens-lsp-project-");
 		const globalDir = tmpDir("pi-lens-lsp-global-");
 		process.env.PI_LENS_HOME = globalDir;
-		fs.writeFileSync(
-			path.join(globalDir, "lsp.json"),
-			`{"piToken": ${TOKEN}}`,
-		);
+		fs.writeFileSync(path.join(globalDir, "lsp.json"), `{"piToken": ${TOKEN}}`);
 		const error = vi.spyOn(console, "error").mockImplementation(() => {});
 
 		const { loadLSPConfig } = await import("../../../clients/lsp/config.js");
@@ -174,9 +171,8 @@ describe("loadLSPConfig global configuration (#870)", () => {
 		expect(message).not.toContain(TOKEN);
 		expect(message).not.toContain("ghp_");
 
-		const { getDegradationSummary } = await import(
-			"../../../clients/degradation-ledger.js"
-		);
+		const { getDegradationSummary } =
+			await import("../../../clients/degradation-ledger.js");
 		const group = getDegradationSummary().find(
 			(g) => g.kind === "config-ignored",
 		);

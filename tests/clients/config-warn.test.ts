@@ -31,8 +31,14 @@ vi.mock("../../clients/extension-log.js", async (importOriginal) => {
 		await importOriginal<typeof import("../../clients/extension-log.js")>();
 	return {
 		...actual,
-		logExtension: (entry: { message: string; metadata?: Record<string, unknown> }) => {
-			loggedExtension.push({ message: entry.message, metadata: entry.metadata });
+		logExtension: (entry: {
+			message: string;
+			metadata?: Record<string, unknown>;
+		}) => {
+			loggedExtension.push({
+				message: entry.message,
+				metadata: entry.metadata,
+			});
 		},
 	};
 });
@@ -386,8 +392,6 @@ describe("warnIgnoredConfigOnce parse-error reason redaction (#2431)", () => {
 			file: "/tmp/a.json",
 			reason: "widget.visible must be a boolean",
 		});
-		expect(notified[0].message).toContain(
-			"widget.visible must be a boolean",
-		);
+		expect(notified[0].message).toContain("widget.visible must be a boolean");
 	});
 });
