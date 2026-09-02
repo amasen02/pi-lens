@@ -51,6 +51,16 @@ import {
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
 import {
+	lookupLearnedMutatingTool,
+	noteObservedMutation,
+	resetMutationAttribution,
+} from "../../clients/mutation-attribution.js";
+import {
+	_observedMutationStateForTests,
+	noteMutationHandled,
+	resetObservedMutationNet,
+} from "../../clients/observed-mutation.js";
+import {
 	acquireWorkspaceSweepHold,
 	clearWorkspaceSweepHoldForSessionStart,
 	isWorkspaceSweepActive,
@@ -331,6 +341,44 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 		resetName: "resetOpaqueMutationState",
 		reason:
 			"#2000 phase 2: pending pre-command baselines are keyed cwd:generation and become unreachable when the session generation advances; and the git-worktree and toplevel memos must re-probe after a session that may have seen a directory become a worktree, or become a LINKED worktree of another (#2007). Without the reset the baselines leak per session and the memos mis-answer forever.",
+	},
+	// ── #2430 observational mutation net ────────────────────────────────
+	{
+		id: "observed-mutation:pending+ledger+handled",
+		module: "observed-mutation.ts",
+		state:
+			"pending BoundedFifoMap (toolCallId -> baseline), ledger BoundedFifoMap (path -> content stamp), handled Set, per-turn budget counters",
+		policy: "session_start",
+		resetName: "resetObservedMutationNet",
+		reason:
+			"#2430: a pending pre-snapshot is keyed by tool-call id and carries the session generation it was taken in, so it is unreachable once the session advances; the content ledger and the handled set describe the PREVIOUS session's files, and diffing a resumed session against them would report every intervening external change as this session's drift. The per-turn budget counters are the same class — a turn index from a finished session must not decide whether this session may take a snapshot.",
+		probe: {
+			arm: () => {
+				noteMutationHandled(path.join(os.tmpdir(), "pi-lens-2430-probe.ts"));
+			},
+			isArmed: () =>
+				_observedMutationStateForTests().handled.length === 0 &&
+				_observedMutationStateForTests().pending.length === 0,
+			reset: resetObservedMutationNet,
+		},
+	},
+	{
+		id: "mutation-attribution:session+fromDisk",
+		module: "mutation-attribution.ts",
+		state:
+			"session BoundedFifoMap (toolName -> observations), fromDisk Set, primedCwd",
+		policy: "session_start",
+		resetName: "resetMutationAttribution",
+		reason:
+			"#2430: the learned map says 'this tool name mutates files' for the SESSION, and the adopted disk set belongs to one project root. A `pi --session` switch can change that root, so carrying either across a session boundary classifies a tool for a project that never observed it. The reset is immediately followed by `primePersistedMutationAttribution(ctxCwd)`, which re-adopts the CURRENT project's persisted attributions.",
+		probe: {
+			arm: () => {
+				noteObservedMutation("pi-lens-2430-probe-tool", undefined);
+			},
+			isArmed: () =>
+				lookupLearnedMutatingTool("pi-lens-2430-probe-tool") === undefined,
+			reset: resetMutationAttribution,
+		},
 	},
 	// ── #2026 pending auxiliary coverage baselines ──────────────────────
 	{

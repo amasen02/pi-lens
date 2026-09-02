@@ -53,15 +53,24 @@
  *
  * A declarative `tools.mutating` catalog entry and the `FormatQueuedPayload.tool`
  * widening are public-API decisions and belong to the #2421 and #2415 program.
- * The tool-agnostic observational net, which would arm the opaque-mutation disk
- * diff around any unclassified call carrying a path-shaped field, is a
- * follow-up.
+ *
+ * ## The fourth tier lives elsewhere (#2430)
+ *
+ * Recognition tiers 1–3 are finite; the population of third-party edit tools is
+ * not. `clients/observed-mutation.ts` therefore WATCHES an unclassified call —
+ * a bounded disk diff around it — and `clients/mutation-attribution.ts`
+ * remembers what that watching proved. This module consults that memory as tier
+ * 4 ({@link MutationProvenance} `"learned"`), so a tool observed once is
+ * classified by name from then on with no snapshot at all. The observation
+ * itself, and the `agent_settled` sweep for tools that name no path, stay in
+ * those modules: this one is the classifier, not the observer.
  */
 import { BoundedFifoMap } from "./bounded-cache.js";
 import {
 	type HashlineAnchorFailure,
 	resolveHashlineAnchor,
 } from "./hashline-anchor.js";
+import { lookupLearnedMutatingTool } from "./mutation-attribution.js";
 import {
 	boundedIndexesForCount,
 	createReadGuardEditBatchSummary,
@@ -92,7 +101,24 @@ export type MutationProvenance =
 	/** A shape adapter recognized the input of a tool pi-lens does not name. */
 	| "declared"
 	/** An in-process producer recorded it through `clients/mutation-bridge.ts`. */
-	| "bridge";
+	| "bridge"
+	/**
+	 * #2430: nothing recognized the tool, but the observational net diffed the
+	 * disk around the call and SAW the change. This is the first-call verdict —
+	 * evidence, not recognition.
+	 */
+	| "observed"
+	/**
+	 * #2430: a previous observation attributed this tool name as mutating, in
+	 * this session or in a persisted attribution from an earlier one, so the
+	 * call is classified with no snapshot at all.
+	 */
+	| "learned"
+	/**
+	 * #2430: no tool call could be blamed. The `agent_settled` sweep found the
+	 * file's content had drifted from the last baseline pi-lens took.
+	 */
+	| "settled-sweep";
 
 /**
  * Line information an adapter resolved from a tool's input.
@@ -219,8 +245,13 @@ function asRecord(value: unknown): Record<string, unknown> {
 /**
  * Path field, in a fixed order. `path` is pi's spelling; `filePath` and
  * `file_path` are the two spellings third-party edit tools use in practice.
+ *
+ * Exported for #2430: the observational net arms only for a call whose input
+ * carries a path-shaped field, and it must ask that question with the SAME
+ * field list the seam classifies with — a second spelling list would arm on
+ * inputs the seam cannot resolve, and miss ones it can.
  */
-function resolveMutationPath(
+export function resolveMutationPath(
 	input: Record<string, unknown>,
 ): string | undefined {
 	for (const key of ["path", "filePath", "file_path"]) {
@@ -228,6 +259,17 @@ function resolveMutationPath(
 		if (typeof value === "string" && value.length > 0) return value;
 	}
 	return undefined;
+}
+
+/**
+ * The path-shaped field on an event's input, or `undefined` (#2430).
+ *
+ * This is the arming predicate for the observational net. It deliberately
+ * answers only "does this input name a file", never "does this tool mutate" —
+ * the whole point of the net is that the second question has no static answer.
+ */
+export function readMutationPathField(event: unknown): string | undefined {
+	return resolveMutationPath(asRecord((event as { input?: unknown })?.input));
 }
 
 /**
@@ -783,6 +825,27 @@ export function classifyMutatingTool(
 		};
 	}
 
+	// #2430, tier 4: nothing NAMED or SHAPED this tool, but a previous
+	// observation attributed it. `edit` is the kind, because a partial rewrite
+	// is the safe timing assumption for a tool whose semantics are unknown, and
+	// the deferred pass is what a wrong guess costs least.
+	//
+	// A path field is required. Without one there is no target to record, and
+	// the settled sweep — not this branch — is the net for that shape.
+	const learnedPath = resolveMutationPath(input);
+	if (learnedPath !== undefined) {
+		const learned = lookupLearnedMutatingTool(toolName);
+		if (learned !== undefined) {
+			return {
+				toolName,
+				path: learnedPath,
+				kind: "edit",
+				provenance: "learned",
+				source: `attribution:${learned}`,
+			};
+		}
+	}
+
 	return undefined;
 }
 
@@ -794,6 +857,15 @@ export interface BridgeMutationEntry {
 	editRanges?: [number, number][];
 	/** Producer identity, surfaced as the tool name on the classification. */
 	consumer?: string;
+	/**
+	 * #2430: how the producer knows. The observational net replays through the
+	 * bridge and its evidence is a disk diff, not a producer's own statement, so
+	 * the classification must not claim `"bridge"` for it — a report that says
+	 * "an extension told us" about something pi-lens INFERRED is a lie about
+	 * provenance. Only the two observational values are accepted; anything else
+	 * falls back to `"bridge"`.
+	 */
+	provenance?: "observed" | "settled-sweep";
 }
 
 /**
@@ -804,13 +876,17 @@ export interface BridgeMutationEntry {
 export function classifyBridgeMutation(
 	entry: BridgeMutationEntry,
 ): MutatingToolClassification {
+	const provenance: MutationProvenance =
+		entry.provenance === "observed" || entry.provenance === "settled-sweep"
+			? entry.provenance
+			: "bridge";
 	return {
 		toolName: entry.consumer ?? "unknown",
 		path: entry.filePath,
 		kind: entry.kind,
 		touchedLines: entry.touchedLines,
 		editRanges: entry.editRanges,
-		provenance: "bridge",
-		source: "mutation-bridge",
+		provenance,
+		source: provenance === "bridge" ? "mutation-bridge" : "observed-mutation",
 	};
 }

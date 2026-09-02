@@ -2550,7 +2550,8 @@ state → deferred queue → `agent_settled` drain) used to hang below fifteen
 independent literal comparisons, so a host or extension edit tool under any
 other name was dropped before the first bookkeeping call, with its path already
 resolved. The seam answers with a `kind` (`write` or `edit`), a `provenance`
-(`builtin`, `bash-derived`, `declared`, `bridge`), and any lines a shape adapter
+(`builtin`, `bash-derived`, `declared`, `bridge`, plus `observed`, `learned` and
+`settled-sweep` from the #2430 net below), and any lines a shape adapter
 resolved. It recognizes pi's built-ins from a table and a third-party tool from
 its INPUT SHAPE through the ordered `MUTATION_SHAPE_ADAPTERS` registry, where
 the first non-`undefined` result wins. A new mutating-tool shape is a new
@@ -2563,6 +2564,102 @@ The write-side counterpart of the read bridge is `clients/mutation-bridge.ts`:
 an in-process producer that writes a file outside the tool-event path calls
 `recordMutation` at `Symbol.for("pi-lens:mutation-bridge")` and gets the same
 bookkeeping; `ast_grep_replace apply:true` is the in-repo consumer.
+
+**OBSERVATIONAL MUTATION NET (#2430):** the name table and the shape registry
+are finite and the population of third-party edit tools is not, so a fourth
+tier WATCHES. When `classifyMutatingTool` returns `undefined` for a call whose
+input still carries a path-shaped field, `clients/observed-mutation.ts` takes a
+bounded pre-snapshot and diffs it at the `tool_result`; whatever changed is
+replayed through the mutation bridge as `kind: "edit"` with `provenance:
+"observed"` and `editRanges` derived from the read-guard's stored per-line
+hashes. **The observation universe is the TARGET PATH ALONE** — that path's
+file, or, when it is a directory, that directory's own entries non-recursively
+and capped. Never siblings, never the tracked set: watching the neighbourhood
+attributed a background write to whatever tool happened to be running, so a
+`read`-shaped tool got learned as an editor from one coincidence. The tracked
+set is the SETTLED SWEEP's domain, and only its. When the directory cap BITES
+the universe is a TRUNCATION, so an empty diff over it is `unverifiable` and
+never clean — scoring the truncation as clean de-attributed a real codemod that
+rewrote the 84th entry of an 84-entry directory.
+
+`clients/mutation-attribution.ts` remembers the tool: `provenance: "learned"`
+for the session on the first observation, persisted under
+`getProjectDataDir(cwd)` on the second — and a session-learned tool STAYS armed
+until that second observation lands, because nothing else can produce it (latch
+off at observation one and the persist threshold is unreachable). A
+still-armed-and-already-classified tool is recorded by exactly ONE of the two
+paths: **when the settle replayed, the classification chain skips**, or the same
+physical edit lands in the change log twice (once with measured ranges, once
+whole-file). Three CONSECUTIVE clean observations withdraw a provisional
+attribution again, and withdrawing resets BOTH counters — leaving the clean
+count at three made the withdrawal terminal, so the tool was never armed again
+and could never be re-learned. An observation the net could not COMPLETE is
+`unverifiable`: it neither spends the arm latch nor votes in the
+de-attribution run. One `unclassified-mutating-tool` degradation per tool keeps
+the registry gap visible; a truncated directory watch adds an
+`observed-mutation-dir-cap` tally naming the tool.
+
+A tool that names no file is caught by the `agent_settled` sweep, which runs
+BEFORE the deferred drain and re-baselines after it so pi-lens's own formatter
+output is never read as third-party drift. The sweep is INCREMENTAL and
+**stat-first**: it stats a bounded window of the tracked set per turn from a
+carried cursor and reads a file only when its size or mtime moved, so coverage
+of a large tracked set accumulates across turns instead of timing out in one,
+and the record reports its own `scanned`/`notReachedThisPass`/`cursor`. Two rules there
+are not negotiable — **never replay on size+mtime alone** (a `touch` moves mtime
+without moving a byte, so a candidate is confirmed by content hash or named in
+`unverifiable`), and **never trust the stat short-circuit against a baseline
+recorded while the file's mtime was still fresh** (`LedgerEntry.seenAtMs`
+against `OBSERVED_LEDGER_SETTLE_MS`, the same-tick same-size rewrite of catalog
+shape 6). That comparison goes through `clients/freshness.ts`, like every other
+mtime-against-a-recorded-instant question in `clients/` (#1739). A file pi-lens
+has never seen has no baseline and is not covered, by design. The post-drain
+re-baseline retires the "pi-lens wrote these bytes" mark **per FILE**, not
+all-or-nothing: a mark drops exactly when the ledger has been moved onto that
+file's post-drain bytes (`rebaseline` inside `scanTrackedIncrementally`), so an
+aborted or truncated pass still clears the marks for the files it reached and
+correctly leaves the rest standing. Two earlier shapes both cost a fabricated
+mutation — clearing the whole set unconditionally (including on an abort)
+replayed pi-lens's own formatter output as third-party drift, and clearing only
+on a *complete* pass suppressed a genuine third-party change to an
+already-covered file until some later pass happened to finish. Its traversal is
+`handled` itself — the files THIS run's pipeline or drain actually wrote (see
+`noteMutationHandled`) — not the tracked set: every file the refresh needs to
+re-baseline is, by construction, already in `handled`, so walking it is
+O(handful) regardless of how large the tracked set is, and (barring an abort or
+a genuinely pathological handled-set size) completes in one pass every time.
+Walking `getTrackedPaths()` instead was the earlier shape, and it coupled this
+function's completion to the tracked-set size: `report: false` always starts
+its cursor at 0, so a tracked set too large to finish inside
+`OBSERVED_CAPTURE_BUDGET_MS` parked at the SAME prefix every turn and a mark
+past that prefix never retired, permanently suppressing drift reports for it
+(#2449 review round 5, F2/PROBE-B1).
+
+`deriveObservedEditRanges` reports ranges only when it can MEASURE them: a
+windowed read-guard baseline, a changed line count, an unreadable file or a
+spent read budget all return `undefined` so the bridge over-approximates to the
+whole file. Naming lines that were never touched is worse than naming none.
+
+Do not add a second scanner: the snapshot and diff primitives are
+`captureFileStatsForPaths` / `diffFileStats` in
+`clients/opaque-mutation-scan.ts`, shared with the #2000 bash recovery so the
+paths cannot disagree about what "changed" means. There is no synchronous twin
+any more, and adding one back is not the answer to an ordering problem. Every
+capture carries a timeout AND an abort race, a file cap, a hash-byte budget and
+a per-turn wall-clock budget; exceeding any of them writes a bounded record and
+a degradation-ledger tally, never a silent skip. The SETTLE is the deliberate
+exception to the BUDGET only: it has its own deadline rather than the arm's
+leftovers, because a settle clamped to a spent budget drops a mutation that was
+already measured. It is ASYNC, and the #1086 ordering contract is met at the
+CALL SITE instead: the pending-baseline probe (`hasPendingObservation`) is
+synchronous, and `handleToolResult` reads everything it derives from the
+post-result bytes — the state hash the in-flight composite key is built from —
+BEFORE the settle's yield. Move that read after the yield and a racing
+tool_result for the same path collapses two distinct pipelines into one.
+Steady-state cost is zero for a classified `write`/`edit` (the net is gated on
+`classifyMutatingTool` having returned `undefined` or the attribution still
+being provisional) and ~1.3ms for one armed observation of a file target, paid
+at most a handful of times per tool name per session.
 `tests/clients/mutating-tool-classification.test.ts` greps `clients/`, `tools/`
 and `index.ts` and fails when a mutation decision reappears outside the seam —
 `===`/`!==`/`==`/`!=` against `"write"`/`"edit"`/`"multiedit"` (any
