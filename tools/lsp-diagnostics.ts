@@ -57,40 +57,10 @@ import {
 	isWarmAttached,
 	tryWarmAttachedDiagnostics,
 } from "../clients/warm-attach.js";
-
-const LANG_EXTENSIONS: Record<string, string[]> = {
-	".ts": [".ts", ".tsx", ".mts", ".cts"],
-	".tsx": [".ts", ".tsx", ".mts", ".cts"],
-	".js": [".js", ".jsx", ".mjs", ".cjs"],
-	".py": [".py", ".pyi"],
-	".rs": [".rs"],
-	".go": [".go"],
-	".rb": [".rb", ".rake", ".gemspec"],
-	".java": [".java"],
-	".kt": [".kt", ".kts"],
-	".swift": [".swift"],
-	".cs": [".cs"],
-	".cpp": [".cpp", ".cc", ".cxx", ".hpp", ".hxx"],
-	".c": [".c", ".h"],
-	".zig": [".zig", ".zon"],
-	".hs": [".hs", ".lhs"],
-	".ex": [".ex", ".exs"],
-	".gleam": [".gleam"],
-	".tf": [".tf", ".tfvars"],
-	".nix": [".nix"],
-	".sh": [".sh", ".bash", ".zsh"],
-	".php": [".php"],
-	".lua": [".lua"],
-	".dart": [".dart"],
-	".vue": [".vue"],
-	".svelte": [".svelte"],
-	".css": [".css", ".scss", ".less"],
-	".html": [".html", ".htm"],
-	".json": [".json", ".jsonc"],
-	".yaml": [".yaml", ".yml"],
-	".toml": [".toml"],
-	".prisma": [".prisma"],
-};
+import {
+	extensionsForLanguage,
+	SCAN_LANGUAGE_PRIORITY,
+} from "../clients/language-registry.js";
 
 const MAX_FILES = 100;
 const MAX_BATCH_FILES = 100;
@@ -344,8 +314,8 @@ function projectIgnorePredicate(
  * `maxFiles` *kept* — an ignored-heavy or cloud-backed (OneDrive/network) tree
  * could traverse unboundedly many entries, and a single stalled `readdirSync`
  * held the loop for the whole stall. It is also called once PER LANGUAGE in
- * `runDirectoryDiagnostics`'s `LANG_EXTENSIONS` loop, so a directory-mode
- * `lsp_diagnostics` could pay that cost several times over.
+ * `runDirectoryDiagnostics`'s `SCAN_LANGUAGE_PRIORITY` loop (#2434), so a
+ * directory-mode `lsp_diagnostics` could pay that cost several times over.
  *
  * The traversal is deliberately still **depth-first with immediate descent**
  * (not the shared stack-based `walkTreeStackAsync`): the `maxFiles` cap makes
@@ -1987,15 +1957,16 @@ async function runDirectoryDiagnostics(
 	let collectedFiles: string[] = [];
 
 	const isIgnored = projectIgnorePredicate(absPath);
-	for (const [ext, exts] of Object.entries(LANG_EXTENSIONS)) {
+	for (const languageId of SCAN_LANGUAGE_PRIORITY) {
+		const exts = extensionsForLanguage(languageId);
 		collectedFiles = await collectFiles(
 			absPath,
-			exts,
+			[...exts],
 			MAX_FILES + 1,
 			isIgnored,
 		);
 		if (collectedFiles.length > 0) {
-			extension = ext;
+			extension = languageId;
 			break;
 		}
 	}
