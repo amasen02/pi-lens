@@ -17,9 +17,10 @@
  */
 
 import * as path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { logLatency } from "../../../clients/latency-logger.js";
+import { spawnFakeLspServer } from "../../support/fake-lsp-server.js";
 
 vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
 	...(await importActual<
@@ -27,12 +28,6 @@ vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
 	>()),
 	logLatency: vi.fn(),
 }));
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const FAKE_SERVER_PATH = path.join(
-	__dirname,
-	"../../fixtures/fake-lsp-server.mjs",
-);
 
 describe("LSP client — crash exit is logged, not silently swallowed", () => {
 	let client:
@@ -42,11 +37,7 @@ describe("LSP client — crash exit is logged, not silently swallowed", () => {
 				>
 		  >
 		| undefined;
-	let proc:
-		| Awaited<
-				ReturnType<typeof import("../../../clients/lsp/launch.js").launchLSP>
-		  >
-		| undefined;
+	let proc: Awaited<ReturnType<typeof spawnFakeLspServer>> | undefined;
 
 	beforeEach(() => {
 		(logLatency as ReturnType<typeof vi.fn>).mockReset();
@@ -66,11 +57,7 @@ describe("LSP client — crash exit is logged, not silently swallowed", () => {
 
 	it("logs lsp_server_unexpected_exit with a real exit signal when the child dies unprompted", async () => {
 		const { createLSPClient } = await import("../../../clients/lsp/client.js");
-		const { launchLSP } = await import("../../../clients/lsp/launch.js");
-
-		proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
-			cwd: process.cwd(),
-		});
+		proc = await spawnFakeLspServer({ cwd: process.cwd() });
 		client = await createLSPClient({
 			serverId: "fake",
 			process: proc,
@@ -102,11 +89,7 @@ describe("LSP client — crash exit is logged, not silently swallowed", () => {
 
 	it("does NOT log lsp_server_unexpected_exit for an intentional shutdown()", async () => {
 		const { createLSPClient } = await import("../../../clients/lsp/client.js");
-		const { launchLSP } = await import("../../../clients/lsp/launch.js");
-
-		proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
-			cwd: process.cwd(),
-		});
+		proc = await spawnFakeLspServer({ cwd: process.cwd() });
 		client = await createLSPClient({
 			serverId: "fake",
 			process: proc,
@@ -128,13 +111,10 @@ describe("LSP client — crash exit is logged, not silently swallowed", () => {
 
 	it("closeDocument sends didClose and clears document lifecycle state", async () => {
 		const { createLSPClient } = await import("../../../clients/lsp/client.js");
-		const { launchLSP } = await import("../../../clients/lsp/launch.js");
 		const filePath = path.join(process.cwd(), "client-close-document.ts");
 		const fileUri = pathToFileURL(filePath).href;
 
-		proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
-			cwd: process.cwd(),
-		});
+		proc = await spawnFakeLspServer({ cwd: process.cwd() });
 		client = await createLSPClient({
 			serverId: "fake",
 			process: proc,

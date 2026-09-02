@@ -12,7 +12,6 @@
 
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
 	buildMemorySample,
@@ -43,13 +42,8 @@ import {
 import { PathKeyedMap } from "../../clients/path-keyed-map.js";
 import { normalizeEphemeralMapKey } from "../../clients/path-utils.js";
 import { createLSPClient } from "../../clients/lsp/client.js";
-import { launchLSP, stopLSP } from "../../clients/lsp/launch.js";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const FAKE_SERVER_PATH = path.join(
-	__dirname,
-	"../fixtures/fake-lsp-server.mjs",
-);
+import { stopLSP } from "../../clients/lsp/launch.js";
+import { spawnFakeLspServer } from "../support/fake-lsp-server.js";
 
 describe("shouldEmitMemorySample (cadence)", () => {
 	it("is false on turn 0 (nothing meaningful resident yet)", () => {
@@ -308,7 +302,7 @@ describe("collectMemorySampleSubsystems (O(1)/O(bounded-cache-size) live reads)"
 		// `incrementalTextEntries`/`incrementalTextBytes` all read 0 whether or
 		// not the plumbing works. A real client with known retained text is the
 		// only way to prove a positive value flows through.
-		const proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+		const proc = await spawnFakeLspServer({
 			cwd: process.cwd(),
 			env: { ...process.env, FAKE_LSP_SYNC_KIND: "2" }, // Incremental
 		});

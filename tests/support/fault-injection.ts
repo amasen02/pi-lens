@@ -25,7 +25,7 @@
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
-import { vi } from "vitest";
+import { onTestFinished, vi } from "vitest";
 
 const FIXTURE_DIR = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -237,6 +237,24 @@ export async function spawnWedgedChild(): Promise<WedgedChild> {
 	// Writes into a dead child's pipe emit EPIPE asynchronously; swallow them
 	// so cleanup-order races don't surface as unhandled 'error' events.
 	child.stdin?.on("error", () => {});
+
+	// #2436 class-sweep: `wedged-stdin-child.mjs` never reads stdin and never
+	// exits on its own by design — the caller alone decides its lifetime via
+	// `kill()`. A caller-owned `.kill()` that never runs (an assertion throws
+	// first, the test times out) leaked exactly like the unrelated
+	// fake-lsp-server.mjs orphan this issue fixed. Register a guaranteed
+	// backstop kill through the held `child` handle (no spawned `taskkill` —
+	// AGENTS.md's Windows teardown note) so a call site cannot reintroduce
+	// that leak by omission; a caller's own explicit `kill()` still runs
+	// first and this becomes a no-op once the process has already exited.
+	onTestFinished(() => {
+		if (child.exitCode !== null || child.signalCode !== null) return;
+		try {
+			child.kill();
+		} catch {
+			/* already gone */
+		}
+	});
 
 	let exited: Promise<void> | undefined;
 	const whenExited = (): Promise<void> => {

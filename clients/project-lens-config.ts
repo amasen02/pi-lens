@@ -402,7 +402,15 @@ function discoverPiLensProjectConfig(startDir: string): DiscoveryCacheEntry {
 	return { info: undefined, dirMtimes };
 }
 
-function warnInvalidConfigOnce(configPath: string, reason: string): void {
+function warnInvalidConfigOnce(
+	configPath: string,
+	// A hand-authored string for a validated bad value/wrong type (every call
+	// site below but the JSON.parse catch); `{ parseError }` for a caught
+	// parse/read error, so `warnIgnoredConfigOnce` — not this wrapper — decides
+	// how much of a `JSON.parse` `SyntaxError#message` (which embeds a snippet
+	// of the source file on Node >=20, #2431) survives into the three sinks.
+	reason: string | { readonly parseError: unknown },
+): void {
 	// Shared seam since #2418: latch, extension.log line, durable
 	// `config-ignored` ledger row, and stable-coded notification in one place.
 	warnIgnoredConfigOnce({
@@ -454,10 +462,7 @@ function parseConfigFile(configPath: string): PiLensProjectConfig {
 		const text = fs.readFileSync(configPath, "utf-8");
 		raw = JSON.parse(text);
 	} catch (error) {
-		warnInvalidConfigOnce(
-			configPath,
-			error instanceof Error ? error.message : "failed to parse JSON",
-		);
+		warnInvalidConfigOnce(configPath, { parseError: error });
 		return EMPTY_PROJECT_CONFIG;
 	}
 
