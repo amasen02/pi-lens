@@ -21,8 +21,9 @@ vi.mock("../../clients/lsp/index.js", () => ({
 	resetLSPService: () => {},
 }));
 
-vi.mock("../../clients/bootstrap.js", () => ({
-	loadBootstrapClients: async () => ({
+vi.mock("../../clients/bootstrap.js", async () => {
+	const { bootstrapSeamMock } = await import("../support/bootstrap-mock.js");
+	return bootstrapSeamMock(async () => ({
 		complexityClient: {
 			isSupportedFile: () => false,
 			analyzeFile: async () => null,
@@ -31,8 +32,8 @@ vi.mock("../../clients/bootstrap.js", () => ({
 		ruffClient: {},
 		metricsClient: {},
 		agentBehaviorClient: { recordToolCall: () => [], formatWarnings: () => "" },
-	}),
-}));
+	}));
+});
 
 // #2402: the partial-apply afterWrite routes through handleToolResult, whose
 // dispatch pipeline is a real subprocess surface. The mock keeps the test at

@@ -174,6 +174,18 @@ finding with its red-run evidence.
   Ending your turn is for "deliverable produced" or "blocked on the
   orchestrator," never "waiting on a process."
 
+## Probe hygiene (mandatory)
+
+Any ad-hoc probe you run against the built `clients/*.js` outside vitest — a
+`node -e`, a throwaway `.mjs`, a harness script — runs with NO test-mode gate
+and NO home pin, so every logger, ledger and cache it touches writes into the
+MAINTAINER'S REAL `~/.pi-lens` (latency.log, extension.log, probe-cache,
+turn-state). On 2026-09-02 two review probes wrote 42 rows of `/p/.pi-lens.json`
+fixture garbage into the real telemetry (#2506). Before every such probe:
+`export PI_LENS_HOME=<your worktree>/.probe-home` (or set it inline), and
+`PILENS_DATA_DIR` likewise when the probe touches project-scoped data. A probe
+that forgets is a finding against YOUR report, not the PR's.
+
 ## Report format
 
 Outcome first: branch, PR URL, then root cause in two sentences, red-run

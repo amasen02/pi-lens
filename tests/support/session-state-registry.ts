@@ -51,6 +51,13 @@ import {
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
 import {
+	_analyzerBootstrapFailureStrikes as analyzerBootstrapStrikes,
+	_armAnalyzerBootstrapLatchForTests as armAnalyzerBootstrapLatch,
+	isAnalyzerBootstrapShutdown,
+	markAnalyzerBootstrapShutdown,
+	resetAnalyzerBootstrapSessionState,
+} from "../../clients/bootstrap.js";
+import {
 	lookupLearnedMutatingTool,
 	noteObservedMutation,
 	resetMutationAttribution,
@@ -220,6 +227,34 @@ function scratchCwd(): string {
 }
 
 export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
+	{
+		id: "bootstrap:shutdown-gate",
+		module: "bootstrap.ts",
+		state: "bootstrapShutdown",
+		policy: "session_start",
+		resetName: "resetAnalyzerBootstrapSessionState",
+		reason:
+			"#2467: the analyzer bootstrap refuses NEW loads once the primary session has torn down, which is a per-SESSION claim held in process-lived storage — without a session_start reset a replacement session in the same process would find every analyzer refused for the rest of the process (defect shape 17). The resident clients themselves are deliberately NOT dropped: they are stateless constructions whose session-scoped latches are re-armed by their own registered resets (resetInstallRetryLatches, #1497), so re-paying the seventeen-module load at every session boundary would cost the interactive path for nothing.",
+		probe: {
+			arm: () => markAnalyzerBootstrapShutdown(),
+			isArmed: () => !isAnalyzerBootstrapShutdown(),
+			reset: () => resetAnalyzerBootstrapSessionState(),
+		},
+	},
+	{
+		id: "bootstrap:failure-latch",
+		module: "bootstrap.ts",
+		state: "bootstrapFailureStrikes",
+		policy: "session_start",
+		resetName: "resetAnalyzerBootstrapSessionState",
+		reason:
+			"#2467 review: after BOOTSTRAP_FAILURE_STRIKE_LIMIT consecutive failed builds the seam stops rebuilding, so a permanently unresolvable analyzer module no longer re-runs seventeen dynamic imports plus collectInstallDiagnostics on every tool call. That verdict is about an ENVIRONMENT, and an environment is repaired between sessions (a dependency installed, a package layout fixed) — held process-wide without a session_start reset it would write the analyzers off for the life of the process, which is defect shape 17 exactly.",
+		probe: {
+			arm: () => armAnalyzerBootstrapLatch(),
+			isArmed: () => analyzerBootstrapStrikes() === 0,
+			reset: () => resetAnalyzerBootstrapSessionState(),
+		},
+	},
 	{
 		id: "test-runner-delivery:pending",
 		module: "test-runner-delivery.ts",
@@ -976,6 +1011,56 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 			reset: () => resetPendingRunnerFindings(),
 		},
 	},
+	// ── #2455: GoClient/RustClient's own availability latches ─────────────────
+	// Found by hand while auditing what the widened predicate SHOULD have
+	// covered, not by the widened predicate itself. #2455 fix round 3, F4
+	// corrects the causal claim an earlier draft of this comment made: the
+	// sweep skips any file that exports no reset at all (`session-state-scan.ts`:
+	// `if (resets.length === 0) continue`), and on master no file in this chain
+	// exported one — so however wide the container predicate got, none of them
+	// could yield a candidate. They became visible to the sweep only because
+	// #2455 added `resetGoAvailability`/`resetRustAvailability`, i.e. the reset
+	// came first and the visibility followed. The pair-with-reset gate is
+	// MISS 3 in `SWEEP_HEURISTIC_LIMITS` ("state with no reset seam at all")
+	// and #2455 does not narrow it.
+	//
+	// What the audit found stands on its own: `goClient`/`rustClient` are
+	// module-scope singletons wrapping a `createAvailabilityLatch()` each, and
+	// they are NOT stateless. A probe-class "missing" verdict never expires
+	// (`isLatchingOutcome`), so a go/cargo install between sessions stayed
+	// unobserved for the rest of the process's life, the same #1496 shape
+	// `package-manager.ts` and the same #1535 shape `zizmor-config.ts`'s
+	// `ghTokenLatch` already have registered resets for.
+	//
+	// #2455 fix round 4, F2 moved both instances and both resets OFF the
+	// runner modules and into the client modules that own the classes. Round 2
+	// left the runner holding one instance while `bootstrap.ts` built a second
+	// for `BootstrapClients.goClient`/`.rustClient` — the objects
+	// `handleSessionStart` reads for its "Active tools" line — so the reset
+	// re-armed a latch nothing user-visible consulted, and the bug survived its
+	// own fix. One instance per toolchain, beside the reset that clears it, is
+	// what makes the reset total; `tests/clients/toolchain-client-singleton.test.ts`
+	// is the ratchet.
+	{
+		id: "go-client:goClientAvailability",
+		module: "go-client.ts",
+		state:
+			"goClient's ToolchainAvailability latch (resolved go path, availability verdict)",
+		policy: "session_start",
+		resetName: "resetGoAvailability",
+		reason:
+			"#2455: GoClient wraps createAvailabilityLatch() the same way zizmor-config.ts's standalone gh-token latch does, outside the dispatch generation counter (runner-helpers.ts) and outside the install-retry generation (availability-policy.ts, which only re-arms the install-EXHAUSTED ceiling, not a plain probe-class 'missing' verdict). A go binary installed mid-process stayed invisible until process restart. Fix round 4, F2: the instance and this reset live in go-client.ts, which is what makes go-vet.ts's runner and bootstrap.ts's BootstrapClients.goClient the same object — two instances meant the reset never reached the session-start 'Active tools' line.",
+	},
+	{
+		id: "rust-client:rustClientAvailability",
+		module: "rust-client.ts",
+		state:
+			"rustClient's ToolchainAvailability latch (resolved cargo path, availability verdict); clippyAvailabilityByCargo (the cwd-keyed clippy-tool probe cache) is a SEPARATE, already-covered latch — it rides createCwdCachedProbe's shared availabilityGeneration counter (runner-helpers.ts's resetDispatchAvailabilityState, registered above as runner-helpers:availabilityGeneration), not this reset",
+		policy: "session_start",
+		resetName: "resetRustAvailability",
+		reason:
+			"#2455: same shape as go-client:goClientAvailability — RustClient's own createAvailabilityLatch() sits outside every generation counter that already covers the rust-clippy runner's OTHER cache. A cargo install mid-process stayed invisible until process restart. Fix round 4, F2: the instance and this reset live in rust-client.ts so the runner and bootstrap.ts share one object.",
+	},
 	{
 		id: "lsp-mutation:noBridgeDbgLogged",
 		module: "lsp-mutation.ts",
@@ -1227,9 +1312,9 @@ export const EXEMPT_SESSION_STATE_FILES: Readonly<Record<string, string>> = {
 	"word-index.ts":
 		"word-index build guard, per build; asyncWordIndexOperations queue is keyed by WordIndex and self-deletes in finally, so it needs no reset",
 	"mcp/analyze.ts":
-		"warm word-index cache keyed by path with its own freshness check",
+		"warm word-index cache keyed by path with its own freshness check. #2455 fix round 2: the widened detector (any class declared in clients/, not just clear()/delete()-owning ones) also now flags `warmGraphFacts`, a module-scope FactStore. #2455 fix round 3, F3: an earlier draft of this exemption claimed the MCP server has no pi session_start boundary to hook into. That is false — `clients/mcp/session.ts`'s runSessionStart calls handleSessionStart, and `mcp/server.ts` runs it both at boot (:252) and from the `pilens_session_start` tool (:1631) — so the exemption rests only on its real merits. `warmGraphFacts` is deliberately reused across calls by design (#536: buildOrUpdateGraph's incremental/cached tiers key off a stable instance, so a fresh store per call would defeat that reuse), and its entity-snapshot diff self-heals on eviction (wasBoundedSessionFactEvicted). It is NOT risk-free: the entity-snapshot key has no cwd component, so a warm process serving two projects that share a relative path could cross-contaminate a diff — filed as #2477, out of scope for the detector fix itself.",
 	"mcp/session.ts":
-		"MCP turn-end delivery chain, drained per turn; its session context is replaced, not accumulated",
+		"MCP turn-end delivery chain, drained per turn; its session context is replaced, not accumulated. #2455 fix round 2: the widened detector also now flags `turnEndQueue`, a non-exported TurnEndQueue instance — the serial queue this same delivery chain drains through. It already has a reset seam (`_resetTurnEndChain`, exported above), and the same reasoning applies: at most one item is ever pending (a second enqueue is rejected busy), and each carries its own 5s unref'd timeout, so nothing accumulates across a boundary. (#2455 fix round 3, F3: an earlier draft added the clause 'and MCP has no pi session_start boundary for this file to hook into anyway'. Struck — it is false. runSessionStart in this very file calls handleSessionStart, and `mcp/server.ts` runs it at boot (:252) and from the `pilens_session_start` tool (:1631).)",
 	"project-report.ts": "project-report build guard, per build",
 	"project-snapshot.ts":
 		"snapshot parse caches and the bounded per-root persist coordinator are process-lifetime state keyed by content/generation; a session reset must not abandon an in-flight durable publication",
@@ -1275,6 +1360,10 @@ export const EXEMPT_SESSION_STATE_FILES: Readonly<Record<string, string>> = {
 export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"agent-nudge.ts": 1,
 	"blocker-freshness.ts": 2,
+	// #2467: flagged because the file now exports a session_start reset; the
+	// scan counts no module-scope CONTAINER here (the gate is a boolean and the
+	// resident slot a nullable reference).
+	"bootstrap.ts": 0,
 	"bounded-telemetry.ts": 2,
 	"bus-events-logger.ts": 1,
 	"bus-publish.ts": 0,
@@ -1282,7 +1371,13 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"cache-observability.ts": 2,
 	// #2418: the one warn-once latch behind all three config loaders, moved
 	// here out of lens-config.ts and project-lens-config.ts.
-	"config-warn.ts": 1,
+	// #2426: 1 -> 2. The second symbol is `DEPRECATION_NOUN_BY_CODE`, an
+	// import-time `Map` DERIVED from `DEPRECATED_CONFIG_SURFACES` — a lookup
+	// table over a frozen data leaf, not session state (SWEEP_HEURISTIC_LIMITS
+	// item 5: the scan cannot tell a constant `Map` from a mutable one). It is
+	// never written after module evaluation, so resetting it would be
+	// meaningless; the file's one real latch is still the warn-once Set above.
+	"config-warn.ts": 2,
 	"degradation-ledger.ts": 3,
 	"diagnostic-dispositions.ts": 1,
 	"diagnostic-line-freshness.ts": 1,
@@ -1293,7 +1388,24 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"dispatch/collect-later-tier.ts": 1,
 	// #1899 removed the dead `neighborTouchCache` (10 → 9); #2282 removed the
 	// redundant `cascadeDiagnosticBaselines` shadow map (9 → 8).
-	"dispatch/integration.ts": 8,
+	// #2455 fix round 1: the container scan recognised any repo-local class
+	// owning a `clear()`/`delete()` method instead of a hard-coded name list,
+	// so `sessionRunnerRegistry` (`new RunnerRegistry()`) was counted (8 → 9).
+	// It is an import-time-built lookup with no session lifetime
+	// (SWEEP_HEURISTIC_LIMITS item 5, same as this file's other frozen
+	// vocabulary constants) — no new registry entry needed.
+	// #2455 fix round 2: the predicate widened again, from "owns clear()/
+	// delete()" to "declared in clients/" (any export shape). `sessionFacts`
+	// (`new FactStore("dispatch")`) is now ALSO counted (9 → 10) — FactStore's
+	// own clear methods are named `clearAll`/`deleteFileFact`, so round 1's
+	// method-name filter still missed it. Already registered above
+	// (dispatch-integration:sessionCaches names `sessionFacts` and its reset
+	// clears it via a method call) — only the pin was stale.
+	// #2455 fix round 4: the container regex now also allows an `export`
+	// prefix, so `CASCADE_GRAPH_KINDS` (an exported module-level `new Set`) is
+	// counted (10 -> 11). Import-time frozen vocabulary, same class as this
+	// file's other constant lookups above — SWEEP_HEURISTIC_LIMITS item 5.
+	"dispatch/integration.ts": 11,
 	"dispatch/lazy.ts": 0,
 	// #2215 added the language matrix's two derived lookups
 	// (`BINDING_BY_EXTENSION`, `LSP_ONLY_RULE_LANGUAGES`) (5 → 7). Both are
@@ -1301,7 +1413,9 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	// SWEEP_HEURISTIC_LIMITS item 5, not state that must re-arm.
 	"dispatch/runners/ast-grep-napi.ts": 7,
 	"dispatch/runners/biome-check.ts": 1,
+
 	"dispatch/runners/psscriptanalyzer.ts": 2,
+
 	// #2442 review F2: the container regex now recognises BoundedFifoMap /
 	// BoundedLruCache, so this file's module-level bounded cache is counted.
 	"dispatch/runners/spotbugs.ts": 1,
@@ -1312,7 +1426,12 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"format-events-publish.ts": 0,
 	// #2442 review F2: the container regex now recognises BoundedFifoMap /
 	// BoundedLruCache, so this file's module-level bounded cache is counted.
-	"formatters.ts": 8,
+	// #2455 fix round 4: the container regex now also allows an `export`
+	// prefix, so `FORMATTERS_WITH_EXPLICIT_CONFIG_CHECK` (an exported
+	// module-level `new Set`) is counted (8 -> 9). An import-time frozen
+	// vocabulary with no session lifetime — SWEEP_HEURISTIC_LIMITS item 5, and
+	// this file's existing registry entries already cover its real caches.
+	"formatters.ts": 9,
 	// #2442 review F2: the container regex now recognises BoundedFifoMap /
 	// BoundedLruCache, so this file's module-level bounded cache is counted.
 	"generated-artifacts.ts": 3,
@@ -1321,6 +1440,17 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	// SWEEP_HEURISTIC_LIMITS item 5, not state that must re-arm.
 	"git-guard.ts": 2,
 	"git-tracked-ignore.ts": 3,
+	// #2455 fix round 4, F2: `go-client.ts` now owns the process's ONE
+	// `GoClient` (`export const goClient = new GoClient()`) and the
+	// `resetGoAvailability` seam beside it, so the pair-with-reset rule flags
+	// it here instead of in `dispatch/runners/go-vet.ts`. Round 2 put the
+	// instance in the runner and let `bootstrap.ts` build a SECOND one for the
+	// object `handleSessionStart` reads, so the reset re-armed a latch nothing
+	// user-visible consulted. Registered above (go-client:goClientAvailability).
+	// Visible only because the container regex now allows an `export` prefix —
+	// without that widening this fix would have moved the state OUT of the
+	// sweep's view.
+	"go-client.ts": 1,
 	// #2442 review F2: the container regex now recognises BoundedFifoMap /
 	// BoundedLruCache, so this file's module-level bounded cache is counted.
 	"installer/index.ts": 13,
@@ -1363,8 +1493,18 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"lsp/server.ts": 6,
 	"lsp/workspace-diagnostics-cache.ts": 1,
 	"lsp/workspace-sweep-hold.ts": 0,
-	"mcp/analyze.ts": 1,
-	"mcp/session.ts": 2,
+	// #2455 fix round 2: `warmGraphFacts` (`new FactStore("mcp-analyze")`) is now
+	// counted (1 → 2) under the widened "declared in clients/" predicate. See
+	// this file's EXEMPT_SESSION_STATE_FILES entry above for why it stays
+	// exempt rather than registered.
+	"mcp/analyze.ts": 2,
+	// #2455 fix round 2: `turnEndQueue` (a non-exported `TurnEndQueue`,
+	// unreachable by the round-1 `export class` regex and undiscoverable by its
+	// clear()/delete()-shaped-method filter — it exposes `reset()`, not either
+	// name) is now counted (2 → 3) under the widened "declared in clients/,
+	// any export shape" predicate. See this file's EXEMPT_SESSION_STATE_FILES
+	// entry above.
+	"mcp/session.ts": 3,
 	"module-report-lsp.ts": 1,
 	// #2423: the frozen built-in tool-name table plus the call-scoped
 	// resolved-range carry. Both are argued in EXEMPT_SESSION_STATE_FILES.
@@ -1405,6 +1545,15 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	// #2060: 3 -> 5 for GIT_INTEGRATION_SUBCOMMANDS and
 	// GIT_GLOBAL_OPTIONS_WITH_VALUE — command-shape vocabulary, not state.
 	"runtime-tool-result.ts": 5,
+	// #2455 fix round 4, F2: the twin of `go-client.ts` above — the process's
+	// ONE `RustClient` plus `resetRustAvailability`, moved off
+	// `dispatch/runners/rust-clippy.ts`. That file keeps
+	// `clippyAvailabilityByCargo`, which is covered by
+	// `resetDispatchAvailabilityState`'s generation
+	// (runner-helpers:availabilityGeneration) and, exporting no reset of its
+	// own, is not a candidate on its own account — the pre-#2455 status quo,
+	// and MISS 3 in SWEEP_HEURISTIC_LIMITS.
+	"rust-client.ts": 1,
 	"safe-spawn.ts": 3,
 	// #2146 moved the four registration fields onto the process singleton, so the
 	// scan sees no module-scope container here either.
@@ -1427,7 +1576,12 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"warm-attach.ts": 0,
 	// #2275 added `renderedDependencyDriftFiles` (the drained per-turn footer
 	// delivery set) alongside the existing two.
-	"widget-state.ts": 3,
+	// #2455: the container scan now recognises any repo-local class owning a
+	// `clear()`/`delete()` method, so `diagnosticsWriteGuard` and
+	// `runnerWriteGuard` (`new WriteOrderingGuard(...)`) are now counted
+	// (3 → 5). Both were already cleared by `clearWidgetState` — the file's
+	// exemption above already covers them; only the pin was stale.
+	"widget-state.ts": 5,
 	// #2068 added the per-index dirty-file set; it is process-local wire-cache
 	// state and is cleared by serialization, so it needs no session reset.
 	"word-index.ts": 4,

@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import { withResidentBootstrap } from "../support/bootstrap-access.js";
 import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { CacheManager } from "../../clients/cache-manager.js";
@@ -210,51 +211,56 @@ describe("runtime event flow", () => {
 			fs.mkdirSync(path.dirname(filePath), { recursive: true });
 			fs.writeFileSync(filePath, "export const value = 1;\n");
 
-			await handleSessionStart({
-				ctxCwd: env.tmpDir,
-				getFlag: () => false,
-				notify,
-				dbg: () => {},
-				log: () => {},
-				runtime,
-				metricsClient: { reset: () => {} },
-				cacheManager,
-				todoScanner: { scanDirectory: () => ({ items: [] }) },
-				astGrepClient: {
-					isAvailable: () => false,
-					ensureAvailable: async () => false,
-					scanExports: async () => new Map(),
-				},
-				biomeClient: {
-					isAvailable: () => false,
-					ensureAvailable: async () => false,
-				},
-				ruffClient: {
-					isAvailable: () => false,
-					ensureAvailable: async () => false,
-				},
-				knipClient: {
-					isAvailable: () => false,
-					ensureAvailable: async () => false,
-					analyze: async () => EMPTY_KNIP_RESULT,
-				},
-				jscpdClient: {
-					isAvailable: () => false,
-					ensureAvailable: async () => false,
-				},
-				deadCodeClients: [],
-				depChecker: {
-					isAvailable: () => false,
-					ensureAvailable: async () => false,
-				},
-				testRunnerClient: { detectRunner: () => null, runTestFile: () => ({}) },
-				goClient: { isGoAvailableAsync: async () => false },
-				rustClient: { isAvailableAsync: async () => false },
-				ensureTool: async () => null,
-				cleanStaleTsBuildInfo: () => [],
-				resetDispatchBaselines: () => {},
-				resetLSPService: () => {},
-			} as any);
+			await handleSessionStart(
+				withResidentBootstrap({
+					ctxCwd: env.tmpDir,
+					getFlag: () => false,
+					notify,
+					dbg: () => {},
+					log: () => {},
+					runtime,
+					metricsClient: { reset: () => {} },
+					cacheManager,
+					todoScanner: { scanDirectory: () => ({ items: [] }) },
+					astGrepClient: {
+						isAvailable: () => false,
+						ensureAvailable: async () => false,
+						scanExports: async () => new Map(),
+					},
+					biomeClient: {
+						isAvailable: () => false,
+						ensureAvailable: async () => false,
+					},
+					ruffClient: {
+						isAvailable: () => false,
+						ensureAvailable: async () => false,
+					},
+					knipClient: {
+						isAvailable: () => false,
+						ensureAvailable: async () => false,
+						analyze: async () => EMPTY_KNIP_RESULT,
+					},
+					jscpdClient: {
+						isAvailable: () => false,
+						ensureAvailable: async () => false,
+					},
+					deadCodeClients: [],
+					depChecker: {
+						isAvailable: () => false,
+						ensureAvailable: async () => false,
+					},
+					testRunnerClient: {
+						detectRunner: () => null,
+						runTestFile: () => ({}),
+					},
+					goClient: { isGoAvailableAsync: async () => false },
+					rustClient: { isAvailableAsync: async () => false },
+					ensureTool: async () => null,
+					cleanStaleTsBuildInfo: () => [],
+					resetDispatchBaselines: () => {},
+					resetLSPService: () => {},
+				}) as any,
+			);
 
 			await handleToolResult({
 				event: {

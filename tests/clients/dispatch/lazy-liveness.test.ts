@@ -30,8 +30,10 @@ describe("dispatch session warm/first-use liveness (#1394)", () => {
 				dispatchLintWithResult: async () => dispatchResult,
 			}),
 		);
-		vi.doMock("../../../clients/bootstrap.js", () => ({
-			loadBootstrapClients: async () => ({
+		vi.doMock("../../../clients/bootstrap.js", async () => {
+			const { bootstrapSeamMock } =
+				await import("../../support/bootstrap-mock.js");
+			return bootstrapSeamMock(async () => ({
 				metricsClient: { reset: () => {} },
 				todoScanner: {},
 				biomeClient: { isAvailable: () => false, isSupportedFile: () => false },
@@ -53,8 +55,8 @@ describe("dispatch session warm/first-use liveness (#1394)", () => {
 					isSupportedFile: () => false,
 					analyzeFile: () => null,
 				},
-			}),
-		}));
+			}));
+		});
 		vi.doMock("../../../clients/lsp/index.js", () => ({
 			getLSPService: () => ({
 				touchFile: async () => [],

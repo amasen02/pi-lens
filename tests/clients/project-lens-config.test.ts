@@ -4,9 +4,15 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	findPiLensProjectConfig,
+	loadPiLensConfigInDir,
 	loadPiLensProjectConfig,
+	PROJECT_CONFIG_BASENAMES,
 	resetProjectLensConfigCache,
 } from "../../clients/project-lens-config.js";
+import {
+	getDegradationSummary,
+	resetDegradationLedger,
+} from "../../clients/degradation-ledger.js";
 import { removeTempDirSync } from "./test-utils.js";
 
 // #1333: these config/telemetry warnings no longer reach the terminal — pi owns
@@ -128,6 +134,37 @@ describe("loadPiLensProjectConfig", () => {
 		);
 		const cfg = loadPiLensProjectConfig(tmpDir);
 		expect(cfg.ignore).toEqual(["dotfile-wins/**"]);
+	});
+
+	/**
+	 * #2426 review round 2, F4: the only canonical-wins coverage at this loader
+	 * used to be the `ignore` case above plus a shape assertion on the location
+	 * TABLE. Both halves below are BEHAVIORAL and both go red under a
+	 * `PROJECT_CONFIG_LOCATIONS.reverse()` mutation — the ordering is what
+	 * decides, not `lspSectionOf`'s namespace-over-root rule.
+	 */
+	it("reads a colliding maxProjectFiles from the canonical file (#2426)", () => {
+		fs.writeFileSync(
+			path.join(tmpDir, ".pi-lens.json"),
+			JSON.stringify({ maxProjectFiles: 2222 }),
+		);
+		fs.writeFileSync(
+			path.join(tmpDir, "pi-lens.json"),
+			JSON.stringify({ maxProjectFiles: 1111 }),
+		);
+		const cfg = loadPiLensProjectConfig(tmpDir);
+		expect(cfg.maxProjectFiles).toBe(2222);
+		expect(cfg.configPath).toBe(path.join(tmpDir, ".pi-lens.json"));
+		// The per-directory (no-walk) counterpart used for nested layering (#783)
+		// resolves the same collision the same way.
+		expect(loadPiLensConfigInDir(tmpDir).maxProjectFiles).toBe(2222);
+	});
+
+	it("orders PROJECT_CONFIG_BASENAMES canonical-first (#2426)", () => {
+		// DESCENDING precedence, first match wins — so the canonical basename is
+		// index 0. Pinned as an ordered list rather than as a set: the set is what
+		// is read, the ORDER is what decides a collision.
+		expect(PROJECT_CONFIG_BASENAMES).toEqual([".pi-lens.json", "pi-lens.json"]);
 	});
 
 	it("walks up to find a config in a parent directory", () => {
@@ -432,15 +469,19 @@ describe("loadPiLensProjectConfig", () => {
 			);
 		});
 
-		it("does NOT warn on foreign LSP namespaces or $schema", () => {
+		it("does NOT warn on the `lsp` namespace or $schema", () => {
 			fs.writeFileSync(
 				path.join(tmpDir, ".pi-lens.json"),
 				JSON.stringify({
 					$schema: "https://example.com/pi-lens.json",
-					servers: { foo: { name: "foo" } },
-					serverOverrides: { rust: {} },
-					disabledServers: ["go"],
-					warmFiles: ["src/main.ts"],
+					// The CANONICAL spelling since #2426: `lsp` is a namespace inside
+					// `.pi-lens.json`, read by the LSP loader out of the same file.
+					lsp: {
+						servers: { foo: { name: "foo" } },
+						serverOverrides: { rust: {} },
+						disabledServers: ["go"],
+						warmFiles: ["src/main.ts"],
+					},
 					// Legitimate project keys alongside them.
 					ignore: ["dist/**"],
 					format: { enabled: false },
@@ -448,6 +489,55 @@ describe("loadPiLensProjectConfig", () => {
 			);
 			loadPiLensProjectConfig(tmpDir);
 			expect(console.error).not.toHaveBeenCalled();
+		});
+
+		it("correctly LABELS a legacy root LSP key's migration notice, even reported alone (#2426)", () => {
+			// The four legacy root keys are still honored for their deprecation
+			// window (`DEPRECATED_CONFIG_SURFACES`), so this is not an "unknown key"
+			// and not an "ignoring invalid" — the setting APPLIES.
+			//
+			// WHO announces it changed AGAIN in review round 3 (F1): the subsystem a
+			// record reports under is now derived from the record itself
+			// (`configRecordOwner` + tier), not from which loader is calling. This
+			// loader reports EVERY record its own resolution of this file produced —
+			// no filtering — so it DOES emit these four notices when called alone
+			// (this test never calls `loadLSPConfig`). They are still correctly
+			// LABELLED "deprecated LSP config key", because the subsystem comes from
+			// the record's own `lsp.*` ownership, not from the fact that the project
+			// loader happens to be the one reporting it. Calling the LSP loader too
+			// (`config-notice-ownership.test.ts`) reports the SAME records, and the
+			// warn-once latch (keyed on subsystem, not caller) collapses the two
+			// calls into the one notice per key that a user should see.
+			fs.writeFileSync(
+				path.join(tmpDir, ".pi-lens.json"),
+				JSON.stringify({
+					servers: { foo: { name: "foo" } },
+					serverOverrides: { rust: {} },
+					disabledServers: ["go"],
+					warmFiles: ["src/main.ts"],
+					ignore: ["dist/**"],
+				}),
+			);
+			loadPiLensProjectConfig(tmpDir);
+			for (const key of [
+				"servers",
+				"serverOverrides",
+				"disabledServers",
+				"warmFiles",
+			]) {
+				// Not a typo report.
+				expect(warnedFor(`unknown key "${key}"`), key).toBe(false);
+				// Reported, and labelled as the LSP loader's own notice — never as a
+				// project-config notice.
+				expect(warnedFor(`move "${key}" to "lsp.${key}"`), key).toBe(true);
+				expect(warnedFor(`deprecated LSP config key`), key).toBe(true);
+			}
+			// The whole-file "ignoring invalid" prose must NOT appear: nothing was
+			// ignored.
+			expect(warnedFor("ignoring invalid")).toBe(false);
+			// No PROJECT-labelled notice for any of the four LSP keys — `ignore` is
+			// canonical here and produces no record at all.
+			expect(warnedFor("deprecated project config")).toBe(false);
 		});
 
 		it("does NOT warn on the pi-lens-native `trivy` key (read via .raw)", () => {
@@ -464,14 +554,77 @@ describe("loadPiLensProjectConfig", () => {
 		it("signals that a global-only lens key is not honored at project scope", () => {
 			fs.writeFileSync(
 				path.join(tmpDir, ".pi-lens.json"),
-				JSON.stringify({ lsp: { enabled: false }, tests: { enabled: false } }),
+				JSON.stringify({
+					delta: { enabled: false },
+					tests: { enabled: false },
+				}),
 			);
 			loadPiLensProjectConfig(tmpDir);
 			expect(warnedFor("not honored in a project")).toBe(true);
-			expect(warnedFor('"lsp"')).toBe(true);
+			expect(warnedFor('"delta"')).toBe(true);
 			expect(warnedFor('"tests"')).toBe(true);
 			// It is NOT reported as a typo — it is a real key, wrong scope.
+			expect(warnedFor('unknown key "delta"')).toBe(false);
+		});
+
+		it("does NOT call `lsp` a global-only key any more (#2426)", () => {
+			// `lsp` used to be global-only at project scope, because the LSP loader
+			// read its settings from the ROOT of `.pi-lens.json`. Since #2426 `lsp`
+			// IS the project-scoped namespace those settings live in, so telling a
+			// user their `lsp` section does nothing here would be false.
+			fs.writeFileSync(
+				path.join(tmpDir, ".pi-lens.json"),
+				JSON.stringify({ lsp: { disabledServers: ["go"] } }),
+			);
+			loadPiLensProjectConfig(tmpDir);
+			expect(warnedFor('"lsp" is a global-only')).toBe(false);
 			expect(warnedFor('unknown key "lsp"')).toBe(false);
+		});
+
+		it("still says a GLOBAL-scope flag under `lsp` does nothing here (#2426 R2/F3)", () => {
+			// Tolerating the whole `lsp` namespace swallowed `lsp.enabled`, which is
+			// a `scope: "global"` flag (`--no-lsp`): a user who wrote it in a project
+			// file used to get the honest global-only notice and, after #2426's first
+			// round, got silence — while `docs/configuration.md` promises nothing is
+			// ignored silently. The namespace is tolerated KEY BY KEY: the four LSP
+			// settings a project file may carry pass, anything else is scanned by the
+			// same rules as a top-level key.
+			fs.writeFileSync(
+				path.join(tmpDir, ".pi-lens.json"),
+				JSON.stringify({
+					lsp: {
+						enabled: false,
+						disabledServers: ["go"],
+						servers: {},
+						serverOverrides: {},
+						warmFiles: [],
+					},
+				}),
+			);
+			loadPiLensProjectConfig(tmpDir);
+			expect(warnedFor("not honored in a project")).toBe(true);
+			expect(warnedFor('"lsp.enabled"')).toBe(true);
+			// The four honored LSP settings stay silent — they are read from this
+			// very file by the LSP loader.
+			for (const key of [
+				"disabledServers",
+				"servers",
+				"serverOverrides",
+				"warmFiles",
+			]) {
+				expect(warnedFor(`"lsp.${key}"`), key).toBe(false);
+			}
+			// And it is a scope signal, not a typo report.
+			expect(warnedFor('unknown key "lsp.enabled"')).toBe(false);
+		});
+
+		it("reports an unrecognized sub-key of `lsp` as a typo (#2426 R2/F3)", () => {
+			fs.writeFileSync(
+				path.join(tmpDir, ".pi-lens.json"),
+				JSON.stringify({ lsp: { disabledServer: ["go"] } }),
+			);
+			loadPiLensProjectConfig(tmpDir);
+			expect(warnedFor('unknown key "lsp.disabledServer"')).toBe(true);
 		});
 
 		it("warns once for the same typo across re-parses (warn-once dedup)", async () => {
@@ -773,5 +926,100 @@ describe("config cache freshness (#1105 mtime+size)", () => {
 		// a cold read. Pre-#1105 (mtime-only) this returned the stale 3-entry list.
 		const second = loadPiLensProjectConfig(tmpDir);
 		expect(second.ignore).toEqual(["alpha/**"]);
+	});
+});
+
+describe("the config-deprecated ledger row survives a warm cache across sessions (#2426 review round 3, F2)", () => {
+	beforeEach(() => {
+		resetDegradationLedger();
+	});
+
+	afterEach(() => {
+		resetDegradationLedger();
+	});
+
+	function deprecatedCount(): number {
+		return (
+			getDegradationSummary().find(
+				(entry) => entry.kind === "config-deprecated",
+			)?.count ?? 0
+		);
+	}
+
+	it("re-populates on a cache HIT, not just the session that first parsed the file", () => {
+		fs.writeFileSync(
+			path.join(tmpDir, "pi-lens.json"),
+			JSON.stringify({ ignore: ["dist/**"] }),
+		);
+
+		// Session 1: cold cache — `parseConfigFile` runs, records the row.
+		loadPiLensProjectConfig(tmpDir);
+		expect(deprecatedCount(), "session 1").toBeGreaterThan(0);
+
+		// A session boundary resets the ledger (mirrors `handleSessionStart`'s
+		// `resetDegradationLedger()`) but NOT the project config cache — there is
+		// no production caller of `resetProjectLensConfigCache`, so the cache
+		// stays warm across sessions for the life of the process.
+		resetDegradationLedger();
+		expect(deprecatedCount(), "reset").toBe(0);
+
+		// Session 2: same directory, same unchanged file on disk — a cache HIT.
+		// Before the fix, `loadPiLensProjectConfig` returned the cached config
+		// without re-running `parseConfigFile`, so nothing re-reported the
+		// migration record and this session's row was silently absent.
+		loadPiLensProjectConfig(tmpDir);
+		expect(deprecatedCount(), "session 2, cache warm").toBeGreaterThan(0);
+	});
+});
+
+describe("a global-only setting's notice names the file the resolver actually reads (#2426 review round 3, S1)", () => {
+	const originalConfigPath = process.env.PI_LENS_CONFIG_PATH;
+
+	afterEach(() => {
+		if (originalConfigPath === undefined) {
+			delete process.env.PI_LENS_CONFIG_PATH;
+		} else {
+			process.env.PI_LENS_CONFIG_PATH = originalConfigPath;
+		}
+	});
+
+	function warnedFor(substring: string): boolean {
+		return (console.error as ReturnType<typeof vi.fn>).mock.calls
+			.flat()
+			.some((arg) => typeof arg === "string" && arg.includes(substring));
+	}
+
+	it("names the ~/.pi-lens/config.json default when PI_LENS_CONFIG_PATH is unset", () => {
+		delete process.env.PI_LENS_CONFIG_PATH;
+		fs.writeFileSync(
+			path.join(tmpDir, ".pi-lens.json"),
+			JSON.stringify({ delta: { enabled: false } }),
+		);
+		loadPiLensProjectConfig(tmpDir);
+		expect(warnedFor("set it in ~/.pi-lens/config.json")).toBe(true);
+	});
+
+	it("names the PI_LENS_CONFIG_PATH override, not the hardcoded ~/.pi-lens/config.json", () => {
+		// Under the override the resolver reads THIS file for the global tier,
+		// never `~/.pi-lens/config.json` — a hardcoded string in the notice would
+		// tell the user to write a file the resolver does not read (#2426 review
+		// round 3, S1; the sibling defect the F1 test in
+		// `config-notice-ownership.test.ts` pins for the migration-notice path).
+		const relocated = path.join(tmpDir, "elsewhere", "pi-lens-config.json");
+		process.env.PI_LENS_CONFIG_PATH = relocated;
+
+		fs.writeFileSync(
+			path.join(tmpDir, ".pi-lens.json"),
+			JSON.stringify({ delta: { enabled: false } }),
+		);
+		loadPiLensProjectConfig(tmpDir);
+
+		// Never the stale hardcoded default...
+		expect(warnedFor("~/.pi-lens/config.json")).toBe(false);
+		// ...and it DOES name the override (the tail survives both the raw-path
+		// and the home-relative "~" rendering, so this holds regardless of
+		// whether `tmpDir` happens to sit under the real home directory).
+		expect(warnedFor("pi-lens-config.json")).toBe(true);
+		expect(warnedFor("elsewhere")).toBe(true);
 	});
 });

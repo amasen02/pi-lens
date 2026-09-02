@@ -13,6 +13,7 @@
  * `formatters.ts`'s `tryLazyInstallFormatterTool`.
  */
 
+import { withResidentBootstrap } from "../support/bootstrap-access.js";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	resetProjectTrust,
@@ -99,7 +100,7 @@ function makeSessionStartDeps(
 		isAvailable: () => false,
 		ensureAvailable: async () => false,
 	};
-	return {
+	return withResidentBootstrap({
 		ctxCwd,
 		getFlag: () => false,
 		notify: vi.fn(),
@@ -137,7 +138,7 @@ function makeSessionStartDeps(
 		resetDispatchBaselines: () => {},
 		resetLSPService: () => {},
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	} as any;
+	}) as any;
 }
 
 let cwdSeq = 0;

@@ -83,21 +83,25 @@ export const CONFIG_DIAGNOSTIC_CODES = {
 	/**
 	 * A deprecated config KEY was accepted inside its deprecation window.
 	 *
-	 * RESERVED, NOT YET EMITTED. Nothing in pi-lens raises this today: the
-	 * migration warnings it describes arrive with #2416 slice 1, which is also
-	 * the first release in which any key is actually inside its window. The
-	 * number is registered now because the namespace is append-only — a number
-	 * cannot be chosen after the fact — and `DEPRECATED_CONFIG_SURFACES` already
-	 * points its `kind: "key"` rows at it, so the wiring is a call site, not a
-	 * new public surface. Deliberately reserved-but-inert per AGENTS.md's
-	 * "Issue and PR design contract".
+	 * EMITTED since #2426, by `deprecationRecords` (`clients/config-resolve.ts`)
+	 * for every `kind: "key"` row below that appears at the ROOT of a canonical
+	 * file — one record per `(file, key)` — and delivered through
+	 * `reportPiLensConfigRecords` -> `warnIgnoredConfigOnce`, which renders it as
+	 * `deprecated <label> key in <file>: …` and records a `config-deprecated`
+	 * ledger row rather than a `config-ignored` one. The setting still APPLIES;
+	 * the code says only that the spelling is on a removal schedule.
+	 *
+	 * The record carries `canonicalKey`, so the auto-migrator #2426 defers can
+	 * be a pure function over these records rather than a prose parser.
 	 */
 	PILENS_CFG_0002: "deprecated config key accepted",
 	/**
 	 * A deprecated config FILE LOCATION was read inside its window.
 	 *
-	 * RESERVED, NOT YET EMITTED — same slice, same reasoning as
-	 * `PILENS_CFG_0002`.
+	 * EMITTED since #2426 — same producer, same delivery path, and the same
+	 * one-record-per-`(file, key)` granularity as `PILENS_CFG_0002`; this is the
+	 * code for the `kind: "file"` rows below. Per-key rather than per-file so the
+	 * warning can name the destination of each setting the user has to move.
 	 */
 	PILENS_CFG_0003: "deprecated config file location accepted",
 	/**
@@ -106,7 +110,7 @@ export const CONFIG_DIAGNOSTIC_CODES = {
 	 * PRODUCED by `validate()` (`clients/config-core/normalize.ts`), which is
 	 * the one place the unknown-field policy in `docs/public-api-stability.md`
 	 * is implemented: warn and drop, never throw. It reaches a user through
-	 * `reportMigrationRecords` -> `warnIgnoredConfigOnce`, which #2426 wires
+	 * `reportPiLensConfigRecords` -> `warnIgnoredConfigOnce`, which #2426 wires
 	 * when the loaders adopt the core. Registered now because the resolution
 	 * pipeline already stamps records with it, and a record carrying an
 	 * unregistered code is exactly what the #2418 drift test forbids.
@@ -137,6 +141,51 @@ export const CONFIG_DIAGNOSTIC_CODES = {
 	 * not write has something worth looking at.
 	 */
 	PILENS_CFG_0006: "config key would modify the object prototype; ignored",
+	/**
+	 * Further config notices were suppressed by a per-resolution bound.
+	 *
+	 * The record count a config file can produce is USER INPUT — one key, one
+	 * record — so every producer collects into a bounded
+	 * `MigrationRecordCollector` through `finalizeRecords`, which holds one slot
+	 * back for this code. It is the difference between a bound that is honest
+	 * and one that drops notices silently: a user who sees it knows the list
+	 * they were shown is partial, and how much of it is missing. The count is
+	 * the WHOLE truncation, including anything an earlier bound in the same
+	 * pipeline already discarded (#2426 review round 6, F1).
+	 *
+	 * Registered as its own code rather than folded into `PILENS_CFG_0001`
+	 * because the user action differs — nothing about the config is wrong, the
+	 * OUTPUT was truncated, and the fix is to read the file rather than to
+	 * change it. For the same reason it is the ONE code `warnIgnoredConfigOnce`
+	 * renders with neither the `ignoring invalid …` prose nor the
+	 * `config-ignored` ledger kind: it records under `config-notice-suppressed`,
+	 * because a file whose every setting applied can still overflow the bound.
+	 */
+	PILENS_CFG_0007:
+		"further config notices suppressed by the per-resolution bound",
+	/**
+	 * A WHOLE configuration was dropped because resolving it failed internally.
+	 *
+	 * PRODUCED by the two guards that stand under the config pipeline —
+	 * `resolveConfig` (`clients/config-core/resolve.ts`) and the global loader's
+	 * post-parse catch (`clients/lens-config.ts`) — each of which degrades a
+	 * failed resolution to "no config" rather than taking the session with it.
+	 * The record carries the error CLASS only, never its message.
+	 *
+	 * Distinct from `PILENS_CFG_0005`, which both guards borrowed until #2426
+	 * review round 6 (S1). 0005 is registered as a per-FIELD rejection: a user
+	 * who matches on it expects one setting to have been dropped and the rest to
+	 * be in effect. Here NOTHING in the file is in effect, so the two need
+	 * different codes to be worth matching on at all.
+	 *
+	 * The ONE code the per-resolution bound never suppresses (#2426 review round
+	 * 7, F1). Every other record is one more per-key notice, and past 20 of
+	 * those a count is worth more than the list; this record is the statement
+	 * that those notices are no longer the whole story, so letting a
+	 * `PILENS_CFG_0007` stand in for it told the user "19 keys rejected, N more
+	 * suppressed" about a configuration that applied nothing at all.
+	 */
+	PILENS_CFG_0008: "config resolution failed; whole configuration ignored",
 } as const satisfies Record<`PILENS_CFG_${string}`, string>;
 
 export type ConfigDiagnosticCode = keyof typeof CONFIG_DIAGNOSTIC_CODES;

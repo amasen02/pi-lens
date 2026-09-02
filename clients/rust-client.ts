@@ -90,4 +90,38 @@ export class RustClient {
 	isRustFile(filePath: string): boolean {
 		return path.extname(filePath).toLowerCase() === ".rs";
 	}
+
+	/** Forget the memoized cargo path and latched availability verdict — #2455. */
+	resetAvailability(): void {
+		this.availability.reset();
+	}
+}
+
+/**
+ * The one `RustClient` this process owns (#2455 fix round 4, F2).
+ *
+ * Same shape as `go-client.ts`'s `goClient`, and the same round-2 defect: the
+ * runner (`dispatch/runners/rust-clippy.ts`) and `bootstrap.ts` each built
+ * their own instance, so `resetRustAvailability` re-armed one latch while
+ * `handleSessionStart`'s "Active tools" line read the other's never-expiring
+ * probe-class "missing" verdict. One instance, in the module that owns the
+ * class; `tests/clients/toolchain-client-singleton.test.ts` holds the line.
+ */
+export const rustClient = new RustClient();
+
+/**
+ * Forget `rustClient`'s memoized cargo path and latched availability verdict —
+ * #2455. Same #1496/#1535 shape as `resetZizmorTokenAvailability`; wired into
+ * `handleSessionStart` beside it (`clients/runtime-session.ts`) so a Rust
+ * toolchain installed mid-process is observed by the next session instead of
+ * staying "missing" for the rest of the process's life.
+ *
+ * This module — not `rust-clippy.ts` — because the reset must sit beside the
+ * single instance it clears (#2455 fix round 4, F2). `rust-clippy.ts`'s
+ * `clippyAvailabilityByCargo` is a separate, already-covered latch: it rides
+ * `createCwdCachedProbe`'s shared `availabilityGeneration` counter (see
+ * `runner-helpers.ts`'s `resetDispatchAvailabilityState`), not this reset.
+ */
+export function resetRustAvailability(): void {
+	rustClient.resetAvailability();
 }

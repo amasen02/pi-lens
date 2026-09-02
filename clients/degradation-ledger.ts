@@ -2,7 +2,11 @@
 
 import type { ConfigDiagnosticCode } from "./config-diagnostic-codes.js";
 import { logExtension } from "./extension-log.js";
-import { LEDGER_FIELD_MAX, truncateForLedger } from "./ledger-bounds.js";
+import {
+	DEGRADATION_ENTRIES_PER_KIND,
+	LEDGER_FIELD_MAX,
+	truncateForLedger,
+} from "./ledger-bounds.js";
 import { logLatency } from "./latency-logger.js";
 import {
 	getSinkWriteFailures,
@@ -114,6 +118,17 @@ export type DegradationKind =
 	 * record; the count here is the exact total.
 	 */
 	| "review-graph-snapshot-read"
+	/**
+	 * #2477 round 2: `recordEntitySnapshotDiff` (`clients/review-graph/service.ts`)
+	 * received a non-absolute `filePath`. Every production writer
+	 * (`clients/dispatch/runners/tree-sitter.ts`) passes `ctx.filePath`, which
+	 * `createDispatchContext` guarantees is always absolute (the #2016
+	 * invariant) — this is a caller regression, not a runtime condition, so it
+	 * fires at most once per subject (the offending path) and the diff is
+	 * skipped rather than computed under a key the builder's reader could
+	 * never reach. Subject is the raw (unnormalized) `filePath` received.
+	 */
+	| "review-graph-non-absolute-entity-path"
 	/**
 	 * The project-snapshot persist seam detected durable meta/body evidence
 	 * failing the #2008 integrity gate — the meta's recorded gz size no longer
@@ -584,6 +599,35 @@ export type DegradationKind =
 	 */
 	| "ast-grep-napi-html-script-scan-failed"
 	/**
+	 * A demand for the analyzer bootstrap clients (`clients/bootstrap.ts`)
+	 * could not be served, so the caller PROCEEDED WITHOUT them (#2467). The
+	 * subject is the demand reason — `session-start-scans`,
+	 * `tool-call-complexity-baseline`, … — so the ledger still answers WHICH
+	 * consumer degraded after the bounded records stop; `unavailableReason` in
+	 * the record says which of four SEAM causes fired (the primary session was
+	 * shutting down, the caller's wall-clock ceiling elapsed, the load itself
+	 * rejected, or the strike latch had already closed). A fifth possible
+	 * reason, `aborted` — the caller's OWN signal firing (Escape, a turn
+	 * ending) — is deliberately never written here: that is the caller
+	 * choosing to stop waiting, not the seam degrading, and counting it would
+	 * make a user's cancel read as an unhealthy analyzer graph. Counted rather
+	 * than once-per-session: the load is retried on the next demand, so the
+	 * number of failed demands is the observability question. Fail-open is the
+	 * whole point — without this kind, an analyzer silently not running and an
+	 * analyzer finding nothing read identically (AGENTS.md shape 10).
+	 */
+	| "analyzer-bootstrap-unavailable"
+	/**
+	 * The analyzer bootstrap stopped rebuilding after
+	 * `BOOTSTRAP_FAILURE_STRIKE_LIMIT` consecutive failed loads (#2467 review).
+	 * Recorded ONCE per session, because that is exactly what it reports: a
+	 * state change, not a rate. The per-demand degradations that follow keep
+	 * arriving under `analyzer-bootstrap-unavailable` with
+	 * `unavailableReason: "latched"`, so the ledger still answers both "how
+	 * often did a consumer degrade" and "why did it stop even trying".
+	 */
+	| "analyzer-bootstrap-latched"
+	/**
 	 * A config file the user wrote — or one key inside it — was rejected and
 	 * IGNORED, so pi-lens ran on defaults instead of on what the user asked for
 	 * (#2418). Written only through `warnIgnoredConfigOnce`
@@ -598,7 +642,34 @@ export type DegradationKind =
 	 * observability question, the fact of the ignore is. This is the only kind
 	 * that carries a `code` (`PILENS_CFG_0001`) into the durable row.
 	 */
-	| "config-ignored";
+	| "config-ignored"
+	/**
+	 * A config file location or root key the user wrote is DEPRECATED and was
+	 * still honored (#2426). The deliberate opposite of `config-ignored`: the
+	 * setting applied exactly as written, and the location it was written in is
+	 * on the removal schedule in `DEPRECATED_CONFIG_SURFACES`. Kept as its own
+	 * kind so "how many sessions ran on defaults because a config was rejected"
+	 * stays answerable from the ledger without subtracting deprecations out of
+	 * it. Same producer and same `<file>\0<key>` subject as `config-ignored`,
+	 * one row per `(file, key)` per session, carrying `PILENS_CFG_0002`
+	 * (deprecated key) or `PILENS_CFG_0003` (deprecated file location).
+	 */
+	| "config-deprecated"
+	/**
+	 * A config file's NOTICE LIST was truncated by the per-resolution bound, and
+	 * this row carries how many notices were summarised away (#2426 review round
+	 * 6). Written through `warnIgnoredConfigOnce` like the two kinds above,
+	 * under `PILENS_CFG_0007`, with the same `<file>` subject.
+	 *
+	 * Its own kind because it is a fact about the OUTPUT, not about the config:
+	 * a legacy file whose every setting was applied still overflows the bound,
+	 * and recording that under `config-ignored` — which it did before this kind
+	 * existed — both told the user their valid file was being ignored and made
+	 * "how many sessions ran on defaults because a config was rejected"
+	 * unanswerable, since the ledger could no longer tell a rejection from a
+	 * long list. One row per file per session.
+	 */
+	| "config-notice-suppressed";
 
 export interface DegradationRecord {
 	kind: unknown;
@@ -622,7 +693,7 @@ export interface DegradationGroup {
 	latestReasons: Array<{ subject: string; reason: string }>;
 }
 
-const ENTRIES_PER_KIND = 20;
+const ENTRIES_PER_KIND = DEGRADATION_ENTRIES_PER_KIND;
 const MAX_DISTINCT_KINDS = 32;
 const OVERFLOW_KIND = "other";
 const groups = new Map<
@@ -909,5 +980,9 @@ export function resetDegradationLedger(): void {
 	// life. Deliberate exception to catalog shape 17, not an oversight.
 }
 
-export const DEGRADATION_ENTRIES_PER_KIND = ENTRIES_PER_KIND;
+// Re-exported so every existing importer keeps its specifier. The value now
+// lives in the `ledger-bounds.js` leaf (#2426), so a producer that only needs
+// the BOUND does not have to import the ledger — and cannot be broken by a test
+// that mocks it wholesale.
+export { DEGRADATION_ENTRIES_PER_KIND };
 export const DEGRADATION_MAX_DISTINCT_KINDS = MAX_DISTINCT_KINDS;

@@ -19,6 +19,7 @@
  * usually means something synchronous crept onto the hot path.
  */
 
+import { withResidentBootstrap } from "../support/bootstrap-access.js";
 import * as os from "node:os";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { handleSessionStart } from "../../clients/runtime-session.js";
@@ -61,7 +62,7 @@ function setStartupMode(mode: "full" | "quick"): () => void {
 }
 
 function makeDeps(ctxCwd: string, dbg: (msg: string) => void = () => {}) {
-	return {
+	return withResidentBootstrap({
 		ctxCwd,
 		getFlag: (_name: string) => false,
 		notify: () => {},
@@ -120,7 +121,7 @@ function makeDeps(ctxCwd: string, dbg: (msg: string) => void = () => {}) {
 		cleanStaleTsBuildInfo: () => [],
 		resetDispatchBaselines: () => {},
 		resetLSPService: () => {},
-	} as any;
+	}) as any;
 }
 
 afterEach(() => {
@@ -165,8 +166,6 @@ describe("startup overhead — interactive path regression guard", () => {
 				...makeDeps(env.tmpDir),
 				sessionStartFiredAt: firedAt,
 				handlerEnteredAt: firedAt + 2,
-				bootstrapClientsStartedAt: firedAt,
-				bootstrapClientsDurationMs: 1,
 				sessionReason: "startup",
 				extensionLoadedAt: 100,
 				sessionStartMonotonicAt: 125,
@@ -179,9 +178,13 @@ describe("startup overhead — interactive path regression guard", () => {
 			// #1019: session_start_log_cleanup is intentionally NOT asserted here —
 			// it was deferred off the critical path (setImmediate) and so is not
 			// emitted synchronously within handleSessionStart's awaited chain.
+			// #2467: `bootstrap_clients_load` is no longer emitted from here. The
+			// analyzer graph is not loaded before this handler runs any more, so
+			// nothing on this path can measure it; `clients/bootstrap.ts` emits
+			// the record where the load actually happens, and
+			// `tests/clients/bootstrap-on-demand.test.ts` pins it there.
 			expect([...phases.keys()]).toEqual(
 				expect.arrayContaining([
-					"bootstrap_clients_load",
 					"session_start_prehandler",
 					"session_start_runtime_reset",
 					"session_start_sequence_read",

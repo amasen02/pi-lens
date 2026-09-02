@@ -4,6 +4,7 @@
  * lazy translation-unit indexing.
  */
 
+import { withResidentBootstrap } from "../support/bootstrap-access.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -60,7 +61,7 @@ function makeDeps(
 		ctxCwd?: string;
 	} = {},
 ) {
-	return {
+	return withResidentBootstrap({
 		ctxCwd: overrides.ctxCwd ?? process.cwd(),
 		getFlag: overrides.getFlag ?? (() => false),
 		notify: vi.fn(),
@@ -108,7 +109,7 @@ function makeDeps(
 		cleanStaleTsBuildInfo: () => [],
 		resetDispatchBaselines: () => {},
 		resetLSPService: () => {},
-	} as any;
+	}) as any;
 }
 
 describe("warmFiles session start", () => {

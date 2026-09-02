@@ -4,35 +4,44 @@
  * Allows users to define custom LSP servers and override initialization options
  * for built-in servers via configuration.
  *
- * Config file: .pi-lens/lsp.json (or .pi-lens.json, pi-lsp.json)
+ * CANONICAL LOCATION (#2426): the `lsp` namespace of `.pi-lens.json` (project)
+ * and `~/.pi-lens/config.json` (machine-global). `.pi-lens/lsp.json`,
+ * `pi-lsp.json` and `~/.pi-lens/lsp.json` — and the four LSP keys at the ROOT
+ * of a canonical file — are still read for their deprecation window
+ * (`DEPRECATED_CONFIG_SURFACES`) and emit one migration warning per
+ * `(file, key)` naming where the setting moves. The canonical spelling wins
+ * every collision. `docs/configuration.md` documents the full lookup order;
+ * discovery itself lives in `clients/config-resolve.ts`, which this module and
+ * the other two loaders now share.
  *
- * Example — custom server:
+ * Example — custom server (canonical spelling, inside `.pi-lens.json`):
  * {
- *   "servers": {
- *     "my-server": {
- *       "name": "My Custom LSP",
- *       "extensions": [".myext"],
- *       "command": "my-lsp-server",
- *       "args": ["--stdio"],
- *       "rootMarkers": ["package.json"]
+ *   "lsp": {
+ *     "servers": {
+ *       "my-server": {
+ *         "name": "My Custom LSP",
+ *         "extensions": [".myext"],
+ *         "command": "my-lsp-server",
+ *         "args": ["--stdio"],
+ *         "rootMarkers": ["package.json"]
+ *       }
  *     }
  *   }
  * }
  *
  * Example — override initializationOptions for a built-in server:
  * {
- *   "serverOverrides": {
- *     "rust": {
- *       "initializationOptions": {
- *         "check": { "command": "clippy", "allTargets": true },
- *         "cargo": { "features": "all", "targetDir": true }
- *       }
- *     },
- *     "nix": {
- *       "initializationOptions": {
- *         "nixpkgs": { "expr": "import <nixpkgs> {}" },
- *         "options": {
- *           "home_manager": { "expr": "(builtins.getFlake (toString ./.)).homeConfigurations.me.options" }
+ *   "lsp": {
+ *     "serverOverrides": {
+ *       "rust": {
+ *         "initializationOptions": {
+ *           "check": { "command": "clippy", "allTargets": true },
+ *           "cargo": { "features": "all", "targetDir": true }
+ *         }
+ *       },
+ *       "nix": {
+ *         "initializationOptions": {
+ *           "nixpkgs": { "expr": "import <nixpkgs> {}" }
  *         }
  *       }
  *     }
@@ -47,14 +56,18 @@
  * clients/lsp/server.ts (e.g. "rust", "nix", "bash", "python", "go", "ts").
  */
 
-import {
-	resetIgnoredConfigWarnCache,
-	warnIgnoredConfigOnce,
-} from "../config-warn.js";
-import fs from "node:fs/promises";
+import { resetIgnoredConfigWarnCache } from "../config-warn.js";
+import * as os from "node:os";
 import path from "node:path";
 import { BoundedLruCache } from "../bounded-cache.js";
+import {
+	lspSectionOf,
+	reportConfigReadFailure,
+	reportPiLensConfigRecords,
+	resolvePiLensConfig,
+} from "../config-resolve.js";
 import { getGlobalPiLensDir } from "../file-utils.js";
+import { getPiLensGlobalConfigPath } from "../lens-config.js";
 import { launchLSP } from "./launch.js";
 import {
 	registerSessionRoot,
@@ -113,40 +126,6 @@ interface RegisteredLSPConfig {
 // --- Config Loading ---
 
 /**
- * Project-relative LSP config locations, in precedence order. Exported so the
- * deprecation-window registry test (#2418) can check every deprecated FILE row
- * against the paths actually read, rather than a hand-copied list.
- */
-export const LSP_CONFIG_PATHS = [
-	".pi-lens/lsp.json",
-	".pi-lens.json",
-	"pi-lsp.json",
-] as const;
-
-/** Basename of the machine-global LSP config inside `~/.pi-lens/`. */
-export const GLOBAL_LSP_CONFIG_BASENAME = "lsp.json";
-
-const CONFIG_PATHS = LSP_CONFIG_PATHS;
-
-function warnInvalidLSPConfig(configPath: string, error: unknown): void {
-	// One shared seam for all three config loaders (#2418): it owns the
-	// warn-once latch, the extension.log line, the durable `config-ignored`
-	// ledger row, and the stable-coded user notification. The rendered prose is
-	// unchanged — `ignoring invalid LSP config <path>: <reason>`.
-	//
-	// `{ parseError: error }`, not a pre-stringified message: `error` here is
-	// either a caught `JSON.parse` `SyntaxError` (whose message embeds a
-	// snippet of the source file being parsed on Node >=20, #2431) or a caught
-	// `fs.readFile` error, and `warnIgnoredConfigOnce` is the one seam that
-	// decides how much of either survives into the three sinks it owns.
-	warnIgnoredConfigOnce({
-		subsystem: "lsp-config",
-		file: configPath,
-		reason: { parseError: error },
-	});
-}
-
-/**
  * For tests that need to force the warn-once cache to reset between cases —
  * the LSP loader's counterpart to `resetGlobalConfigWarnCache` in
  * lens-config.ts and to the clear folded into `resetProjectLensConfigCache`
@@ -158,87 +137,85 @@ export function resetLSPConfigWarnCache(): void {
 	resetIgnoredConfigWarnCache("lsp-config");
 }
 
-async function readLSPConfig(
-	configPath: string,
-): Promise<LSPConfig | undefined> {
-	let content: string;
-	try {
-		content = await fs.readFile(configPath, "utf-8");
-	} catch (error) {
-		if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-			return undefined;
-		}
-		warnInvalidLSPConfig(configPath, error);
-		return undefined;
-	}
-
-	try {
-		const parsed = JSON.parse(content) as unknown;
-		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-			throw new TypeError("expected a JSON object");
-		}
-		return parsed as LSPConfig;
-	} catch (error) {
-		warnInvalidLSPConfig(configPath, error);
-		return undefined;
-	}
-}
-
-function mergeLSPConfigs(
-	globalConfig: LSPConfig,
-	projectConfig: LSPConfig,
-): LSPConfig {
-	const merged: LSPConfig = { ...globalConfig, ...projectConfig };
-
-	const servers = { ...globalConfig.servers, ...projectConfig.servers };
-	if (Object.keys(servers).length > 0) merged.servers = servers;
-
-	const serverOverrides = {
-		...globalConfig.serverOverrides,
-		...projectConfig.serverOverrides,
-	};
-	if (Object.keys(serverOverrides).length > 0) {
-		merged.serverOverrides = serverOverrides;
-	}
-
-	if (!Object.hasOwn(projectConfig, "disabledServers")) {
-		merged.disabledServers = globalConfig.disabledServers;
-	}
-	if (!Object.hasOwn(projectConfig, "warmFiles")) {
-		merged.warmFiles = globalConfig.warmFiles;
-	}
-
-	return merged;
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+	return value && typeof value === "object" && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: undefined;
 }
 
 /**
- * Load LSP configuration, with project settings overriding machine-global
- * settings from ~/.pi-lens/lsp.json.
+ * Load LSP configuration — a PROJECTION of the one resolved pi-lens config.
+ *
+ * Everything that used to be here (the candidate list, the unbounded upward
+ * walk, the two-object merge with its four hand-patched keys) now lives in
+ * `config-resolve.ts` and applies identically to the other two loaders. What is
+ * left is the projection: pick the `lsp` section out of the resolved value and
+ * shape it into `LSPConfig`.
+ *
+ * Three behaviors changed with the move, all of them deliberate and all of them
+ * pinned by `tests/clients/config-golden-layouts.test.ts`:
+ *
+ * 1. THE WALK IS CEILING-BOUNDED. It used to run to the filesystem root with no
+ *    `$HOME` stop, so a `pi-lsp.json` in the user's home directory was adopted
+ *    by every project on the machine (#622/#625's class, and #2426's one
+ *    outright bug fix rather than deprecation).
+ * 2. THE CANONICAL FILE WINS. `.pi-lens.json` used to LOSE to a leftover
+ *    `.pi-lens/lsp.json` in the same directory, which made the migration users
+ *    are now being asked to perform impossible to complete.
+ * 3. NESTED CONFIGS LAYER instead of the nearest one winning wholesale, which
+ *    is the same nearest-wins-per-field rule `.pi-lens.json`'s `ignore` has had
+ *    since #783.
+ *
+ * `homeDir` is a test seam only, matching `findNestedProjectMutationValue`'s.
  */
-export async function loadLSPConfig(cwd: string): Promise<LSPConfig> {
-	let projectConfig: LSPConfig | undefined;
-	let dir = path.resolve(cwd);
-	while (true) {
-		for (const configPath of CONFIG_PATHS) {
-			const fullPath = path.join(dir, configPath);
-			const config = await readLSPConfig(fullPath);
-			if (config) {
-				projectConfig = config;
-				break;
-			}
-		}
-		if (projectConfig) break;
+export async function loadLSPConfig(
+	cwd: string,
+	homeDir: string = os.homedir(),
+): Promise<LSPConfig> {
+	const resolution = resolvePiLensConfig({
+		cwd,
+		globalDir: getGlobalPiLensDir(),
+		// `homeDir` is threaded, not dropped: it is the `$HOME` this call resolves
+		// against, and the canonical global config is `$HOME/.pi-lens/config.json`
+		// whenever `PI_LENS_CONFIG_PATH` does not override it. Production behavior
+		// is unchanged (the default IS `os.homedir()`); what it buys is that the
+		// seam means the same `$HOME` on both sides of the resolution, so a test
+		// can exercise a relocated `PI_LENS_HOME` without reaching the real one.
+		globalConfigPath: getPiLensGlobalConfigPath(homeDir),
+		homeDir,
+		// The subsystem comes from the failing DOCUMENT, not from this loader
+		// (#2445). This resolution opens `~/.pi-lens/config.json` and
+		// `.pi-lens.json` as well as the LSP-scoped files, and reporting all of
+		// them as `lsp-config` announced an "invalid LSP config" for a file whose
+		// contents are pi-lens settings. An LSP-scoped file still reports here.
+		onReadError: reportConfigReadFailure,
+	});
+	// EVERY record this resolution produced (#2426 review round 3, F1) — not
+	// filtered to what this loader "owns". `reportPiLensConfigRecords` derives
+	// the reporting subsystem per record; the warn-once latch collapses this
+	// loader's report with the pi-lens loaders' report of the SAME record into
+	// one notice. Filtering here (as round 2 did) silently dropped a pi-lens-
+	// owned record from a document only this multi-file resolution discovered.
+	reportPiLensConfigRecords(resolution.records);
 
-		const parent = path.dirname(dir);
-		if (parent === dir) break;
-		dir = parent;
+	const section = lspSectionOf(resolution.value);
+	const config: LSPConfig = {};
+	const servers = asRecord(section.servers);
+	if (servers) config.servers = servers as Record<string, CustomServerConfig>;
+	const serverOverrides = asRecord(section.serverOverrides);
+	if (serverOverrides) {
+		config.serverOverrides = serverOverrides as Record<
+			string,
+			ServerInitOverride
+		>;
 	}
-
-	const globalConfig =
-		(await readLSPConfig(
-			path.join(getGlobalPiLensDir(), GLOBAL_LSP_CONFIG_BASENAME),
-		)) ?? {};
-	return mergeLSPConfigs(globalConfig, projectConfig ?? {});
+	if (Array.isArray(section.disabledServers)) {
+		config.disabledServers = section.disabledServers as string[];
+	}
+	if (Array.isArray(section.warmFiles)) {
+		config.warmFiles = section.warmFiles as string[];
+	}
+	return config;
 }
 
 // --- Custom Server Factory ---

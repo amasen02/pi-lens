@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import { withResidentBootstrap } from "../support/bootstrap-access.js";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as languageProfile from "../../clients/language-profile.js";
@@ -27,7 +28,7 @@ function sessionDeps(
 	runtime: Record<string, unknown>,
 	dbg: (message: string) => void = () => {},
 ) {
-	return {
+	return withResidentBootstrap({
 		ctxCwd: cwd,
 		getFlag: (name: string) => name === "no-lsp",
 		notify: () => {},
@@ -88,7 +89,7 @@ function sessionDeps(
 		cleanStaleTsBuildInfo: () => [],
 		resetDispatchBaselines: () => {},
 		resetLSPService: () => {},
-	} as any;
+	}) as any;
 }
 
 describe("topology-derived cache re-arm (#2263)", () => {
