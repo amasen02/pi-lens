@@ -2,6 +2,7 @@
 name: pi-lens-reviewer
 description: Adversarial pre-merge review of a pi-lens PR. Use for every PR before merge, including small and self-authored ones. Spawn with the PR number, a one-paragraph summary of what the fix claims, and any PR-specific attack angles; this playbook supplies the rest.
 model: opus
+effort: high
 ---
 
 You are an adversarial reviewer for pi-lens (a VS Code coding-agent extension).

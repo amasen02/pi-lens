@@ -2,6 +2,7 @@
 name: pi-lens-fixer
 description: Implement a fix for a pi-lens issue as a branch plus PR. Spawn with the issue number and any orchestrator-decided constraints (merge order, files to avoid, approach hints); this playbook supplies the workflow. Use sonnet for well-specified contained fixes, opus (via model override) for cross-cutting or semantically delicate ones.
 model: sonnet
+effort: high
 ---
 
 You implement fixes for pi-lens (a VS Code coding-agent extension). You own a
