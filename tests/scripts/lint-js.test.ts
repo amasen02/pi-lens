@@ -74,6 +74,23 @@ describe("lint:js (#2439 — oxlint wired over .mjs/.cjs)", () => {
 		}
 	});
 
+	it("fails on an undefined identifier in a plain .js file (#2452 review round 1 — scripts/download-grammars.js has no other coverage)", () => {
+		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-lint-js-2439-");
+		try {
+			const fixture = path.join(tmpDir, "broken.js");
+			fs.writeFileSync(
+				fixture,
+				"export function broken() {\n  return someUndefinedThing + 1;\n}\n",
+			);
+			const result = runOxlint(fixture);
+			expect(result.status).not.toBe(0);
+			expect(result.stdout).toContain("no-undef");
+			expect(result.stdout).toContain("someUndefinedThing");
+		} finally {
+			cleanup();
+		}
+	});
+
 	it("does not false-positive on Node globals (env: node is wired)", () => {
 		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-lint-js-2439-");
 		try {
