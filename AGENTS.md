@@ -1731,14 +1731,18 @@ activity signal must be proven unchanged across a `git status` before it is
 added to that list; the reflog is read for its recorded ENTRY time, not its
 mtime, so copying a tree cannot forge freshness.
 
-**Who removes what.** `SubagentStop` NEVER removes a worktree: resume-by-
-SendMessage happens after that hook fires, and a fixer's worktree has to
-survive until its PR merges (`.claude/skills/merge-train/SKILL.md`). It runs
-only the orphan-fixture sweep, scoped to that agent's own tree, and does
-nothing at all without a usable `agent_id`. Removal belongs to `SessionStart`
-(default 30m min-age, at most ONE tree per run so the removal fits inside the
-90s hook timeout — `git worktree remove` is itself bounded at 60s with
-SIGKILL) and to a manual `npm run hygiene`. The `SessionStart` registration
+**Who removes what.** `SubagentStop` as REGISTERED never removes a worktree:
+resume-by-SendMessage happens after that hook fires, and a fixer's worktree
+has to survive until its PR merges (`.claude/skills/merge-train/SKILL.md`). It
+runs only the orphan-fixture sweep, scoped to that agent's own tree. The one
+exception is an explicit `--hook subagent-stop --only <tree>`, which removes
+exactly the trees it names under the unchanged dirty/unpushed rails (#2486);
+the registered hook line passes no `--only`, so the rule above still holds for
+every automatic run, and an `--only` run gets the manual budget because it is
+always a human or an orchestrator at a terminal. Removal belongs otherwise to
+`SessionStart` (default 30m min-age, at most ONE tree per run so the removal
+fits inside the 90s hook timeout — `git worktree remove` is itself bounded at
+60s with SIGKILL) and to a manual `npm run hygiene`. The `SessionStart`
 carries `"matcher": "startup|resume"`, so the sweep runs when a session begins
 or resumes and NOT on `/clear`, compaction or a fork — without it a long
 session re-ran the whole sweep every time it auto-compacted, roughly every
@@ -1754,6 +1758,34 @@ truncated listing would read every live helper as an orphan: the sweep
 refuses to run unless the listing exited 0 and contains this process plus
 every ancestor that is still alive, and records `hygiene.scan-degraded`
 instead of quietly killing nothing.
+
+EVERY invocation also writes exactly one `hygiene.run` record — `fired`, or
+`skipped` with a reason from `RUN_SKIP_REASONS` (#2486). Both hooks are
+`--quiet` and Claude Code discards their stderr, so before that an early
+return was indistinguishable from a hook that never fired: ten finished
+agents' trees accumulated behind a ledger that said nothing at all. The two
+skip reasons are kept apart on purpose — `no-agent-id` (no `agent_id` on
+stdin) versus `agent-worktree-missing` (a perfectly good `agent_id` whose
+`.claude/worktrees/agent-<id>` does not exist, which is the ORDINARY case
+because most subagents are not worktree-isolated).
+
+A worktree removal is INDEPENDENT of the process listing. The listing feeds
+only the orphan sweep and the kill-what-holds-the-tree step; when it fails or
+is skipped, both degrade visibly and the removal still runs. Budgets come from
+the timeouts registered in `.claude/settings.json` (`HOOK_TIMEOUT_MS`, pinned
+to that file by a conformance test): `hookBudgetMs` gives SessionStart
+`90s - 60s removal reserve - 5s margin = 25s` and a bare SubagentStop
+`15s - 5s = 10s`, floored at `DEFAULT_HOOK_BUDGET_MS` (2s) for an unregistered
+event. The process listing has its own ceiling, `DEFAULT_SCAN_TIMEOUT_MS` =
+4000ms against a measured 584/651/707ms min/median/max for a 467-row Windows
+listing, overridable with `--scan-timeout-ms` so a short listing ceiling can
+never squeeze the `git` calls that decide whether a tree is removable.
+
+The SubagentStop payload is Claude Code's contract, not ours: `agent_id` is
+required on that event and a managed agent worktree is named `agent-<agentId>`
+(read from the shipped binary, per defect shape 16 — never paraphrased from
+docs). There is no worktree-path field on the event, so the derived path is
+verified on disk before the sweep acts on it.
 
 Whole-project loops that reuse one `FactStore` must delete `file.content` after
 that file's consumers finish (in a `finally` so abort/error exits release it).
