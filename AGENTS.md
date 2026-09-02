@@ -2548,7 +2548,16 @@ autofix pass, the safe timing, and its changes get their own
 The write-side counterpart of the read bridge is `clients/mutation-bridge.ts`:
 an in-process producer that writes a file outside the tool-event path calls
 `recordMutation` at `Symbol.for("pi-lens:mutation-bridge")` and gets the same
-bookkeeping; `ast_grep_replace apply:true` is the in-repo consumer.
+bookkeeping; `ast_grep_replace apply:true` is the in-repo consumer. The entry
+carries two optional producer-stated fields the seam otherwise cannot infer:
+`importsChanged` (gates the madge re-scan filter, default `false` — the safe
+prior behavior every existing producer keeps) and `deferAutofix` (queues a
+deferred autofix/format pass at `agent_settled`, default `true`). A second
+in-repo consumer, `clients/lsp-mutation.ts`'s `bookkeepLspMutation`, calls the
+bridge as ITS OWN internal fallback (never a parallel seam other code reaches
+for) when its own caller could not thread `runtime`/`cacheManager` — it
+passes the real `importsChanged` value and `deferAutofix: false`, since the
+LSP direct path never defers a format pass either (#2450).
 `tests/clients/mutating-tool-classification.test.ts` greps `clients/`, `tools/`
 and `index.ts` and fails when a mutation decision reappears outside the seam —
 `===`/`!==`/`==`/`!=` against `"write"`/`"edit"`/`"multiedit"` (any
