@@ -161,7 +161,7 @@ export class TreeCache {
 		counterObserver?: TreeCacheCounterObserver,
 		treeErrorObserver?: (error: unknown) => void,
 	) {
-		this.cache.setMaxEntries(maxSize);
+		this.cache.setMaxEntries(Math.max(1, Math.floor(maxSize)));
 		this.evictionHistoryMax = Math.max(1, Math.floor(evictionHistoryMax));
 		this.recentlyEvicted = new BoundedFifoMap<string, string>(
 			this.evictionHistoryMax,

@@ -480,6 +480,20 @@ describe("TreeCache capacity growth for scan working sets (#1715)", () => {
 		expect(cache.get(fileC, "c", "typescript")).toBe(c);
 	});
 
+	it("constructor floors maxSize at 1 (0 does not evict the just-inserted tree, #2442 round-3 F1)", async () => {
+		const env = setupTestEnvironment("pi-lens-tccache-zerofloor-");
+		cleanups.push(env.cleanup);
+		const fileA = createTempFile(env.tmpDir, "a.ts", "a");
+		const cache = new TreeCache(0);
+		const a = fakeTree();
+		cache.set(fileA, "a", "typescript", a);
+		await flushRetiredTrees();
+
+		expect(cache.getStats().maxSize).toBe(1);
+		expect(a.delete).not.toHaveBeenCalled();
+		expect(cache.get(fileA, "a", "typescript")).toBe(a);
+	});
+
 	it("after growing to span the working set, a second identical scan sees zero capacityMisses", () => {
 		const env = setupTestEnvironment("pi-lens-tccache-scanreuse-");
 		cleanups.push(env.cleanup);
