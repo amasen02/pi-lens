@@ -115,6 +115,17 @@ export type DegradationKind =
 	 */
 	| "review-graph-snapshot-read"
 	/**
+	 * #2477 round 2: `recordEntitySnapshotDiff` (`clients/review-graph/service.ts`)
+	 * received a non-absolute `filePath`. Every production writer
+	 * (`clients/dispatch/runners/tree-sitter.ts`) passes `ctx.filePath`, which
+	 * `createDispatchContext` guarantees is always absolute (the #2016
+	 * invariant) — this is a caller regression, not a runtime condition, so it
+	 * fires at most once per subject (the offending path) and the diff is
+	 * skipped rather than computed under a key the builder's reader could
+	 * never reach. Subject is the raw (unnormalized) `filePath` received.
+	 */
+	| "review-graph-non-absolute-entity-path"
+	/**
 	 * The project-snapshot persist seam detected durable meta/body evidence
 	 * failing the #2008 integrity gate — the meta's recorded gz size no longer
 	 * matches the on-disk body (torn/truncated gzip under an intact meta), or a

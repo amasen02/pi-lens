@@ -29,7 +29,6 @@ import {
 } from "../lsp-document-symbols.js";
 import type { LSPSymbol } from "../lsp/client.js";
 import {
-	combineCwdScopedKey,
 	isAtOrAboveHomeDir,
 	normalizeFilePath,
 	normalizeMapKey,
@@ -3662,19 +3661,13 @@ function localImportToFile(
 function upsertChangedSymbols(
 	graph: ReviewGraph,
 	facts: FactStore,
-	normalizedCwd: string,
 	filePath: string,
 ): void {
 	// #260: tests aren't in the graph, so don't track their changed symbols.
 	if (detectFileRole(filePath) === "test") return;
 	const normalized = normalizeMapKey(filePath);
-	// Read the SAME cwd+path-folded key `recordEntitySnapshotDiff`
-	// (clients/review-graph/service.ts) writes (#2477) — `normalizedCwd` must
-	// already be `normalizeMapKey`-normalized by every caller. This runs inside
-	// a per-file loop over a stable cwd, so re-normalizing the cwd here (instead
-	// of once per build) would be the shape-1 "path-keyed map" multiplier.
 	const changed = facts.getBoundedSessionFact<string[]>(
-		`${CHANGED_SYMBOLS_PREFIX}${combineCwdScopedKey(normalizedCwd, normalized)}`,
+		`${CHANGED_SYMBOLS_PREFIX}${normalized}`,
 	);
 	if (changed && changed.length > 0) {
 		graph.changedSymbolsByFile.set(normalized, [...changed]);
@@ -4831,7 +4824,6 @@ function importTargetsForFile(graph: ReviewGraph, filePath: string): string[] {
 async function updateGraphFiles(
 	graph: ReviewGraph,
 	cwd: string,
-	normalizedCwd: string,
 	files: string[],
 	facts: FactStore,
 	ignoredIds?: ReadonlySet<string>,
@@ -4871,7 +4863,7 @@ async function updateGraphFiles(
 	resolveDeferredSymbolEdges(graph, false);
 	graph.changedSymbolsByFile.clear();
 	for (const file of files) {
-		upsertChangedSymbols(graph, facts, normalizedCwd, file);
+		upsertChangedSymbols(graph, facts, file);
 	}
 	return prior.map(({ filePath, existedBefore, priorTargets }) => ({
 		filePath,
@@ -5073,7 +5065,7 @@ async function tryIncrementalFromCache(
 		rebuildIndexes(graph);
 		graph.changedSymbolsByFile.clear();
 		for (const file of ctx.normalizedChanged) {
-			upsertChangedSymbols(graph, ctx.facts, ctx.normalizedCwd, file);
+			upsertChangedSymbols(graph, ctx.facts, file);
 		}
 		setWorkspaceGraph(
 			ctx.normalizedCwd,
@@ -5110,7 +5102,6 @@ async function tryIncrementalFromCache(
 	const importChanges = await updateGraphFiles(
 		graph,
 		ctx.cwd,
-		ctx.normalizedCwd,
 		filesToUpdate,
 		ctx.facts,
 		ctx.ignoredIds,
@@ -5275,7 +5266,7 @@ async function trySeqFastpath(
 		rebuildIndexes(graph);
 		graph.changedSymbolsByFile.clear();
 		for (const file of normalizedChanged) {
-			upsertChangedSymbols(graph, facts, normalizedCwd, file);
+			upsertChangedSymbols(graph, facts, file);
 		}
 		// Stamp the seq captured at BUILD START — a bump that raced in during this
 		// build has seq > stamp and is re-diffed next build, never missed.
@@ -5311,7 +5302,6 @@ async function trySeqFastpath(
 		importChanges = await updateGraphFiles(
 			graph,
 			cwd,
-			normalizedCwd,
 			filesToUpdate,
 			facts,
 			ignoredIds,
@@ -5418,7 +5408,7 @@ async function _doBuildGraph(
 	if (isAtOrAboveHomeDir(path.resolve(cwd))) {
 		const graph = createEmptyGraph();
 		for (const file of normalizedChanged) {
-			upsertChangedSymbols(graph, facts, normalizedCwd, file);
+			upsertChangedSymbols(graph, facts, file);
 		}
 		setGraphBuildInfo(graph, {
 			reused: false,
@@ -5477,7 +5467,7 @@ async function _doBuildGraph(
 		graph.version = REVIEW_GRAPH_VERSION;
 		graph.builtAt = new Date().toISOString();
 		for (const file of normalizedChanged) {
-			upsertChangedSymbols(graph, facts, normalizedCwd, file);
+			upsertChangedSymbols(graph, facts, file);
 		}
 		// #782: record a TTL'd verdict so getCachedReviewGraph can stop serving
 		// any graph cached/persisted from before the repo crossed the cap, and so
@@ -5573,7 +5563,7 @@ async function _doBuildGraph(
 		rebuildIndexes(graph);
 		graph.changedSymbolsByFile.clear();
 		for (const file of normalizedChanged) {
-			upsertChangedSymbols(graph, facts, normalizedCwd, file);
+			upsertChangedSymbols(graph, facts, file);
 		}
 		// #451: a signature-matching hit means the walk+stat just confirmed nothing
 		// changed — a legitimate full verify. Refresh the clock/counter and seq so a
@@ -5624,7 +5614,7 @@ async function _doBuildGraph(
 		rebuildIndexes(graph);
 		graph.changedSymbolsByFile.clear();
 		for (const file of normalizedChanged) {
-			upsertChangedSymbols(graph, facts, normalizedCwd, file);
+			upsertChangedSymbols(graph, facts, file);
 		}
 		// #459: disk-hydrated content is new to THIS process — fresh stamp (a prior
 		// process's derived caches don't exist here; in-process derived caches from
@@ -5729,7 +5719,7 @@ async function _doBuildGraph(
 			}
 			await addFileToGraph(graph, cwd, file, facts, ignoredIds, content);
 			if (normalizedChangedSet.has(file)) {
-				upsertChangedSymbols(graph, facts, normalizedCwd, file);
+				upsertChangedSymbols(graph, facts, file);
 			}
 			extractedCount++;
 			filesSinceCheckpoint++;
@@ -5816,7 +5806,7 @@ async function _doBuildGraph(
 	if (resumed) {
 		for (const file of normalizedChangedSet) {
 			if (resumed.fileHashes.has(file)) {
-				upsertChangedSymbols(graph, facts, normalizedCwd, file);
+				upsertChangedSymbols(graph, facts, file);
 			}
 		}
 	}

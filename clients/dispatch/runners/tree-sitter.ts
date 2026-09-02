@@ -692,12 +692,7 @@ const treeSitterRunner: RunnerDefinition = {
 					languageId,
 					contentOverride,
 				);
-				const diff = recordEntitySnapshotDiff(
-					ctx.facts,
-					ctx.cwd,
-					filePath,
-					snapshot,
-				);
+				const diff = recordEntitySnapshotDiff(ctx.facts, filePath, snapshot);
 				const changedEntityKeys = [
 					...diff.added,
 					...diff.modified,
