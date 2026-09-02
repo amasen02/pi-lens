@@ -21,6 +21,9 @@
  * write (last-writer-wins), matching a plain `Map`'s "the key you set is the
  * key you see" intuition while still de-duplicating by normalized identity.
  *
+ * Optionally BOUNDED: pass `maxEntries` and the backing store becomes a
+ * `BoundedFifoMap` (see the constructor). Unbounded by default.
+ *
  * Choose the normalizer to match how the keyed state is used:
  *  - `normalizeEphemeralMapKey` (path-utils.ts) — cheap slash-fold +
  *    win32-lowercase, NO filesystem I/O — for hot, single-process, in-memory
@@ -28,10 +31,52 @@
  *  - `normalizeMapKey` — realpath-canonicalizing — for long-lived state shared
  *    across call sites where symlink/real-casing resolution matters.
  */
-export class PathKeyedMap<V> {
-	private readonly store = new Map<string, { displayPath: string; value: V }>();
+import { BoundedFifoMap } from "./bounded-cache.js";
 
-	constructor(private readonly normalize: (p: string) => string) {}
+/**
+ * The slice of `Map` this class actually uses, so the backing store can be
+ * either a plain `Map` (unbounded) or a `BoundedFifoMap` (bounded) without
+ * either leaking into the public surface. `set` is declared `void` — the two
+ * implementations return different things (`this` vs the evicted pairs) and
+ * neither is this class's to hand out; TypeScript's void-return assignability
+ * rule accepts both.
+ */
+interface PathKeyedStore<E> {
+	get(key: string): E | undefined;
+	has(key: string): boolean;
+	set(key: string, value: E): void;
+	delete(key: string): boolean;
+	clear(): void;
+	readonly size: number;
+	values(): IterableIterator<E>;
+	[Symbol.iterator](): IterableIterator<[string, E]>;
+}
+
+export class PathKeyedMap<V> {
+	private readonly store: PathKeyedStore<{ displayPath: string; value: V }>;
+
+	/**
+	 * `maxEntries` bounds the map with insertion-order (FIFO) eviction, on
+	 * `BoundedFifoMap` — the repo's one eviction implementation (#2442). Omit
+	 * it for an unbounded map. A path-keyed map that needs a bound gets it
+	 * here rather than hand-rolling `keys().next().value` at the call site,
+	 * which is what `PartialApplyRecordStore` did before #2442's review round.
+	 *
+	 * FIFO, not LRU, and evicting AFTER the write, not before: a `set` of an
+	 * already-resident path is an update, and must not drop an unrelated file
+	 * to make room for a key that needs none.
+	 */
+	constructor(
+		private readonly normalize: (p: string) => string,
+		maxEntries?: number,
+	) {
+		this.store =
+			maxEntries === undefined
+				? new Map()
+				: new BoundedFifoMap<string, { displayPath: string; value: V }>(
+						maxEntries,
+					);
+	}
 
 	get size(): number {
 		return this.store.size;

@@ -308,6 +308,29 @@ describe("GenerationMap — keyed independence", () => {
 		expect(hot.guardedWrite("entry", () => "wrote")).toBeUndefined();
 	});
 
+	it("a current() read never reorders eviction order (red on an accidental LRU substitution)", () => {
+		// #2442 review F4: the eviction tests above only ever read a key AFTER
+		// it was evicted, so they passed whether the underlying BoundedFifoMap
+		// was FIFO or LRU. `current(key)` is a real production read —
+		// `stamps.get(normalizedKey)` — so reading the OLDEST key before the
+		// overflow write is what discriminates the two.
+		const map = createGenerationMap("keyed-store", { maxKeys: 2 });
+		map.bump("/repo/oldest");
+		map.bump("/repo/newer");
+
+		// The production read, on the oldest key, before the overflow.
+		expect(map.current("/repo/oldest")).toBeGreaterThan(0);
+
+		map.bump("/repo/overflow");
+
+		expect(map.size()).toBe(2);
+		// FIFO: the read did not promote /repo/oldest, so it is still the one
+		// evicted and now reads the reserved 0. Under an LRU substitution both
+		// assertions flip — /repo/oldest survives and /repo/newer is evicted.
+		expect(map.current("/repo/oldest")).toBe(0);
+		expect(map.current("/repo/newer")).toBeGreaterThan(0);
+	});
+
 	it("fails closed for an evicted key that was bumped before eviction too", () => {
 		const map = createGenerationMap("keyed-store", { maxKeys: 2 });
 		map.capture("/repo/hot");

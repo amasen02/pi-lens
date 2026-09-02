@@ -51,6 +51,7 @@
  * path exists at all.
  */
 
+import { BoundedFifoMap } from "./bounded-cache.js";
 import { incrementDegradationCount } from "./degradation-ledger.js";
 
 /**
@@ -265,7 +266,7 @@ export function createGenerationMap(
 	// Insertion-ordered: the oldest key is evicted first. Re-stamping a key
 	// refreshes its position so a hot cwd is not evicted by a burst of
 	// one-shot ones.
-	const stamps = new Map<string, number>();
+	const stamps = new BoundedFifoMap<string, number>(maxKeys);
 	// ONE ticket counter for the whole map. See GenerationMap's doc comment:
 	// per-key counters starting at 0 make eviction and forget() fail OPEN.
 	// 0 is reserved for "this key holds no stamp" and is never issued.
@@ -280,13 +281,8 @@ export function createGenerationMap(
 	function issue(key: string): number {
 		nextTicket += 1;
 		stamps.delete(key);
-		stamps.set(key, nextTicket);
-		while (stamps.size > maxKeys) {
-			const oldest = stamps.keys().next().value;
-			if (oldest === undefined) break;
-			stamps.delete(oldest);
-			invalidations += 1;
-		}
+		const evicted = stamps.set(key, nextTicket);
+		invalidations += evicted.length;
 		return nextTicket;
 	}
 
