@@ -429,8 +429,8 @@ describe("consumer projections track the registry", () => {
 			expect(extensionsForLanguageToken("haskell")).toEqual(
 				extensionsForLanguage("haskell"),
 			);
-			// Id-derived sets keep the entry's declaration order; grammar-derived
-			// ones are deduped and sorted (two entries can share a grammar).
+			// Both halves answer in the registry's declaration order, deduped —
+			// never re-sorted, so no locale can reorder a frozen table.
 			expect(extensionsForLanguageToken("scala")).toEqual([".scala", ".sc"]);
 			// An unknown token selects nothing rather than everything.
 			expect(extensionsForLanguageToken("solidity")).toEqual([]);
@@ -497,10 +497,10 @@ describe("consumer projections track the registry", () => {
 			// Widened: the registry owns php's four alias extensions.
 			expect(extensionsForLanguageToken("php")).toEqual([
 				".php",
+				".phtml",
 				".php3",
 				".php4",
 				".php5",
-				".phtml",
 			]);
 			// Widened: the registry owns .ru (Rack config).
 			expect(extensionsForLanguageToken("ruby")).toContain(".ru");

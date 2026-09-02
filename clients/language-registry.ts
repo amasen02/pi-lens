@@ -544,6 +544,12 @@ export function extensionsForLanguage(id: string): readonly string[] {
  * symbols is invisible, while under-including one hides real hits.
  * `clients/lens-engine.ts`'s symbol_search `lang` filter projects this (#2424
  * review, S2).
+ *
+ * Order is the registry's own declaration order, deduped — the same order
+ * {@link extensionsForLanguage} returns, so the two halves of
+ * {@link extensionsForLanguageToken} answer alike. Deliberately NOT `.sort()`:
+ * a locale-sensitive comparator over strings carrying `+` and `.` (`.c++` vs
+ * `.cc`) would make a frozen table's contents depend on the host's ICU data.
  */
 export const GRAMMAR_TO_EXTENSIONS: Readonly<
 	Record<string, readonly string[]>
@@ -559,7 +565,7 @@ export const GRAMMAR_TO_EXTENSIONS: Readonly<
 		return Object.fromEntries(
 			[...byGrammar].map(([grammar, extensions]) => [
 				grammar,
-				Object.freeze([...new Set(extensions)].sort()),
+				Object.freeze([...new Set(extensions)]),
 			]),
 		);
 	})(),
