@@ -31,15 +31,8 @@
  * tests/clients/lsp/kill-process-tree.test.ts instead).
  */
 
-import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const FAKE_SERVER_PATH = path.join(
-	__dirname,
-	"../../fixtures/fake-lsp-server.mjs",
-);
+import { spawnFakeLspServer } from "../../support/fake-lsp-server.js";
 
 const describeOrSkip = process.platform === "win32" ? describe.skip : describe;
 
@@ -49,9 +42,8 @@ describeOrSkip(
 		it("does not re-send SIGKILL once killProcessTree's own SIGTERM has already ended the process", async () => {
 			const { createLSPClient } =
 				await import("../../../clients/lsp/client.js");
-			const { launchLSP } = await import("../../../clients/lsp/launch.js");
 
-			const proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+			const proc = await spawnFakeLspServer({
 				cwd: process.cwd(),
 				env: { ...process.env, FAKE_LSP_IGNORE_INITIALIZE: "1" },
 			});

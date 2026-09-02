@@ -6,7 +6,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 
 import {
@@ -20,8 +20,9 @@ import {
 	type LSPClientState,
 	MAX_INCREMENTAL_TEXT_RETAINED_ENTRIES,
 } from "../../../clients/lsp/client.js";
-import { launchLSP, stopLSP } from "../../../clients/lsp/launch.js";
+import { stopLSP } from "../../../clients/lsp/launch.js";
 import { normalizeMapKey } from "../../../clients/path-utils.js";
+import { spawnFakeLspServer } from "../../support/fake-lsp-server.js";
 import {
 	createWorkspaceDiagnosticsCacheContext,
 	loadWorkspaceDiagnosticsCache,
@@ -38,11 +39,6 @@ import { suspendAt } from "../interleaving-kit.js";
 
 const TEST_FILE = "/project/app.ts";
 const TEST_KEY = normalizeMapKey(TEST_FILE);
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const FAKE_SERVER_PATH = path.join(
-	__dirname,
-	"../../fixtures/fake-lsp-server.mjs",
-);
 
 describe("workspace/diagnostic/refresh handler (#1669)", () => {
 	it("registers a handler that replies null and clears workspacePullResultCache", async () => {
@@ -1443,7 +1439,7 @@ describe("createWorkspaceDiagnosticsCacheContext.lookup() honors a mid-sweep cle
 // itself, not just `buildContentChanges` in isolation, drives production.
 describe("negotiateSyncKind through the real createLSPClient init path (#1669 review F5)", () => {
 	it("a server advertising Incremental sync gets a ranged didChange on the wire", async () => {
-		const proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+		const proc = await spawnFakeLspServer({
 			cwd: process.cwd(),
 			env: {
 				...process.env,
@@ -1489,7 +1485,7 @@ describe("negotiateSyncKind through the real createLSPClient init path (#1669 re
 	}, 15_000);
 
 	it("a server advertising Full sync (the fixture's default) gets a whole-document didChange", async () => {
-		const proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+		const proc = await spawnFakeLspServer({
 			cwd: process.cwd(),
 			env: { ...process.env, FAKE_LSP_ECHO_DID_CHANGE: "1" },
 		});
@@ -1534,7 +1530,7 @@ describe("negotiateSyncKind through the real createLSPClient init path (#1669 re
 describe("#2065 fix round 1 F1: a crashed client deregisters from activeLspClients", () => {
 	it("stops counting a client's retained text once its process is killed, without a graceful shutdown() call", async () => {
 		const before = getLspDocumentTextRetentionSnapshot();
-		const proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+		const proc = await spawnFakeLspServer({
 			cwd: process.cwd(),
 			env: { ...process.env, FAKE_LSP_SYNC_KIND: "2" }, // Incremental
 		});

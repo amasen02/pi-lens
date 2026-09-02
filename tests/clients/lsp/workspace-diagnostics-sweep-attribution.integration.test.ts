@@ -10,6 +10,7 @@ import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { waitFor } from "../interleaving-kit.js";
+import { spawnFakeLspServer } from "../../support/fake-lsp-server.js";
 import { removeTempDirSync } from "../test-utils.js";
 
 const getServersForFileWithConfig = vi.fn();
@@ -18,8 +19,6 @@ vi.mock("../../../clients/lsp/config.js", () => ({
 	getServersForFileWithConfig,
 	getServerInitOverride: vi.fn().mockReturnValue(undefined),
 }));
-
-const FAKE_SERVER_PATH = path.resolve("tests/fixtures/fake-lsp-server.mjs");
 
 describe("runWorkspaceDiagnostics sweep bracket on the real wire (#2332)", () => {
 	let root: string;
@@ -37,7 +36,6 @@ describe("runWorkspaceDiagnostics sweep bracket on the real wire (#2332)", () =>
 		fs.writeFileSync(file, "export const subject = 1;\n");
 		process.env.PI_LENS_LSP_WORKSPACE_PULL = "1";
 
-		const { launchLSP } = await import("../../../clients/lsp/launch.js");
 		getServersForFileWithConfig.mockReturnValue([
 			{
 				id: "typescript",
@@ -45,7 +43,7 @@ describe("runWorkspaceDiagnostics sweep bracket on the real wire (#2332)", () =>
 				extensions: [".ts"],
 				root: async () => root,
 				spawn: async () => ({
-					process: await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+					process: await spawnFakeLspServer({
 						cwd: root,
 						env: {
 							...process.env,

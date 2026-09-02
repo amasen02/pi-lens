@@ -1,6 +1,58 @@
 // Minimal JSON-RPC 2.0 LSP fake server over stdio
 // Used for integration tests — speaks real LSP protocol without actual language smarts
 
+// #2436: parent-death watchdog. A test that spawns this fixture and then
+// dies without running its own cleanup (a SIGKILLed vitest worker fork, a
+// `--force` worktree removal) must not leave this process running forever —
+// a real orphan was found on disk an hour after its parent process no
+// longer existed, holding its worktree directory open. Two independent
+// triggers, because neither alone covers every real teardown shape:
+//
+//   - stdin EOF: the parent's write end of this process's stdio pipe closes
+//     the instant the parent's file descriptors are torn down — true
+//     whether it exits cleanly, crashes, or is SIGKILLed (the OS closes a
+//     dead process's handles/fds unconditionally, pipes included). This is
+//     the primary trigger and covers the large majority of real teardown
+//     paths well inside the interval below. It does NOT fire while a test
+//     deliberately holds this process paused mid-wedge
+//     (`FAKE_LSP_WEDGE_STDIN_AFTER_INIT`, which calls `stdin.pause()` and
+//     never drains) — that mode relies on the second trigger instead.
+//   - a `process.ppid` liveness poll, as a backstop for any shape where
+//     stdin doesn't close. POSIX reparents an orphan to init/a subreaper, so
+//     a changed `process.ppid` is itself conclusive; Windows does NOT do
+//     this — `process.ppid` is fixed at process-creation time and never
+//     updates to reflect the live parent, so a bare value comparison is a
+//     POSIX-only signal there. The portable check is whether the ORIGINAL
+//     parent pid is still alive at all: `process.kill(pid, 0)` sends no
+//     signal, it only probes existence (ESRCH means gone) — a syscall
+//     probe, not a spawned `taskkill` (AGENTS.md's "held handle, not a
+//     spawned taskkill" teardown note).
+const PARENT_WATCHDOG_INTERVAL_MS = 1000;
+const initialPpid = process.ppid;
+
+function parentIsAlive() {
+	if (!initialPpid) return true;
+	if (process.ppid !== initialPpid) return false;
+	try {
+		process.kill(initialPpid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+const parentWatchdog = setInterval(() => {
+	if (!parentIsAlive()) {
+		clearInterval(parentWatchdog);
+		process.exit(1);
+	}
+}, PARENT_WATCHDOG_INTERVAL_MS);
+parentWatchdog.unref();
+
+process.stdin.on("end", () => {
+	process.exit(0);
+});
+
 function encode(message) {
 	const json = JSON.stringify(message);
 	const header = `Content-Length: ${Buffer.byteLength(json, "utf8")}\r\n\r\n`;

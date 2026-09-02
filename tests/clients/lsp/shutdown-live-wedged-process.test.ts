@@ -23,10 +23,9 @@
  * the per-test timeout. See the PR body for the captured red run.
  */
 
-import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { logLatency } from "../../../clients/latency-logger.js";
+import { spawnFakeLspServer } from "../../support/fake-lsp-server.js";
 
 // Keep both budgets short so the wedge is bounded well inside the per-test
 // timeout, same pattern as shutdown-wedged-connection.test.ts. Assigned
@@ -41,12 +40,6 @@ vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
 	>()),
 	logLatency: vi.fn(),
 }));
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const FAKE_SERVER_PATH = path.join(
-	__dirname,
-	"../../fixtures/fake-lsp-server.mjs",
-);
 
 // Comfortably past what a throwaway probe measured as sufficient (~1-2MB) to
 // exhaust an anonymous pipe's OS buffer on both Windows and Linux CI.
@@ -78,7 +71,6 @@ describe("clientShutdown against a real wedged child process (#1620)", () => {
 
 	it("settles within the shutdown budget, kills the pid, and deregisters it", async () => {
 		const { createLSPClient } = await import("../../../clients/lsp/client.js");
-		const { launchLSP } = await import("../../../clients/lsp/launch.js");
 		const { removeLspChild } =
 			await import("../../../clients/instance-registry.js");
 		const removeSpy = vi.spyOn(
@@ -86,7 +78,7 @@ describe("clientShutdown against a real wedged child process (#1620)", () => {
 			"removeLspChild",
 		);
 
-		const proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+		const proc = await spawnFakeLspServer({
 			cwd: process.cwd(),
 			env: { ...process.env, FAKE_LSP_WEDGE_STDIN_AFTER_INIT: "1" },
 		});

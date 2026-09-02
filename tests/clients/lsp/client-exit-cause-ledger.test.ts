@@ -17,20 +17,13 @@
  * gate turns every eviction into a fake crash, and reds the second test.
  */
 
-import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
 	getDegradationSummary,
 	resetDegradationLedger,
 } from "../../../clients/degradation-ledger.js";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const FAKE_SERVER_PATH = path.join(
-	__dirname,
-	"../../fixtures/fake-lsp-server.mjs",
-);
+import { spawnFakeLspServer } from "../../support/fake-lsp-server.js";
 
 function closeGroup() {
 	return getDegradationSummary().find(
@@ -91,9 +84,7 @@ describe("LSP client — unexpected close records its cause (#1969)", () => {
 
 	it("records a ledger entry naming the server, the exit code, and the empty stderr", async () => {
 		const { createLSPClient } = await import("../../../clients/lsp/client.js");
-		const { launchLSP } = await import("../../../clients/lsp/launch.js");
-
-		const proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+		const proc = await spawnFakeLspServer({
 			cwd: process.cwd(),
 			env: {
 				FAKE_LSP_SELF_EXIT_CODE: "1",
@@ -127,9 +118,7 @@ describe("LSP client — unexpected close records its cause (#1969)", () => {
 
 	it("records NOTHING for an intentional shutdown()", async () => {
 		const { createLSPClient } = await import("../../../clients/lsp/client.js");
-		const { launchLSP } = await import("../../../clients/lsp/launch.js");
-
-		const proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+		const proc = await spawnFakeLspServer({
 			cwd: process.cwd(),
 		});
 		client = await createLSPClient({
@@ -167,9 +156,7 @@ describe("LSP client — unexpected close records its cause (#1969)", () => {
 	// deleting that line reds this test.
 	it("records NOTHING when OUR OWN initialize-timeout kill tears the child down", async () => {
 		const { createLSPClient } = await import("../../../clients/lsp/client.js");
-		const { launchLSP } = await import("../../../clients/lsp/launch.js");
-
-		const proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+		const proc = await spawnFakeLspServer({
 			cwd: process.cwd(),
 			// Never answers `initialize`, so `withTimeout` fires and the catch
 			// below kills the child.

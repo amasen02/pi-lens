@@ -17,8 +17,6 @@
  */
 
 import * as fs from "node:fs";
-import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { normalizeMapKey } from "../../../clients/path-utils.js";
 import type { LSPProcess } from "../../../clients/lsp/launch.js";
@@ -36,11 +34,6 @@ vi.mock("../../../clients/lsp/config.js", () => ({
 	getServerInitOverride: vi.fn().mockReturnValue(undefined),
 }));
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const FAKE_SERVER_PATH = path.join(
-	__dirname,
-	"../../fixtures/fake-lsp-server.mjs",
-);
 const ROOT = process.cwd();
 const NOTIFY_BUDGET_MS = 200;
 /** `notifyWedgedMs` = budget x 5 = 1000 at this budget. */
@@ -120,19 +113,16 @@ describe("#2358 — CPU-liveness discriminator on a real wedged scanner", () => 
 			extensions: [".ts"],
 			root: async () => ROOT,
 			spawn: async () => {
-				const { launchLSP } = await import("../../../clients/lsp/launch.js");
-				const childHandle = await launchLSP(
-					process.execPath,
-					[FAKE_SERVER_PATH],
-					{
-						cwd: ROOT,
-						env: {
-							...process.env,
-							FAKE_LSP_WEDGE_STDIN_AFTER_INIT: "1",
-							...(burnCpu ? { FAKE_LSP_BURN_CPU_AFTER_INIT: "1" } : {}),
-						},
+				const { spawnFakeLspServer } =
+					await import("../../support/fake-lsp-server.js");
+				const childHandle = await spawnFakeLspServer({
+					cwd: ROOT,
+					env: {
+						...process.env,
+						FAKE_LSP_WEDGE_STDIN_AFTER_INIT: "1",
+						...(burnCpu ? { FAKE_LSP_BURN_CPU_AFTER_INIT: "1" } : {}),
 					},
-				);
+				});
 				childHandles.push(childHandle);
 				return { process: childHandle, source: "test" as const };
 			},
