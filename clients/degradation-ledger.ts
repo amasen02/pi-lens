@@ -2,7 +2,11 @@
 
 import type { ConfigDiagnosticCode } from "./config-diagnostic-codes.js";
 import { logExtension } from "./extension-log.js";
-import { LEDGER_FIELD_MAX, truncateForLedger } from "./ledger-bounds.js";
+import {
+	DEGRADATION_ENTRIES_PER_KIND,
+	LEDGER_FIELD_MAX,
+	truncateForLedger,
+} from "./ledger-bounds.js";
 import { logLatency } from "./latency-logger.js";
 import {
 	getSinkWriteFailures,
@@ -598,7 +602,34 @@ export type DegradationKind =
 	 * observability question, the fact of the ignore is. This is the only kind
 	 * that carries a `code` (`PILENS_CFG_0001`) into the durable row.
 	 */
-	| "config-ignored";
+	| "config-ignored"
+	/**
+	 * A config file location or root key the user wrote is DEPRECATED and was
+	 * still honored (#2426). The deliberate opposite of `config-ignored`: the
+	 * setting applied exactly as written, and the location it was written in is
+	 * on the removal schedule in `DEPRECATED_CONFIG_SURFACES`. Kept as its own
+	 * kind so "how many sessions ran on defaults because a config was rejected"
+	 * stays answerable from the ledger without subtracting deprecations out of
+	 * it. Same producer and same `<file>\0<key>` subject as `config-ignored`,
+	 * one row per `(file, key)` per session, carrying `PILENS_CFG_0002`
+	 * (deprecated key) or `PILENS_CFG_0003` (deprecated file location).
+	 */
+	| "config-deprecated"
+	/**
+	 * A config file's NOTICE LIST was truncated by the per-resolution bound, and
+	 * this row carries how many notices were summarised away (#2426 review round
+	 * 6). Written through `warnIgnoredConfigOnce` like the two kinds above,
+	 * under `PILENS_CFG_0007`, with the same `<file>` subject.
+	 *
+	 * Its own kind because it is a fact about the OUTPUT, not about the config:
+	 * a legacy file whose every setting was applied still overflows the bound,
+	 * and recording that under `config-ignored` — which it did before this kind
+	 * existed — both told the user their valid file was being ignored and made
+	 * "how many sessions ran on defaults because a config was rejected"
+	 * unanswerable, since the ledger could no longer tell a rejection from a
+	 * long list. One row per file per session.
+	 */
+	| "config-notice-suppressed";
 
 export interface DegradationRecord {
 	kind: unknown;
@@ -622,7 +653,7 @@ export interface DegradationGroup {
 	latestReasons: Array<{ subject: string; reason: string }>;
 }
 
-const ENTRIES_PER_KIND = 20;
+const ENTRIES_PER_KIND = DEGRADATION_ENTRIES_PER_KIND;
 const MAX_DISTINCT_KINDS = 32;
 const OVERFLOW_KIND = "other";
 const groups = new Map<
@@ -909,5 +940,9 @@ export function resetDegradationLedger(): void {
 	// life. Deliberate exception to catalog shape 17, not an oversight.
 }
 
-export const DEGRADATION_ENTRIES_PER_KIND = ENTRIES_PER_KIND;
+// Re-exported so every existing importer keeps its specifier. The value now
+// lives in the `ledger-bounds.js` leaf (#2426), so a producer that only needs
+// the BOUND does not have to import the ledger — and cannot be broken by a test
+// that mocks it wholesale.
+export { DEGRADATION_ENTRIES_PER_KIND };
 export const DEGRADATION_MAX_DISTINCT_KINDS = MAX_DISTINCT_KINDS;

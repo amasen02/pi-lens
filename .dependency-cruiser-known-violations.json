@@ -1,5 +1,63 @@
-// Follow-up reduction tracked in issue #2125; 31 entries, seven traverse a dynamic-import edge. Entry 30 (instance-registry-lock -> degradation-ledger, #2173): the machine-global lock records its own timeout telemetry; the ledger sits upstream of the reaper/registry chain, so the edge closes a baseline-class cycle rather than introducing new coupling. #2418 reshaped three entries and added one: the three config loaders warn through the shared clients/config-warn.js seam, so config-warn now sits on the pre-existing extension-log -> file-utils -> lens-config cycle instead of each loader sitting on it directly (3 removed, 3 equivalent added), and config-warn -> degradation-ledger is the one net-new edge - the warn seam records its own ignored-config telemetry, and the ledger sits upstream of the config chain, so the edge closes a baseline-class cycle rather than introducing new coupling, exactly as entry 30 does.
+// Follow-up reduction tracked in issue #2125; 33 entries, seven traverse a dynamic-import edge. Entry 30 (instance-registry-lock -> degradation-ledger, #2173): the machine-global lock records its own timeout telemetry; the ledger sits upstream of the reaper/registry chain, so the edge closes a baseline-class cycle rather than introducing new coupling. #2418 reshaped three entries and added one: the three config loaders warn through the shared clients/config-warn.js seam, so config-warn now sits on the pre-existing extension-log -> file-utils -> lens-config cycle instead of each loader sitting on it directly (3 removed, 3 equivalent added), and config-warn -> degradation-ledger is the one net-new edge - the warn seam records its own ignored-config telemetry, and the ledger sits upstream of the config chain, so the edge closes a baseline-class cycle rather than introducing new coupling, exactly as entry 30 does. #2426 reshaped two entries and added two: the three config loaders now resolve through the shared clients/config-resolve.js, so that module sits on the pre-existing config-warn -> degradation-ledger -> extension-log -> file-utils cycle where project-lens-config sat directly (2 removed, 2 equivalent added), and config-resolve -> config-warn plus project-lens-config -> config-warn are the two net-new edges - the shared resolver reporting its migration records through the SAME warn seam each loader already used, so they close a baseline-class cycle rather than introducing new coupling, exactly as #2418 entry 31 and entry 30 (#2173) do. The same PR REMOVED six other cycles it would otherwise have added, by extracting resolveConfig out of the config-core barrel (so a resolver no longer imports process-spec -> project-trust) and by moving the two sink dependencies out of config-core entirely (reportMigrationRecords to config-resolve.js, DEGRADATION_ENTRIES_PER_KIND to the ledger-bounds.js leaf) - config-core/ now imports no sink at all, which is what its own module doc always claimed. 33 entries.
 [
+  {
+    "type": "cycle",
+    "from": "clients/config-resolve.js",
+    "to": "clients/config-warn.js",
+    "unresolvedTo": "./config-warn.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-client-cycles"
+    },
+    "cycle": [
+      {
+        "name": "clients/config-warn.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/degradation-ledger.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/extension-log.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/file-utils.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/lens-config.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/config-resolve.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
   {
     "type": "cycle",
     "from": "clients/config-warn.js",
@@ -368,6 +426,13 @@
     "cycle": [
       {
         "name": "clients/project-lens-config.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/config-resolve.js",
         "dependencyTypes": [
           "local",
           "import"
@@ -942,6 +1007,13 @@
         ]
       },
       {
+        "name": "clients/config-resolve.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
         "name": "clients/config-warn.js",
         "dependencyTypes": [
           "local",
@@ -1147,6 +1219,57 @@
       },
       {
         "name": "clients/lsp/server.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "clients/project-lens-config.js",
+    "to": "clients/config-warn.js",
+    "unresolvedTo": "./config-warn.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-client-cycles"
+    },
+    "cycle": [
+      {
+        "name": "clients/config-warn.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/degradation-ledger.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/extension-log.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/file-utils.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/project-lens-config.js",
         "dependencyTypes": [
           "local",
           "import"
