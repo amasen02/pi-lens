@@ -123,6 +123,29 @@ export function jsonTypeName(value: unknown): string {
 }
 
 /**
+ * The file (and, when known, the tier) a FINALIZED record list belongs to.
+ *
+ * Only the overflow record needs it: every producer already fills `file` and
+ * `tier` on the records it emits — including `config-core`'s own
+ * internal-failure record, which anchors itself from the sources it was handed
+ * (`resolve.ts`) — so there is nothing left for a sink to back-fill. What a
+ * sink cannot know on its own is which file the *suppression* is about, since
+ * that record describes the list rather than any one entry in it.
+ */
+export interface RecordAnchor {
+	readonly file: string;
+	readonly tier?: SourceTier;
+}
+
+/**
+ * The file a finalized list names when its producer can anchor it to none.
+ *
+ * A list with no records cannot overflow, so this is the floor under an
+ * anchorless producer rather than a case production reaches.
+ */
+export const UNANCHORED_RECORD_LABEL = "(config resolution)";
+
+/**
  * A bounded collector for one resolution.
  *
  * Deliberately an instance rather than a module singleton: a resolution is a
@@ -160,4 +183,67 @@ export class MigrationRecordCollector {
 	get totalCount(): number {
 		return this.kept.length + this.dropped;
 	}
+
+	/**
+	 * The retained records plus, when the bound discarded any, ONE record
+	 * counting them.
+	 *
+	 * The whole of "bound a record list and say so when it truncates" lives
+	 * here, and nowhere else (#2426 review round 5, F-A/F-B/S-A). Three
+	 * producers had grown their own copy of it — the shared resolution, the
+	 * project loader's unknown-key scan, and (by omission, which is how the
+	 * defect showed) the project loader's legacy-document enumeration, which
+	 * shipped its records raw and let one file's key count set the
+	 * notification count. A fourth producer must not have to remember any of
+	 * this: it calls `finalizeRecords`, or finalizes a
+	 * `finalizableCollector`, and is bounded.
+	 *
+	 * Two finalized lists that anchor to the SAME file and suppress the SAME
+	 * number of records render one notice, not two. That is the warn-once
+	 * latch doing its documented job: both records state the identical fact
+	 * about the identical file, and the user has one thing to do about it.
+	 */
+	finalize(anchor?: RecordAnchor): readonly MigrationRecord[] {
+		if (this.dropped === 0) return this.kept;
+		const file = anchor?.file ?? UNANCHORED_RECORD_LABEL;
+		return [
+			...this.kept,
+			{
+				code: "PILENS_CFG_0007",
+				file,
+				key: "",
+				subject: migrationSubject(file, ""),
+				reason: `${this.dropped} further config notices were suppressed by the bound of ${MAX_MIGRATION_RECORDS}`,
+				...(anchor?.tier === undefined ? {} : { tier: anchor.tier }),
+			},
+		];
+	}
+}
+
+/**
+ * A collector for a list that will be FINALIZED: one slot held back so the
+ * overflow record fits INSIDE the bound rather than pushing the list past it.
+ *
+ * The reserved slot is arithmetic, so it is written once here and nowhere at a
+ * call site — a producer that streams records (a key-by-key scan, where
+ * building the full list first would defeat the point of bounding at the
+ * source) constructs one of these instead of doing the subtraction itself.
+ */
+export function finalizableCollector(): MigrationRecordCollector {
+	return new MigrationRecordCollector(MAX_MIGRATION_RECORDS - 1);
+}
+
+/**
+ * Bound a record list and append the suppression count when it truncates.
+ *
+ * The list form of `finalizableCollector().finalize()`, for the producers that
+ * already hold every record.
+ */
+export function finalizeRecords(
+	records: Iterable<MigrationRecord>,
+	anchor?: RecordAnchor,
+): readonly MigrationRecord[] {
+	const collector = finalizableCollector();
+	for (const record of records) collector.add(record);
+	return collector.finalize(anchor);
 }

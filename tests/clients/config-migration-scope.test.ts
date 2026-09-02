@@ -22,6 +22,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MAX_MIGRATION_RECORDS } from "../../clients/config-core/records.js";
+import { PI_LENS_CONFIG_SCHEMA } from "../../clients/config-schema.js";
 import { resetIgnoredConfigWarnCache } from "../../clients/config-warn.js";
 import { removeTempDirSync } from "./test-utils.js";
 
@@ -239,12 +240,11 @@ describe("F2/F5: migration advice only for keys the schema recognizes, bounded",
 			),
 			JSON.stringify(deprecationNotices()),
 		).toHaveLength(1);
-		// … and the suppression is COUNTED rather than silent.
+		// … and the suppression is COUNTED rather than silent. One prose shape for
+		// every producer since round 5, because there is now one producer.
 		expect(
 			ignoredNotices().filter((message) =>
-				message.includes(
-					"further ignored settings in this file were not listed",
-				),
+				message.includes("further config notices were suppressed"),
 			),
 		).toHaveLength(1);
 	});
@@ -446,5 +446,202 @@ describe("#2445: a malformed GLOBAL config is not silent, and is not LSP's", () 
 				message.includes("ignoring invalid global config"),
 			),
 		).toHaveLength(1);
+	});
+});
+
+/**
+ * Round 5, F-A/F-B/S-A/F-D: ONE bound, on every producer of a record list.
+ *
+ * "Bound a record list and say so when it truncates" existed three times —
+ * `boundedResolutionRecords` in `config-resolve.ts`, `ignoredRecordCollector`
+ * in `project-lens-config.ts`, and NOT AT ALL on the third producer, the
+ * project loader's legacy-document enumeration, which shipped
+ * `deprecationRecords(...)` raw. Which is the single-source-of-truth defect
+ * doing what it always does: the copy that matters is the one nobody wrote.
+ *
+ * The probes below are the LEGACY path specifically, because that is the one
+ * with no bound at all. Neutering either of the two existing copies leaves the
+ * suite green, so those copies were never the thing under test.
+ */
+const recognizedTopLevelKeys = (): string[] =>
+	Object.keys(
+		(PI_LENS_CONFIG_SCHEMA as { properties?: Record<string, unknown> })
+			.properties ?? {},
+	);
+
+/**
+ * A legacy document spelling EVERY key pi-lens recognizes — 28 of them, well
+ * past the bound of 20, and every one of them a key the user is being told to
+ * move.
+ *
+ * The values VALIDATE on purpose. A rejected value would add a validation
+ * record to the same finalized list and change the count the two loaders are
+ * compared on in the parity probe; only `$schema` (declared `string`) and
+ * `lsp` (declared `object`) constrain anything.
+ */
+function everyRecognizedKey(): Record<string, unknown> {
+	const value: Record<string, unknown> = {};
+	for (const key of recognizedTopLevelKeys()) {
+		value[key] =
+			key === "$schema"
+				? "https://pi-lens.dev/schema/v1.json"
+				: key === "lsp"
+					? {}
+					: true;
+	}
+	return value;
+}
+
+const suppressionNoticesFor = (file: string): string[] =>
+	notices.filter(
+		(message) =>
+			message.includes(file) &&
+			message.includes("further config notices were suppressed"),
+	);
+
+const deprecationNoticesFor = (file: string): string[] =>
+	deprecationNotices().filter((message) => message.includes(file));
+
+describe("round 5 F-A/F-B/S-A: every record list goes through the one bound", () => {
+	it("bounds a legacy file with more RECOGNIZED keys than the bound", async () => {
+		const home = tmpRoot("pi-lens-r5a-home-");
+		process.env.PI_LENS_HOME = tmpRoot("pi-lens-r5a-global-");
+		process.env.PI_LENS_CONFIG_PATH = path.join(home, "absent", "config.json");
+		const projectDir = path.join(home, "proj");
+		const legacyFile = path.join(projectDir, "pi-lens.json");
+		write(legacyFile, everyRecognizedKey());
+
+		// The premise the probe rests on: this file's RECOGNIZED key count — the
+		// count that survives round 4's "advice only for keys we recognize" fix —
+		// is itself past the bound.
+		expect(
+			recognizedTopLevelKeys().length,
+			"recognized top-level keys",
+		).toBeGreaterThan(MAX_MIGRATION_RECORDS);
+
+		const { loadPiLensProjectConfig, resetProjectLensConfigCache } =
+			await import("../../clients/project-lens-config.js");
+		resetProjectLensConfigCache();
+		loadPiLensProjectConfig(projectDir);
+
+		const moves = deprecationNoticesFor(legacyFile);
+		const suppressed = suppressionNoticesFor(legacyFile);
+		const detail = `moves=${moves.length} suppressed=${suppressed.length}`;
+		// One slot of the bound is held back for the count, so the notices this
+		// one file can produce never exceed the bound however many keys it has.
+		expect(moves.length + suppressed.length, detail).toBeLessThanOrEqual(
+			MAX_MIGRATION_RECORDS,
+		);
+		// … and the truncation is COUNTED, not silent.
+		expect(suppressed, detail).toHaveLength(1);
+	});
+
+	it("bounds five nested legacy files PER FILE, each with its own count", async () => {
+		const home = tmpRoot("pi-lens-r5b-home-");
+		process.env.PI_LENS_HOME = tmpRoot("pi-lens-r5b-global-");
+		process.env.PI_LENS_CONFIG_PATH = path.join(home, "absent", "config.json");
+		const dirs = ["root", "root/a", "root/a/b", "root/a/b/c", "root/a/b/c/d"];
+		const legacyFiles = dirs.map((relative) =>
+			path.join(home, ...relative.split("/"), "pi-lens.json"),
+		);
+		for (const file of legacyFiles) write(file, everyRecognizedKey());
+
+		const { loadPiLensProjectConfig, resetProjectLensConfigCache } =
+			await import("../../clients/project-lens-config.js");
+		resetProjectLensConfigCache();
+		loadPiLensProjectConfig(path.dirname(legacyFiles[4] as string));
+
+		// Per FILE, not per walk: each file is separately actionable, so a
+		// per-walk bound would silently drop whole files' advice.
+		for (const file of legacyFiles) {
+			const moves = deprecationNoticesFor(file);
+			const suppressed = suppressionNoticesFor(file);
+			const detail = `${file}: moves=${moves.length} suppressed=${suppressed.length}`;
+			expect(moves.length + suppressed.length, detail).toBeLessThanOrEqual(
+				MAX_MIGRATION_RECORDS,
+			);
+			expect(suppressed, detail).toHaveLength(1);
+		}
+		// Pre-fix this walk produced 5 x 28 deprecation notices and no
+		// suppression record anywhere.
+		expect(
+			deprecationNotices().length,
+			`total deprecation notices: ${deprecationNotices().length}`,
+		).toBeLessThanOrEqual(legacyFiles.length * MAX_MIGRATION_RECORDS);
+	});
+
+	it("gives the same file the same notice count through either loader", async () => {
+		const home = tmpRoot("pi-lens-r5c-home-");
+		process.env.PI_LENS_HOME = tmpRoot("pi-lens-r5c-global-");
+		process.env.PI_LENS_CONFIG_PATH = path.join(home, "absent", "config.json");
+		const projectDir = path.join(home, "proj");
+		const legacyFile = path.join(projectDir, "pi-lens.json");
+		write(legacyFile, everyRecognizedKey());
+
+		const { loadPiLensProjectConfig, resetProjectLensConfigCache } =
+			await import("../../clients/project-lens-config.js");
+		resetProjectLensConfigCache();
+		loadPiLensProjectConfig(projectDir);
+		const viaProject = {
+			moves: deprecationNoticesFor(legacyFile).length,
+			suppressed: suppressionNoticesFor(legacyFile).length,
+		};
+
+		// Same file, other loader, from a clean latch.
+		notices.length = 0;
+		resetIgnoredConfigWarnCache();
+		resetProjectLensConfigCache();
+		const { loadLSPConfig } = await import("../../clients/lsp/config.js");
+		await loadLSPConfig(projectDir, home);
+		const viaLsp = {
+			moves: deprecationNoticesFor(legacyFile).length,
+			suppressed: suppressionNoticesFor(legacyFile).length,
+		};
+
+		// The half-migrated notices for a pi-lens-owned file must not depend on
+		// which loader happened to run — the F4 premise. Pre-fix the project
+		// loader said 28 and the LSP loader said 19 plus a count.
+		expect(
+			viaProject,
+			`project=${JSON.stringify(viaProject)} lsp=${JSON.stringify(viaLsp)}`,
+		).toEqual(viaLsp);
+		expect(viaProject.suppressed).toBe(1);
+	});
+});
+
+describe("round 5 F-D: a WARM load replays a bounded ledger, not the raw list", () => {
+	it("keeps a warm load's config-deprecated rows inside the bound", async () => {
+		const home = tmpRoot("pi-lens-r5d-home-");
+		process.env.PI_LENS_HOME = tmpRoot("pi-lens-r5d-global-");
+		process.env.PI_LENS_CONFIG_PATH = path.join(home, "absent", "config.json");
+		const projectDir = path.join(home, "proj");
+		write(path.join(projectDir, "pi-lens.json"), everyRecognizedKey());
+
+		const { loadPiLensProjectConfig, resetProjectLensConfigCache } =
+			await import("../../clients/project-lens-config.js");
+		resetProjectLensConfigCache();
+		loadPiLensProjectConfig(projectDir);
+
+		// Session 2: the ledger is reset at session_start, the discovery cache is
+		// not, so the cached record list is replayed verbatim. An unbounded list
+		// in the cache is an unbounded ledger write on EVERY later load, not just
+		// the first.
+		ledgerRows.length = 0;
+		loadPiLensProjectConfig(projectDir);
+		// DISTINCT (kind, subject), because that is what the real ledger stores:
+		// `recordDegradationOnce` dedupes on the pair, and this file's mock does
+		// not, so counting raw calls would count the by-design double report of
+		// the same file by two loaders (which the latch and the ledger both
+		// collapse) instead of the thing under test — how long the replayed list
+		// is.
+		const deprecated = new Set(
+			ledgerRows
+				.filter((row) => row.kind === "config-deprecated")
+				.map((row) => row.subject),
+		);
+		expect(
+			deprecated.size,
+			`warm-load config-deprecated rows: ${deprecated.size}`,
+		).toBeLessThanOrEqual(MAX_MIGRATION_RECORDS);
 	});
 });

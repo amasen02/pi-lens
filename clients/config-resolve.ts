@@ -65,10 +65,10 @@ import {
 // supported way into the pipeline — `merge()` is deliberately not imported here.
 import { type RawConfigSource, resolveConfig } from "./config-core/resolve.js";
 import {
-	MAX_MIGRATION_RECORDS,
+	finalizeRecords,
 	type MigrationRecord,
-	MigrationRecordCollector,
 	migrationSubject,
+	type RecordAnchor,
 } from "./config-core/records.js";
 import type { Provenance, SourceTier } from "./config-core/provenance.js";
 import { PI_LENS_CONFIG_SCHEMA } from "./config-schema.js";
@@ -283,7 +283,7 @@ export function resolvePiLensConfig(
 	return {
 		value: resolution.resolved.value ?? {},
 		provenance: resolution.resolved.provenance,
-		records: boundedResolutionRecords(
+		records: finalizeRecords(
 			[
 				...resolution.records,
 				...deprecationRecords(
@@ -292,7 +292,7 @@ export function resolvePiLensConfig(
 					canonicalGlobalFile(options),
 				),
 			],
-			documents,
+			documentAnchor(documents),
 		),
 		documents,
 	};
@@ -321,78 +321,31 @@ export function resolveOnePiLensConfigDocument(
 	});
 	return {
 		value: resolution.resolved.value ?? {},
-		records: boundedResolutionRecords(
+		records: finalizeRecords(
 			[...resolution.records, ...deprecationRecords([document], homeDir)],
-			[document],
+			documentAnchor([document]),
 		),
 	};
 }
 
 /**
- * The label a whole-resolution failure names when no document can anchor it.
- * A resolution over zero sources cannot fail, so this is the floor rather than
- * a case production reaches.
- */
-const RESOLUTION_FAILURE_LABEL = "(config resolution)";
-
-/**
- * Bound a resolution's records AT THE SOURCE, and attribute the ones that name
- * no file (#2426 review round 4, F5 + S1).
+ * The anchor for a record list produced from these documents: the
+ * highest-precedence one — the file whose values would have won, and the one a
+ * user reading a config notice is looking at.
  *
- * Two obligations that have to happen together, because both are about the
- * record list a loader is handed rather than about any one producer:
- *
- * 1. THE BOUND. `resolveConfig` bounds what its OWN two halves emit, but the
- *    deprecation records were concatenated on afterwards, outside any
- *    collector — so a legacy file's key count, which is user input, set the
- *    notification count. One collector over the combined list restores the
- *    per-resolution bound `MigrationRecordCollector` exists to enforce. The
- *    last slot is reserved for the count of what the bound discarded, so a
- *    drop is reported rather than silent.
- * 2. THE ANCHOR. `config-core`'s internal-failure record carries `file: ""`,
- *    `key: ""` and no tier, which rendered as `ignoring invalid LSP config :
- *    …` — no file, and three notices, because a record naming no key is
- *    reported by every subsystem that could have produced it. Anchoring it to
- *    the resolution's highest-precedence document (the file whose values would
- *    have won, and the one a user editing config is looking at) gives the
- *    notice a path and a tier, and the tier picks ONE reporting subsystem.
+ * The list's BOUND, its overflow record, and the reserved slot that record
+ * occupies all live in `config-core/records.ts` (#2426 review round 5,
+ * F-A/F-B/S-A). This module used to carry its own copy of them, the project
+ * loader carried a second, and the project loader's legacy path carried none
+ * at all — the shape the single-source rule exists to catch. What is left here
+ * is the one thing `config-core` cannot know: which of the caller's documents
+ * is the anchor.
  */
-function boundedResolutionRecords(
-	records: readonly MigrationRecord[],
+function documentAnchor(
 	documents: readonly ConfigDocument[],
-): readonly MigrationRecord[] {
-	const anchor = documents[documents.length - 1];
-	// One slot held back so an overflow can be COUNTED inside the same bound.
-	const collector = new MigrationRecordCollector(MAX_MIGRATION_RECORDS - 1);
-	for (const record of records) collector.add(anchored(record, anchor));
-	if (collector.droppedCount === 0) return collector.records;
-	const file = anchor?.file ?? RESOLUTION_FAILURE_LABEL;
-	return [
-		...collector.records,
-		{
-			code: "PILENS_CFG_0007",
-			file,
-			key: "",
-			subject: migrationSubject(file, ""),
-			reason: `${collector.droppedCount} further config notices for this resolution were suppressed by the per-resolution bound of ${MAX_MIGRATION_RECORDS}`,
-			...(anchor ? { tier: anchor.tier } : {}),
-		},
-	];
-}
-
-/** Give a record that names neither a file nor a key the resolution's anchor. */
-function anchored(
-	record: MigrationRecord,
-	anchor: ConfigDocument | undefined,
-): MigrationRecord {
-	if (record.file.length > 0 || record.key.length > 0) return record;
-	const file = anchor?.file ?? RESOLUTION_FAILURE_LABEL;
-	return {
-		...record,
-		file,
-		subject: migrationSubject(file, ""),
-		...(anchor ? { tier: anchor.tier } : {}),
-	};
+): RecordAnchor | undefined {
+	const last = documents[documents.length - 1];
+	return last === undefined ? undefined : { file: last.file, tier: last.tier };
 }
 
 /**
@@ -701,9 +654,9 @@ function piLensSubsystemFor(
  * TIER names, when a tier is known (#2426 review round 4, S1). Round 3 sent it
  * to every subsystem that could plausibly have produced it, which turned one
  * internal failure into three notices, one of them announcing an "LSP config"
- * problem in a file with no LSP settings in it. `boundedResolutionRecords`
- * anchors those records to the resolution's own highest-precedence document
- * precisely so the tier is known; the report-by-all fallback survives only for
+ * problem in a file with no LSP settings in it. `config-core`'s own
+ * `resolveConfig` anchors that record to the resolution's highest-precedence
+ * source precisely so the tier is known; the report-by-all fallback survives only for
  * a record that names no source at all.
  */
 function configRecordSubsystems(

@@ -95,9 +95,9 @@ import {
 	resolveOnePiLensConfigDocument,
 } from "./config-resolve.js";
 import {
-	MAX_MIGRATION_RECORDS,
+	finalizableCollector,
+	finalizeRecords,
 	type MigrationRecord,
-	MigrationRecordCollector,
 	migrationSubject,
 } from "./config-core/records.js";
 import {
@@ -325,8 +325,15 @@ function replayConfigNotices(entry: {
  */
 export function loadPiLensProjectConfig(
 	startDir: string,
-	preloadedInfo = findPiLensProjectConfig(startDir),
+	preloadedInfo?: PiLensProjectConfigFileInfo,
 ): PiLensProjectConfig {
+	// ONE discovery per load (#2426 review round 5, F-C). The legacy-document
+	// enumeration below and the config-file lookup are two READS of the same
+	// cache entry, and resolving that entry twice — the default argument once,
+	// the record replay again — doubled the freshness stats every warm load
+	// pays, on a path called per dispatch. The entry is resolved here and both
+	// halves read it.
+	const entry = discoveryEntryFor(startDir);
 	// #2426 review round 4, F4. The half-migrated notices — a legacy
 	// `pi-lens.json` sitting BESIDE or ABOVE the canonical `.pi-lens.json` this
 	// walk stops at — used to be produced only by `loadLSPConfig`, whose
@@ -336,8 +343,8 @@ export function loadPiLensProjectConfig(
 	// a pi-lens-owned file were then produced by nobody at all. The pi-lens
 	// loader now enumerates those documents itself, for records only: nothing
 	// here is merged, and which file supplies a VALUE is unchanged.
-	reportLegacyProjectDocuments(startDir);
-	const configInfo = preloadedInfo;
+	reportPiLensConfigRecords(entry.legacyRecords);
+	const configInfo = preloadedInfo ?? freshInfoFor(entry);
 	if (!configInfo) return EMPTY_PROJECT_CONFIG;
 	return loadCachedConfigFile(configInfo);
 }
@@ -439,28 +446,25 @@ function discoveryEntryFor(startDir: string): DiscoveryCacheEntry {
 export function findPiLensProjectConfig(
 	startDir: string,
 ): PiLensProjectConfigFileInfo | undefined {
-	const entry = discoveryEntryFor(startDir);
-	if (!entry.info) return undefined;
-	// Re-stat: the entry can be fresh by directory mtime while the config file
-	// itself was rewritten in place, and the caller keys its content cache on
-	// the mtime/size this returns.
-	const stat = safeFileStat(entry.info.path);
-	if (!stat?.isFile()) return entry.info;
-	return { ...entry.info, mtimeMs: stat.mtimeMs, size: stat.size };
+	return freshInfoFor(discoveryEntryFor(startDir));
 }
 
 /**
- * Report the deprecation records for every LEGACY config document at or above
- * `startDir` (#2426 review round 4, F4).
+ * The winning config file's info, re-statted.
  *
- * Records only — none of these documents contributes a VALUE to what this
- * loader returns, and the nearest-file precedence that decides values is
- * untouched. The enumeration rides the discovery cache, so the repeat cost on
- * a hot path is the freshness stats the cache already does; the common case
- * (no legacy file anywhere in the walk) parses nothing.
+ * Split out of `findPiLensProjectConfig` so a caller that already holds the
+ * discovery entry does not resolve it a second time to get here (#2426 review
+ * round 5, F-C). The re-stat itself stays: the entry can be fresh by directory
+ * mtime while the config file was rewritten in place, and the caller keys its
+ * content cache on the mtime/size this returns.
  */
-function reportLegacyProjectDocuments(startDir: string): void {
-	reportPiLensConfigRecords(discoveryEntryFor(startDir).legacyRecords);
+function freshInfoFor(
+	entry: DiscoveryCacheEntry,
+): PiLensProjectConfigFileInfo | undefined {
+	if (!entry.info) return undefined;
+	const stat = safeFileStat(entry.info.path);
+	if (!stat?.isFile()) return entry.info;
+	return { ...entry.info, mtimeMs: stat.mtimeMs, size: stat.size };
 }
 
 function safeFileStat(filePath: string): fs.Stats | undefined {
@@ -566,10 +570,68 @@ function discoverPiLensProjectConfig(startDir: string): DiscoveryCacheEntry {
 	}
 	return {
 		info,
-		dirMtimes,
-		legacyRecords: deprecationRecords(legacyDocuments, os.homedir()),
+		dirMtimes: bearingDirMtimes(dirMtimes, info),
+		legacyRecords: legacyDeprecationRecords(legacyDocuments),
 		legacySources,
 	};
+}
+
+/**
+ * The legacy documents' deprecation records, BOUNDED per document (#2426
+ * review round 5, F-A/F-B).
+ *
+ * This path shipped its records raw. A legacy file's recognized top-level key
+ * count is user input, so one 28-key `pi-lens.json` produced 28 notifications
+ * through this loader while the LSP loader — which finalizes the same records —
+ * produced the bound plus a count for the identical file, and five nested
+ * legacy files produced 145 with no suppression record anywhere. Every producer
+ * now goes through the one \`finalizeRecords\`.
+ *
+ * Per DOCUMENT rather than per walk, because these are not one resolution: each
+ * file is separately actionable ("move these keys out of THIS file"), and a
+ * per-walk bound would silently drop whole files' advice while naming only the
+ * last one. Per document also makes the two loaders agree on the count for a
+ * given file, which is the parity `config-notice-ownership` asserts.
+ */
+function legacyDeprecationRecords(
+	documents: readonly ConfigDocument[],
+): readonly MigrationRecord[] {
+	const home = os.homedir();
+	return documents.flatMap((document) =>
+		finalizeRecords(deprecationRecords([document], home), {
+			file: document.file,
+			tier: document.tier,
+		}),
+	);
+}
+
+/**
+ * The directory mtimes this entry's freshness is keyed on: the BEARING chain —
+ * `startDir` up to and including the directory that supplied `info` (#2426
+ * review round 5, F-C).
+ *
+ * The walk itself no longer stops at the first bearing directory, because the
+ * legacy documents a user is asked to migrate can sit above it. Keying
+ * freshness on every directory it VISITS is a different decision, and a bad
+ * one: the walk runs to just below `$HOME`, so the entry was invalidated by any
+ * churn in an ancestor like `~/Desktop` — a full re-walk, re-read and re-parse
+ * of every legacy document, on a hot path, triggered by an unrelated directory.
+ *
+ * Scoping it back to the bearing chain restores the pre-#2426 invalidation
+ * surface exactly. Nothing that decides a VALUE is outside that chain, and an
+ * already-discovered legacy document above it carries its own (mtime, size)
+ * stamp in `legacySources`, so an EDIT to one is still noticed. What is given
+ * up is noticing a legacy file NEWLY CREATED above the bearing directory
+ * mid-process — records-only, and strictly more than the pre-#2426 loader saw,
+ * since it never looked above that directory at all.
+ */
+function bearingDirMtimes(
+	dirMtimes: readonly { dir: string; mtimeMs: number }[],
+	info: PiLensProjectConfigFileInfo | undefined,
+): Array<{ dir: string; mtimeMs: number }> {
+	if (!info) return [...dirMtimes];
+	const bearing = dirMtimes.findIndex((entry) => entry.dir === info.dir);
+	return bearing < 0 ? [...dirMtimes] : dirMtimes.slice(0, bearing + 1);
 }
 
 /**
@@ -597,7 +659,10 @@ function ignoredRecordCollector(configPath: string): {
 	note: NoteIgnored;
 	records: () => readonly MigrationRecord[];
 } {
-	const collector = new MigrationRecordCollector(MAX_MIGRATION_RECORDS - 1);
+	// Streaming, so the bound is spent at the SOURCE rather than on a list built
+	// first and truncated after: the number of these a file can produce is the
+	// number of keys the user typed, and the core puts no ceiling on that.
+	const collector = finalizableCollector();
 	const note: NoteIgnored = (reason) => {
 		collector.add({
 			code: "PILENS_CFG_0001",
@@ -613,20 +678,7 @@ function ignoredRecordCollector(configPath: string): {
 	};
 	return {
 		note,
-		records: () =>
-			collector.droppedCount === 0
-				? collector.records
-				: [
-						...collector.records,
-						{
-							code: "PILENS_CFG_0007" as const,
-							file: configPath,
-							key: "",
-							subject: migrationSubject(configPath, ""),
-							reason: `${collector.droppedCount} further ignored settings in this file were not listed (bound ${MAX_MIGRATION_RECORDS})`,
-							tier: "project" as const,
-						},
-					],
+		records: () => collector.finalize({ file: configPath, tier: "project" }),
 	};
 }
 

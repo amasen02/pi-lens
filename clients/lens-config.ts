@@ -1,3 +1,4 @@
+import type { ConfigDiagnosticCode } from "./config-diagnostic-codes.js";
 import {
 	resetIgnoredConfigWarnCache,
 	warnIgnoredConfigOnce,
@@ -151,11 +152,16 @@ export interface PiLensGlobalConfig {
  * the latch, the log line, the durable ledger row, and the stable-coded
  * notification all live in the one shared seam.
  */
-function warnInvalidGlobalConfigOnce(configPath: string, reason: string): void {
+function warnInvalidGlobalConfigOnce(
+	configPath: string,
+	reason: string,
+	code?: ConfigDiagnosticCode,
+): void {
 	warnIgnoredConfigOnce({
 		subsystem: "lens-config",
 		file: configPath,
 		reason,
+		...(code === undefined ? {} : { code }),
 	});
 }
 
@@ -345,7 +351,26 @@ export function loadPiLensGlobalConfig(
 		}
 
 		return config as PiLensGlobalConfig;
-	} catch {
+	} catch (error) {
+		// #2426 review round 5, S-C. The other half of #2445's silence. The
+		// read/parse failure above now reports, but everything AFTER the parse —
+		// the resolution through the core and the field-by-field projection —
+		// still sat under a bare `catch { return undefined }`, so a throw in any
+		// of it dropped the WHOLE global config with no log line, no ledger row
+		// and no notification: pi-lens ran on defaults and said nothing, which is
+		// the exact defect #2445 was filed for.
+		//
+		// `PILENS_CFG_0005` ("resolution failed internally; configuration
+		// ignored") rather than `0001`, and the ERROR CLASS only, never its
+		// message, which could quote the file — the same rule `resolveConfig`'s
+		// own guard follows for the same reason.
+		warnInvalidGlobalConfigOnce(
+			configPath,
+			`global config could not be interpreted (${
+				error instanceof Error ? error.name : "unknown error"
+			}); configuration ignored`,
+			"PILENS_CFG_0005",
+		);
 		return undefined;
 	}
 }
