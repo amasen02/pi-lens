@@ -7,12 +7,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	__testing,
 	clearWidgetState,
+	drainRenderedDependencyDriftFilePaths,
 	exportWidgetState,
 	getFailedLspServerIds,
 	getFileDiagnostics,
 	getFileDiagnosticSummaries,
 	getSessionLanguages,
-	getWidgetStaleDependencyDriftFilePaths,
 	importWidgetState,
 	incrementWidgetDependencyDriftDelivery,
 	isBlocking,
@@ -795,6 +795,10 @@ describe("widget-state renderWidget", () => {
 		markWidgetFileBlockersStale(filePath, "dependency-drift");
 		expect(incrementWidgetDependencyDriftDelivery(filePath)).toBe(1);
 		expect(incrementWidgetDependencyDriftDelivery(filePath)).toBe(2);
+		// #2275 review F2: the footer-hide is a THIS-session delivery verdict —
+		// it must not outlive the session either, or a resumed footer would
+		// silently omit a finding it has never actually shown.
+		expect(retireWidgetDependencyDriftBlockers(filePath)).toBe(true);
 
 		const snapshot = exportWidgetState();
 		clearWidgetState();
@@ -804,6 +808,7 @@ describe("widget-state renderWidget", () => {
 		expect(restored).toHaveLength(1);
 		expect(restored[0]?.stale).toBeUndefined();
 		expect(restored[0]?.staleDeliveryCount).toBeUndefined();
+		expect(restored[0]?.footerRetired).toBeUndefined();
 	});
 
 	// #1631 review F10: `isBlocking` answers false for a demoted finding by design
@@ -859,25 +864,53 @@ describe("widget-state renderWidget", () => {
 	// `runtime-coordinator-dependency-drift-cap.test.ts` — the same shape one
 	// store over.
 	describe("widget dependency-drift delivery-cap primitives (#2275)", () => {
-		it("getWidgetStaleDependencyDriftFilePaths only reports files with a CURRENTLY stale, dependency-drift-demoted diagnostic", () => {
-			const blockingPath = `${process.cwd()}/blocking.ts`;
-			const demotedPath = `${process.cwd()}/demoted.ts`;
+		// #2275 review F1: the population is what the FOOTER RENDERED since the
+		// last drain — not every file that merely holds a demoted row. The
+		// footer draws one record per pass (`withBlocking[0]`), so a store-wide
+		// query would charge deliveries to rows the agent never saw.
+		it("drainRenderedDependencyDriftFilePaths reports only files the footer actually rendered, and drains", () => {
+			const filePath = `${process.cwd()}/demoted.ts`;
 			recordDiagnostics(
-				blockingPath,
-				[{ severity: "error", semantic: "blocking", tool: "lsp" }],
+				filePath,
+				[
+					{
+						severity: "error",
+						semantic: "blocking",
+						message: "demoted row",
+						tool: "lsp",
+						line: 1,
+					},
+					// A live blocking row from another tool on the same file: the
+					// footer renders it too, but `markWidgetFileBlockersStale` only
+					// demotes LSP rows, so it must never put the file in the
+					// delivery population.
+					{
+						severity: "error",
+						semantic: "blocking",
+						message: "live row",
+						tool: "eslint",
+						line: 2,
+					},
+				],
 				1,
 			);
-			recordDiagnostics(
-				demotedPath,
-				[{ severity: "error", semantic: "blocking", tool: "lsp" }],
-				1,
-			);
-			expect(getWidgetStaleDependencyDriftFilePaths()).toEqual([]);
 
-			expect(markWidgetFileBlockersStale(demotedPath, "dependency-drift")).toBe(
+			// Rendered, but nothing is drift-demoted yet — no delivery to count.
+			let footer = renderWidget(120, theme).join("\n");
+			expect(footer).toContain("live row");
+			expect(drainRenderedDependencyDriftFilePaths()).toEqual([]);
+
+			expect(markWidgetFileBlockersStale(filePath, "dependency-drift")).toBe(
 				true,
 			);
-			expect(getWidgetStaleDependencyDriftFilePaths()).toEqual([demotedPath]);
+			// Demoted, but nothing has been drawn SINCE — nothing was delivered.
+			expect(drainRenderedDependencyDriftFilePaths()).toEqual([]);
+
+			footer = renderWidget(120, theme).join("\n");
+			expect(footer).toContain("demoted row");
+			expect(drainRenderedDependencyDriftFilePaths()).toEqual([filePath]);
+			// Drained: a second read without a further render reports nothing.
+			expect(drainRenderedDependencyDriftFilePaths()).toEqual([]);
 		});
 
 		it("incrementWidgetDependencyDriftDelivery advances every qualifying entry on the file together, and returns 0 for a file with no demotion", () => {
@@ -897,9 +930,23 @@ describe("widget-state renderWidget", () => {
 			expect(incrementWidgetDependencyDriftDelivery(filePath)).toBe(2);
 			const stored = getFileDiagnostics(filePath) ?? [];
 			expect(stored[0]?.staleDeliveryCount).toBe(2);
+
+			// #2275 review F1/F2: once footer-retired the row is no longer
+			// delivered, so it must stop advancing — even if a caller asks.
+			expect(retireWidgetDependencyDriftBlockers(filePath)).toBe(true);
+			expect(incrementWidgetDependencyDriftDelivery(filePath)).toBe(0);
+			expect(
+				(getFileDiagnostics(filePath) ?? [])[0]?.staleDeliveryCount,
+			).toBe(2);
 		});
 
-		it("retireWidgetDependencyDriftBlockers drops only the dependency-drift-demoted entries, leaving an unrelated finding on the same file untouched", () => {
+		// #2275 review F2: retirement HIDES the row from the footer. It must NOT
+		// splice the entry out of `allDiagnostics` — that same store backs
+		// `getFileDiagnosticSummaries` (lens_diagnostics mode=all) and
+		// `lens_diagnostic_mark`, where dropping an unconfirmed LSP error makes
+		// the file read as CLEAN. The #1631 "stays in the error tally"
+		// invariant has to survive the cap.
+		it("retireWidgetDependencyDriftBlockers hides only the demoted entries from the footer, keeping them in the store", () => {
 			const filePath = `${process.cwd()}/mixed-retire.ts`;
 			recordDiagnostics(
 				filePath,
@@ -931,9 +978,29 @@ describe("widget-state renderWidget", () => {
 
 			expect(retireWidgetDependencyDriftBlockers(filePath)).toBe(true);
 			const remaining = getFileDiagnostics(filePath) ?? [];
-			expect(remaining).toHaveLength(1);
-			expect(remaining[0]?.message).toBe("unrelated warning");
-			expect(remaining[0]?.stale).toBeFalsy();
+			// BOTH entries are still stored — nothing was dropped.
+			expect(remaining).toHaveLength(2);
+			const drift = remaining.find((d) => d.message === "drift finding");
+			expect(drift?.footerRetired).toBe(true);
+			expect(drift?.stale).toBe(true);
+			expect(drift?.staleReason).toBe("dependency-drift");
+			const unrelated = remaining.find(
+				(d) => d.message === "unrelated warning",
+			);
+			expect(unrelated?.footerRetired).toBeUndefined();
+			expect(unrelated?.stale).toBeFalsy();
+
+			// mode=all's tally keeps the error (#1631): still counted, never blocking.
+			const summary = getFileDiagnosticSummaries().find(
+				(s) => s.filePath === filePath,
+			);
+			expect(summary?.errors).toBe(1);
+			expect(summary?.blocking).toBe(0);
+
+			// …but the footer no longer serves it.
+			expect(renderWidget(120, theme).join("\n")).not.toContain(
+				"drift finding",
+			);
 
 			// A second call has nothing left of ITS kind to retire.
 			expect(retireWidgetDependencyDriftBlockers(filePath)).toBe(false);
@@ -945,6 +1012,51 @@ describe("widget-state renderWidget", () => {
 					`${process.cwd()}/never-recorded.ts`,
 				),
 			).toBe(false);
+		});
+
+		// #2275 review F2: the footer-hide is not permanent state the agent has
+		// to live with — a later dispatch that re-observes the file replaces
+		// `allDiagnostics` wholesale (`recordDiagnostics`), so a re-confirmed
+		// finding comes back at full authority in the footer.
+		it("a later dispatch that re-confirms the finding clears the footer-hide", () => {
+			const filePath = `${process.cwd()}/reconfirmed.ts`;
+			recordDiagnostics(
+				filePath,
+				[
+					{
+						severity: "error",
+						semantic: "blocking",
+						message: "still broken",
+						tool: "lsp",
+						line: 1,
+					},
+				],
+				1,
+			);
+			markWidgetFileBlockersStale(filePath, "dependency-drift");
+			expect(retireWidgetDependencyDriftBlockers(filePath)).toBe(true);
+			expect(renderWidget(120, theme).join("\n")).not.toContain(
+				"still broken",
+			);
+
+			recordDiagnostics(
+				filePath,
+				[
+					{
+						severity: "error",
+						semantic: "blocking",
+						message: "still broken",
+						tool: "lsp",
+						line: 1,
+					},
+				],
+				2,
+			);
+			const reconfirmed = (getFileDiagnostics(filePath) ?? [])[0];
+			expect(reconfirmed?.footerRetired).toBeUndefined();
+			expect(reconfirmed?.stale).toBeUndefined();
+			expect(isBlocking(reconfirmed!)).toBe(true);
+			expect(renderWidget(120, theme).join("\n")).toContain("still broken");
 		});
 	});
 

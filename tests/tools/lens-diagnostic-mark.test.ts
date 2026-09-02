@@ -10,7 +10,9 @@ import {
 } from "../../clients/diagnostic-dispositions.js";
 import {
 	clearWidgetState,
+	markWidgetFileBlockersStale,
 	recordDiagnostics,
+	retireWidgetDependencyDriftBlockers,
 } from "../../clients/widget-state.js";
 import { createLensDiagnosticMarkTool } from "../../tools/lens-diagnostic-mark.js";
 import { removeTempDirSync } from "../clients/test-utils.js";
@@ -158,6 +160,44 @@ describe("lens_diagnostic_mark tool — line verification/reanchoring (#802)", (
 		const anchor = (result.details as { anchor: string }).anchor;
 		const entry = getDisposition(tmpDir, anchor);
 		expect(entry?.disposition).toBe("false-positive");
+	});
+
+	// #2275 review F2: the widget footer's dependency-drift delivery cap stops
+	// RENDERING a demoted row after N unconfirmed deliveries. It must not
+	// splice the entry out of widget-state — this tool cross-checks that same
+	// `allDiagnostics` list to reanchor, so a dropped record would silently
+	// degrade every post-cap mark to the fuzzy fallback.
+	it("still cross-checks a footer-capped dependency-drift demotion", async () => {
+		const absPath = writeFile(
+			"capped.ts",
+			"const a = 1;\nconst b = 2;\nconst target = bad();\n",
+		);
+		recordDiagnostics(absPath, [
+			{
+				tool: "lsp",
+				rule: "no-bad",
+				message: "bad call",
+				line: 3,
+				severity: "error",
+				semantic: "blocking",
+			},
+		]);
+		expect(markWidgetFileBlockersStale(absPath, "dependency-drift")).toBe(true);
+		expect(retireWidgetDependencyDriftBlockers(absPath)).toBe(true);
+
+		const result = await run({
+			filePath: "capped.ts",
+			line: 2, // stale
+			message: "bad call",
+			rule: "no-bad",
+			tool: "lsp",
+			disposition: "false-positive",
+		});
+		expect(result.isError).toBeFalsy();
+		expect(String(result.content[0]?.text)).toMatch(
+			/reanchored from line 2 to 3/,
+		);
+		expect((result.details as { line: number }).line).toBe(3);
 	});
 
 	it("suppress with reanchor writes the comment above the CURRENT line, not the stale caller line", async () => {

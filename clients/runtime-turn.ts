@@ -94,7 +94,7 @@ import {
 	snapshotAdvisoryProvenance,
 } from "./advisory-provenance.js";
 import {
-	isDependencyDriftDeliveryCapReached,
+	DEPENDENCY_DRIFT_MAX_DELIVERIES,
 	sweepInlineBlockerFreshness,
 } from "./blocker-freshness.js";
 import { sweepInlineBlockerPastEof } from "./blocker-past-eof.js";
@@ -129,8 +129,8 @@ import { STALE_LINE_MARKER } from "./stale-marker.js";
 import { getActiveSessionId } from "./session-lifecycle.js";
 
 import {
+	drainRenderedDependencyDriftFilePaths,
 	getWidgetBlockingFilesForSweep,
-	getWidgetStaleDependencyDriftFilePaths,
 	incrementWidgetDependencyDriftDelivery,
 	markWidgetFileBlockersStale,
 	recordRunner,
@@ -646,26 +646,28 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	 * completely separate store from `RuntimeCoordinator`'s inline-blocker
 	 * map, so it needed its own delivery count
 	 * (`WidgetDiagnostic.staleDeliveryCount`) rather than inheriting one.
-	 * Unlike the inline-blocker loop below, there is no
-	 * `turn-end-findings-last` signature dedupe over the footer to defer
-	 * against: the footer is not an agent-facing turn-end text delivery, it
-	 * just renders current state, so every turn end IS a delivery and the
-	 * count advances directly, once per turn, for every file the widget
-	 * store currently holds a stale dependency-drift diagnostic on —
-	 * including one the sweep above demoted for the first time THIS turn,
-	 * mirroring the inline-blocker loop's same-turn delivery-1 behavior.
+	 *
+	 * Review F1: the population is what the footer RENDERED since the last
+	 * turn end, drained here — not every file that merely holds a demoted
+	 * row. The footer draws one record per pass (`withBlocking[0]`, its top
+	 * five entries) and may not be drawn at all, so a per-turn walk of the
+	 * whole store charged deliveries the agent never received and retired a
+	 * delivery early. This is the widget-surface analogue of the inline
+	 * loop's own `pendingDependencyDriftDeliveries` deferral below: both
+	 * commit a delivery only once the surface has actually served it. Every
+	 * `deliveryCount` reported to the ledger is therefore a count of RENDERS.
 	 */
 	let widgetDemotedFindingsRetired = 0;
-	for (const wPath of getWidgetStaleDependencyDriftFilePaths()) {
+	for (const wPath of drainRenderedDependencyDriftFilePaths()) {
 		const deliveryCount = incrementWidgetDependencyDriftDelivery(wPath);
-		if (isDependencyDriftDeliveryCapReached(deliveryCount)) {
+		if (deliveryCount >= DEPENDENCY_DRIFT_MAX_DELIVERIES) {
 			const capRetired = retireWidgetDependencyDriftBlockers(wPath);
 			if (capRetired) {
 				widgetDemotedFindingsRetired += 1;
 				incrementDegradationCount({
 					kind: "demoted-finding-retired",
 					subject: `widget-blocker:${toRunnerDisplayPath(cwd, wPath)}`,
-					reason: `capped after ${deliveryCount} deliveries with no re-run; re-run can still confirm`,
+					reason: `capped after ${deliveryCount} deliveries with no re-run; hidden from the pi-lens footer, still listed by lens_diagnostics mode=all — re-run can still confirm`,
 				});
 			}
 		}
@@ -729,13 +731,13 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				// stored count.
 				const tentativeCount =
 					runtime.peekInlineBlockerStaleDeliveryCount(bPath) + 1;
-				if (isDependencyDriftDeliveryCapReached(tentativeCount)) {
+				if (tentativeCount >= DEPENDENCY_DRIFT_MAX_DELIVERIES) {
 					retirementNote = formatDeliveryCapNote(tentativeCount);
 				}
 				pendingDependencyDriftDeliveries.push(() => {
 					const deliveryCount =
 						runtime.incrementInlineBlockerStaleDelivery(bPath);
-					if (isDependencyDriftDeliveryCapReached(deliveryCount)) {
+					if (deliveryCount >= DEPENDENCY_DRIFT_MAX_DELIVERIES) {
 						const capRetired =
 							runtime.retireDemotedDependencyDriftBlocker(bPath);
 						if (capRetired) {
