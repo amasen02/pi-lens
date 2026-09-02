@@ -104,7 +104,7 @@ const EXEMPT_SITES: Readonly<Record<string, string>> = {
 		"silent: it emits `observed_handled_evicted` naming the dropped path " +
 		"(#2449 review round 4, S2), because dropping a mark makes pi-lens read " +
 		"its own formatter output as third-party drift.",
-	"clients/lsp-mutation.ts:420":
+	"clients/lsp-mutation.ts:430":
 		"Set, not Map: `autofixRecordedPaths` is membership-only, and it is " +
 		"per-CONTEXT state (created on the mutation context, not module " +
 		"scope), so it is not even process-lifetime. No BoundedSet exists; " +
