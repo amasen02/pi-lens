@@ -16,6 +16,7 @@ import * as path from "node:path";
 import { BoundedLruCache } from "./bounded-cache.js";
 import { createGenerationSource } from "./generation-guard.js";
 import { normalizeMapKey } from "./path-utils.js";
+import { resolveCargoPackageEdition } from "./cargo-manifest.js";
 import { TERRAGRUNT_FILENAMES } from "./file-kinds.js";
 import { stripAnsi } from "./sanitize.js";
 import {
@@ -1140,6 +1141,17 @@ export const rustfmtFormatter: FormatterInfo = {
 	name: "rustfmt",
 	command: ["rustfmt", "$FILE"],
 	extensions: [".rs"],
+	// #2466: rustfmt defaults to an OLDER edition than the file's actual Cargo
+	// package when invoked bare, so it can reject valid newer-edition syntax
+	// (e.g. Rust 2024). Carry the nearest package's `edition` (honoring
+	// `edition.workspace = true` inheritance) through `--edition`; `undefined`
+	// (unreadable/unparseable manifest) falls back to the static command
+	// above, unchanged from pre-#2466 behavior.
+	async resolveCommand(filePath, _cwd) {
+		const edition = await resolveCargoPackageEdition(filePath);
+		if (edition === undefined) return null;
+		return ["rustfmt", "--edition", edition, filePath];
+	},
 	async detect(cwd: string) {
 		if ((await which("rustfmt")) !== null) return true;
 		// If we're in a Rust project, attempt one lazy install of rustfmt component.
