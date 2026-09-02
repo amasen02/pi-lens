@@ -19,6 +19,7 @@ import type {
 	RuleDescription,
 	SgMatch,
 } from "./ast-grep-types.js";
+import { getMutationBridge } from "./mutation-bridge.js";
 import { resolvePackagePath } from "./package-root.js";
 import { truncatedByOutputCap } from "./spawn-output-cap.js";
 import {
@@ -26,6 +27,39 @@ import {
 	type SgExecutionOptions,
 	type SgScanResult,
 } from "./sg-runner.js";
+
+/**
+ * Record an applied `ast_grep_replace` rewrite through the mutation bridge
+ * (#2423, acceptance criterion 3).
+ *
+ * ast-grep reports 0-based line numbers; the guard and the change log are
+ * 1-based, so every range is shifted by one. One record per FILE carries every
+ * range that file's matches covered, because the bridge's contract is
+ * per-file — the same shape a multi-hunk edit produces.
+ *
+ * Exported for tests: they drive it against a registered bridge instead of
+ * spawning ast-grep.
+ */
+export function recordAstGrepApply(matches: AstGrepMatch[]): void {
+	const bridge = getMutationBridge();
+	if (!bridge || matches.length === 0) return;
+	const rangesByFile = new Map<string, Array<[number, number]>>();
+	for (const match of matches) {
+		const start = (match.range?.start?.line ?? 0) + 1;
+		const end = Math.max(start, (match.range?.end?.line ?? 0) + 1);
+		const existing = rangesByFile.get(match.file);
+		if (existing) existing.push([start, end]);
+		else rangesByFile.set(match.file, [[start, end]]);
+	}
+	for (const [filePath, editRanges] of rangesByFile) {
+		bridge.recordMutation({
+			filePath,
+			kind: "edit",
+			editRanges,
+			consumer: "ast_grep_replace",
+		});
+	}
+}
 
 // --- Client ---
 
@@ -653,6 +687,13 @@ export class AstGrepClient {
 				error: applyResult.error,
 			};
 		}
+		// #2423: `--update-all` just rewrote these files, and no `tool_result`
+		// describes it — pi-lens's own tool was as invisible to the mutation
+		// bookkeeping as any third-party one. Record each rewritten file through
+		// the same seam an extension would use. Fire-and-forget: the bridge never
+		// throws, and a missing bridge (pi-lens not activated, guard disabled) is
+		// a silent no-op.
+		recordAstGrepApply(preCheck.matches);
 		return {
 			matches: preCheck.matches,
 			totalMatches: preCheck.totalMatches,

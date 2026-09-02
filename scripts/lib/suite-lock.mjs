@@ -149,6 +149,50 @@ function describeOwner(owner) {
 }
 
 /**
+ * Default number of concurrent SHARED slots (#2435). Targeted `vitest run
+ * <files>` batches from parallel agents used to bypass this lock entirely by
+ * design — cheap individually, but 4-6 of them at once saturate the box and
+ * produce exactly the timeout/spawn-budget flake class the exclusive lock
+ * exists to prevent (#2435 evidence: 27-69 such failures per local full run,
+ * none reproducible in isolation). Two is deliberately small: the point is a
+ * ceiling on concurrent vitest fork pools, not a queue.
+ */
+export const DEFAULT_SHARED_SLOTS = 2;
+
+/**
+ * Path of shared slot `index`, derived from the exclusive lock path so a
+ * test that redirects `lockPath` into a temp dir redirects the slots with it
+ * (single source of truth for the lock directory — never a second env read).
+ *
+ * @param {string} lockPath
+ * @param {number} index
+ * @returns {string}
+ */
+export function getSlotPath(lockPath, index) {
+	const dir = path.dirname(lockPath);
+	const ext = path.extname(lockPath);
+	const stem = path.basename(lockPath, ext);
+	return path.join(dir, `${stem}.slot-${index}${ext}`);
+}
+
+/**
+ * Resolve a requested slot count to a sane integer. NaN/negative/garbage all
+ * fall back to the default rather than to 0 (0 slots would mean "shared runs
+ * can never acquire", a silent hang) — the repo's standing
+ * `Number.isFinite`-before-`Math.max` guard for env-sourced numbers.
+ *
+ * @param {unknown} raw
+ * @returns {number}
+ */
+export function resolveSharedSlots(raw) {
+	const value = Number(raw);
+	if (!Number.isFinite(value)) return DEFAULT_SHARED_SLOTS;
+	const floored = Math.floor(value);
+	if (floored < 1) return DEFAULT_SHARED_SLOTS;
+	return Math.min(floored, 32);
+}
+
+/**
  * Remove a lock file, retrying briefly on transient Windows file-hold
  * errors (EBUSY/EPERM from AV/indexer) instead of failing immediately.
  * Returns true if the file was removed (or already gone), false if it
@@ -179,10 +223,262 @@ async function removeLockWithRetry(lockPath, opts = {}) {
 }
 
 /**
+ * Read one lock file's state without taking it.
+ *
+ * Staleness follows the SAME two rules acquireTestLock uses, deliberately —
+ * a readable-but-dead PID is stale immediately; an unreadable/corrupt file is
+ * stale only once it ages past `staleMaxAgeMs`; a readable LIVE PID is never
+ * aged out (see the file header, point 5). Sharing the rules between the
+ * exclusive lock and the shared slots is the point: a second, subtly
+ * different staleness policy for slots would be exactly the hand-rolled
+ * parallel state this repo keeps folding back onto one seam.
+ *
+ * @param {string} lockPath
+ * @param {number} staleMaxAgeMs
+ * @returns {Promise<{ state: "free"|"held"|"stale", owner: { pid?: unknown, startedIso?: unknown } | null }>}
+ */
+async function inspectLock(lockPath, staleMaxAgeMs) {
+	/** @type {{ pid?: unknown, startedIso?: unknown } | null} */
+	let owner = null;
+	try {
+		owner = JSON.parse(await fsp.readFile(lockPath, "utf8"));
+	} catch (err) {
+		const error = /** @type {NodeJS.ErrnoException} */ (err);
+		if (error.code === "ENOENT") return { state: "free", owner: null };
+		// Present but unreadable (racing writer / transient Windows hold):
+		// fall through to the mtime bound below.
+	}
+	if (
+		owner &&
+		typeof owner.pid === "number" &&
+		Number.isInteger(owner.pid) &&
+		owner.pid > 0
+	) {
+		return { state: isProcessAlive(owner.pid) ? "held" : "stale", owner };
+	}
+	try {
+		const stat = await fsp.stat(lockPath);
+		return {
+			state: Date.now() - stat.mtimeMs > staleMaxAgeMs ? "stale" : "held",
+			owner,
+		};
+	} catch {
+		// Raced a release between the read and the stat.
+		return { state: "free", owner: null };
+	}
+}
+
+/**
+ * Atomically create `lockPath` with this process as owner. Returns false when
+ * the file already exists (or is transiently unopenable on Windows — treated
+ * as contended for the same reason acquireTestLock does); throws on anything
+ * else.
+ *
+ * @param {string} lockPath
+ * @returns {Promise<boolean>}
+ */
+async function createOwnedLock(lockPath) {
+	try {
+		const handle = await fsp.open(lockPath, "wx");
+		try {
+			await handle.writeFile(
+				JSON.stringify({
+					pid: process.pid,
+					startedIso: new Date().toISOString(),
+				}),
+			);
+		} finally {
+			await handle.close();
+		}
+		return true;
+	} catch (err) {
+		const error = /** @type {NodeJS.ErrnoException} */ (err);
+		if (
+			error.code === "EEXIST" ||
+			error.code === "EBUSY" ||
+			error.code === "EPERM"
+		) {
+			return false;
+		}
+		throw error;
+	}
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Wait until every shared slot is free (or reclaimable as stale), called by
+ * the EXCLUSIVE holder AFTER it already owns the exclusive lock file. That
+ * order is what makes the protocol terminate: a shared acquirer re-checks
+ * the exclusive lock immediately after taking a slot and gives its slot back
+ * when the lock is held, so the drain cannot be starved by an endless stream
+ * of new shared runs.
+ *
+ * @param {object} options
+ * @returns {Promise<void>}
+ */
+async function drainSharedSlots({
+	lockPath,
+	slots,
+	start,
+	timeoutMs,
+	pollIntervalMs,
+	heartbeatIntervalMs,
+	staleMaxAgeMs,
+	log,
+}) {
+	let lastHeartbeat = 0;
+	for (;;) {
+		let busy = 0;
+		for (let index = 0; index < slots; index++) {
+			const slotPath = getSlotPath(lockPath, index);
+			const { state } = await inspectLock(slotPath, staleMaxAgeMs);
+			if (state === "free") continue;
+			if (state === "stale") {
+				await removeLockWithRetry(slotPath);
+				continue;
+			}
+			busy++;
+		}
+		if (busy === 0) return;
+
+		const now = Date.now();
+		if (timeoutMs > 0 && now - start > timeoutMs) {
+			// Prefix is pinned: scripts/pre-push-targeted-tests.mjs greps a
+			// caller's stderr for /timed out after \d+ms waiting for test-suite
+			// lock/ to tell a lock timeout (push proceeds) from a real test
+			// failure (push blocks). Keep the prefix when rewording.
+			throw new Error(
+				`timed out after ${timeoutMs}ms waiting for test-suite lock: ` +
+					`${busy} of ${slots} shared slot(s) still busy`,
+			);
+		}
+		if (now - lastHeartbeat >= heartbeatIntervalMs) {
+			lastHeartbeat = now;
+			log(
+				`waiting for test-suite lock: draining ${busy} of ${slots} shared slot(s)`,
+			);
+		}
+		await sleep(pollIntervalMs);
+	}
+}
+
+/**
+ * Acquire ONE of `slots` shared slots (#2435) — the mode targeted `vitest
+ * run <files>` batches use, so several agents can iterate concurrently
+ * without the box hosting six full fork pools at once.
+ *
+ * Protocol, and why it is this shape:
+ *   1. Wait while the EXCLUSIVE lock is held (a full-suite run wins).
+ *   2. Atomically create the first free slot file.
+ *   3. RE-CHECK the exclusive lock. If it appeared between 1 and 2, give the
+ *      slot back and go to 1.
+ * Step 3 is the whole correctness argument: without it, an exclusive holder
+ * that observed all slots free could run concurrently with a shared run that
+ * had already passed its own check. With it, the two orders interleave
+ * safely and neither side can deadlock — the exclusive holder never yields
+ * its lock while draining, and the shared side always yields.
+ *
+ * Same timeout/heartbeat/stale-reclaim semantics as acquireTestLock; a slot
+ * whose recorded PID is dead is reclaimed immediately.
+ *
+ * @param {object} [options] Same shape as acquireTestLock, plus `slots`.
+ * @returns {Promise<{ release: () => Promise<void>, lockPath: string, slotPath: string, slotIndex: number }>}
+ */
+export async function acquireSharedSlot(options = {}) {
+	const lockPath = options.lockPath || getLockPath();
+	const slots = resolveSharedSlots(
+		options.slots ?? process.env.PI_LENS_TEST_SHARED_SLOTS,
+	);
+	const pollIntervalMs =
+		options.pollIntervalMs ??
+		(Number(process.env.PI_LENS_TEST_LOCK_POLL_MS) || 500);
+	const heartbeatIntervalMs =
+		options.heartbeatIntervalMs ??
+		(Number(process.env.PI_LENS_TEST_LOCK_HEARTBEAT_MS) || 15_000);
+	const timeoutMs =
+		options.timeoutMs ??
+		(Number(process.env.PI_LENS_TEST_LOCK_TIMEOUT_MS) || 0);
+	const staleMaxAgeMs = options.staleMaxAgeMs ?? 5 * 60_000;
+	const log = options.log || ((message) => console.error(message));
+
+	await fsp.mkdir(path.dirname(lockPath), { recursive: true });
+
+	const start = Date.now();
+	let lastHeartbeat = 0;
+	/** @type {string} */
+	let waitReason = "";
+
+	for (;;) {
+		const exclusive = await inspectLock(lockPath, staleMaxAgeMs);
+		if (exclusive.state === "stale") {
+			await removeLockWithRetry(lockPath);
+		}
+		if (exclusive.state !== "held") {
+			for (let index = 0; index < slots; index++) {
+				const slotPath = getSlotPath(lockPath, index);
+				const slot = await inspectLock(slotPath, staleMaxAgeMs);
+				if (slot.state === "stale") await removeLockWithRetry(slotPath);
+				else if (slot.state === "held") continue;
+
+				if (!(await createOwnedLock(slotPath))) continue;
+
+				// Acquire-then-verify: an exclusive holder may have taken the
+				// lock while we were creating this slot.
+				const recheck = await inspectLock(lockPath, staleMaxAgeMs);
+				if (recheck.state === "held") {
+					activeLocks.delete(slotPath);
+					await removeLockWithRetry(slotPath);
+					break;
+				}
+
+				activeLocks.add(slotPath);
+				registerExitCleanup();
+				let released = false;
+				return {
+					lockPath,
+					slotPath,
+					slotIndex: index,
+					release: async () => {
+						if (released) return;
+						released = true;
+						activeLocks.delete(slotPath);
+						const removed = await removeLockWithRetry(slotPath);
+						if (!removed) {
+							log(
+								`[test-lock] warning: could not remove shared slot file at ` +
+									`${slotPath} after retries (Windows AV/indexer hold?); the ` +
+									`next waiter's stale-PID check will recover it`,
+							);
+						}
+					},
+				};
+			}
+			waitReason = `all ${slots} shared slot(s) busy`;
+		} else {
+			waitReason = `exclusive test-suite lock held by ${describeOwner(exclusive.owner)}`;
+		}
+
+		const now = Date.now();
+		if (timeoutMs > 0 && now - start > timeoutMs) {
+			// Same pinned prefix as the exclusive path — see drainSharedSlots.
+			throw new Error(
+				`timed out after ${timeoutMs}ms waiting for test-suite lock: ${waitReason}`,
+			);
+		}
+		if (now - lastHeartbeat >= heartbeatIntervalMs) {
+			lastHeartbeat = now;
+			log(`waiting for a shared test-suite slot: ${waitReason}`);
+		}
+		await sleep(pollIntervalMs);
+	}
+}
+
+/**
  * Acquire the test-suite lock, waiting (with a heartbeat) if another process
  * already holds it. Resolves once the lock file has been atomically created
- * by this process; the caller MUST call the returned `release()` in a
- * `finally`.
+ * by this process AND every shared slot (#2435) has drained; the caller MUST
+ * call the returned `release()` in a `finally`.
  *
  * @param {object} [options]
  * @param {string} [options.lockPath] Override the lock file path (default: getLockPath()).
@@ -191,10 +487,18 @@ async function removeLockWithRetry(lockPath, opts = {}) {
  * @param {number} [options.timeoutMs] Give up after this long waiting; 0/undefined = wait forever (default: env PI_LENS_TEST_LOCK_TIMEOUT_MS or 0).
  * @param {(message: string) => void} [options.log] Heartbeat sink (default: console.error).
  * @param {number} [options.staleMaxAgeMs] Age (ms) after which an unreadable/empty lock is treated as stale even without a readable owner PID (default: 5 minutes).
+ * @param {number} [options.slots] Shared slots to drain before returning (default: env PI_LENS_TEST_SHARED_SLOTS or 2).
  * @returns {Promise<{ release: () => Promise<void>, lockPath: string }>}
  */
 export async function acquireTestLock(options = {}) {
 	const lockPath = options.lockPath || getLockPath();
+	// The exclusive holder drains shared slots UNCONDITIONALLY, whether or not
+	// its caller knows slots exist: a full-suite run must not share the box
+	// with targeted runs, and making that depend on the caller passing a flag
+	// would be a rail that silently defaults off.
+	const slots = resolveSharedSlots(
+		options.slots ?? process.env.PI_LENS_TEST_SHARED_SLOTS,
+	);
 	const pollIntervalMs =
 		options.pollIntervalMs ??
 		(Number(process.env.PI_LENS_TEST_LOCK_POLL_MS) || 500);
@@ -229,22 +533,38 @@ export async function acquireTestLock(options = {}) {
 			activeLocks.add(lockPath);
 			registerExitCleanup();
 			let released = false;
-			return {
-				lockPath,
-				release: async () => {
-					if (released) return;
-					released = true;
-					activeLocks.delete(lockPath);
-					const removed = await removeLockWithRetry(lockPath);
-					if (!removed) {
-						log(
-							`[test-lock] warning: could not remove lock file at ${lockPath} ` +
-								`after retries (Windows AV/indexer hold?); the next waiter's ` +
-								`stale-PID check will recover it`,
-						);
-					}
-				},
+			const release = async () => {
+				if (released) return;
+				released = true;
+				activeLocks.delete(lockPath);
+				const removed = await removeLockWithRetry(lockPath);
+				if (!removed) {
+					log(
+						`[test-lock] warning: could not remove lock file at ${lockPath} ` +
+							`after retries (Windows AV/indexer hold?); the next waiter's ` +
+							`stale-PID check will recover it`,
+					);
+				}
 			};
+			try {
+				await drainSharedSlots({
+					lockPath,
+					slots,
+					start,
+					timeoutMs,
+					pollIntervalMs,
+					heartbeatIntervalMs,
+					staleMaxAgeMs,
+					log,
+				});
+			} catch (drainError) {
+				// Never leak the exclusive lock on a drain timeout: without this
+				// the file survives with a live PID, and every later run waits
+				// forever on a holder that already gave up.
+				await release();
+				throw drainError;
+			}
+			return { lockPath, release };
 		} catch (err) {
 			const error = /** @type {NodeJS.ErrnoException} */ (err);
 			// EBUSY/EPERM on the CREATE itself (not just on unlink — see

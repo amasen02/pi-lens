@@ -6,6 +6,7 @@ import { recordDegradationOnce } from "./degradation-ledger.js";
 import { detectFileKind } from "./file-kinds.js";
 import { isPathIgnoredByProject } from "./file-utils.js";
 import { evaluateGitGuard, isGitCommitOrPushAttempt } from "./git-guard.js";
+import { dropHashlineAnchorMemo } from "./hashline-anchor.js";
 import { evaluateSharedCheckoutGuard } from "./shared-checkout-guard.js";
 import { logLatency } from "./latency-logger.js";
 import { normalizeMapKey } from "./path-utils.js";
@@ -18,6 +19,7 @@ import {
 import { normalizeForGuardMatch } from "./host-edit-normalize.js";
 import { retargetReplacementIndentation } from "./indent-retarget.js";
 import { LANGUAGE_POLICY } from "./language-policy.js";
+import { classifyMutatingTool } from "./mutating-tool.js";
 import type { LSPShutdownOptions } from "./lsp/client.js";
 import { getLSPService } from "./lsp/index.js";
 import {
@@ -58,10 +60,7 @@ import {
 } from "./read-guard-tool-lines.js";
 import type { RuntimeCoordinator } from "./runtime-coordinator.js";
 import { handleToolResult } from "./runtime-tool-result.js";
-import {
-	isToolCallEventType,
-	resolveToolCallCorrelationId,
-} from "./tool-event.js";
+import { resolveToolCallCorrelationId } from "./tool-event.js";
 import { getSharedTreeSitterClient } from "./tree-sitter-shared.js";
 
 const LSP_TOOLCALL_NAV_TOUCH_BUDGET_MS = Math.max(
@@ -117,13 +116,10 @@ function getToolCallRawFilePath(
 ): string | undefined {
 	const inputObj = (event.input ?? {}) as Record<string, unknown>;
 
-	if (
-		isToolCallEventType("write", event as any) ||
-		isToolCallEventType("edit", event as any)
-	) {
-		const filePath = (event.input as { path?: unknown }).path;
-		return typeof filePath === "string" ? filePath : undefined;
-	}
+	// #2423: the seam owns "does this tool target a file it mutates". No ctx is
+	// passed — the path is not resolved yet, so adapters must not log here.
+	const mutation = classifyMutatingTool({ ...event, toolName });
+	if (mutation) return mutation.path;
 
 	if (toolName === "read") {
 		if (typeof inputObj.path === "string") return inputObj.path;
@@ -287,11 +283,12 @@ function isIndentationOnlyChange(before: string, after: string): boolean {
 }
 
 function getNewContentFromToolCall(event: unknown): string | undefined {
-	if (isToolCallEventType("write", event as any)) {
+	const mutation = classifyMutatingTool(event);
+	if (mutation?.kind === "write") {
 		return ((event as { input?: unknown }).input as { content?: string })
 			.content;
 	}
-	if (isToolCallEventType("edit", event as any)) {
+	if (mutation?.kind === "edit") {
 		const edits = (
 			(event as { input?: unknown }).input as {
 				edits?: Array<{ newText?: string }>;
@@ -476,6 +473,13 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 		getTreeSitterClient = getSharedTreeSitterClient,
 	} = deps;
 
+	// #2423 review round 4, finding F5: the hashline anchor memo is keyed by
+	// mtime+size, which a same-size rewrite inside one mtime tick cannot
+	// distinguish from stale content. It only ever needs to survive the
+	// several `classifyMutatingTool` asks WITHIN this one tool_call, so drop
+	// it here at the boundary rather than trusting mtime+size across calls.
+	dropHashlineAnchorMemo();
+
 	const readGuardCorrelationId = getReadGuardCorrelationId(event);
 	let filePath: string | undefined;
 	const logToolReadGuardEvent = (
@@ -483,6 +487,10 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 	): void =>
 		logReadGuardEvent({ ...entry, correlationId: readGuardCorrelationId });
 	const toolName = (event as { toolName?: string }).toolName ?? "";
+	// #2423: one classification per tool_call, reused by every branch below that
+	// used to compare `toolName` to the `"write"` / `"edit"` literals. No ctx —
+	// `filePath` is not resolved yet, and adapters stay silent without one.
+	const mutation = classifyMutatingTool(event);
 	const editInputForTelemetry = (event as { input?: unknown }).input as
 		| { edits?: unknown[] }
 		| undefined;
@@ -499,13 +507,13 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 	// changed width in between produced an internally inconsistent summary —
 	// indexes from the call-time array, totals from the mutated one.
 	const requestedEditIndexes =
-		toolName === "write"
+		mutation?.kind === "write"
 			? [0]
 			: Array.isArray(editInputForTelemetry?.edits)
 				? boundedIndexesForCount(editInputForTelemetry.edits.length)
 				: [0];
 	const requestedEditTotal =
-		toolName === "write"
+		mutation?.kind === "write"
 			? 1
 			: Array.isArray(editInputForTelemetry?.edits)
 				? editInputForTelemetry.edits.length
@@ -649,7 +657,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 	);
 	const toolCallId = resolveToolCallCorrelationId(event);
 	const attributesMutationTarget =
-		toolCallId !== undefined && (toolName === "write" || toolName === "edit");
+		toolCallId !== undefined && mutation !== undefined;
 	const targetMissing = !nodeFs.existsSync(filePath);
 	// #1642 F1: a brand-new file's WRITE is never a "skip" — `tool_call`
 	// fires PRE-execution, so `existsSync` is false for every path a write
@@ -691,7 +699,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 		// those paths have no quote and no AM/PM, so every stage-2 candidate
 		// collapses onto the base path and nothing is "tried". `unresolved` is
 		// the whole condition; the tried list is detail for the reason string.
-		if (toolName !== "write" && pathResolution?.unresolved) {
+		if (mutation?.kind !== "write" && pathResolution?.unresolved) {
 			const tried =
 				pathResolution.triedVariants.length > 0
 					? `tried ${pathResolution.triedVariants.join(", ")}`
@@ -725,8 +733,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 		lspAutoTouchEligible &&
 		runtime.shouldWarmLspOnRead(filePath);
 	const shouldAutoTouch =
-		(toolName === "write" ||
-			toolName === "edit" ||
+		(mutation !== undefined ||
 			toolName === "lsp_navigation" ||
 			shouldWarmReadLsp) &&
 		!getFlag("no-lsp") &&
@@ -981,8 +988,8 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 	// --- Read-Before-Edit Guard: check edits ---
 	// write = full replacement; no prior read needed (you're starting fresh).
 	// edit = partial modification; guard enforced to prevent blind overwrites.
-	const isEditOnly = isToolCallEventType("edit", event);
-	const isWriteOrEdit = isToolCallEventType("write", event) || isEditOnly;
+	const isEditOnly = mutation?.kind === "edit";
+	const isWriteOrEdit = mutation !== undefined;
 
 	// Track any Write so recordWritten can inject a synthetic read afterward.
 	// The agent authored the content (new or overwritten), so it trivially "knows" the file.
@@ -1386,7 +1393,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 				sessionId: runtime.telemetrySessionId,
 				filePath,
 				metadata: {
-					tool: isToolCallEventType("write", event) ? "write" : "edit",
+					tool: mutation?.kind ?? "edit",
 					touchedLines: touchedLines ?? null,
 					isExistingFile,
 				},

@@ -152,6 +152,9 @@ clients/lsp/.intelephense/
 !.claude/skills/
 !.claude/skills/**
 !.claude/skills/**/*.md
+# Project-level hook registrations (#2435). settings.local.json stays ignored:
+# it is per-developer permission state, not shared configuration.
+!.claude/settings.json
 autoresearch.jsonl
 coverage/
 PR_issues_Audit.md

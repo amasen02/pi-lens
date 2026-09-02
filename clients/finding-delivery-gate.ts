@@ -621,6 +621,15 @@ export const DELIVERY_SURFACES: Record<string, DeliverySurfaceEntry> = {
 			"session-scoped record, which resets with the session.",
 		"live",
 	),
+	"mutating-tool:adapter-preflight-errors": labeled(
+		"clients/mutating-tool.ts",
+		"Shape-adapter BLOCKED preflight errors for hashline edit inputs the " +
+			"adapter recognized but could not resolve to a range (#2423).",
+		"Computed fresh from the tool input on each attempt and returned as that " +
+			"attempt's rejection, so there is no staleness window. The adapters " +
+			"read only the call's own arguments; nothing cached is replayed.",
+		"live",
+	),
 	"tool-call:duplicate-export-blocker": labeled(
 		"clients/runtime-tool-call.ts",
 		"Duplicate-export STOP rejection returned inline with the failed edit.",
