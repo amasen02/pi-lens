@@ -1047,6 +1047,8 @@ export const EXEMPT_SESSION_STATE_FILES: Readonly<Record<string, string>> = {
 		"git tracked/ignored sets, invalidated by their own mtime checks rather than by the session boundary",
 	"blocker-freshness.ts":
 		"grammar-load memo plus a turn-scoped forward-import parse memo keyed on each file's own mtime and size; both re-derive from disk, so a session boundary cannot make them lie",
+	"hashline-anchor.ts":
+		"#2423: the per-file hashline anchor index, keyed on the file's own mtime AND size and re-stat'd on every lookup — a mismatch always recomputes from disk, so it is invalidated by its own freshness check per file rather than by the session boundary, exactly like diagnostic-line-freshness.ts and git-tracked-ignore.ts. Bounded to 8 entries, FIFO",
 	"diagnostic-line-freshness.ts":
 		"the #1641 past-EOF line-count memo, keyed on mtime AND size and re-stat'd on every read — a mismatch always recomputes, so it is invalidated by its own freshness check per file, not by the session boundary, same as git-tracked-ignore.ts",
 	"warm-attach.ts":
@@ -1097,6 +1099,8 @@ export const EXEMPT_SESSION_STATE_FILES: Readonly<Record<string, string>> = {
 	"git-guard.ts": "git-guard turn state, cleared on the turn path",
 	"runtime-tool-result.ts":
 		"in-flight pipeline and last-analyzed memo, per file and per call",
+	"mutating-tool.ts":
+		"#2423: the built-in tool-name table is an import-time frozen lookup (SWEEP_HEURISTIC_LIMITS item 5), and the resolved-range carry is CALL-scoped — one entry per toolCallId, written by the tool_call classification and read by that same call's tool_result, drained FIFO at 64 entries. Host tool-call ids are unique per call, so a carried entry cannot be read by a later session; a session_start reset would be redundant, not missing",
 	"recent-touches.ts":
 		"the recent-touch cursor, consumed and advanced per read",
 	"widget-state.ts":
@@ -1189,6 +1193,8 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	// SWEEP_HEURISTIC_LIMITS item 5, not state that must re-arm.
 	"git-guard.ts": 2,
 	"git-tracked-ignore.ts": 3,
+	// #2423 review round 1: the per-file anchor index, keyed on mtime+size.
+	"hashline-anchor.ts": 1,
 	"installer/index.ts": 12,
 	"instance-registry.ts": 0,
 	"latency-logger.ts": 2,
@@ -1228,6 +1234,9 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"mcp/analyze.ts": 1,
 	"mcp/session.ts": 2,
 	"module-report-lsp.ts": 1,
+	// #2423: the frozen built-in tool-name table plus the call-scoped
+	// resolved-range carry. Both are argued in EXEMPT_SESSION_STATE_FILES.
+	"mutating-tool.ts": 2,
 	"ndjson-logger.ts": 0,
 	// #1602 added `globalBinDirCache` (1 → 2), cleared by the same
 	// `_resetPackageManagerCache` the registry entry above names.

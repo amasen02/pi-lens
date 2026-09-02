@@ -1524,6 +1524,13 @@ export function getTouchedLinesForGuard(
 					// needs a shape adapter.
 					mutatingToolName: mutation.toolName,
 					mutationProvenance: mutation.provenance,
+					// #2423 review round 1 (F1): an adapter that RECOGNIZED the
+					// shape but could not turn its anchors into lines says so here.
+					// `adapterSource: "hashline-edit-pro"` with
+					// `unresolvedReason: "remove_from:anchor_not_found"` is the
+					// production record of a stale anchor — a report, not a block.
+					adapterSource: mutation.source,
+					unresolvedReason: mutation.unresolvedReason,
 					topLevelKeys,
 					hasNativeOldRange: !!editInput.oldRange,
 					hasNativeEdits: Array.isArray(editInput.edits),

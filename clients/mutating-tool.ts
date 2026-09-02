@@ -58,6 +58,10 @@
  * follow-up.
  */
 import {
+	type HashlineAnchorFailure,
+	resolveHashlineAnchor,
+} from "./hashline-anchor.js";
+import {
 	boundedIndexesForCount,
 	createReadGuardEditBatchSummary,
 	logReadGuardEvent,
@@ -103,6 +107,12 @@ export interface MutationLineResult {
 	editRanges?: [number, number][];
 	preflightError?: string;
 	editBatchSummary?: ReadGuardEditBatchSummary;
+	/**
+	 * Why an adapter that RECOGNIZED the shape could not name the lines. It is a
+	 * report, not a verdict: the mutation is still classified, and the caller
+	 * proceeds exactly as it does for a host edit whose schema it cannot read.
+	 */
+	unresolvedReason?: string;
 }
 
 /** Optional context an adapter uses for telemetry and file probing. */
@@ -111,6 +121,19 @@ export interface MutatingToolContext {
 	filePath?: string;
 	sessionId?: string;
 	correlationId?: string;
+	/**
+	 * "Answer the shape question only." An adapter must not read the file and
+	 * must not log.
+	 *
+	 * The `tool_result` side sets this (#2423 review round 1, finding F5). By
+	 * then the edit HAS been applied, so resolving an anchor against the file on
+	 * disk would resolve it against post-edit content — and re-running the
+	 * adapter's telemetry there logged a second `touched_lines_detected` for
+	 * every edit, plus an `edit_preflight_blocked` for edits that were never
+	 * blocked. The ranges the tool_call side resolved are carried forward by
+	 * `toolCallId` instead.
+	 */
+	recognizeOnly?: boolean;
 }
 
 /**
@@ -142,6 +165,8 @@ export interface MutatingToolClassification {
 	editRanges?: [number, number][];
 	preflightError?: string;
 	editBatchSummary?: ReadGuardEditBatchSummary;
+	/** Set when an adapter recognized the shape but could not name the lines. */
+	unresolvedReason?: string;
 	provenance: MutationProvenance;
 	/** Adapter that resolved the lines. `undefined` for a built-in shape. */
 	source?: string;
@@ -205,8 +230,14 @@ function resolveMutationPath(
 }
 
 /**
- * Parse a hashline anchor (`"42"` or `"42: some code"`) to its 1-based line.
- * Moved here from `read-guard-tool-lines.ts` with the adapters that use it.
+ * Parse a `pi-hashline-readmap` anchor (`"42"` or `"42: some code"`) to its
+ * 1-based line. Moved here from `read-guard-tool-lines.ts` with the adapters
+ * that use it.
+ *
+ * This is the READMAP form and it is decimal. `pi-hashline-edit-pro` is a
+ * different extension with a different addressing scheme — a bare three-char
+ * base62 anchor — handled by `clients/hashline-anchor.ts`. Do not reach for
+ * this function there.
  */
 export function parseHashlineAnchor(anchor: unknown): number | undefined {
 	if (typeof anchor !== "string") return undefined;
@@ -257,7 +288,7 @@ function blockedByAdapter(args: {
 		durationMs: 0,
 		terminalStatus: "blocked",
 	});
-	if (args.ctx.filePath) {
+	if (args.ctx.filePath && !args.ctx.recognizeOnly) {
 		logReadGuardEvent({
 			event: "edit_preflight_blocked",
 			correlationId: args.ctx.correlationId,
@@ -293,7 +324,7 @@ function logTouchedLines(args: {
 	ctx: MutatingToolContext;
 	extra?: Record<string, unknown>;
 }): void {
-	if (!args.ctx.filePath) return;
+	if (!args.ctx.filePath || args.ctx.recognizeOnly) return;
 	logReadGuardEvent({
 		event: "touched_lines_detected",
 		correlationId: args.ctx.correlationId,
@@ -314,17 +345,46 @@ function logTouchedLines(args: {
 // Adapter: hashline-readmap (the shape `resolveHashlineEditInput` recognized)
 // ---------------------------------------------------------------------------
 
-function getHashlineOperations(input: Record<string, unknown>): unknown[] {
-	if (Array.isArray(input.operations)) return input.operations;
-	if (Array.isArray(input.ops)) return input.ops;
-	if (input.set_line || input.replace_lines || input.replace_symbol)
-		return [input];
-	return [];
+/**
+ * One recognized hashline operation: a record carrying one of the three
+ * operation keys the readmap tool defines.
+ *
+ * This is what separates RECOGNIZING the shape from RESOLVING the range
+ * (#2423 review round 1, finding F2). `operations` and `ops` are generic enough
+ * that an unrelated tool carries them — a batch runner, a refactoring tool, a
+ * migration tool — and claiming those and then BLOCKING turned the seam into a
+ * denial-of-service for any tool that happened to name an array `operations`.
+ */
+function isHashlineOperation(value: unknown): boolean {
+	const op = asRecord(value);
+	return (
+		op.set_line !== undefined ||
+		op.replace_lines !== undefined ||
+		op.replace_symbol !== undefined
+	);
+}
+
+/**
+ * The readmap batch, or `undefined` when this input is not one. A batch is
+ * claimed only when at least one entry is a recognized hashline operation.
+ */
+function getHashlineOperations(
+	input: Record<string, unknown>,
+): unknown[] | undefined {
+	const operations = Array.isArray(input.operations)
+		? input.operations
+		: Array.isArray(input.ops)
+			? input.ops
+			: isHashlineOperation(input)
+				? [input]
+				: undefined;
+	if (operations === undefined || operations.length === 0) return undefined;
+	return operations.some(isHashlineOperation) ? operations : undefined;
 }
 
 const hashlineReadmapAdapter: ShapeAdapter = (input, ctx) => {
 	const operations = getHashlineOperations(input);
-	if (operations.length === 0) return undefined;
+	if (operations === undefined) return undefined;
 	const ranges: [number, number][] = [];
 	const errors: string[] = [];
 
@@ -394,19 +454,68 @@ const hashlineReadmapAdapter: ShapeAdapter = (input, ctx) => {
 // Adapter: hashline-edit-pro
 // ---------------------------------------------------------------------------
 
-function isHashlineProReplace(input: Record<string, unknown>): boolean {
-	return input.remove_from !== undefined || input.remove_to !== undefined;
-}
-
-function isHashlineProInsert(input: Record<string, unknown>): boolean {
-	return input.anchor !== undefined && input.direction !== undefined;
+function isStringArray(value: unknown): value is string[] {
+	return (
+		Array.isArray(value) && value.every((entry) => typeof entry === "string")
+	);
 }
 
 /**
- * `hashline-edit-pro` ships two operations, both addressed by hashline anchor:
+ * The `replace` request, or `undefined` when this is not one.
  *
- * - `replace`: `{path, remove_from, remove_to, replacement_lines}` — an
- *   inclusive line range, resolved directly.
+ * Recognition needs ALL THREE required fields of the upstream schema
+ * (`src/payload-contract.ts` `ROOT_KS` / `assertReq`): two anchor strings and a
+ * `replacement_lines` array of strings. `remove_from` alone is not enough
+ * (#2423 review round 1, finding F2) — the fields are common English and a
+ * navigation or query tool can carry one without editing anything.
+ */
+function readHashlineProReplace(
+	input: Record<string, unknown>,
+): { removeFrom: string; removeTo: string } | undefined {
+	if (
+		typeof input.remove_from !== "string" ||
+		typeof input.remove_to !== "string" ||
+		!isStringArray(input.replacement_lines)
+	) {
+		return undefined;
+	}
+	return { removeFrom: input.remove_from, removeTo: input.remove_to };
+}
+
+/**
+ * The `insert` request, or `undefined` when this is not one.
+ *
+ * `assertInsertReq` in `src/insert.ts` requires a non-empty `anchor` string, a
+ * `direction` that is exactly `"before"` or `"after"`, and `lines` as an array
+ * of strings. An `anchor` + `direction` pair alone is a shape plenty of
+ * non-mutating tools carry (a scroll, a cursor move, a jump-to-symbol), so all
+ * three are required here too.
+ */
+function readHashlineProInsert(
+	input: Record<string, unknown>,
+): { anchor: string; direction: "before" | "after" } | undefined {
+	if (typeof input.anchor !== "string" || input.anchor.length === 0)
+		return undefined;
+	if (input.direction !== "before" && input.direction !== "after")
+		return undefined;
+	if (!isStringArray(input.lines)) return undefined;
+	return { anchor: input.anchor, direction: input.direction };
+}
+
+/** One `unresolvedReason` string, so the telemetry vocabulary stays fixed. */
+function anchorUnresolved(
+	field: string,
+	failure: HashlineAnchorFailure,
+): string {
+	return `${field}:${failure}`;
+}
+
+/**
+ * `hashline-edit-pro` ships two operations, both addressed by a bare three-char
+ * base62 ANCHOR — `"aB3"`, never a line number:
+ *
+ * - `replace`: `{path, remove_from, remove_to, replacement_lines}` — the two
+ *   anchors bound an inclusive line range.
  * - `insert`: `{path, anchor, direction, lines}` — a zero-width insertion
  *   before or after one anchor line. The anchor line itself is the range the
  *   guard checks, because that is the line the agent must have read to name it.
@@ -414,73 +523,148 @@ function isHashlineProInsert(input: Record<string, unknown>): boolean {
  *   (`ReadGuard.findRelocation`, the #505 machinery) reports where the read
  *   content moved to and offers the auto-apply. The adapter deliberately does
  *   not re-implement that search.
+ *
+ * Anchors are resolved by `clients/hashline-anchor.ts`, which reproduces the
+ * extension's own hash function against the file's current content and answers
+ * only on a UNIQUE match. An anchor that does not resolve leaves the mutation
+ * classified with its lines unknown — never a block. See that module's header
+ * for why pi-lens's recomputation can legitimately disagree with the live
+ * extension, and why blocking on that disagreement would be wrong.
+ *
+ * Upstream `swapReversedRanges` (`src/hashline/resolve.ts`) AUTOCORRECTS a
+ * reversed pair rather than refusing it, so a resolved pair is normalized here
+ * the same way instead of being treated as an error.
  */
 const hashlineEditProAdapter: ShapeAdapter = (input, ctx) => {
-	if (isHashlineProReplace(input)) {
-		const start = parseHashlineAnchor(input.remove_from);
-		const end = parseHashlineAnchor(input.remove_to);
-		const errors: string[] = [];
-		if (!start) errors.push("replace.remove_from anchor is malformed");
-		if (!end) errors.push("replace.remove_to anchor is malformed");
-		if (start && end && start > end)
-			errors.push("replace range is inverted (remove_from is after remove_to)");
-		if (errors.length > 0 || !start || !end) {
-			const target = ctx.filePath ? `\`${ctx.filePath}\`` : "the file";
-			return blockedByAdapter({
-				adapterSource: "hashline_edit_pro",
-				reasonKind: "unsupported_hashline_pro_replace",
-				title: "Unresolvable hashline replace range",
-				errors,
-				operationCount: 1,
-				retryHint: `Re-read ${target} to get current #line anchors, then retry replace with remove_from and remove_to set to those anchors.`,
-				ctx,
-			});
+	const replace = readHashlineProReplace(input);
+	if (replace) {
+		if (ctx.recognizeOnly || !ctx.filePath) {
+			return {
+				touchedLines: undefined,
+				unresolvedReason: ctx.recognizeOnly
+					? "replace:recognize_only"
+					: "replace:no_file_path",
+			};
 		}
-		const result = combineRanges([[start, end]]);
+		const from = resolveHashlineAnchor(ctx.filePath, replace.removeFrom);
+		const to = resolveHashlineAnchor(ctx.filePath, replace.removeTo);
+		if (from.line === undefined || to.line === undefined) {
+			return {
+				touchedLines: undefined,
+				unresolvedReason:
+					from.line === undefined
+						? anchorUnresolved(
+								"remove_from",
+								from.failure ?? "anchor_not_found",
+							)
+						: anchorUnresolved("remove_to", to.failure ?? "anchor_not_found"),
+			};
+		}
+		const result = combineRanges([
+			[Math.min(from.line, to.line), Math.max(from.line, to.line)],
+		]);
 		logTouchedLines({
 			adapterSource: "hashline_pro_replace",
 			result,
 			operationCount: 1,
 			ctx,
+			extra: {
+				anchors: [replace.removeFrom, replace.removeTo],
+				swapped: from.line > to.line,
+			},
 		});
 		return result;
 	}
 
-	if (isHashlineProInsert(input)) {
-		const line = parseHashlineAnchor(input.anchor);
-		const direction =
-			typeof input.direction === "string" ? input.direction : undefined;
-		const errors: string[] = [];
-		if (!line) errors.push("insert.anchor is malformed");
-		if (direction !== "before" && direction !== "after")
-			errors.push(
-				`insert.direction must be "before" or "after" (got ${JSON.stringify(input.direction)})`,
-			);
-		if (errors.length > 0 || !line) {
-			const target = ctx.filePath ? `\`${ctx.filePath}\`` : "the file";
-			return blockedByAdapter({
-				adapterSource: "hashline_edit_pro",
-				reasonKind: "unsupported_hashline_pro_insert",
-				title: "Unresolvable hashline insert anchor",
-				errors,
-				operationCount: 1,
-				retryHint: `Re-read ${target} to get a current #line anchor, then retry insert with that anchor and direction "before" or "after".`,
-				ctx,
-			});
+	const insert = readHashlineProInsert(input);
+	if (insert) {
+		if (ctx.recognizeOnly || !ctx.filePath) {
+			return {
+				touchedLines: undefined,
+				unresolvedReason: ctx.recognizeOnly
+					? "insert:recognize_only"
+					: "insert:no_file_path",
+			};
 		}
-		const result = combineRanges([[line, line]]);
+		const anchor = resolveHashlineAnchor(ctx.filePath, insert.anchor);
+		if (anchor.line === undefined) {
+			return {
+				touchedLines: undefined,
+				unresolvedReason: anchorUnresolved(
+					"anchor",
+					anchor.failure ?? "anchor_not_found",
+				),
+			};
+		}
+		const result = combineRanges([[anchor.line, anchor.line]]);
 		logTouchedLines({
 			adapterSource: "hashline_pro_insert",
 			result,
 			operationCount: 1,
 			ctx,
-			extra: { direction },
+			extra: { direction: insert.direction, anchors: [insert.anchor] },
 		});
 		return result;
 	}
 
 	return undefined;
 };
+
+// ---------------------------------------------------------------------------
+// Carrying a tool_call resolution to its tool_result
+// ---------------------------------------------------------------------------
+
+/**
+ * Ranges an adapter resolved on the `tool_call` side, keyed by `toolCallId`.
+ *
+ * By `tool_result` the edit has ALREADY been applied, so an anchor can no
+ * longer be resolved against the file: the lines a `replace` named are gone,
+ * and an `insert`'s anchor has moved. The classification still needs those
+ * ranges — they are what `runtime-tool-result.ts` hands to
+ * `cacheManager.addModifiedRange`, i.e. the `turn-state.json` entry whose
+ * absence is the bug #2423 reports.
+ *
+ * Reads do not consume the entry: several call sites classify the same event,
+ * and a consuming read would hand the ranges to whichever asked first. The map
+ * drains by capacity instead.
+ */
+const RESOLVED_RANGE_CARRY = new Map<
+	string,
+	{ touchedLines: [number, number]; editRanges?: [number, number][] }
+>();
+const RESOLVED_RANGE_CARRY_LIMIT = 64;
+
+function readToolCallId(event: unknown): string | undefined {
+	const id = (event as { toolCallId?: unknown } | undefined)?.toolCallId;
+	return typeof id === "string" && id.length > 0 ? id : undefined;
+}
+
+function carryResolvedRanges(event: unknown, result: MutationLineResult): void {
+	const toolCallId = readToolCallId(event);
+	if (!toolCallId || result.touchedLines === undefined) return;
+	if (RESOLVED_RANGE_CARRY.size >= RESOLVED_RANGE_CARRY_LIMIT) {
+		const oldest = RESOLVED_RANGE_CARRY.keys().next().value;
+		if (oldest !== undefined) RESOLVED_RANGE_CARRY.delete(oldest);
+	}
+	RESOLVED_RANGE_CARRY.set(toolCallId, {
+		touchedLines: result.touchedLines,
+		editRanges: result.editRanges,
+	});
+}
+
+function readCarriedRanges(
+	event: unknown,
+):
+	| { touchedLines: [number, number]; editRanges?: [number, number][] }
+	| undefined {
+	const toolCallId = readToolCallId(event);
+	return toolCallId ? RESOLVED_RANGE_CARRY.get(toolCallId) : undefined;
+}
+
+/** Test seam: the carry map is process-global, so a suite must be able to clear it. */
+export function _resetMutationRangeCarryForTests(): void {
+	RESOLVED_RANGE_CARRY.clear();
+}
 
 /**
  * The registry. ORDER IS THE CONTRACT: adapters run top to bottom and the first
@@ -546,8 +730,17 @@ export function classifyMutatingTool(
 	}
 
 	for (const adapter of MUTATION_SHAPE_ADAPTERS) {
-		const resolved = adapter.resolve(input, ctx);
+		let resolved = adapter.resolve(input, ctx);
 		if (resolved === undefined) continue;
+		if (resolved.touchedLines !== undefined) {
+			carryResolvedRanges(event, resolved);
+		} else if (!resolved.preflightError) {
+			// The tool_result side cannot re-resolve an anchor against a file the
+			// edit has already rewritten; reuse what the tool_call side resolved.
+			const carried = readCarriedRanges(event);
+			if (carried)
+				resolved = { ...resolved, ...carried, unresolvedReason: undefined };
+		}
 		return {
 			toolName,
 			path: resolveMutationPath(input),
@@ -556,6 +749,7 @@ export function classifyMutatingTool(
 			editRanges: resolved.editRanges,
 			preflightError: resolved.preflightError,
 			editBatchSummary: resolved.editBatchSummary,
+			unresolvedReason: resolved.unresolvedReason,
 			// A built-in name that an adapter resolved is still built-in; only a
 			// name pi-lens does not know is a declared third-party shape.
 			provenance: builtinKind !== undefined ? builtinProvenance : "declared",

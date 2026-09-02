@@ -16,6 +16,7 @@ import {
 } from "../../clients/partial-edit-apply.js";
 import { logReadGuardEvent } from "../../clients/read-guard-logger.js";
 import { ReadGuard } from "../../clients/read-guard.js";
+import { hashlineFixture } from "../support/hashline-anchor-vectors.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
 vi.mock("../../clients/read-guard-logger.js", async (importOriginal) => ({
@@ -1880,116 +1881,219 @@ describe("getTouchedLinesForGuard — preflight spans and exact-retry recognitio
 // guard allow a blind edit. The adapters promoted into
 // `clients/mutating-tool.ts` recognize the INPUT SHAPE instead.
 
+// The `pi-hashline-edit-pro` cases below address lines the way the extension
+// actually does: a bare THREE-CHARACTER base62 anchor ("aB3"), never a decimal
+// line number. Every anchor here comes from the upstream-generated vector table
+// (`tests/support/hashline-anchor-vectors.ts`), and the file under test is
+// written to disk with the exact content those anchors were computed from —
+// because resolution is a lookup against the real file, not a parse.
+
+/** Writes a fixture file and hands back its path plus its anchor table. */
+function writeHashlineFixture(
+	tmpDir: string,
+	name: string,
+	fixture: string,
+): {
+	filePath: string;
+	anchorFor: (line: number) => string;
+	lineCount: number;
+} {
+	const { content, anchorFor, lineCount } = hashlineFixture(fixture);
+	const filePath = path.join(tmpDir, name);
+	fs.writeFileSync(filePath, content, "utf8");
+	return { filePath, anchorFor, lineCount };
+}
+
 describe("#2423 hashline-edit-pro adapter", () => {
-	it("resolves remove_from/remove_to to an inclusive range for a `replace` tool", () => {
-		const result = getTouchedLinesForGuard(
-			{
-				toolName: "replace",
-				input: {
-					path: "/src/file.ts",
-					remove_from: "12",
-					remove_to: "18",
-					replacement_lines: ["const x = 1;"],
+	it("resolves remove_from/remove_to anchors to an inclusive line range", () => {
+		const env = setupTestEnvironment("pi-lens-2423-pro-replace-");
+		try {
+			const { filePath, anchorFor } = writeHashlineFixture(
+				env.tmpDir,
+				"target.ts",
+				"manyBlanks",
+			);
+			const result = getTouchedLinesForGuard(
+				{
+					toolName: "replace",
+					input: {
+						path: filePath,
+						remove_from: anchorFor(12),
+						remove_to: anchorFor(14),
+						replacement_lines: ["const x = 1;"],
+					},
 				},
-			},
-			"/src/file.ts",
-		);
-		expect(result.touchedLines).toEqual([12, 18]);
-		expect(result.preflightError).toBeUndefined();
+				filePath,
+			);
+			expect(result.touchedLines).toEqual([12, 14]);
+			expect(result.preflightError).toBeUndefined();
+		} finally {
+			env.cleanup();
+		}
 	});
 
-	it("accepts an anchor that carries its line content", () => {
-		const result = getTouchedLinesForGuard(
-			{
-				toolName: "replace",
-				input: {
-					path: "/src/file.ts",
-					remove_from: "4: const a = 1;",
-					remove_to: "4: const a = 1;",
+	it("autocorrects a reversed anchor pair the way the extension does", () => {
+		// `swapReversedRanges` in the extension's src/hashline/resolve.ts swaps
+		// them with a warning rather than refusing the edit.
+		const env = setupTestEnvironment("pi-lens-2423-pro-reversed-");
+		try {
+			const { filePath, anchorFor } = writeHashlineFixture(
+				env.tmpDir,
+				"target.ts",
+				"manyBlanks",
+			);
+			const result = getTouchedLinesForGuard(
+				{
+					toolName: "replace",
+					input: {
+						path: filePath,
+						remove_from: anchorFor(14),
+						remove_to: anchorFor(12),
+						replacement_lines: [],
+					},
 				},
-			},
-			"/src/file.ts",
-		);
-		expect(result.touchedLines).toEqual([4, 4]);
+				filePath,
+			);
+			expect(result.touchedLines).toEqual([12, 14]);
+			expect(result.preflightError).toBeUndefined();
+		} finally {
+			env.cleanup();
+		}
 	});
 
 	it("resolves an `insert` call to its anchor line", () => {
-		const result = getTouchedLinesForGuard(
-			{
-				toolName: "insert",
-				input: {
-					path: "/src/file.ts",
-					anchor: "7: return value;",
-					direction: "before",
-					lines: ["// note"],
+		const env = setupTestEnvironment("pi-lens-2423-pro-insert-");
+		try {
+			const { filePath, anchorFor } = writeHashlineFixture(
+				env.tmpDir,
+				"target.ts",
+				"manyBlanks",
+			);
+			const result = getTouchedLinesForGuard(
+				{
+					toolName: "insert",
+					input: {
+						path: filePath,
+						anchor: anchorFor(7),
+						direction: "before",
+						lines: ["// note"],
+					},
 				},
-			},
-			"/src/file.ts",
-		);
-		expect(result.touchedLines).toEqual([7, 7]);
+				filePath,
+			);
+			expect(result.touchedLines).toEqual([7, 7]);
+		} finally {
+			env.cleanup();
+		}
 	});
 
-	it("blocks instead of guessing when the replace range is inverted", () => {
-		const result = getTouchedLinesForGuard(
-			{
-				toolName: "replace",
-				input: { path: "/src/file.ts", remove_from: "20", remove_to: "3" },
-			},
-			"/src/file.ts",
-		);
-		expect(result.touchedLines).toBeUndefined();
-		expect(result.preflightError).toContain("inverted");
+	it("does NOT read a decimal line number as an anchor", () => {
+		// The contract is a bare 3-char anchor. Reading "12" as line 12 is what
+		// the first cut of this adapter did, and against the real extension it
+		// blocked every call. It must resolve nothing — and block nothing.
+		const env = setupTestEnvironment("pi-lens-2423-pro-decimal-");
+		try {
+			const { filePath } = writeHashlineFixture(
+				env.tmpDir,
+				"target.ts",
+				"manyBlanks",
+			);
+			const result = getTouchedLinesForGuard(
+				{
+					toolName: "replace",
+					input: {
+						path: filePath,
+						remove_from: "12",
+						remove_to: "18",
+						replacement_lines: ["const x = 1;"],
+					},
+				},
+				filePath,
+			);
+			expect(result.touchedLines).toBeUndefined();
+			expect(result.preflightError).toBeUndefined();
+		} finally {
+			env.cleanup();
+		}
 	});
 
-	it("blocks an `insert` whose direction is not before/after", () => {
-		const result = getTouchedLinesForGuard(
-			{
-				toolName: "insert",
-				input: { path: "/src/file.ts", anchor: "7", direction: "sideways" },
-			},
-			"/src/file.ts",
-		);
-		expect(result.touchedLines).toBeUndefined();
-		expect(result.preflightError).toContain("direction");
+	it("reports a stale anchor instead of blocking the edit", () => {
+		const env = setupTestEnvironment("pi-lens-2423-pro-stale-");
+		try {
+			const { filePath } = writeHashlineFixture(
+				env.tmpDir,
+				"target.ts",
+				"manyBlanks",
+			);
+			const result = getTouchedLinesForGuard(
+				{
+					toolName: "replace",
+					input: {
+						path: filePath,
+						// A well-formed anchor that no line of this file carries.
+						remove_from: "zZ9",
+						remove_to: "zZ8",
+						replacement_lines: ["const x = 1;"],
+					},
+				},
+				filePath,
+				"session-2423",
+				"corr-2423",
+			);
+			expect(result.touchedLines).toBeUndefined();
+			// Never a block: pi-lens recomputes the extension's hashes without its
+			// persisted store, so "I cannot resolve this" is not evidence that the
+			// agent's anchor is wrong.
+			expect(result.preflightError).toBeUndefined();
+			expect(logReadGuardEvent).not.toHaveBeenCalledWith(
+				expect.objectContaining({ event: "edit_preflight_blocked" }),
+			);
+			// It is reported, though — this is the actionable production record.
+			expect(logReadGuardEvent).toHaveBeenCalledWith(
+				expect.objectContaining({
+					event: "touched_lines_missing",
+					metadata: expect.objectContaining({
+						adapterSource: "hashline-edit-pro",
+						unresolvedReason: "remove_from:anchor_not_found",
+					}),
+				}),
+			);
+		} finally {
+			env.cleanup();
+		}
 	});
 
 	it("stamps its own source discriminator into touched_lines_detected", () => {
-		getTouchedLinesForGuard(
-			{
-				toolName: "replace",
-				input: { path: "/src/file.ts", remove_from: "2", remove_to: "5" },
-			},
-			"/src/file.ts",
-			"session-2423",
-			"corr-2423",
-		);
-		expect(logReadGuardEvent).toHaveBeenCalledWith(
-			expect.objectContaining({
-				event: "touched_lines_detected",
-				metadata: expect.objectContaining({ source: "hashline_pro_replace" }),
-			}),
-		);
-	});
-
-	it("stamps its own source discriminator into edit_preflight_blocked", () => {
-		getTouchedLinesForGuard(
-			{
-				toolName: "insert",
-				input: { path: "/src/file.ts", anchor: "nope", direction: "after" },
-			},
-			"/src/file.ts",
-			"session-2423",
-			"corr-2423",
-		);
-		expect(logReadGuardEvent).toHaveBeenCalledWith(
-			expect.objectContaining({
-				event: "edit_preflight_blocked",
-				metadata: expect.objectContaining({
-					source: "hashline_edit_pro",
-					reasonKind: "unsupported_hashline_pro_insert",
+		const env = setupTestEnvironment("pi-lens-2423-pro-source-");
+		try {
+			const { filePath, anchorFor } = writeHashlineFixture(
+				env.tmpDir,
+				"target.ts",
+				"manyBlanks",
+			);
+			getTouchedLinesForGuard(
+				{
+					toolName: "replace",
+					input: {
+						path: filePath,
+						remove_from: anchorFor(2),
+						remove_to: anchorFor(5),
+						replacement_lines: [],
+					},
+				},
+				filePath,
+				"session-2423",
+				"corr-2423",
+			);
+			expect(logReadGuardEvent).toHaveBeenCalledWith(
+				expect.objectContaining({
+					event: "touched_lines_detected",
+					metadata: expect.objectContaining({ source: "hashline_pro_replace" }),
 				}),
-			}),
-		);
+			);
+		} finally {
+			env.cleanup();
+		}
 	});
 
 	it("leaves a tool that is neither named nor shaped as a mutation unclassified", () => {
@@ -2002,15 +2106,92 @@ describe("#2423 hashline-edit-pro adapter", () => {
 	});
 });
 
+// ── #2423 review round 1, finding F2 ────────────────────────────────────────
+//
+// Recognizing a shape and resolving a range are separate questions. The first
+// cut claimed on `operations` / `ops` / `set_line`, and on `anchor` +
+// `direction`, and then BLOCKED when it could not resolve — so a tool that
+// merely happened to carry one of those fields was denied by pi-lens.
+
+describe("#2423 an adapter claims only a shape it can positively identify", () => {
+	it("ignores an unrelated tool that carries an `operations` array", () => {
+		const result = getTouchedLinesForGuard(
+			{
+				toolName: "run_migrations",
+				input: {
+					path: "/src/file.ts",
+					operations: [{ name: "backfill" }, { name: "reindex" }],
+				},
+			},
+			"/src/file.ts",
+		);
+		expect(result.touchedLines).toBeUndefined();
+		expect(result.preflightError).toBeUndefined();
+		expect(logReadGuardEvent).not.toHaveBeenCalledWith(
+			expect.objectContaining({ event: "edit_preflight_blocked" }),
+		);
+	});
+
+	it("ignores a navigation tool that carries `anchor` and `direction`", () => {
+		const result = getTouchedLinesForGuard(
+			{
+				toolName: "scroll_to",
+				input: { path: "/src/file.ts", anchor: "aB3", direction: "after" },
+			},
+			"/src/file.ts",
+		);
+		expect(result.touchedLines).toBeUndefined();
+		expect(result.preflightError).toBeUndefined();
+		expect(logReadGuardEvent).not.toHaveBeenCalledWith(
+			expect.objectContaining({ event: "edit_preflight_blocked" }),
+		);
+	});
+
+	it("ignores a `replace`-named tool with no replacement_lines", () => {
+		const result = getTouchedLinesForGuard(
+			{
+				toolName: "replace",
+				input: { path: "/src/file.ts", remove_from: "aB3", remove_to: "cD4" },
+			},
+			"/src/file.ts",
+		);
+		expect(result.touchedLines).toBeUndefined();
+		expect(result.preflightError).toBeUndefined();
+	});
+
+	it("still claims — and still blocks — a readmap batch with a real op", () => {
+		// The positive control for the tightening: a batch that DOES carry a
+		// recognized hashline operation is claimed, and a malformed anchor inside
+		// it still blocks, because there the shape is not in doubt.
+		const result = getTouchedLinesForGuard(
+			{
+				toolName: "hashline_edit",
+				input: {
+					path: "/src/file.ts",
+					operations: [{ set_line: { anchor: "not-a-line" } }],
+				},
+			},
+			"/src/file.ts",
+		);
+		expect(result.touchedLines).toBeUndefined();
+		expect(result.preflightError).toContain("BLOCKED");
+		expect(logReadGuardEvent).toHaveBeenCalledWith(
+			expect.objectContaining({
+				event: "edit_preflight_blocked",
+				metadata: expect.objectContaining({ source: "hashline_edit" }),
+			}),
+		);
+	});
+});
+
 describe("#2423 the read-before-edit guard covers a third-party edit tool", () => {
 	it("blocks an unread `replace` and allows it after the range is read", () => {
 		const env = setupTestEnvironment("pi-lens-2423-guard-");
 		try {
-			const filePath = path.join(env.tmpDir, "guarded.ts");
-			fs.writeFileSync(
-				filePath,
-				Array.from({ length: 30 }, (_, i) => `const v${i} = ${i};`).join("\n") +
-					"\n",
+			const { filePath, anchorFor, lineCount } = writeHashlineFixture(
+				env.tmpDir,
+				"guarded.ts",
+				"manyBlanks",
 			);
 			// The guard treats a file whose mtime is at or after its own
 			// sessionStartMs as authored this session and lets the edit through.
@@ -2024,7 +2205,12 @@ describe("#2423 the read-before-edit guard covers a third-party edit tool", () =
 			const { touchedLines } = getTouchedLinesForGuard(
 				{
 					toolName: "replace",
-					input: { path: filePath, remove_from: "12", remove_to: "14" },
+					input: {
+						path: filePath,
+						remove_from: anchorFor(12),
+						remove_to: anchorFor(14),
+						replacement_lines: ["const x = 1;"],
+					},
 				},
 				filePath,
 			);
@@ -2038,9 +2224,9 @@ describe("#2423 the read-before-edit guard covers a third-party edit tool", () =
 			read.recordRead({
 				filePath,
 				requestedOffset: 1,
-				requestedLimit: 30,
+				requestedLimit: lineCount,
 				effectiveOffset: 1,
-				effectiveLimit: 30,
+				effectiveLimit: lineCount,
 				expandedByLsp: false,
 				turnIndex: 1,
 				writeIndex: 0,

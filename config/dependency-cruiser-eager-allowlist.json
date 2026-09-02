@@ -43,6 +43,7 @@
   "./clients/lsp/index.js",
   "./clients/memory-sampler.js",
   "./clients/message-end-attribution.js",
+  "./clients/mutating-tool.js",
   "./clients/mutation-bridge.js",
   "./clients/package-root.js",
   "./clients/path-attribution-telemetry.js",

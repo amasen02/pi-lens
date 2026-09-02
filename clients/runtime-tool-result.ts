@@ -914,9 +914,17 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	// receipt, deferred autofix and format. Before the seam this compared
 	// `event.toolName` to two literals, so a host or extension edit tool under
 	// any other name was dropped here with the path already resolved.
+	// `recognizeOnly` (#2423 review round 1, finding F5): the tool_call side
+	// already ran the adapters against the PRE-edit file and logged what they
+	// resolved. Re-running them here logged a second `touched_lines_detected`
+	// for every edit and an `edit_preflight_blocked` for edits that were never
+	// blocked, and any anchor it re-resolved would be resolved against content
+	// the edit has already rewritten. The seam carries the tool_call ranges
+	// forward by `toolCallId` instead.
 	const mutation = classifyMutatingTool(event, {
 		filePath: filePath || undefined,
 		sessionId: deps.sessionId,
+		recognizeOnly: true,
 	});
 	if (mutation === undefined) {
 		dbg(
@@ -1210,6 +1218,29 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 					runtime.telemetrySessionId,
 				);
 			}
+		} else if (
+			mutation.kind === "edit" &&
+			mutation.provenance === "declared" &&
+			nodeFs.existsSync(filePath)
+		) {
+			// #2423 review round 1 (F1): a third-party edit whose anchors did not
+			// resolve — a stale anchor, or the read-guard preflight never ran to
+			// resolve them — still CHANGED the file. Recording the whole file is a
+			// deliberate superset: turn state exists to say "this file changed,
+			// format and attribute it", and an empty `files` map is the exact
+			// symptom the issue reports. A host `edit` keeps its old behavior,
+			// because its ranges come from `details.diff` above.
+			const content = nodeFs.readFileSync(filePath, "utf-8");
+			const lineCount = content.split("\n").length;
+			const importsChanged = /^import\s/m.test(content);
+			modifiedRanges = [{ start: 1, end: lineCount }];
+			cacheManager.addModifiedRange(
+				filePath,
+				{ start: 1, end: lineCount },
+				importsChanged,
+				turnStateCwd,
+				runtime.telemetrySessionId,
+			);
 		} else if (mutation.kind === "write" && nodeFs.existsSync(filePath)) {
 			const content = nodeFs.readFileSync(filePath, "utf-8");
 			const lineCount = content.split("\n").length;

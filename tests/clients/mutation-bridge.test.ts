@@ -273,4 +273,35 @@ describe("mutation bridge registration", () => {
 			env.cleanup();
 		}
 	});
+
+	it("keeps the deps its live-getter claim depends on at module scope", () => {
+		// #2423 review round 1 (F6). The module header claims "every dep is a
+		// GETTER resolved at call time, so a replaced runtime or cache manager is
+		// picked up without re-registration". Registration happens ONCE per
+		// process, so the claim only holds if what the getters close over
+		// outlives one activation. `runtime` always did; `cacheManager` was
+		// declared INSIDE `activateExtension`, which pinned the first
+		// activation's instance for the life of the process.
+		//
+		// A source assertion, deliberately: both instances write the same
+		// on-disk turn state, so the difference is invisible at runtime right up
+		// until something holds per-activation state in memory. The invariant is
+		// the thing worth pinning.
+		const indexSource = fs.readFileSync(
+			path.resolve(import.meta.dirname, "..", "..", "index.ts"),
+			"utf8",
+		);
+		const declarations = indexSource
+			.split("\n")
+			.filter((line) => /\bcacheManager\s*=\s*new CacheManager\(/.test(line));
+		expect(declarations).toHaveLength(1);
+		// Module scope: everything inside `activateExtension` is indented.
+		expect(declarations[0]).toMatch(/^const cacheManager = new CacheManager\(/);
+		expect(
+			indexSource
+				.split("\n")
+				.filter((line) => /\bruntime\s*=\s*new RuntimeCoordinator\(/.test(line))
+				.every((line) => !/^\s/.test(line)),
+		).toBe(true);
+	});
 });

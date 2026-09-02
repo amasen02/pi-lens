@@ -10,12 +10,15 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { CacheManager } from "../../clients/cache-manager.js";
 import { readChangesSince } from "../../clients/project-changes.js";
+import { logReadGuardEvent } from "../../clients/read-guard-logger.js";
+import { getTouchedLinesForGuard } from "../../clients/read-guard-tool-lines.js";
 import { handleAgentEnd } from "../../clients/runtime-agent-end.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { handleToolResult } from "../../clients/runtime-tool-result.js";
+import { hashlineFixture } from "../support/hashline-anchor-vectors.js";
 import { assertNonEmptyScan } from "../support/sweep-kit.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
@@ -29,7 +32,27 @@ vi.mock("../../clients/lsp/index.js", () => ({
 	notifyExternalFileChange: vi.fn(async () => undefined),
 }));
 
-const SOURCE = ["const a = 1;", "const b = 2;", "const c = 3;", ""].join("\n");
+vi.mock("../../clients/read-guard-logger.js", async (importOriginal) => ({
+	...(await importOriginal<
+		typeof import("../../clients/read-guard-logger.js")
+	>()),
+	logReadGuardEvent: vi.fn(),
+}));
+
+beforeEach(() => {
+	vi.mocked(logReadGuardEvent).mockClear();
+});
+
+/**
+ * The file the third-party tool edits, and the anchors its lines carry.
+ *
+ * Both come from the upstream-generated vector table, so `ANCHOR(2)` is the
+ * anchor `pi-hashline-edit-pro` would actually print for line 2 of this exact
+ * content — not a decimal line number (#2423 review round 1, finding F1).
+ */
+const FIXTURE = hashlineFixture("simple");
+const SOURCE = FIXTURE.content;
+const ANCHOR = FIXTURE.anchorFor;
 
 async function stubPipeline(): Promise<void> {
 	const { runPipeline } = await import("../../clients/pipeline.js");
@@ -63,17 +86,20 @@ function toolResultDeps(args: {
 
 /**
  * One `hashline-edit-pro` `replace` call, the exact shape the reporter's host
- * emits: no `details.diff`, an inclusive anchor range, and a tool name pi-lens
+ * emits: no `details.diff`, two bare 3-char anchors, and a tool name pi-lens
  * has never heard of.
  */
-function replaceEvent(filePath: string): Record<string, unknown> {
+function replaceEvent(
+	filePath: string,
+	toolCallId = "call-replace-1",
+): Record<string, unknown> {
 	return {
 		toolName: "replace",
-		toolCallId: "call-replace-1",
+		toolCallId,
 		input: {
 			path: filePath,
-			remove_from: "2",
-			remove_to: "3",
+			remove_from: ANCHOR(2),
+			remove_to: ANCHOR(3),
 			replacement_lines: ["const b = 20;", "const c = 30;"],
 		},
 		content: [{ type: "text", text: "replaced" }],
@@ -81,18 +107,31 @@ function replaceEvent(filePath: string): Record<string, unknown> {
 }
 
 /** One `hashline-edit-pro` `insert` call. */
-function insertEvent(filePath: string): Record<string, unknown> {
+function insertEvent(
+	filePath: string,
+	toolCallId = "call-insert-1",
+): Record<string, unknown> {
 	return {
 		toolName: "insert",
-		toolCallId: "call-insert-1",
+		toolCallId,
 		input: {
 			path: filePath,
-			anchor: "2: const b = 2;",
+			anchor: ANCHOR(2),
 			direction: "after",
 			lines: ["const b2 = 22;"],
 		},
 		content: [{ type: "text", text: "inserted" }],
 	};
+}
+
+/**
+ * The tool_call half of one edit, exactly as `runtime-tool-call.ts` runs it
+ * (`clients/runtime-tool-call.ts:1258`). This is where the anchors are resolved
+ * — against the file BEFORE the edit lands — and the seam carries the ranges to
+ * the tool_result by `toolCallId`.
+ */
+function runPreflight(event: Record<string, unknown>, filePath: string): void {
+	getTouchedLinesForGuard(event, filePath, "s-2423", "corr-2423");
 }
 
 describe("#2423 acceptance 1 — a third-party edit reaches the bookkeeping chain", () => {
@@ -111,13 +150,9 @@ describe("#2423 acceptance 1 — a third-party edit reaches the bookkeeping chai
 			runtime.setTelemetryIdentity({ sessionId: "s-2423-replace" });
 			runtime.beginTurn();
 
-			await handleToolResult(
-				toolResultDeps({
-					event: replaceEvent(filePath),
-					runtime,
-					cacheManager,
-				}),
-			);
+			const event = replaceEvent(filePath, "call-acceptance-replace");
+			runPreflight(event, filePath);
+			await handleToolResult(toolResultDeps({ event, runtime, cacheManager }));
 
 			const files = Object.keys(
 				cacheManager.readTurnState(env.tmpDir).files ?? {},
@@ -156,13 +191,9 @@ describe("#2423 acceptance 1 — a third-party edit reaches the bookkeeping chai
 			runtime.setTelemetryIdentity({ sessionId: "s-2423-drain" });
 			runtime.beginTurn();
 
-			await handleToolResult(
-				toolResultDeps({
-					event: replaceEvent(filePath),
-					runtime,
-					cacheManager,
-				}),
-			);
+			const event = replaceEvent(filePath, "call-acceptance-drain");
+			runPreflight(event, filePath);
+			await handleToolResult(toolResultDeps({ event, runtime, cacheManager }));
 
 			// Deferred, never immediate: an unknown edit-shaped tool takes the
 			// safe timing.
@@ -216,9 +247,9 @@ describe("#2423 acceptance 1 — a third-party edit reaches the bookkeeping chai
 			runtime.setTelemetryIdentity({ sessionId: "s-2423-insert" });
 			runtime.beginTurn();
 
-			await handleToolResult(
-				toolResultDeps({ event: insertEvent(filePath), runtime, cacheManager }),
-			);
+			const event = insertEvent(filePath, "call-acceptance-insert");
+			runPreflight(event, filePath);
+			await handleToolResult(toolResultDeps({ event, runtime, cacheManager }));
 
 			const state = cacheManager.readTurnState(env.tmpDir);
 			const files = Object.keys(state.files ?? {});
@@ -265,6 +296,134 @@ describe("#2423 acceptance 1 — a third-party edit reaches the bookkeeping chai
 				Object.keys(cacheManager.readTurnState(env.tmpDir).files ?? {}),
 			).toHaveLength(0);
 			expect(runtime.pendingDeferredFormatCount).toBe(0);
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+
+	it("still records the file when no preflight resolved the anchors", async () => {
+		// The read-guard preflight is where anchors get resolved, and it does not
+		// run when the guard is off, when the tool_call was not observed, or when
+		// the anchor has gone stale. The file still changed, so turn state must
+		// still name it — an empty `files` map is the symptom #2423 reports. The
+		// range degrades to the whole file rather than to nothing.
+		await stubPipeline();
+		const env = setupTestEnvironment("pi-lens-2423-nopreflight-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		try {
+			const filePath = path.join(env.tmpDir, "unpreflighted.ts");
+			fs.writeFileSync(filePath, SOURCE);
+
+			const cacheManager = new CacheManager(false);
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			runtime.setTelemetryIdentity({ sessionId: "s-2423-nopreflight" });
+			runtime.beginTurn();
+
+			await handleToolResult(
+				toolResultDeps({
+					event: replaceEvent(filePath, "call-no-preflight"),
+					runtime,
+					cacheManager,
+				}),
+			);
+
+			const state = cacheManager.readTurnState(env.tmpDir);
+			const files = Object.keys(state.files ?? {});
+			expect(files).toHaveLength(1);
+			expect(state.files[files[0]].modifiedRanges).toEqual([
+				{ start: 1, end: SOURCE.split("\n").length },
+			]);
+			expect(runtime.pendingDeferredFormatCount).toBeGreaterThan(0);
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+});
+
+// ── #2423 review round 1, finding F5 ────────────────────────────────────────
+//
+// The adapters ran twice per edit — once at tool_call with the file path, once
+// again at tool_result with the same path — so every resolved edit logged two
+// `touched_lines_detected` rows, and a shape the adapter refused logged an
+// `edit_preflight_blocked` at tool_result for an edit nothing had blocked.
+
+describe("#2423 adapter telemetry fires once, on the tool_call side", () => {
+	it("logs exactly one touched_lines_detected across one edit's two halves", async () => {
+		await stubPipeline();
+		const env = setupTestEnvironment("pi-lens-2423-telemetry-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		try {
+			const filePath = path.join(env.tmpDir, "logged.ts");
+			fs.writeFileSync(filePath, SOURCE);
+
+			const cacheManager = new CacheManager(false);
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			runtime.setTelemetryIdentity({ sessionId: "s-2423-telemetry" });
+			runtime.beginTurn();
+
+			const event = replaceEvent(filePath, "call-telemetry-1");
+			runPreflight(event, filePath);
+			await handleToolResult(toolResultDeps({ event, runtime, cacheManager }));
+
+			const detected = vi
+				.mocked(logReadGuardEvent)
+				.mock.calls.filter(
+					([entry]) =>
+						entry.event === "touched_lines_detected" &&
+						entry.metadata?.source === "hashline_pro_replace",
+				);
+			expect(detected).toHaveLength(1);
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+
+	it("logs no edit_preflight_blocked at tool_result when nothing blocked the edit", async () => {
+		// No preflight ran (the guard is off), so nothing blocked anything. The
+		// tool_result classification must not invent a blocking record.
+		await stubPipeline();
+		const env = setupTestEnvironment("pi-lens-2423-noblock-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		try {
+			const filePath = path.join(env.tmpDir, "unblocked.ts");
+			fs.writeFileSync(filePath, SOURCE);
+
+			const cacheManager = new CacheManager(false);
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			runtime.setTelemetryIdentity({ sessionId: "s-2423-noblock" });
+			runtime.beginTurn();
+
+			await handleToolResult(
+				toolResultDeps({
+					event: {
+						toolName: "hashline_edit",
+						toolCallId: "call-noblock-1",
+						input: {
+							path: filePath,
+							operations: [{ set_line: { anchor: "not-a-line" } }],
+						},
+						content: [{ type: "text", text: "edited" }],
+					},
+					runtime,
+					cacheManager,
+				}),
+			);
+
+			expect(logReadGuardEvent).not.toHaveBeenCalledWith(
+				expect.objectContaining({ event: "edit_preflight_blocked" }),
+			);
 		} finally {
 			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
 			else process.env.PILENS_DATA_DIR = previousDataDir;
@@ -333,28 +492,149 @@ describe("#2423 — classification contract", () => {
 	it("resolves the hashline-edit-pro shape (red if that adapter is removed)", async () => {
 		const { classifyMutatingTool } =
 			await import("../../clients/mutating-tool.js");
+		const env = setupTestEnvironment("pi-lens-2423-registry-pro-");
+		try {
+			const filePath = path.join(env.tmpDir, "a.ts");
+			fs.writeFileSync(filePath, SOURCE);
+			expect(
+				classifyMutatingTool(
+					{
+						toolName: "replace",
+						input: {
+							path: filePath,
+							remove_from: ANCHOR(1),
+							remove_to: ANCHOR(3),
+							replacement_lines: ["x"],
+						},
+					},
+					{ filePath },
+				),
+			).toMatchObject({
+				kind: "edit",
+				source: "hashline-edit-pro",
+				touchedLines: [1, 3],
+				provenance: "declared",
+			});
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("reports — never blocks — when an edit-pro anchor does not resolve", async () => {
+		const { classifyMutatingTool } =
+			await import("../../clients/mutating-tool.js");
+		const env = setupTestEnvironment("pi-lens-2423-registry-stale-");
+		try {
+			const filePath = path.join(env.tmpDir, "a.ts");
+			fs.writeFileSync(filePath, SOURCE);
+			const unresolved = classifyMutatingTool(
+				{
+					toolName: "replace",
+					input: {
+						path: filePath,
+						remove_from: "zZ9",
+						remove_to: ANCHOR(3),
+						replacement_lines: ["x"],
+					},
+				},
+				{ filePath },
+			);
+			// Still a classified mutation — the file changed and the bookkeeping
+			// chain must still run.
+			expect(unresolved).toMatchObject({
+				kind: "edit",
+				source: "hashline-edit-pro",
+				provenance: "declared",
+			});
+			expect(unresolved?.touchedLines).toBeUndefined();
+			expect(unresolved?.preflightError).toBeUndefined();
+			expect(unresolved?.unresolvedReason).toBe("remove_from:anchor_not_found");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("does not claim a shape it cannot positively identify (F2)", async () => {
+		const { classifyMutatingTool } =
+			await import("../../clients/mutating-tool.js");
+		// An unrelated tool that happens to carry an `operations` array.
+		expect(
+			classifyMutatingTool({
+				toolName: "run_migrations",
+				input: { path: "/a.ts", operations: [{ name: "backfill" }] },
+			}),
+		).toBeUndefined();
+		// A navigation tool that happens to carry `anchor` + `direction`.
+		expect(
+			classifyMutatingTool({
+				toolName: "scroll_to",
+				input: { path: "/a.ts", anchor: "aB3", direction: "after" },
+			}),
+		).toBeUndefined();
+		// `remove_from` without the `replacement_lines` the schema requires.
 		expect(
 			classifyMutatingTool({
 				toolName: "replace",
-				input: { path: "/a.ts", remove_from: "9", remove_to: "12" },
+				input: { path: "/a.ts", remove_from: "aB3", remove_to: "cD4" },
 			}),
-		).toMatchObject({
-			kind: "edit",
-			source: "hashline-edit-pro",
-			touchedLines: [9, 12],
-			provenance: "declared",
-		});
+		).toBeUndefined();
+		// Positive control: the same shape WITH the required field is claimed.
+		expect(
+			classifyMutatingTool({
+				toolName: "replace",
+				input: {
+					path: "/a.ts",
+					remove_from: "aB3",
+					remove_to: "cD4",
+					replacement_lines: [],
+				},
+			}),
+		).toMatchObject({ source: "hashline-edit-pro", kind: "edit" });
 	});
 
-	it("blocks rather than guesses when an adapter cannot resolve its anchors", async () => {
-		const { classifyMutatingTool } =
+	it("carries the tool_call ranges to the tool_result by toolCallId", async () => {
+		// At tool_result the edit has landed, so the anchors no longer address
+		// the lines they named. The seam reuses what the tool_call resolved
+		// rather than re-resolving against rewritten content.
+		const { classifyMutatingTool, _resetMutationRangeCarryForTests } =
 			await import("../../clients/mutating-tool.js");
-		const blocked = classifyMutatingTool({
-			toolName: "replace",
-			input: { path: "/a.ts", remove_from: "notaline", remove_to: "12" },
-		});
-		expect(blocked?.touchedLines).toBeUndefined();
-		expect(blocked?.preflightError).toContain("BLOCKED");
+		_resetMutationRangeCarryForTests();
+		const env = setupTestEnvironment("pi-lens-2423-carry-");
+		try {
+			const filePath = path.join(env.tmpDir, "a.ts");
+			fs.writeFileSync(filePath, SOURCE);
+			const event = {
+				toolName: "replace",
+				toolCallId: "call-carry-1",
+				input: {
+					path: filePath,
+					remove_from: ANCHOR(2),
+					remove_to: ANCHOR(3),
+					replacement_lines: ["x"],
+				},
+			};
+			expect(classifyMutatingTool(event, { filePath })?.touchedLines).toEqual([
+				2, 3,
+			]);
+
+			// The edit lands: the anchored lines are gone.
+			fs.writeFileSync(filePath, "const a = 1;\nconst z = 9;\n");
+			expect(
+				classifyMutatingTool(event, { filePath, recognizeOnly: true })
+					?.touchedLines,
+			).toEqual([2, 3]);
+
+			// A different call id gets nothing — the carry is per tool call, not
+			// a global "last resolved range".
+			expect(
+				classifyMutatingTool(
+					{ ...event, toolCallId: "call-carry-other" },
+					{ filePath, recognizeOnly: true },
+				)?.touchedLines,
+			).toBeUndefined();
+		} finally {
+			env.cleanup();
+		}
 	});
 
 	it("has no dead `multiedit` entry left in the mutating-tool table", async () => {
@@ -371,8 +651,41 @@ describe("#2423 — classification contract", () => {
 // `clients/` and fails when a mutation decision is made by comparing a tool
 // name to the `"write"` / `"edit"` literals anywhere else.
 
-const CLIENTS_DIR = path.resolve(import.meta.dirname, "..", "..", "clients");
+const REPO_ROOT = path.resolve(import.meta.dirname, "..", "..");
+const CLIENTS_DIR = path.join(REPO_ROOT, "clients");
 const SEAM_FILE = path.join(CLIENTS_DIR, "mutating-tool.ts");
+
+/**
+ * What the guard walks. `index.ts` and `tools/` were added in review round 1
+ * (finding F4): `index.ts:2344` compared `rtToolName` to the two literals to
+ * gate the `tool_result_received` latency marker — a sixteenth site the sweep
+ * missed twice over, because the walk stopped at `clients/` AND because the
+ * variable was named `rtToolName`, which the old `toolName === "…"` pattern did
+ * not match.
+ */
+const SCAN_ROOTS = [CLIENTS_DIR, path.join(REPO_ROOT, "tools")];
+const SCAN_FILES = [path.join(REPO_ROOT, "index.ts")];
+
+/**
+ * The class sweep's declared exclusions: files that legitimately carry a
+ * `"write"` / `"edit"` literal. They are NOT skipped by the walk — they are
+ * listed so the reason is auditable, and the case below proves each one holds
+ * only the declared form, so a real comparison appearing in any of them would
+ * still be an offender.
+ *
+ * `scripts/run-harness.mjs` is the third declared exclusion: an offline
+ * transcript-analysis script producing per-tool statistics (`writeCallCount`,
+ * `editCallCount`, …), not a pipeline mutation decision, and as untyped `.mjs`
+ * outside the tsc surface it cannot import the seam without a sibling `.d.mts`.
+ * It is absent from this list because the walk is TypeScript-only.
+ */
+const DECLARED_EXCLUSIONS: Array<{ file: string; reason: string }> = [
+	{
+		file: path.join(CLIENTS_DIR, "format-events-publish.ts"),
+		reason:
+			'published v1 bus payload: `tool: "write" | "edit"` is the DECLARED type of pilens:format:queued, pinned by tests/config/files-touched-bus-conformance.test.ts. Widening it is #2421.',
+	},
+];
 
 function walkTypeScript(dir: string, out: string[] = []): string[] {
 	for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -384,19 +697,49 @@ function walkTypeScript(dir: string, out: string[] = []): string[] {
 	return out;
 }
 
+/**
+ * Every way the codebase has actually spelled "is this the write or edit tool".
+ *
+ * `!==` is the form the ORIGINAL gate on master used
+ * (`if (event.toolName !== "write" && event.toolName !== "edit") return;`), and
+ * the first cut of this guard matched only `===` — so the exact shape the seam
+ * replaced could have been reintroduced without a red (review round 1, finding
+ * F3). The leading `\w*` catches a renamed local like `rtToolName`.
+ */
 const LITERAL_COMPARISONS = [
-	/toolName\s*===\s*"(?:write|edit|multiedit)"/,
+	/\w*[Tt]oolName\s*[=!]==?\s*"(?:write|edit|multiedit)"/,
+	/"(?:write|edit|multiedit)"\s*[=!]==?\s*\w*[Tt]oolName\b/,
 	/isToolCallEventType\(\s*"(?:write|edit|multiedit)"/,
 	/isToolCallEventType\(\s*[A-Za-z_$][\w$]*\s*,\s*"(?:write|edit|multiedit)"/,
 ];
 
 describe("#2423 grep guard — the seam is the only mutation decision point", () => {
+	it("keeps every declared exclusion a declaration, not a comparison", () => {
+		expect(DECLARED_EXCLUSIONS.length).toBeGreaterThan(0);
+		for (const { file, reason } of DECLARED_EXCLUSIONS) {
+			expect(fs.existsSync(file), `${file}: ${reason}`).toBe(true);
+			const hits = fs
+				.readFileSync(file, "utf8")
+				.split("\n")
+				.filter((line) => LITERAL_COMPARISONS.some((re) => re.test(line)));
+			expect(hits, `${file}: ${reason}`).toEqual([]);
+		}
+	});
+
 	it("finds no tool-name literal comparison outside clients/mutating-tool.ts", () => {
-		const files = walkTypeScript(CLIENTS_DIR);
+		const files = [
+			...SCAN_ROOTS.flatMap((root) => walkTypeScript(root)),
+			...SCAN_FILES,
+		];
 		// Non-empty scan floor: a walker that silently found nothing would make
-		// this suite pass for the wrong reason. `clients/` held well over 200
-		// TypeScript files when this floor was set on 2026-09-02.
+		// this suite pass for the wrong reason. `clients/` alone held well over
+		// 200 TypeScript files when this floor was set on 2026-09-02.
 		assertNonEmptyScan("#2423 mutation-literal grep guard", files.length, 150);
+		// The two roots added in review round 1 must actually contribute.
+		expect(files).toContain(path.join(REPO_ROOT, "index.ts"));
+		expect(
+			files.some((file) => file.startsWith(path.join(REPO_ROOT, "tools"))),
+		).toBe(true);
 
 		const offenders: string[] = [];
 		for (const file of files) {
@@ -405,7 +748,7 @@ describe("#2423 grep guard — the seam is the only mutation decision point", ()
 			lines.forEach((line, index) => {
 				if (LITERAL_COMPARISONS.some((re) => re.test(line))) {
 					offenders.push(
-						`${path.relative(CLIENTS_DIR, file)}:${index + 1}: ${line.trim()}`,
+						`${path.relative(REPO_ROOT, file)}:${index + 1}: ${line.trim()}`,
 					);
 				}
 			});
@@ -414,9 +757,33 @@ describe("#2423 grep guard — the seam is the only mutation decision point", ()
 	});
 
 	it("still detects an offender when one exists (the guard is not vacuous)", () => {
-		const sample = '\tif (event.toolName === "edit") return 1;';
-		expect(LITERAL_COMPARISONS.some((re) => re.test(sample))).toBe(true);
-		const nav = '\tif (toolName === "lsp_navigation") return 1;';
-		expect(LITERAL_COMPARISONS.some((re) => re.test(nav))).toBe(false);
+		const offenders = [
+			'\tif (event.toolName === "edit") return 1;',
+			// The master gate the seam replaced.
+			'\tif (event.toolName !== "write" && event.toolName !== "edit") return;',
+			'\tif (toolName != "edit") return;',
+			'\tif (toolName == "write") return;',
+			// The renamed local that hid index.ts:2344 from the first sweep.
+			'\t\tif (rtToolName === "edit" || rtToolName === "write") {',
+			'\tif ("write" === toolName) return;',
+			'\tif (isToolCallEventType("write", event as any)) {',
+		];
+		for (const sample of offenders) {
+			expect(
+				LITERAL_COMPARISONS.some((re) => re.test(sample)),
+				sample,
+			).toBe(true);
+		}
+		const allowed = [
+			'\tif (toolName === "lsp_navigation") return 1;',
+			'\tif (mutation.kind === "write") return 1;',
+			'\ttool: "write" | "edit";',
+		];
+		for (const sample of allowed) {
+			expect(
+				LITERAL_COMPARISONS.some((re) => re.test(sample)),
+				sample,
+			).toBe(false);
+		}
 	});
 });
