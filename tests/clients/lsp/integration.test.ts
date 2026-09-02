@@ -176,7 +176,9 @@ describe("LSP Client Integration", () => {
 	it("advertises executeCommand commands from initialize", () => {
 		expect(client!.getAdvertisedCommands().sort()).toEqual([
 			"fake.applyEdit",
+			"fake.applyEditDeferred",
 			"fake.doThing",
+			"fake.releaseDeferredApplyEdit",
 		]);
 	});
 
@@ -1286,5 +1288,172 @@ describe("LSP Client Integration — mutation-bridge fallback for server-initiat
 
 		const turnFiles = cacheManager.readTurnState(subPkgCwd).files ?? {};
 		expect(Object.keys(turnFiles)).toHaveLength(1);
+	});
+
+	// #2479. `runServerCommand` (clients/lsp/client.ts) restored
+	// `activeMutationContext` only when `activeMutationDepth` returned to 0 —
+	// never back to the OUTER call's own context when a nested
+	// `executeCommand` unwound from depth 2 to depth 1. Every server-initiated
+	// applyEdit the outer call solicited AFTER that unwind therefore read
+	// `undefined`, fell to the mutation-bridge fallback, and carried the
+	// generic `agent-tool:lsp-workspace-applyEdit` receipt instead of the outer
+	// operation's own (`lsp-execute-command`, or `lsp-rename` for a rename) for
+	// the entire remaining life of its window.
+	//
+	// The ordering is made deterministic by the fixture's
+	// "fake.applyEditDeferred" / "fake.releaseDeferredApplyEdit" pair rather
+	// than by message-arrival timing: the outer call's edit is HELD server-side
+	// until the test has AWAITED the nested call (so the depth 2 to 1 unwind,
+	// which runs in `runServerCommand`'s `finally` before its promise settles,
+	// has definitely completed), and only then released into the outer call's
+	// still-open `serverEditsAllowed` window. The release rides
+	// `executeReadOnlyCommand` — the #1412 read-only sibling that never touches
+	// `serverEditsAllowed`/`activeMutationDepth`/`activeMutationContext` — so
+	// what the applyEdit handler reads is the RESTORED outer context, not a
+	// third mutating frame's own.
+	it("keeps the outer call's own mutation context for an applyEdit solicited after a nested executeCommand unwinds (#2479)", async () => {
+		// Separate cwds for the outer and inner calls' own bookkeeping, distinct
+		// from `tmpDir` (the edit target's directory and the bridge's
+		// `getProjectRoot`) and from each other — `readTurnState`/
+		// `readChangesSince` are cwd-scoped on-disk stores, so sharing a cwd
+		// would make "whose context recorded this" unanswerable.
+		const outerCwd = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-nested-restore-outer-"),
+		);
+		const innerCwd = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-nested-restore-inner-"),
+		);
+		try {
+			// Both calls' runtimes carry the REAL project root (`tmpDir`, the
+			// LSP client's launch root), exactly as `tools/lsp-navigation.ts`
+			// threads it — their `cwd` is the narrower calling directory. So
+			// each context's `isRecordable` is built the way production builds
+			// it, and neither call is exempted from that gate by construction.
+			const outerRuntime = new RuntimeCoordinator();
+			outerRuntime.projectRoot = tmpDir;
+			outerRuntime.setTelemetryIdentity({ sessionId: "s-2479-outer" });
+			outerRuntime.beginTurn();
+			const outerCacheManager = new CacheManager(false);
+
+			const innerRuntime = new RuntimeCoordinator();
+			innerRuntime.projectRoot = tmpDir;
+			innerRuntime.setTelemetryIdentity({ sessionId: "s-2479-inner" });
+			innerRuntime.beginTurn();
+			const innerCacheManager = new CacheManager(false);
+
+			const bridgeRuntime = new RuntimeCoordinator();
+			bridgeRuntime.projectRoot = tmpDir;
+			bridgeRuntime.setTelemetryIdentity({ sessionId: "s-2479-bridge" });
+			bridgeRuntime.beginTurn();
+			const bridgeCacheManager = new CacheManager(false);
+			registerMutationBridge({
+				getRuntime: () => bridgeRuntime as never,
+				getCacheManager: () => bridgeCacheManager,
+				getProjectRoot: () => tmpDir,
+				getDispatchCwd: () => tmpDir,
+				countFileLines,
+				isRecordable: () => true,
+				dbg: () => {},
+			});
+
+			const outerContext = {
+				cwd: outerCwd,
+				correlationId: "restore-outer",
+				tool: "lsp_navigation:executeCommand",
+				source: "lsp-execute-command" as const,
+				runtime: outerRuntime as never,
+				cacheManager: outerCacheManager,
+				isRecordable: (fp: string): boolean =>
+					isRecordableProjectPath(fp, outerRuntime.projectRoot ?? outerCwd),
+				emitSummary: false,
+			};
+			const innerContext = {
+				cwd: innerCwd,
+				correlationId: "restore-inner",
+				tool: "lsp_navigation:executeCommand",
+				source: "lsp-execute-command" as const,
+				runtime: innerRuntime as never,
+				cacheManager: innerCacheManager,
+				isRecordable: (fp: string): boolean =>
+					isRecordableProjectPath(fp, innerRuntime.projectRoot ?? innerCwd),
+				emitSummary: false,
+			};
+
+			// Depth 0 to 1, context = the outer call's. The server holds the
+			// edit back rather than sending it during this window's first leg.
+			const outerPromise = client!.executeCommand(
+				"fake.applyEditDeferred",
+				[
+					pathToFileURL(filePath).href,
+					{ line: EDIT_LINE_0BASED, startCharacter: 0, endCharacter: 5 },
+				],
+				outerContext,
+			);
+			// Depth 1 to 2, context cleared for the nested frame — then awaited
+			// to completion, so the 2 to 1 unwind has run before anything below.
+			const innerRes = await client!.executeCommand(
+				"fake.doThing",
+				undefined,
+				innerContext,
+			);
+			expect(innerRes.executed).toBe(true);
+
+			// Release the held edit into the outer call's still-open window.
+			const released = await client!.executeReadOnlyCommand(
+				"fake.releaseDeferredApplyEdit",
+			);
+			expect(released.executed).toBe(true);
+			expect((released.result as { released?: boolean }).released).toBe(true);
+
+			const outerRes = await outerPromise;
+			expect(outerRes.executed).toBe(true);
+			const expectedLines = [...FIXTURE_LINES];
+			expectedLines[EDIT_LINE_0BASED] = "EDITED world;";
+			expect(fs.readFileSync(filePath, "utf-8")).toBe(
+				`${expectedLines.join("\n")}\n`,
+			);
+
+			// The receipt carries the OUTER operation's own provenance, through
+			// the outer call's own directly-threaded runtime/cacheManager.
+			const outerReceipts = outerRuntime.getMutationsSince(0);
+			expect(outerReceipts.map((r) => r.filePath)).toEqual([
+				normalizeMapKey(filePath),
+			]);
+			expect(outerReceipts[0].source).toBe("lsp-execute-command");
+
+			const outerChanges = readChangesSince(outerCwd, 0);
+			expect(outerChanges).toHaveLength(1);
+			expect(outerChanges[0].source).toBe("lsp-execute-command");
+			expect(outerChanges[0].changedRange).toEqual({ start: 7, end: 7 });
+
+			const outerTurnFiles =
+				outerCacheManager.readTurnState(outerCwd).files ?? {};
+			const outerKeys = Object.keys(outerTurnFiles);
+			expect(outerKeys).toHaveLength(1);
+			expect(outerKeys[0]).toContain("target.ts");
+			expect(outerTurnFiles[outerKeys[0]].modifiedRanges).toEqual([
+				{ start: 7, end: 7 },
+			]);
+
+			// Nothing reached the mutation-bridge fallback: the generic
+			// `agent-tool:lsp-workspace-applyEdit` receipt is exactly the lost
+			// provenance this test exists to catch.
+			expect(readChangesSince(tmpDir, 0)).toEqual([]);
+			expect(bridgeRuntime.getMutationsSince(0)).toEqual([]);
+			expect(
+				Object.keys(bridgeCacheManager.readTurnState(tmpDir).files ?? {}),
+			).toHaveLength(0);
+
+			// And what was restored is the OUTER call's context, not the
+			// already-unwound inner frame's.
+			expect(readChangesSince(innerCwd, 0)).toEqual([]);
+			expect(innerRuntime.getMutationsSince(0)).toEqual([]);
+			expect(
+				Object.keys(innerCacheManager.readTurnState(innerCwd).files ?? {}),
+			).toHaveLength(0);
+		} finally {
+			removeTempDirSync(outerCwd);
+			removeTempDirSync(innerCwd);
+		}
 	});
 });
