@@ -31,6 +31,7 @@ import { normalizeMapKey } from "../../../clients/path-utils.js";
 import { readChangesSince } from "../../../clients/project-changes.js";
 import { countFileLines } from "../../../clients/read-guard-tool-lines.js";
 import { RuntimeCoordinator } from "../../../clients/runtime-coordinator.js";
+import { isRecordableProjectPath } from "../../../clients/file-utils.js";
 
 describe("LSP Client Integration", () => {
 	let client: Awaited<ReturnType<typeof createLSPClient>> | undefined;
@@ -1061,33 +1062,43 @@ describe("LSP Client Integration — mutation-bridge fallback for server-initiat
 		expect(turnFiles[keys[0]].modifiedRanges).toEqual([{ start: 7, end: 7 }]);
 	});
 
-	// #2450 review round 2 (F5). The reachable production shape is nested
-	// executeCommand, not "a caller that never threads a context" — see the
-	// describe-level comment above. Two `executeCommand` calls fire back to
-	// back with NO `await` between them, so both calls' synchronous prefix
-	// (the `activeMutationDepth` bump in `runServerCommand`, before its first
-	// `await`) runs before either awaits a server round-trip: the outer call
-	// bumps depth 0→1 and stores ITS OWN (fully-threaded) mutation context;
-	// the inner call then bumps depth 1→2, which — per `runServerCommand` —
-	// clears `activeMutationContext` to `undefined` for the window, even
-	// though the outer call's context object is still very much alive. The
-	// inner call's own `workspace/applyEdit` therefore lands with NO context,
-	// exactly like the un-nested test above, and must fall back to the bridge
-	// — proving the fallback triggers on `activeMutationDepth !== 1`, not
-	// merely on "nobody ever passed a context".
-	it("falls back to the mutation bridge for a nested executeCommand's server-initiated edit, without touching the outer call's own context", async () => {
-		// A SEPARATE cwd for the outer call's own bookkeeping, deliberately
-		// distinct from `tmpDir` (the real edit target's directory, and the
-		// bridge's `getProjectRoot`). `cacheManager.addModifiedRange`/
-		// `readTurnState` and `readChangesSince` are FILE-scoped by `cwd` — any
-		// two `CacheManager`/`readChangesSince` calls sharing the same `cwd`
+	// #2450 review round 2 (F5)/round 3 (F3). The reachable production shape
+	// is nested executeCommand, not "a caller that never threads a context"
+	// — see the describe-level comment above. Two `executeCommand` calls fire
+	// back to back with NO `await` between them, so both calls' synchronous
+	// prefix (the `activeMutationDepth` bump in `runServerCommand`, before
+	// its first `await`) runs before either awaits a server round-trip: the
+	// outer call bumps depth 0→1 and stores ITS OWN (fully-threaded) mutation
+	// context; the inner call then bumps depth 1→2, which — per
+	// `runServerCommand` — clears `activeMutationContext` to `undefined` for
+	// the window, even though BOTH calls' context objects are still very much
+	// alive. Round 3 (F3): the inner call below now threads its OWN
+	// fully-threaded context too (own runtime/cacheManager/cwd), not
+	// `undefined` — the round-2 version passed no context at all, which made
+	// a test asserting "the outer call's context isn't used" pass even with
+	// the `workspace/applyEdit` handler's now-deleted `depth === 1` re-check
+	// removed, because there was never a second context in play for that
+	// removal to accidentally let through. With the inner call threading its
+	// own context, the fallback must still fire — proving nesting clears
+	// `activeMutationContext` for ANY inner context, not merely "no context
+	// was ever passed for the inner call".
+	it("falls back to the mutation bridge for a nested executeCommand's server-initiated edit, using neither the outer nor the inner call's own context", async () => {
+		// SEPARATE cwds for the outer and inner calls' own bookkeeping,
+		// deliberately distinct from `tmpDir` (the real edit target's
+		// directory, and the bridge's `getProjectRoot`) and from each other.
+		// `cacheManager.addModifiedRange`/`readTurnState` and
+		// `readChangesSince` are FILE-scoped by `cwd` — any two
+		// `CacheManager`/`readChangesSince` calls sharing the same `cwd`
 		// observe the SAME on-disk store regardless of which JS instance made
-		// them. Using the same `tmpDir` for both `outerContext` and the bridge
-		// would make the outer call's turn-state/change-log indistinguishable
-		// from the bridge's, defeating the "never touched the outer call's own
-		// context" assertion below.
+		// them. Reusing `tmpDir` for either call's own context would make
+		// that call's turn-state/change-log indistinguishable from the
+		// bridge's, defeating the "never touched by either call's own
+		// context" assertions below.
 		const outerCwd = fs.mkdtempSync(
 			path.join(os.tmpdir(), "pi-lens-lsp-bridge-fallback-outer-"),
+		);
+		const innerCwd = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-bridge-fallback-inner-"),
 		);
 		try {
 			const outerRuntime = new RuntimeCoordinator();
@@ -1095,6 +1106,12 @@ describe("LSP Client Integration — mutation-bridge fallback for server-initiat
 			outerRuntime.setTelemetryIdentity({ sessionId: "s-2450-outer" });
 			outerRuntime.beginTurn();
 			const outerCacheManager = new CacheManager(false);
+
+			const innerRuntime = new RuntimeCoordinator();
+			innerRuntime.projectRoot = innerCwd;
+			innerRuntime.setTelemetryIdentity({ sessionId: "s-2450-inner" });
+			innerRuntime.beginTurn();
+			const innerCacheManager = new CacheManager(false);
 
 			const bridgeRuntime = new RuntimeCoordinator();
 			bridgeRuntime.projectRoot = tmpDir;
@@ -1122,6 +1139,21 @@ describe("LSP Client Integration — mutation-bridge fallback for server-initiat
 				cacheManager: outerCacheManager,
 				emitSummary: false,
 			};
+			// Round 3 (F3): the inner call's OWN fully-threaded context — a
+			// distinct runtime/cacheManager/cwd from the outer call's, so a
+			// bug that let the applyEdit handler read `state.activeMutationContext`
+			// as the INNER call's own context (instead of falling back to the
+			// bridge) would show up as a write landing in `innerCacheManager`/
+			// `innerRuntime`, not just "the outer call's stores stayed empty".
+			const innerContext = {
+				cwd: innerCwd,
+				correlationId: "nested-inner",
+				tool: "lsp_navigation:executeCommand",
+				source: "lsp-execute-command" as const,
+				runtime: innerRuntime as never,
+				cacheManager: innerCacheManager,
+				emitSummary: false,
+			};
 
 			// Fired back to back, deliberately not awaited individually — see the
 			// comment above for why this ordering is what makes depth 1→2 happen
@@ -1131,10 +1163,14 @@ describe("LSP Client Integration — mutation-bridge fallback for server-initiat
 				undefined,
 				outerContext,
 			);
-			const innerPromise = client!.executeCommand("fake.applyEdit", [
-				pathToFileURL(filePath).href,
-				{ line: EDIT_LINE_0BASED, startCharacter: 0, endCharacter: 5 },
-			]);
+			const innerPromise = client!.executeCommand(
+				"fake.applyEdit",
+				[
+					pathToFileURL(filePath).href,
+					{ line: EDIT_LINE_0BASED, startCharacter: 0, endCharacter: 5 },
+				],
+				innerContext,
+			);
 
 			const [outerRes, innerRes] = await Promise.all([
 				outerPromise,
@@ -1149,7 +1185,7 @@ describe("LSP Client Integration — mutation-bridge fallback for server-initiat
 				`${expectedLines.join("\n")}\n`,
 			);
 
-			// The inner write landed through the bridge fallback, not the outer
+			// The inner write landed through the bridge fallback, not either
 			// call's directly-threaded runtime/cacheManager.
 			const bridgeChanges = readChangesSince(tmpDir, 0);
 			expect(bridgeChanges).toHaveLength(1);
@@ -1161,18 +1197,94 @@ describe("LSP Client Integration — mutation-bridge fallback for server-initiat
 				bridgeCacheManager.readTurnState(tmpDir).files ?? {};
 			expect(Object.keys(bridgeTurnFiles)).toHaveLength(1);
 
-			// The outer call's OWN context (and its own, differently-scoped
-			// turn-state/change-log/receipt store) was never used for the inner
-			// write — proof the fallback fired because nesting cleared the
-			// active context, not because no context existed anywhere in the
-			// process.
+			// Neither call's OWN context (and its own, differently-scoped
+			// turn-state/change-log/receipt store) was used for the inner
+			// write — proof the fallback fired because nesting clears the
+			// active context for ANY inner context, not merely because the
+			// inner call happened to pass none.
 			expect(
 				Object.keys(outerCacheManager.readTurnState(outerCwd).files ?? {}),
 			).toHaveLength(0);
 			expect(readChangesSince(outerCwd, 0)).toEqual([]);
 			expect(outerRuntime.getMutationsSince(0)).toEqual([]);
+
+			expect(
+				Object.keys(innerCacheManager.readTurnState(innerCwd).files ?? {}),
+			).toHaveLength(0);
+			expect(readChangesSince(innerCwd, 0)).toEqual([]);
+			expect(innerRuntime.getMutationsSince(0)).toEqual([]);
 		} finally {
 			removeTempDirSync(outerCwd);
+			removeTempDirSync(innerCwd);
 		}
+	});
+
+	// #2450 fix round 3 (F4): a single (non-nested) executeCommand's
+	// server-initiated edit is confined to `state.root` — the LSP CLIENT's
+	// launch root (`tmpDir` here, matching a monorepo-wide server) — not to
+	// the calling tool's `cwd`. `tools/lsp-navigation.ts` threads a
+	// `cwd`-scoped `LspMutationContext` for a call issued from a sub-package
+	// directory, so an edit landing on a SIBLING package (still inside
+	// `state.root`, just outside the sub-package `cwd`) must still be judged
+	// recordable against the PROJECT root (`runtime.projectRoot`), not the
+	// narrower `cwd` — mirroring exactly how `tools/lsp-navigation.ts` builds
+	// `isRecordable` post-fix.
+	it("records a server-initiated edit on a sibling package when the mutation context's isRecordable judges against the project root, not cwd", async () => {
+		const subPkgCwd = path.join(tmpDir, "packages", "a");
+		const siblingPkgDir = path.join(tmpDir, "packages", "b");
+		fs.mkdirSync(subPkgCwd, { recursive: true });
+		fs.mkdirSync(siblingPkgDir, { recursive: true });
+		const siblingFile = path.join(siblingPkgDir, "index.ts");
+		fs.writeFileSync(siblingFile, `${FIXTURE_LINES.join("\n")}\n`, "utf-8");
+
+		const runtime = new RuntimeCoordinator();
+		// The REAL project root spans both sibling packages; the call below
+		// is issued with the sub-package directory as its `cwd`.
+		runtime.projectRoot = tmpDir;
+		runtime.setTelemetryIdentity({ sessionId: "s-2450-subpkg" });
+		runtime.beginTurn();
+		const cacheManager = new CacheManager(false);
+
+		// Mirrors `tools/lsp-navigation.ts`'s post-fix `isRecordable` closure
+		// exactly: judge against `runtime.projectRoot`, falling back to `cwd`
+		// only when no runtime is threaded.
+		const context = {
+			cwd: subPkgCwd,
+			correlationId: "subpkg-direct",
+			tool: "lsp_navigation:executeCommand",
+			source: "lsp-execute-command" as const,
+			runtime: runtime as never,
+			cacheManager,
+			isRecordable: (fp: string): boolean =>
+				isRecordableProjectPath(fp, runtime.projectRoot ?? subPkgCwd),
+			emitSummary: false,
+		};
+
+		const res = await client!.executeCommand(
+			"fake.applyEdit",
+			[
+				pathToFileURL(siblingFile).href,
+				{ line: EDIT_LINE_0BASED, startCharacter: 0, endCharacter: 5 },
+			],
+			context,
+		);
+		expect(res.executed).toBe(true);
+		const expectedLines = [...FIXTURE_LINES];
+		expectedLines[EDIT_LINE_0BASED] = "EDITED world;";
+		expect(fs.readFileSync(siblingFile, "utf-8")).toBe(
+			`${expectedLines.join("\n")}\n`,
+		);
+
+		const receipts = runtime.getMutationsSince(0);
+		expect(receipts.map((r) => r.filePath)).toEqual([
+			normalizeMapKey(siblingFile),
+		]);
+
+		const changes = readChangesSince(subPkgCwd, 0);
+		expect(changes).toHaveLength(1);
+		expect(changes[0].filePath).toBe(path.resolve(siblingFile));
+
+		const turnFiles = cacheManager.readTurnState(subPkgCwd).files ?? {};
+		expect(Object.keys(turnFiles)).toHaveLength(1);
 	});
 });

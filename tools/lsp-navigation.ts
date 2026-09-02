@@ -1108,16 +1108,26 @@ export function createLspNavigationTool(
 					readGuard: getFlag("no-read-guard", cwd)
 						? undefined
 						: mutationDeps?.readGuard,
-					// #2450 review round 2 (F4): the SAME gate
+					// #2450 review round 2 (F4)/round 3 (F2, F4): the SAME gate
 					// `registerMutationBridge` applies internally in `index.ts`, so
 					// this directly-threaded path and the bridge fallback
 					// (`clients/lsp-mutation.ts`, reached when `mutationDeps` is
 					// absent/partial — e.g. the MCP server) agree on which files
 					// count as project source, rather than the direct path
 					// recording an ignored/vendor write the fallback would drop.
+					// `no-read-guard` is intentionally NOT checked here (round 3
+					// F2): it gates only the read-guard stamp above, the same
+					// canonical split `clients/runtime-tool-result.ts` applies
+					// (`:1120`, `:1485`) — bookkeeping (turn-state / receipts)
+					// still runs under `--no-read-guard`. Judge against the
+					// project root, not the request `cwd` (round 3 F4): a
+					// sub-package `cwd` must not read a sibling-package rename as
+					// external.
 					isRecordable: (filePath: string): boolean => {
-						if (getFlag("no-read-guard", cwd)) return false;
-						return isRecordableProjectPath(filePath, cwd);
+						return isRecordableProjectPath(
+							filePath,
+							mutationDeps?.runtime?.projectRoot ?? cwd,
+						);
 					},
 				};
 			}

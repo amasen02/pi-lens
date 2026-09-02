@@ -221,4 +221,99 @@ describe("bookkeepLspMutation — direct path and bridge fallback are equivalent
 		expect(runtimeDirect.readGuard.checkEdit(fileDirect).action).toBe("allow");
 		expect(runtimeBridge.readGuard.checkEdit(fileBridge).action).toBe("allow");
 	});
+
+	// #2450 fix round 3 (minor): `beforeEach` above only ever exercises
+	// `importsChanged: true` on a SINGLE file. Both are worth pinning
+	// independently: `importsChanged: false` is the more common shape (most
+	// edits don't touch import statements), and a multi-file rename is the
+	// shape #2450 exists for in the first place — a regression that only
+	// shows up with >1 `fileDetails` entry (e.g. an aggregation bug in
+	// `uniqueDetails`, or a loop that stops after the first file) would pass
+	// every test above undetected. Driven against the SAME already-mounted
+	// bridge/runtime/cacheManager `beforeEach` set up (the bridge is a
+	// first-wins process singleton — see `registerMutationBridge` — so a
+	// second `registerMutationBridge` call in a fresh `describe` block would
+	// silently be a no-op against the FIRST block's closure, not this one).
+	it("record a 2-file rename with importsChanged:false identically on both branches", () => {
+		const fileA_Direct = writeFixture(dirDirect, "rename-a.ts");
+		const fileB_Direct = writeFixture(dirDirect, "rename-b.ts");
+		const fileA_Bridge = writeFixture(dirBridge, "rename-a.ts");
+		const fileB_Bridge = writeFixture(dirBridge, "rename-b.ts");
+
+		function renameResultsFor(fileA: string, fileB: string) {
+			return [
+				{
+					descriptions: [],
+					files: [fileA, fileB],
+					operationTotal: 2,
+					appliedOperationTotal: 2,
+					appliedOperationIndexes: [0, 1],
+					operationCounts: { textEdits: 2, create: 0, rename: 0, delete: 0 },
+					fileDetails: [
+						{
+							filePath: fileA,
+							range: { start: EDIT_LINE_1BASED, end: EDIT_LINE_1BASED },
+							importsChanged: false,
+						},
+						{
+							filePath: fileB,
+							range: { start: EDIT_LINE_1BASED, end: EDIT_LINE_1BASED },
+							importsChanged: false,
+						},
+					],
+				},
+			];
+		}
+
+		recordLspMutation(
+			{ ...directContextForReuse(), tool: "lsp_navigation:rename" },
+			{ results: renameResultsFor(fileA_Direct, fileB_Direct) },
+		);
+		recordLspMutation(
+			{ ...bridgeContextForReuse(), tool: "lsp_navigation:rename" },
+			{ results: renameResultsFor(fileA_Bridge, fileB_Bridge) },
+		);
+
+		const directFiles = cacheManagerDirect.readTurnState(dirDirect).files ?? {};
+		const bridgeFiles = cacheManagerBridge.readTurnState(dirBridge).files ?? {};
+		// +1 for the `beforeEach`-recorded `target.ts` already in each store.
+		expect(Object.keys(directFiles)).toHaveLength(3);
+		expect(Object.keys(bridgeFiles)).toHaveLength(3);
+		for (const name of ["rename-a.ts", "rename-b.ts"]) {
+			const directKey = Object.keys(directFiles).find((k) => k.includes(name));
+			const bridgeKey = Object.keys(bridgeFiles).find((k) => k.includes(name));
+			expect(directKey, `direct turn-state missing ${name}`).toBeDefined();
+			expect(bridgeKey, `bridge turn-state missing ${name}`).toBeDefined();
+			expect(directFiles[directKey as string].importsChanged).toBe(false);
+			expect(bridgeFiles[bridgeKey as string].importsChanged).toBe(false);
+		}
+
+		const directChanges = readChangesSince(dirDirect, 0);
+		const bridgeChanges = readChangesSince(dirBridge, 0);
+		// +1 for the `beforeEach`-recorded change already in each store.
+		expect(directChanges).toHaveLength(3);
+		expect(bridgeChanges).toHaveLength(3);
+
+		function directContextForReuse(): LspMutationContext {
+			return {
+				cwd: dirDirect,
+				correlationId: "equiv-rename-direct",
+				tool: "lsp_navigation:rename",
+				source: "lsp-rename",
+				runtime: runtimeDirect as never,
+				cacheManager: cacheManagerDirect,
+				readGuard: runtimeDirect.readGuard,
+				emitSummary: false,
+			};
+		}
+		function bridgeContextForReuse(): LspMutationContext {
+			return {
+				cwd: dirBridge,
+				correlationId: "equiv-rename-bridge",
+				tool: "lsp_navigation:rename",
+				source: "lsp-rename",
+				emitSummary: false,
+			};
+		}
+	});
 });

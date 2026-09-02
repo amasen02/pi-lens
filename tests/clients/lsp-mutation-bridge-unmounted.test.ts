@@ -25,6 +25,7 @@ import {
 } from "../../clients/degradation-ledger.js";
 import { getMutationBridge } from "../../clients/mutation-bridge.js";
 import {
+	resetLspMutationNoBridgeDbgLatch,
 	type LspMutationContext,
 	recordLspMutation,
 } from "../../clients/lsp-mutation.js";
@@ -50,6 +51,7 @@ describe("lsp-mutation bridge fallback with no bridge mounted (#2450 review roun
 	it("dbg's the drop and records a bounded once-per-session degradation, instead of a silent no-op", () => {
 		expect(getMutationBridge()).toBeUndefined();
 		resetDegradationLedger();
+		resetLspMutationNoBridgeDbgLatch();
 
 		const tmpDir = fs.mkdtempSync(
 			path.join(os.tmpdir(), "pi-lens-lsp-nomedge-"),
@@ -85,16 +87,30 @@ describe("lsp-mutation bridge fallback with no bridge mounted (#2450 review roun
 			expect(groupAfterFirst).toBeDefined();
 			expect(groupAfterFirst!.count).toBe(1);
 
-			// A SECOND LSP-applied edit, same tool/subject, in the same session:
-			// `recordDegradationOnce` bounds this to one durable record per
-			// (kind, subject) — the count stays at 1, proving this is a
-			// once-per-session signal, not a per-file spam source.
-			recordLspMutation(context, { results: resultFor(fileB) });
+			// A SECOND LSP-applied edit, DIFFERENT tool value (round 3 minor: the
+			// degradation-ledger `subject` used to be `context.tool`, which
+			// varies per LSP operation — this second call deliberately uses a
+			// different one, "...rename" vs the first call's "...executeCommand"
+			// — so a subject that still varied per tool would show up here as a
+			// SECOND durable record, not a bounded count of 1). Also proves the
+			// dbg line is gated once per SESSION, not once per (tool, file): the
+			// second call touches a different file (`fileB`) but must not add a
+			// second "bridge unavailable" dbg message.
+			const secondContext: LspMutationContext = {
+				...context,
+				tool: "lsp_navigation:rename",
+				correlationId: "no-bridge-mounted-2",
+			};
+			recordLspMutation(secondContext, { results: resultFor(fileB) });
 			const summaryAfterSecond = getDegradationSummary();
 			const groupAfterSecond = summaryAfterSecond.find(
 				(group) => group.kind === "lsp-mutation-bridge-unmounted",
 			);
 			expect(groupAfterSecond!.count).toBe(1);
+			expect(
+				dbgMessages.filter((message) => message.includes("bridge unavailable"))
+					.length,
+			).toBe(1);
 		} finally {
 			removeTempDirSync(tmpDir);
 		}

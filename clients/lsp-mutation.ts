@@ -14,6 +14,24 @@ import { normalizeMapKey } from "./path-utils.js";
 import { getMutationBridge } from "./mutation-bridge.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
 
+// #2450 fix round 3 (minor): gates the "bridge unavailable" dbg line to fire
+// once per session, not once per FILE — a rename that touches many files in
+// a bridge-less process (e.g. the MCP server) would otherwise spam the same
+// line once per touched file. `recordDegradationOnce` itself has no
+// first-occurrence return value (unlike `incrementDegradationCount`), so this
+// tiny local latch is the minimal way to mirror that "once" intent onto the
+// dbg line without changing the ledger's own once-per-(kind,subject) record.
+//
+// Catalog shape 17 (a process-lifetime latch must re-arm at session_start):
+// wired into `handleSessionStart` (`clients/runtime-session.ts`) directly,
+// NOT into `resetDegradationLedger()` — that lives in `degradation-ledger.ts`,
+// which this module already imports, and reaching back from there to here
+// would be a cycle.
+let noBridgeDbgLogged = false;
+export function resetLspMutationNoBridgeDbgLatch(): void {
+	noBridgeDbgLogged = false;
+}
+
 export interface LspMutationRuntime {
 	bumpFileSeq?: (filePath: string) => { projectSeq: number; fileSeq: number };
 	/** One mutation seam (#2000 phase 1) — bump + receipt + change-log. */
@@ -26,6 +44,17 @@ export interface LspMutationRuntime {
 	}) => { projectSeq: number; fileSeq: number };
 	telemetrySessionId?: string;
 	turnIndex?: number;
+	/**
+	 * #2450 fix round 3 (F4): the recordability gate the bridge fallback
+	 * applies (`index.ts`'s `registerMutationBridge`/`registerReadBridge`)
+	 * judges a path against `runtime.projectRoot`, not the request's `cwd` —
+	 * a rename issued from a sub-package `cwd` that touches a sibling
+	 * package must not be judged "external" just because the sub-package
+	 * isn't the request root. Optional so callers that never threaded a
+	 * runtime (or whose runtime has no notion of a project root) keep prior
+	 * behavior of falling back to `cwd`.
+	 */
+	projectRoot?: string;
 }
 
 export interface LspMutationCacheManager {
@@ -275,16 +304,21 @@ function bookkeepLspMutation(
 		if (useBridgeFallback) {
 			const bridge = getMutationBridge();
 			if (!bridge) {
-				// #2450 review round 2 (F4): the MCP server process
+				// #2450 review round 2 (F4)/round 3 (minor): the MCP server process
 				// (`mcp/server.ts`) builds `lsp_navigation` with no
 				// `mutationDeps` AND never mounts the bridge (that only happens
 				// inside pi's own in-process extension activation, `index.ts`) —
 				// every LSP-applied edit in that process is unrecorded. Once per
 				// session (not once per file — a rename can touch many files in
-				// one call), not once per process lifetime silently.
+				// one call, and a session can issue many renames), not once per
+				// process lifetime silently. `subject` is a fixed, one-word
+				// degradation-ledger key (round 3: was `context.tool`, which
+				// varies per LSP operation — "lsp_navigation:rename" vs
+				// "...executeCommand" — so the SAME session could log this
+				// degradation once per operation kind instead of truly once).
 				recordDegradationOnce({
 					kind: "lsp-mutation-bridge-unmounted",
-					subject: context.tool,
+					subject: "lsp-mutation:no-bridge",
 					reason:
 						"workspace/applyEdit bookkeeping fell back to the mutation " +
 						"bridge, but no bridge is mounted in this process (e.g. the " +
@@ -292,9 +326,12 @@ function bookkeepLspMutation(
 						"the write is unrecorded (no read-guard stamp, no turn-state " +
 						"entry, no change-log receipt).",
 				});
-				context.dbg?.(
-					`lsp mutation bridge unavailable, dropping bookkeeping for ${filePath}`,
-				);
+				if (!noBridgeDbgLogged) {
+					noBridgeDbgLogged = true;
+					context.dbg?.(
+						`lsp mutation bridge unavailable, dropping bookkeeping for ${filePath}`,
+					);
+				}
 			} else {
 				try {
 					const recorded = bridge.recordMutation({

@@ -1496,4 +1496,108 @@ describe("lsp_navigation tool", () => {
 			removeTempDirSync(tmpDir);
 		}
 	});
+
+	// #2450 fix round 3 (F2): no-read-guard must gate ONLY the read-guard
+	// stamp (clients/runtime-tool-result.ts:1120,:1485 — the canonical
+	// semantics), never bookkeeping (turn-state / receipts). Before this
+	// round, isRecordable short-circuited to false whenever no-read-guard
+	// was set, so a rename under --no-read-guard recorded NOTHING at all
+	// instead of just skipping the read-guard stamp.
+	it("#2450 fix round 3 (F2): a rename under --no-read-guard still records turn-state and receipts, but skips the read-guard stamp", async () => {
+		const tmpDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-nav-2450-no-read-guard-"),
+		);
+		const fileA = path.join(tmpDir, "a.ts");
+		const fileB = path.join(tmpDir, "b.ts");
+		const filler = "// filler line\n".repeat(5);
+		fs.writeFileSync(fileA, `${filler}const oldName = 1;\n`);
+		fs.writeFileSync(fileB, `${filler}import { oldName } from './a';\n`);
+
+		const runtime = new RuntimeCoordinator();
+		runtime.projectRoot = tmpDir;
+		runtime.setTelemetryIdentity({ sessionId: "s-2450-no-read-guard" });
+		runtime.beginTurn();
+		const cacheManager = new CacheManager(false);
+
+		const recordWritten = vi.fn();
+		const tool = createLspNavigationTool((flag) => flag === "no-read-guard", {
+			runtime: runtime as never,
+			cacheManager,
+			readGuard: { recordWritten },
+			dbg: () => {},
+		});
+
+		(mocked.service as { rename: ReturnType<typeof vi.fn> }).rename = vi
+			.fn()
+			.mockResolvedValue({
+				changes: {
+					[pathToFileURL(fileA).href]: [
+						{
+							range: {
+								start: { line: 5, character: 6 },
+								end: { line: 5, character: 13 },
+							},
+							newText: "newName",
+						},
+					],
+					[pathToFileURL(fileB).href]: [
+						{
+							range: {
+								start: { line: 5, character: 9 },
+								end: { line: 5, character: 16 },
+							},
+							newText: "newName",
+						},
+					],
+				},
+			});
+
+		try {
+			const result = await tool.execute(
+				"rename-no-read-guard",
+				{
+					operation: "rename",
+					path: fileA,
+					line: 6,
+					character: 7,
+					newName: "newName",
+					apply: true,
+				},
+				new AbortController().signal,
+				null,
+				{ cwd: tmpDir },
+			);
+
+			expect(result.isError).toBeUndefined();
+
+			const turnFiles = cacheManager.readTurnState(tmpDir).files ?? {};
+			expect(Object.keys(turnFiles)).toHaveLength(2);
+
+			const changes = readChangesSince(tmpDir, 0);
+			expect(changes).toHaveLength(2);
+
+			// no-read-guard gates ONLY the read-guard stamp, never bookkeeping.
+			expect(recordWritten).not.toHaveBeenCalled();
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
+	});
+
+	// #2450 fix round 3 (F4) note: `isRecordable`'s cwd-vs-projectRoot
+	// divergence is NOT reachable through this file's mocked-service harness.
+	// `rename`'s real (unmocked) `applyWorkspaceEdit(edit, ctx.cwd, ...)`
+	// confines every touched file to `ctx.cwd` itself (clients/lsp/edits.ts
+	// `createWorkspaceUriConfiner`) — a file outside `ctx.cwd` throws
+	// "workspace edit path escapes workspace" before bookkeeping ever runs,
+	// so a cross-package edit can't reach `isRecordable` this way at all.
+	// `executeCommand`'s edit application is fully mocked at the service
+	// layer here (`mocked.service.executeCommand`), so it never exercises the
+	// real `bookkeepLspMutation`/`isRecordable` path either. The actually
+	// reachable production shape — a single executeCommand's server-initiated
+	// `workspace/applyEdit`, confined to `state.root` (the LSP CLIENT's
+	// launch root, which can span multiple packages) rather than `ctx.cwd` —
+	// is covered against the real wire protocol in
+	// tests/clients/lsp/integration.test.ts ("records a server-initiated
+	// edit on a sibling package when the mutation context's isRecordable
+	// judges against the project root, not cwd").
 });
