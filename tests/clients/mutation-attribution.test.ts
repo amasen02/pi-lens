@@ -27,8 +27,13 @@ import {
 	primePersistedMutationAttribution,
 	resetMutationAttribution,
 	shouldArmObservationForTool,
+	_mutationAttributionSnapshotForTests,
 } from "../../clients/mutation-attribution.js";
 import { classifyMutatingTool } from "../../clients/mutating-tool.js";
+import {
+	_seedProcessSingletonCellForTests,
+	PROCESS_SINGLETON_RESET_KIND,
+} from "../../clients/process-singletons.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
 beforeEach(() => {
@@ -262,5 +267,53 @@ describe("#2430 item 2 — persistence across sessions", () => {
 			else process.env.PILENS_DATA_DIR = previousDataDir;
 			env.cleanup();
 		}
+	});
+});
+
+describe("#2449 review round 5, F3 — the version bump for the session shape change", () => {
+	it("discards a v1-shaped cell (session as a plain Map) fail-soft instead of adopting it", () => {
+		// `session` moved from a plain `Map` to a `BoundedFifoMap` without a
+		// version bump at the time, so a cell built by an older process (still
+		// alive in a multi-agent session, or surviving a hot reload) used to be
+		// ADOPTED here as if it already had the newer shape — `getProcessSingleton`
+		// only compares the version NUMBER, so it cannot see that a v1 cell's
+		// `session` lacks the `BoundedFifoMap` surface. The first read that
+		// needed it (`_mutationAttributionSnapshotForTests`'s `.entriesArray()`,
+		// same shape every other consumer of `session` would eventually need)
+		// threw `session.entriesArray is not a function` (reviewer PROBE-A).
+		//
+		// Seed exactly that legacy shape, tagged with the OLD version number.
+		_seedProcessSingletonCellForTests("mutation-attribution", {
+			schema: "pi-lens.process-singletons",
+			version: 1,
+			value: {
+				session: new Map(), // the pre-migration shape: no entriesArray()
+				fromDisk: undefined,
+				primedCwd: undefined,
+			},
+		});
+
+		// The version bump to 2 makes this a version MISMATCH, so
+		// `getProcessSingleton` discards the v1 cell instead of handing it out —
+		// the read must not throw, and it must reflect a FRESH cell.
+		expect(() => _mutationAttributionSnapshotForTests()).not.toThrow();
+		expect(_mutationAttributionSnapshotForTests()).toEqual({
+			session: [],
+			fromDisk: undefined,
+		});
+
+		// The fresh cell is fully usable — the BoundedFifoMap surface really is
+		// there this time, not just an empty snapshot.
+		noteObservedMutation("patch_file", undefined);
+		expect(lookupLearnedMutatingTool("patch_file")).toBe("session");
+
+		// And the discard is not silent (catalog shape 10): the same bounded
+		// reset record every other incompatible-cell case produces.
+		const group = getDegradationSummary().find(
+			(entry) => entry.kind === PROCESS_SINGLETON_RESET_KIND,
+		);
+		expect(
+			group?.latestReasons.some((r) => r.subject === "mutation-attribution"),
+		).toBe(true);
 	});
 });

@@ -133,7 +133,19 @@ interface AttributionState {
 }
 
 const ATTRIBUTION_FAMILY = "mutation-attribution";
-const ATTRIBUTION_VERSION = 1;
+/**
+ * Bumped to 2 (#2449 review round 5, F3): `session` changed shape from a
+ * plain `Map` to a `BoundedFifoMap` without a version bump at the time, so a
+ * cell built by an older process (still alive in a multi-agent session, or
+ * surviving a hot reload) is adopted here as if it already had the newer
+ * shape. `getProcessSingleton`'s adoption check only compares the version
+ * NUMBER — it has no way to see that a v1 cell's `session` lacks
+ * `entriesArray()` — so every read of it throws, and there is no fallback:
+ * the mismatch is discovered mid-call, not at adoption (reviewer PROBE-A).
+ * The version bump makes `getProcessSingleton` discard the old-shaped cell
+ * and rebuild fresh instead of handing out a value this build cannot use.
+ */
+const ATTRIBUTION_VERSION = 2;
 
 function state(): AttributionState {
 	return getProcessSingleton<AttributionState>(

@@ -572,7 +572,8 @@ function denseLineBaseline(
 			: Object.entries(before).map(([line, hash]) => [Number(line), hash]);
 	const count = entries.length;
 	if (count === 0) return undefined;
-	const ordered = new Array<string | undefined>(count);
+	const ordered: Array<string | undefined> = [];
+	ordered.length = count;
 	for (const [line, hash] of entries) {
 		if (!Number.isInteger(line) || line < 1 || line > count) return undefined;
 		ordered[line - 1] = hash;
@@ -1172,22 +1173,36 @@ async function readBytesSafe(filePath: string): Promise<Buffer | undefined> {
  * read: #505 already paid for those bytes, so seeding a file the agent has read
  * costs no I/O beyond the stat it already did.
  *
- * `report: false` is the post-drain re-baseline — same traversal, whole set,
- * nothing reported.
+ * `report: false` is the post-drain re-baseline. Its traversal is NOT the
+ * tracked set — see `refreshObservedMutationLedger` for why it walks
+ * `handled` instead — so `getTrackedPaths` is only ever consulted on the
+ * `report: true` (settled-sweep) path and is optional here.
  */
 async function scanTrackedIncrementally(
 	args: Pick<
 		SettledSweepArgs,
-		"getTrackedPaths" | "signal" | "getStoredLineHashes" | "isRecordable"
-	>,
+		"signal" | "getStoredLineHashes" | "isRecordable"
+	> & { getTrackedPaths?: SettledSweepArgs["getTrackedPaths"] },
 	options: { report: boolean; deadlineMs: number },
 ): Promise<IncrementalScanOutcome> {
 	const current = state();
 	let tracked: string[];
-	try {
-		tracked = args.getTrackedPaths().slice(0, OBSERVED_TRACKED_MAX_FILES);
-	} catch {
-		tracked = [];
+	if (options.report) {
+		try {
+			tracked = (args.getTrackedPaths?.() ?? []).slice(
+				0,
+				OBSERVED_TRACKED_MAX_FILES,
+			);
+		} catch {
+			tracked = [];
+		}
+	} else {
+		// The post-drain refresh's job is to re-baseline pi-lens's OWN drain
+		// output, and every file the drain wrote this run is already in
+		// `handled` (see `noteMutationHandled`) — so THAT is the traversal, not
+		// the full tracked set. See `refreshObservedMutationLedger` for the
+		// coverage argument.
+		tracked = [...current.handled];
 	}
 	const total = tracked.length;
 	if (total === 0) {
@@ -1468,84 +1483,57 @@ export async function runObservedSettledSweep(
 }
 
 /**
- * Re-baseline the tracked set AFTER the deferred drain.
+ * Re-baseline pi-lens's OWN writes AFTER the deferred drain.
  *
  * The drain is pi-lens formatting and autofixing files it already knows about,
  * so those bytes are ours. Without this the next settle would read them as
  * third-party drift and requeue the same files forever.
  *
- * Same traversal as the sweep, so the same "stat first, read only on change"
- * cost applies: the drain touches a handful of files, and only those are read.
- * Retiring `handled` marks is this function's job and not the sweep's — the
- * sweep runs BEFORE the drain, so marks retired there would not cover the
- * drain's own writes.
+ * ## The traversal is `handled`, not the tracked set (#2449 review round 5, F2)
  *
- * ## The retirement is per FILE (#2449 review rounds 3 (S5) and 4 (S2))
+ * Every file this function needs to re-baseline is, by construction, already
+ * in `handled`: that set exists exactly to name "pi-lens wrote these bytes
+ * this run" (see `noteMutationHandled`), and this function's only job is to
+ * clear that claim once the ledger agrees. Walking `getTrackedPaths()`
+ * instead — the earlier shape — coupled this function's cost and completion
+ * to the size of the TRACKED set (up to `OBSERVED_TRACKED_MAX_FILES`, i.e.
+ * 400) rather than to the size of the DRAIN (a handful of files), and on a
+ * tracked set too large to finish inside `OBSERVED_CAPTURE_BUDGET_MS` the
+ * pass parked at the same prefix every turn — `report: false` always starts
+ * its cursor at 0 — so files in the tail never got re-baselined and their
+ * `handled` marks never retired, permanently suppressing drift reports for
+ * them (reviewer PROBE-B1).
  *
- * A mark may be dropped exactly when the ledger has been moved onto the
- * POST-drain bytes for that same file, so it is dropped there — inside the
- * scan, one file at a time (see `rebaseline`). Two earlier cuts got this wrong
- * in opposite directions and both cost a fabricated mutation:
+ * `handled` is bounded by `OBSERVED_HANDLED_MAX` and holds only files the
+ * pipeline or the drain actually wrote this run, so iterating it is
+ * O(handful) rather than O(tracked set) and — barring an aborted turn or a
+ * genuinely pathological handled-set size — completes in one pass every time.
+ * That is what lets every mark retire on every refresh instead of only the
+ * marks a rotating cursor happened to reach.
  *
- * - the FIRST cut cleared the whole set unconditionally, including when the
- *   refresh aborted or timed out. The ledger then still held the PRE-drain
- *   bytes while the only record that those bytes were pi-lens's own had just
- *   been thrown away, so the next settled sweep reported pi-lens's own
- *   formatter output as third-party drift and queued it for another format.
- * - the SECOND cut fixed that by clearing only on a COMPLETE pass, which
- *   over-corrected: a pass that parked kept marks even for the files it had
- *   already re-baselined, so a genuine third-party change to one of those was
- *   suppressed until some later pass happened to complete.
+ * ## The retirement is still per FILE (#2449 review rounds 3 (S5) and 4 (S2))
  *
- * Per-file retirement has neither failure: the covered prefix loses its marks
- * because its ledger entries are current, and the tail keeps its marks because
- * its ledger entries are not. The incompleteness is still REPORTED
- * (`observed_refresh_incomplete`), because a tail carrying stale baselines and
- * standing marks is a coverage gap, not a clean pass.
+ * A mark is dropped exactly when the ledger has been moved onto the
+ * POST-drain bytes for that same file — inside the scan, one file at a time
+ * (see `rebaseline`) — rather than all-or-nothing on completion. An aborted
+ * or truncated pass therefore still retires the marks for the files it DID
+ * reach and correctly leaves the rest standing; it no longer needs a
+ * dedicated "coverage gap" record to stay honest, because the traversal it
+ * covers is the whole of what it was asked to do.
  */
 export async function refreshObservedMutationLedger(
-	args: Pick<
-		SettledSweepArgs,
-		"getTrackedPaths" | "signal" | "getStoredLineHashes"
-	> & { turnIndex?: number },
+	args: Pick<SettledSweepArgs, "signal" | "getStoredLineHashes"> & {
+		turnIndex?: number;
+	},
 ): Promise<number> {
-	const started = Date.now();
 	const outcome = await withBounds(
 		() =>
 			scanTrackedIncrementally(args, {
 				report: false,
-				deadlineMs: started + OBSERVED_CAPTURE_BUDGET_MS,
+				deadlineMs: Date.now() + OBSERVED_CAPTURE_BUDGET_MS,
 			}),
 		OBSERVED_CAPTURE_BUDGET_MS * 2,
 		args.signal,
-	);
-	// The marks themselves are retired per FILE inside the scan (see
-	// `rebaseline` in `scanTrackedIncrementally`), so a parked pass leaves the
-	// tail's marks standing rather than clearing marks for files it never reached.
-	//
-	// `stoppedEarly` still matters as much as `ok`, and it is what this record
-	// reports: a pass that parked at its deadline covered a PREFIX of the tracked
-	// set, so the drain's writes may be in the tail, and the NEXT settled sweep
-	// will see them with the ledger still holding the pre-drain bytes. It is the
-	// kept mark that stops those being replayed, and a coverage gap that reports
-	// itself is the only kind that gets fixed (catalog shape 10).
-	const complete = outcome.ok && !outcome.value.stoppedEarly;
-	if (complete) {
-		return outcome.value.scanned;
-	}
-	emitBounded(
-		"observed_refresh_incomplete",
-		"post-drain-refresh",
-		{
-			durationMs: Date.now() - started,
-			result: outcome.ok ? "window-parked" : outcome.reason,
-		},
-		{
-			ledgerKind: "observed-mutation-budget",
-			reason:
-				"post-drain ledger refresh did not cover the tracked set; the files it never reached keep their already-recorded mark",
-			capPerTurn: { limit: 2, turnIndex: args.turnIndex ?? 0 },
-		},
 	);
 	return outcome.ok ? outcome.value.scanned : 0;
 }

@@ -2576,21 +2576,21 @@ function activateExtension(hostPi: ExtensionAPI) {
 		}
 	}
 
-	/** Post-drain re-baseline; see the call site for why it exists. */
+	/**
+	 * Post-drain re-baseline; see the call site for why it exists.
+	 *
+	 * No `getTrackedPaths` here on purpose (#2449 review round 5, F2): the
+	 * refresh's traversal is the `handled` set — the files THIS run's pipeline
+	 * or drain actually wrote — not the tracked set, so it needs no path
+	 * collection of its own.
+	 */
 	async function refreshObservedLedgerSafely(
 		ctx: DeferredDrainCtx,
 	): Promise<void> {
 		if (getLensFlag("no-read-guard")) return;
-		const cwd = ctx.cwd ?? runtime.projectRoot;
 		try {
 			await refreshObservedMutationLedger({
 				turnIndex: runtime.turnIndex,
-				getTrackedPaths: () =>
-					collectTrackedPaths({
-						readGuard: runtime.readGuard,
-						cwd,
-						limit: OBSERVED_TRACKED_MAX_FILES,
-					}),
 				// Same seeding shortcut the sweep uses: a file first seen here
 				// gets its baseline from the read-guard's stored per-line hashes
 				// rather than a read (#2449 review round 2, F3).

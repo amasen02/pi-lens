@@ -155,13 +155,6 @@ export const BOUNDED_TELEMETRY_PHASES = [
 	 */
 	"observed_target_dir_capped",
 	/**
-	 * #2430: the post-drain ledger refresh did not finish, so the "pi-lens
-	 * wrote these bytes itself" set was deliberately NOT cleared. At most once
-	 * per settle; capped for the same reason as the sweep's own record
-	 * (#2449 review round 3).
-	 */
-	"observed_refresh_incomplete",
-	/**
 	 * #2430: the "pi-lens wrote these bytes itself" set hit
 	 * `OBSERVED_HANDLED_MAX` and dropped its oldest entry. The dropped file is
 	 * NAMED, because the eviction silently reintroduces the exact defect

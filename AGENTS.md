@@ -2614,9 +2614,26 @@ against `OBSERVED_LEDGER_SETTLE_MS`, the same-tick same-size rewrite of catalog
 shape 6). That comparison goes through `clients/freshness.ts`, like every other
 mtime-against-a-recorded-instant question in `clients/` (#1739). A file pi-lens
 has never seen has no baseline and is not covered, by design. The post-drain
-re-baseline clears the "pi-lens wrote these bytes" set only when it actually
-finished: clearing it after an aborted refresh replayed pi-lens's own formatter
-output as third-party drift on the next turn.
+re-baseline retires the "pi-lens wrote these bytes" mark **per FILE**, not
+all-or-nothing: a mark drops exactly when the ledger has been moved onto that
+file's post-drain bytes (`rebaseline` inside `scanTrackedIncrementally`), so an
+aborted or truncated pass still clears the marks for the files it reached and
+correctly leaves the rest standing. Two earlier shapes both cost a fabricated
+mutation — clearing the whole set unconditionally (including on an abort)
+replayed pi-lens's own formatter output as third-party drift, and clearing only
+on a *complete* pass suppressed a genuine third-party change to an
+already-covered file until some later pass happened to finish. Its traversal is
+`handled` itself — the files THIS run's pipeline or drain actually wrote (see
+`noteMutationHandled`) — not the tracked set: every file the refresh needs to
+re-baseline is, by construction, already in `handled`, so walking it is
+O(handful) regardless of how large the tracked set is, and (barring an abort or
+a genuinely pathological handled-set size) completes in one pass every time.
+Walking `getTrackedPaths()` instead was the earlier shape, and it coupled this
+function's completion to the tracked-set size: `report: false` always starts
+its cursor at 0, so a tracked set too large to finish inside
+`OBSERVED_CAPTURE_BUDGET_MS` parked at the SAME prefix every turn and a mark
+past that prefix never retired, permanently suppressing drift reports for it
+(#2449 review round 5, F2/PROBE-B1).
 
 `deriveObservedEditRanges` reports ranges only when it can MEASURE them: a
 windowed read-guard baseline, a changed line count, an unreadable file or a

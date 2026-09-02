@@ -40,6 +40,7 @@ import {
 	runObservedSettledSweep,
 	settleObservedMutation,
 } from "../../clients/observed-mutation.js";
+import { normalizeMapKey } from "../../clients/path-utils.js";
 import { lineContentHash } from "../../clients/read-guard.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
@@ -385,9 +386,15 @@ describe("#2430 item 3 — the agent_settled sweep", () => {
 				getTrackedPaths: tracked,
 				record: recorder().record,
 			});
-			// The deferred drain formats the file AFTER the sweep.
+			// The deferred drain formats the file AFTER the sweep — and marks it
+			// `handled`, exactly as the real drain does through
+			// `recordMutationThroughSeam`. The refresh's traversal IS `handled`
+			// now (#2449 review round 5, F2), so without this mark the refresh
+			// would see nothing to re-baseline and the assertion below would be
+			// testing an impossible state.
 			fs.writeFileSync(filePath, SOURCE.replace("const a", "const  a"));
-			await refreshObservedMutationLedger({ getTrackedPaths: tracked });
+			noteMutationHandled(filePath);
+			await refreshObservedMutationLedger({});
 
 			const sink = recorder();
 			const next = await runObservedSettledSweep({
@@ -1246,9 +1253,17 @@ describe("#2449 review round 2 — the settled sweep is incremental and honest",
 			controller.abort();
 			await refreshObservedMutationLedger({
 				turnIndex: 1,
-				getTrackedPaths: () => tracked,
 				signal: controller.signal,
 			});
+
+			// The abort fired before the refresh reached the file, so its mark is
+			// still standing (round 5, F2: the refresh's traversal is `handled`
+			// itself now, so there is no separate "did it cover the tracked set"
+			// question to report — the per-file retirement below is the whole
+			// guarantee).
+			expect(_observedMutationStateForTests().handled).toContain(
+				normalizeMapKey(path.resolve(filePath)),
+			);
 
 			const sink = recorder();
 			const swept = await runObservedSettledSweep({
@@ -1258,17 +1273,6 @@ describe("#2449 review round 2 — the settled sweep is incremental and honest",
 			});
 			expect(swept.drifted).toEqual([]);
 			expect(sink.entries).toEqual([]);
-			// And the incomplete refresh says so rather than looking like a
-			// successful one (catalog shape 10).
-			expect(
-				getDegradationSummary().some(
-					(group) =>
-						group.kind === "observed-mutation-budget" &&
-						group.latestReasons.some(
-							(entry) => entry.subject === "post-drain-refresh",
-						),
-				),
-			).toBe(true);
 		} finally {
 			env.cleanup();
 		}
@@ -1326,18 +1330,24 @@ describe("#2449 review round 4 — handled marks, bounds and budget honesty", ()
 			.flatMap((group) => group.latestReasons.map((entry) => entry.subject));
 	}
 
-	it("retires a handled mark per FILE, so a parked refresh keeps only the tail's", async () => {
-		// Round 4, S1 + S2. Two properties in one run, because they are two
-		// halves of the same rule: a mark may be dropped exactly when the ledger
-		// has been moved onto the post-drain bytes for THAT file.
+	it("retires every handled mark in ONE pass regardless of tracked-set size, so a third-party edit to a formerly-handled file is reported next sweep", async () => {
+		// Round 5, F2 (reviewer PROBE-B1). The round-4 shape walked the FULL
+		// tracked set on every post-drain refresh (`report: false` set
+		// `window = total`, cursor pinned at 0), so a tracked set too large to
+		// finish inside `OBSERVED_CAPTURE_BUDGET_MS` parked at the SAME prefix
+		// every single turn — the cursor for `report: false` never advances —
+		// and a mark past that prefix never retired. A third-party edit to that
+		// file was suppressed forever, not just delayed.
 		//
-		// The round-3 cut cleared the whole set, and only on a COMPLETE pass. The
-		// existing sibling test drives the ABORT case, which reaches
-		// `outcome.ok === false` and therefore never exercises the `!stoppedEarly`
-		// half of the completeness test at all. This one PARKS instead: a full
-		// tracked set with a slow stat cannot finish inside
-		// OBSERVED_CAPTURE_BUDGET_MS, so the pass covers a prefix and stops.
-		const env = setupTestEnvironment("pi-lens-2449-park-");
+		// The fix makes the refresh's traversal `handled` itself: the files pi-
+		// lens's own drain actually wrote this run, which is a HANDFUL
+		// regardless of how large the tracked set is. This test proves the
+		// bound (scans exactly the handled count, not the tracked count), the
+		// completeness (every mark retires in the one call), and the payoff
+		// (a formerly-handled file's next third-party edit is reported, not
+		// suppressed) — all at a tracked-set size (400) large enough that the
+		// OLD shape would have parked.
+		const env = setupTestEnvironment("pi-lens-2449-refresh-scale-");
 		try {
 			const tracked: string[] = [];
 			for (let index = 0; index < OBSERVED_TRACKED_MAX_FILES; index += 1) {
@@ -1345,40 +1355,47 @@ describe("#2449 review round 4 — handled marks, bounds and budget honesty", ()
 				fs.writeFileSync(filePath, SOURCE);
 				tracked.push(filePath);
 			}
-			const prefixFile = tracked[0];
-			const tailFile = tracked[tracked.length - 1];
 
-			// Give every file a content baseline. The FIRST pass reads each one to
-			// hash it and can hit its own deadline on a slow box, so this loops
-			// until the whole set is covered rather than assuming one pass is
-			// enough — later passes are stat-only for the files already settled.
-			let seeded = 0;
+			// Baseline every tracked file through the SETTLED SWEEP (the
+			// `report: true` traversal, unaffected by this fix). Its window is
+			// `OBSERVED_SWEEP_STAT_WINDOW` per call, so covering 400 files needs
+			// at least `ceil(400 / window)` calls; the extra margin below is what
+			// keeps this from flaking on a slow box without hard-coding a
+			// magic attempt count untethered from the real geometry.
+			const minPasses = Math.ceil(tracked.length / OBSERVED_SWEEP_STAT_WINDOW);
 			for (
 				let attempt = 0;
-				attempt < 25 && seeded < tracked.length;
+				attempt < minPasses + 20 &&
+				_observedMutationStateForTests().ledger.length < tracked.length;
 				attempt++
 			) {
-				seeded = await refreshObservedMutationLedger({
-					turnIndex: 0,
+				await runObservedSettledSweep({
+					turnIndex: attempt,
 					getTrackedPaths: () => tracked,
+					record: recorder().record,
 				});
 			}
-			expect(seeded).toBe(tracked.length);
+			expect(_observedMutationStateForTests().ledger.length).toBe(
+				tracked.length,
+			);
 
-			// The deferred drain formats two of them — pi-lens's own bytes, one at
-			// each end of the rotation.
-			for (const filePath of [prefixFile, tailFile]) {
+			// pi-lens's own drain writes exactly THREE of the 400 — one at each
+			// end of the tracked list and one in the middle — to prove position
+			// is irrelevant to the refresh now.
+			const handledFiles = [tracked[0], tracked[200], tracked[399]];
+			for (const filePath of handledFiles) {
 				noteMutationHandled(filePath);
 				fs.writeFileSync(filePath, `${SOURCE}const formatted = 1;\n`);
 			}
-
-			// Those seeding passes may themselves have reported incompleteness. The
-			// assertion below is about the PARKED pass, so it starts from a clean
-			// ledger — otherwise it would pass on a record it did not produce.
 			resetDegradationLedger();
 
-			// Slow the stat down so the post-drain refresh PARKS deterministically
-			// rather than depending on how fast this box walks the tracked set.
+			// The mutation-testing hook (#2449 review round 5): an injected
+			// per-stat delay. Three handled files at 2ms each is nothing (6ms),
+			// so this must not budge the outcome. Reverting the fix to iterate
+			// `getTrackedPaths()` instead of `handled` turns this into 400
+			// stats * 2ms = 800ms against a 200ms budget, which parks the pass —
+			// `scanned` would land far below 3 and the retirement/report
+			// assertions below would fail. That is the red this test catches.
 			const realStat = fs.promises.stat;
 			const statSpy = vi
 				.spyOn(fs.promises, "stat")
@@ -1386,53 +1403,37 @@ describe("#2449 review round 4 — handled marks, bounds and budget honesty", ()
 					await sleep(2);
 					return realStat(target);
 				});
-			const scanned = await refreshObservedMutationLedger({
-				turnIndex: 1,
-				getTrackedPaths: () => tracked,
-			});
+			const scanned = await refreshObservedMutationLedger({ turnIndex: 1 });
 			statSpy.mockRestore();
 
-			// It really did park: a prefix, not the whole set.
-			expect(scanned).toBeGreaterThan(0);
-			expect(scanned).toBeLessThan(tracked.length);
+			// The bound: exactly the handled set, never the tracked set.
+			expect(scanned).toBe(handledFiles.length);
+			// Never parked — nothing left for a coverage-gap record to report.
+			expect(budgetSubjects()).not.toContain("post-drain-refresh");
 
-			// S1: the `!stoppedEarly` half is what turns a parked pass into a
-			// reported one. Without it a parked refresh looks like a clean pass.
-			expect(budgetSubjects()).toContain("post-drain-refresh");
+			// Completeness: every mark retired in this ONE call, including the
+			// one at tracked-399 that the old cursor-pinned-at-0 shape could
+			// never reach.
+			const marksAfter = _observedMutationStateForTests().handled;
+			for (const filePath of handledFiles) {
+				expect(marksAfter).not.toContain(
+					normalizeMapKey(path.resolve(filePath)),
+				);
+			}
 
-			// S2: the covered prefix lost its mark because its ledger entry is now
-			// current; the unreached tail kept its mark because its ledger entry is
-			// still the PRE-drain one.
-			const marks = _observedMutationStateForTests().handled;
-			expect(marks.some((key) => key.includes("tracked-0."))).toBe(false);
-			expect(
-				marks.some((key) =>
-					key.includes(`tracked-${OBSERVED_TRACKED_MAX_FILES - 1}.`),
-				),
-			).toBe(true);
-
-			// And the marks mean what they say. A THIRD-PARTY change to the covered
-			// prefix file is reported, because its mark was retired — the
-			// all-or-nothing cut suppressed exactly this until some later pass
-			// happened to complete.
-			fs.writeFileSync(prefixFile, `${SOURCE}const third_party = 2;\n`);
-			const prefixSink = recorder();
-			await runObservedSettledSweep({
-				turnIndex: 2,
-				getTrackedPaths: () => [prefixFile],
-				record: prefixSink.record,
-			});
-			expect(prefixSink.entries).toHaveLength(1);
-
-			// While the tail's kept mark still suppresses pi-lens's own drain output,
-			// which is the round-3 (S5) property this must not regress.
+			// The payoff: a third-party edit to the FORMERLY-handled tail file
+			// (tracked-399, deep past where the old shape ever parked) is
+			// reported by the very next look, because its mark is actually
+			// gone rather than standing forever.
+			const tailFile = tracked[399];
+			fs.writeFileSync(tailFile, `${SOURCE}const third_party = 2;\n`);
 			const tailSink = recorder();
 			await runObservedSettledSweep({
-				turnIndex: 3,
+				turnIndex: 2,
 				getTrackedPaths: () => [tailFile],
 				record: tailSink.record,
 			});
-			expect(tailSink.entries).toEqual([]);
+			expect(tailSink.entries).toHaveLength(1);
 		} finally {
 			env.cleanup();
 		}
