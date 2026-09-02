@@ -53,7 +53,11 @@ instructions say so.
    the job id for CI lines — never from memory. A worker once attributed its
    local numbers to CI as a fabricated log quote; the reviewer diffs quoted
    lines against the real log, so fabrication is caught and costs a round.
-5. Run targeted test files while iterating, plus every test file that
+5. Run targeted test files while iterating — through
+   `npm run test:targeted -- <files>` (#2435), which takes one of 2 shared
+   slots instead of bypassing the machine-wide lock; a bare `npx vitest run`
+   from several agents at once saturates the box and manufactures the
+   timeout/spawn-budget flakes reviews then chase. Run them plus every test file that
    references the symbols you changed (grep tests/ — sibling files encode the
    same behavior), PLUS every directory-scanning governance suite: those walk
    `clients/` and fire on any new or edited file, so a symbol grep structurally

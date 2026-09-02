@@ -27,15 +27,27 @@
  * alive; see scripts/lib/suite-lock.mjs's header for why). Waiting prints a
  * heartbeat line at least every 15s so a queued run never looks hung.
  *
+ * SHARED SLOTS (#2435). `--shared[=N]` takes one of N concurrent slots
+ * instead of the exclusive lock, for TARGETED runs (`npm run test:targeted`).
+ * Targeted `vitest run <files>` batches used to bypass this wrapper entirely
+ * — cheap on their own, but 4-6 agents running them at once saturate the box
+ * and manufacture the same timeout/spawn-budget flakes the exclusive lock
+ * exists to prevent. The exclusive mode now waits for all slots to drain
+ * before running, and a shared acquisition waits while the exclusive lock is
+ * held, so full runs still get the machine to themselves.
+ *
  * Usage:
  *   node scripts/with-test-lock.mjs -- <command> [args...]
  *   node scripts/with-test-lock.mjs -- vitest run
+ *   node scripts/with-test-lock.mjs --shared -- vitest run tests/a.test.ts
+ *   node scripts/with-test-lock.mjs --shared=3 -- vitest run tests/a.test.ts
  *
  * Env:
  *   PI_LENS_TEST_NO_LOCK=1          Skip locking entirely (CI sets this —
  *                                   runners are isolated, one job per box).
  *   PI_LENS_TEST_LOCK_TIMEOUT_MS    Give up waiting after this long
  *                                   (default: wait forever).
+ *   PI_LENS_TEST_SHARED_SLOTS       Concurrent shared slots (default 2).
  */
 
 import { spawn } from "node:child_process";
@@ -44,7 +56,12 @@ import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { acquireTestLock, getLockPath } from "./lib/suite-lock.mjs";
+import {
+	acquireSharedSlot,
+	acquireTestLock,
+	getLockPath,
+	resolveSharedSlots,
+} from "./lib/suite-lock.mjs";
 
 const require = createRequire(import.meta.url);
 
@@ -52,6 +69,41 @@ function parseCommandArgs(argv) {
 	const sepIndex = argv.indexOf("--");
 	const rest = sepIndex === -1 ? argv : argv.slice(sepIndex + 1);
 	return rest;
+}
+
+/**
+ * Split this wrapper's OWN flags (before `--`) from the command to run
+ * (after `--`). When there is no `--` at all, everything is the command —
+ * preserving the pre-#2435 contract exactly, so no existing caller changes
+ * meaning.
+ *
+ * @param {string[]} argv
+ * @returns {{ shared: boolean, slots: number|null, commandArgs: string[], errors: string[] }}
+ */
+export function parseWrapperArgs(argv) {
+	const sepIndex = argv.indexOf("--");
+	const flags = sepIndex === -1 ? [] : argv.slice(0, sepIndex);
+	const commandArgs = parseCommandArgs(argv);
+	const result = { shared: false, slots: null, commandArgs, errors: [] };
+	for (const flag of flags) {
+		if (flag === "--shared") {
+			result.shared = true;
+		} else if (flag.startsWith("--shared=")) {
+			result.shared = true;
+			const raw = flag.slice("--shared=".length);
+			// resolveSharedSlots clamps garbage to the default; reject it here
+			// instead so `--shared=abc` is a loud usage error rather than a
+			// silent 2.
+			if (!/^\d+$/.test(raw) || Number(raw) < 1) {
+				result.errors.push(`invalid --shared slot count: ${raw}`);
+			} else {
+				result.slots = resolveSharedSlots(raw);
+			}
+		} else {
+			result.errors.push(`unknown option: ${flag}`);
+		}
+	}
+	return result;
 }
 
 // Resolve vitest's own JS entry point (its package.json `bin` field) so it
@@ -170,10 +222,13 @@ function runCommand(commandArgs) {
 }
 
 async function main() {
-	const commandArgs = parseCommandArgs(process.argv.slice(2));
-	if (commandArgs.length === 0) {
+	const { shared, slots, commandArgs, errors } = parseWrapperArgs(
+		process.argv.slice(2),
+	);
+	for (const error of errors) console.error(`[with-test-lock] ${error}`);
+	if (errors.length > 0 || commandArgs.length === 0) {
 		console.error(
-			"Usage: node scripts/with-test-lock.mjs -- <command> [args...]",
+			"Usage: node scripts/with-test-lock.mjs [--shared[=N]] -- <command> [args...]",
 		);
 		process.exitCode = 2;
 		return;
@@ -185,10 +240,10 @@ async function main() {
 	}
 
 	const lockPath = getLockPath();
-	const lock = await acquireTestLock({
-		lockPath,
-		log: (message) => console.error(`[with-test-lock] ${message}`),
-	});
+	const log = (message) => console.error(`[with-test-lock] ${message}`);
+	const lock = shared
+		? await acquireSharedSlot({ lockPath, slots: slots ?? undefined, log })
+		: await acquireTestLock({ lockPath, log });
 
 	try {
 		process.exitCode = await runCommand(commandArgs);
