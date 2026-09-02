@@ -170,6 +170,33 @@ describe("#2467 — tool_call loads only for a branch that needs it", () => {
 		}
 	}, 30_000);
 
+	it("a read of a vendored file neither loads nor awaits the graph", async () => {
+		process.env.PI_LENS_STARTUP_MODE = "quick";
+		const pi = await activateWithSpiedBootstrap();
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-2467-vendor-"));
+		// A `node_modules` read is the shape the pre-fix code paid the whole
+		// seventeen-module load for and then threw away: `isExternalOrVendor` is
+		// the very next check after the load it used to sit above. The bash case
+		// above returns before that point, so it cannot see this defect at all.
+		const vendorDir = path.join(cwd, "node_modules", "left-pad");
+		fs.mkdirSync(vendorDir, { recursive: true });
+		const filePath = path.join(vendorDir, "index.ts");
+		fs.writeFileSync(filePath, "export const pad = 1;\n");
+		try {
+			await pi.emit("session_start", {}, makeCtx({ cwd }));
+			await pi.emit("turn_start", {}, makeCtx({ cwd }));
+			demands.length = 0;
+			await pi.emit(
+				"tool_call",
+				{ toolName: "read", input: { path: filePath } },
+				makeCtx({ cwd }),
+			);
+			expect(demands).toEqual([]);
+		} finally {
+			removeTempDirSync(cwd);
+		}
+	}, 30_000);
+
 	it("a bootstrap-dependent tool call does demand the clients", async () => {
 		process.env.PI_LENS_STARTUP_MODE = "quick";
 		const pi = await activateWithSpiedBootstrap();
