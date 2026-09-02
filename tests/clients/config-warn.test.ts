@@ -348,6 +348,19 @@ describe("warnIgnoredConfigOnce parse-error reason redaction (#2431)", () => {
 		expect(reason).toBe("SyntaxError at line 1 col 2");
 	});
 
+	it("routes a non-SyntaxError caught error (a fs error, a hand-thrown validation error) through redact/secrets.ts", () => {
+		// Not `JSON.parse`'s own SyntaxError, so the message is not DOCUMENTED
+		// to embed file content — but still defense-in-depth redacted (#2431
+		// AC3), never trusted verbatim on the strength of "it isn't SyntaxError".
+		const error = new TypeError(`expected an object, found token ${TOKEN}`);
+		const reason = normalizeParseErrorReason(error);
+		expect(reason).not.toContain(TOKEN);
+		expect(reason).toContain("[REDACTED:github-token]");
+		// Everything else about the message survives — this is defense in
+		// depth, not the same total strip as the SyntaxError branch.
+		expect(reason).toContain("expected an object, found token");
+	});
+
 	it("does not leak the token into the notification, logExtension metadata, or the ledger row", () => {
 		const content = `{"piToken": ${TOKEN}, "other": "value"}`;
 		const error = realJsonParseError(content);
