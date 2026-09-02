@@ -24,7 +24,8 @@
  * from outermost to innermost.
  *
  * `merge()`'S CONTRACT IS NARROWER THAN "IT ENFORCES THE TWO BOUNDS TOO", which
- * an earlier version of this comment claimed (#2440 F3 review). It required
+ * an earlier version of this comment claimed (#2440 review round 3, finding
+ * F8). It required
  * every source's `value` to already be `validate()`'s output — a sentence on
  * `ConfigSource`, not a compiler check — and does NOT independently re-walk a
  * value to confirm that. Five arms hand a contributor's value back BY
