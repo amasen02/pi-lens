@@ -212,9 +212,9 @@ describe("getGlobalPiLensLogDir probe-home redirect (#2506)", () => {
 			expect(body).toContain("/p/.pi-lens.json");
 
 			// The real-home canary was never created — pre-fix, the row went here.
-			expect(fs.existsSync(path.join(fakeHome, ".pi-lens", "latency.log"))).toBe(
-				false,
-			);
+			expect(
+				fs.existsSync(path.join(fakeHome, ".pi-lens", "latency.log")),
+			).toBe(false);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -230,9 +230,9 @@ describe("getGlobalPiLensLogDir probe-home redirect (#2506)", () => {
 		try {
 			// The child's os.tmpdir() IS the fixture root, so cwd sits under it.
 			const facts = await runChild(probeCwd, fakeHome, root);
-			expect(path.resolve(probeCwd).startsWith(path.resolve(facts.tmpdir))).toBe(
-				true,
-			);
+			expect(
+				path.resolve(probeCwd).startsWith(path.resolve(facts.tmpdir)),
+			).toBe(true);
 			expect(probeCwd).not.toContain(".claude");
 
 			expect(facts.logDir).toBe(path.join(probeCwd, ".pi-lens-probe-home"));
@@ -340,7 +340,9 @@ describe("probe-home resolution is memoized per process (#2506 F5)", () => {
 
 			process.chdir(first);
 			const before = getGlobalPiLensLogDir();
-			expect(before).toBe(path.join(fs.realpathSync(first), ".pi-lens-probe-home"));
+			expect(before).toBe(
+				path.join(fs.realpathSync(first), ".pi-lens-probe-home"),
+			);
 
 			process.chdir(second);
 			// Same answer despite a different cwd: memoized, not re-derived.

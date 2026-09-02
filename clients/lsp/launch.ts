@@ -17,10 +17,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { isTestMode } from "../env-utils.js";
-import {
-	getGlobalPiLensDir,
-	getGlobalPiLensLogDir,
-} from "../file-utils.js";
+import { getGlobalPiLensDir, getGlobalPiLensLogDir } from "../file-utils.js";
 import { isFullyQualified } from "../path-utils.js";
 import { findGlobalBinary } from "../package-manager.js";
 import { redactSecrets } from "../redact/secrets.js";

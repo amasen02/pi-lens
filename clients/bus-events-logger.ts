@@ -49,7 +49,10 @@ import { createNdjsonLogger } from "./ndjson-logger.js";
 import { getMaxLogSizeMB } from "./log-cleanup.js";
 import { logLatency } from "./latency-logger.js";
 
-const BUS_EVENTS_LOG_FILE = path.join(getGlobalPiLensLogDir(), "bus-events.log");
+const BUS_EVENTS_LOG_FILE = path.join(
+	getGlobalPiLensLogDir(),
+	"bus-events.log",
+);
 
 const writer = createNdjsonLogger({
 	filePath: BUS_EVENTS_LOG_FILE,
