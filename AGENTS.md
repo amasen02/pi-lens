@@ -77,7 +77,12 @@ Message-end stale attribution anchors the session id when a live ctx is handled,
 
 - **Every new config key or env flag needs a demonstrated forcing function.** A
   knob added "for flexibility" is public API the moment it ships (schema
-  stability policy #2418) and a permanent test/doc/support obligation. Prefer
+  stability policy #2418, written down in `docs/public-api-stability.md` and
+  held as data in `clients/config-diagnostic-codes.ts` — a published field
+  carries an `x-stability` tier, a user-facing config warning carries a stable
+  `PILENS_CFG_*` code, and a deprecated surface carries a
+  `deprecatedSince`/`removeNotBefore` window) and a permanent
+  test/doc/support obligation. Prefer
   reserved-but-inert schema keys (documented, validated, unimplemented) over
   premature implementation; prefer no knob at all over a reserved one when no
   concrete consumer exists. Name the forcing function in the PR body.

@@ -1,5 +1,6 @@
 /** Bounded, process-local telemetry for behavior degraded during one session. */
 
+import type { ConfigDiagnosticCode } from "./config-diagnostic-codes.js";
 import { logExtension } from "./extension-log.js";
 import { LEDGER_FIELD_MAX, truncateForLedger } from "./ledger-bounds.js";
 import { logLatency } from "./latency-logger.js";
@@ -552,6 +553,12 @@ export interface DegradationRecord {
 	subject: unknown;
 	reason: unknown;
 	metadata?: Record<string, unknown>;
+	/**
+	 * Optional STABLE config diagnostic code (#2418). Reserved row field: it is
+	 * written into the durable row AFTER the bounded caller metadata, so the
+	 * `MAX_METADATA_KEYS` cap can never evict the one field a user greps on.
+	 */
+	code?: ConfigDiagnosticCode;
 }
 
 export interface DegradationGroup {
@@ -620,7 +627,7 @@ export function recordDegradationOnce(record: DegradationRecord): void {
 		if (onceKeys.has(key)) return;
 		onceKeys.add(key);
 		if (recordDegradation({ kind, subject, reason: record.reason })) {
-			logDurableDegradation(kind, subject, 1, record.metadata);
+			logDurableDegradation(kind, subject, 1, record.metadata, record.code);
 		}
 	} catch (error) {
 		debugLedgerFailure("record-once", error);
@@ -669,7 +676,7 @@ export function incrementDegradationCount(record: DegradationRecord): boolean {
 		// Durable rows use the summary's admission and emit the first event and
 		// power-of-two milestones only, keeping the sink bounded.
 		if (admitted && isPowerOfTwo(count)) {
-			logDurableDegradation(kind, subject, count, record.metadata);
+			logDurableDegradation(kind, subject, count, record.metadata, record.code);
 		}
 		return count === 1;
 	} catch (error) {
@@ -690,6 +697,7 @@ function logDurableDegradation(
 	subject: string,
 	count: number,
 	metadata?: Record<string, unknown>,
+	code?: ConfigDiagnosticCode,
 ): void {
 	const boundedMetadata = boundLedgerMetadata(metadata);
 	logLatency({
@@ -703,6 +711,9 @@ function logDurableDegradation(
 			subject,
 			count,
 			ledgerGeneration,
+			// Reserved row field, written AFTER the bounded caller metadata so the
+			// `MAX_METADATA_KEYS` cap cannot evict the stable code (#2418).
+			...(code ? { code } : {}),
 		},
 	});
 }

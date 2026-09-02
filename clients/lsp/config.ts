@@ -47,6 +47,7 @@
  * clients/lsp/server.ts (e.g. "rust", "nix", "bash", "python", "go", "ts").
  */
 
+import type { ConfigDiagnosticCode } from "../config-diagnostic-codes.js";
 import { logExtension } from "../extension-log.js";
 import { notifyUserDegradation } from "../user-notify.js";
 import fs from "node:fs/promises";
@@ -110,19 +111,36 @@ interface RegisteredLSPConfig {
 
 // --- Config Loading ---
 
-const CONFIG_PATHS = [".pi-lens/lsp.json", ".pi-lens.json", "pi-lsp.json"];
+/**
+ * Project-relative LSP config locations, in precedence order. Exported so the
+ * deprecation-window registry test (#2418) can check every deprecated FILE row
+ * against the paths actually read, rather than a hand-copied list.
+ */
+export const LSP_CONFIG_PATHS = [
+	".pi-lens/lsp.json",
+	".pi-lens.json",
+	"pi-lsp.json",
+] as const;
+
+/** Basename of the machine-global LSP config inside `~/.pi-lens/`. */
+export const GLOBAL_LSP_CONFIG_BASENAME = "lsp.json";
+
+const CONFIG_PATHS = LSP_CONFIG_PATHS;
 
 function warnInvalidLSPConfig(configPath: string, error: unknown): void {
 	const reason = error instanceof Error ? error.message : String(error);
 	const message = `ignoring invalid LSP config ${configPath}: ${reason}`;
+	const code: ConfigDiagnosticCode = "PILENS_CFG_0001";
 	logExtension({
 		subsystem: "lsp-config",
 		level: "warn",
 		message,
-		metadata: { configPath, reason },
+		metadata: { configPath, reason, code },
 	});
 	// HUMAN-audience too: the user's own lsp.json is being ignored (#1333).
-	notifyUserDegradation(`pi-lens: ${message}`);
+	// The stable code (#2418) rides along so the warning is matchable by code
+	// rather than by prose; the prose itself is unchanged.
+	notifyUserDegradation(`pi-lens: ${message}`, "warning", { code });
 }
 
 async function readLSPConfig(
@@ -202,7 +220,9 @@ export async function loadLSPConfig(cwd: string): Promise<LSPConfig> {
 	}
 
 	const globalConfig =
-		(await readLSPConfig(path.join(getGlobalPiLensDir(), "lsp.json"))) ?? {};
+		(await readLSPConfig(
+			path.join(getGlobalPiLensDir(), GLOBAL_LSP_CONFIG_BASENAME),
+		)) ?? {};
 	return mergeLSPConfigs(globalConfig, projectConfig ?? {});
 }
 

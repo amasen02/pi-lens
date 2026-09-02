@@ -1,3 +1,4 @@
+import type { ConfigDiagnosticCode } from "./config-diagnostic-codes.js";
 import { logExtension } from "./extension-log.js";
 import { notifyUserDegradation } from "./user-notify.js";
 import * as fs from "node:fs";
@@ -128,15 +129,17 @@ function warnInvalidGlobalConfigOnce(configPath: string, reason: string): void {
 	if (warnedInvalidGlobalConfigs.has(key)) return;
 	warnedInvalidGlobalConfigs.add(key);
 	const message = `ignoring invalid global config ${configPath}: ${reason}`;
+	const code: ConfigDiagnosticCode = "PILENS_CFG_0001";
 	logExtension({
 		subsystem: "lens-config",
 		level: "warn",
 		message,
-		metadata: { configPath, reason },
+		metadata: { configPath, reason, code },
 	});
 	// HUMAN-audience too: a config the user wrote is being ignored. Routed
-	// through the host's own render path (#1333), never a raw write.
-	notifyUserDegradation(`pi-lens: ${message}`);
+	// through the host's own render path (#1333), never a raw write. The
+	// stable code (#2418) makes it matchable without depending on the prose.
+	notifyUserDegradation(`pi-lens: ${message}`, "warning", { code });
 }
 
 /** For tests that need to force the warn-once cache to reset between cases. */

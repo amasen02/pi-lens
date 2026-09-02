@@ -57,6 +57,7 @@
  * patterns apply to files inside that package, in addition to (and with
  * higher precedence than) the root config's `ignore` patterns.
  */
+import type { ConfigDiagnosticCode } from "./config-diagnostic-codes.js";
 import { logExtension } from "./extension-log.js";
 import { notifyUserDegradation } from "./user-notify.js";
 import * as fs from "node:fs";
@@ -76,7 +77,12 @@ import {
 import { isAtOrAboveHomeDir, walkUpDirs } from "./path-utils.js";
 import { findPiLensConfigMarkerInDir } from "./workspace-topology.js";
 
-const PROJECT_CONFIG_BASENAMES = [".pi-lens.json", "pi-lens.json"];
+/**
+ * Project config basenames, in precedence order. Exported so the
+ * deprecation-window registry test (#2418) checks deprecated FILE rows against
+ * the basenames actually read rather than a hand-copied second list.
+ */
+export const PROJECT_CONFIG_BASENAMES = [".pi-lens.json", "pi-lens.json"];
 
 /**
  * The project loader's OWN recognized top-level keys — pi-lens-native sections,
@@ -401,14 +407,16 @@ function warnInvalidConfigOnce(configPath: string, reason: string): void {
 	if (warnedInvalidConfigs.has(key)) return;
 	warnedInvalidConfigs.add(key);
 	const message = `ignoring invalid project config ${configPath}: ${reason}`;
+	const code: ConfigDiagnosticCode = "PILENS_CFG_0001";
 	logExtension({
 		subsystem: "project-lens-config",
 		level: "warn",
 		message,
-		metadata: { configPath, reason },
+		metadata: { configPath, reason, code },
 	});
-	// HUMAN-audience too: the user's own `.pi-lens.json` is being ignored.
-	notifyUserDegradation(`pi-lens: ${message}`);
+	// HUMAN-audience too: the user's own `.pi-lens.json` is being ignored. The
+	// stable code (#2418) is the matchable half; the prose may still change.
+	notifyUserDegradation(`pi-lens: ${message}`, "warning", { code });
 }
 
 function parseRulePolicyList(
