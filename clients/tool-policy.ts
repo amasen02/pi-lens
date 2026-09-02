@@ -2568,8 +2568,14 @@ export function _getSpotlessGradleReadCountForTests(): number {
  * executable Gradle source. This is deliberately a small lexical pre-pass,
  * not a Groovy/Kotlin parser. In particular, statically disabled constructs
  * such as `if (false) { ktlint() }` remain a documented false-positive.
+ *
+ * Exported (with `namedGradleBlockBodies` below) so `clients/gradle-ktfmt-
+ * style.ts` (#2468) reuses this exact pre-pass for the top-level `ktfmt { }`
+ * extension block instead of a second hand-rolled Gradle lexer — the same
+ * single-source-of-truth reuse `clients/cargo-manifest.ts` did for TOML
+ * parsing (#2466).
  */
-function stripGradleCommentsAndStrings(source: string): string {
+export function stripGradleCommentsAndStrings(source: string): string {
 	let result = "";
 	let state: "code" | "line-comment" | "block-comment" | "string" = "code";
 	let quote = "";
@@ -2632,7 +2638,8 @@ function stripGradleCommentsAndStrings(source: string): string {
 	return result;
 }
 
-function namedGradleBlockBodies(source: string, name: string): string[] {
+/** Exported for `clients/gradle-ktfmt-style.ts` (#2468) — see the note above. */
+export function namedGradleBlockBodies(source: string, name: string): string[] {
 	const bodies: string[] = [];
 	const startPattern = new RegExp(`\\b${name}\\s*\\{`, "g");
 	for (const match of source.matchAll(startPattern)) {

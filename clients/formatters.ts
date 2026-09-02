@@ -17,6 +17,7 @@ import { BoundedLruCache } from "./bounded-cache.js";
 import { createGenerationSource } from "./generation-guard.js";
 import { normalizeMapKey } from "./path-utils.js";
 import { resolveCargoPackageEdition } from "./cargo-manifest.js";
+import { resolveKtfmtGradleStyle } from "./gradle-ktfmt-style.js";
 import { TERRAGRUNT_FILENAMES } from "./file-kinds.js";
 import { stripAnsi } from "./sanitize.js";
 import {
@@ -1276,16 +1277,25 @@ export const ktfmtFormatter: FormatterInfo = {
 	// ktfmt formats in place when given a file path (no flag needed).
 	command: ["ktfmt", "$FILE"],
 	extensions: [".kt", ".kts"],
+	// #2468: ktfmt's CLI never reads a project's Gradle `ktfmt { googleStyle()
+	// | kotlinLangStyle() }` selection — style is CLI-flag-only
+	// (`--google-style`/`--kotlinlang-style`, verified against ktfmt v0.63's
+	// own arg parser). Carry the nearest module's declared style through;
+	// `undefined` (no declaration, unreadable/unparseable manifest, or an
+	// unsupported style like the removed `dropboxStyle()`) falls back to the
+	// bare invocation, unchanged from pre-#2468 behavior.
 	async resolveCommand(filePath, _cwd) {
+		const styleFlag = await resolveKtfmtGradleStyle(filePath);
 		const inPath = await which("ktfmt");
-		if (inPath) return [inPath, filePath];
+		if (inPath) return styleFlag ? [inPath, styleFlag, filePath] : [inPath, filePath];
 		const { ensureTool } = await import("./installer/index.js");
 		const installed = await ensureTool("ktfmt");
 		// #2413: which() and ensureTool (PATH/global/managed + install) both
 		// failed, and `detect()` gates only on hasKtfmtConfig — no binary probe —
 		// so a config-only project reaches here with ktfmt absent. The static
 		// command is bare `ktfmt`; spawning it reproduces the ENOENT class.
-		return installed ? [installed, filePath] : FORMATTER_UNAVAILABLE;
+		if (!installed) return FORMATTER_UNAVAILABLE;
+		return styleFlag ? [installed, styleFlag, filePath] : [installed, filePath];
 	},
 	async detect(cwd: string) {
 		// Opt-in only: ktfmt becomes the formatter when the project elects it,
