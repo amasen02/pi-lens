@@ -105,6 +105,55 @@ let pendingExec = null;
 // arrive - the ordering the depth-unwind bug lives in, with no reliance on
 // message-arrival timing.
 let deferredApplyEdit = null;
+
+// #2450 review round 2 (F2): the target line/columns/replacement text are
+// overridable via a second `arguments[1]` object so callers can exercise a real
+// non-{1,1} range - a fixed line-0 edit made every caller's "real range" collide
+// with the {1,1} resource-op/whole-file default, so a test asserting {1,1}
+// passed whether or not the actual range plumbing worked. Omitted fields keep
+// the original line-0/0-5 default, so the pre-existing "applies a
+// server-initiated edit..." tests are unaffected.
+//
+// #2479 review round 2 (S1): declared at MODULE scope, beside the state they
+// read (`applyEditIdCounter`, `deferredApplyEdit`) and beside `send` - they
+// used to sit inside `handle(raw)`, which re-created both closures on every
+// single inbound message and left the block that follows them mis-indented.
+function buildApplyEditSpec(commandArguments) {
+	const uri = commandArguments?.[0];
+	const editOpts = commandArguments?.[1] ?? {};
+	const line = typeof editOpts.line === "number" ? editOpts.line : 0;
+	const startCharacter =
+		typeof editOpts.startCharacter === "number" ? editOpts.startCharacter : 0;
+	const endCharacter =
+		typeof editOpts.endCharacter === "number" ? editOpts.endCharacter : 5;
+	const newText =
+		typeof editOpts.newText === "string" ? editOpts.newText : "EDITED";
+	return { uri, line, startCharacter, endCharacter, newText };
+}
+
+function sendApplyEdit(spec) {
+	send({
+		jsonrpc: "2.0",
+		id: ++applyEditIdCounter,
+		method: "workspace/applyEdit",
+		params: {
+			edit: {
+				changes: {
+					[spec.uri]: [
+						{
+							range: {
+								start: { line: spec.line, character: spec.startCharacter },
+								end: { line: spec.line, character: spec.endCharacter },
+							},
+							newText: spec.newText,
+						},
+					],
+				},
+			},
+		},
+	});
+}
+
 const openDocuments = new Map();
 
 // #1714: a single-threaded scanner with a finite intake ceiling, for the
@@ -749,50 +798,7 @@ function handle(raw) {
 		return;
 	}
 
-	// #2450 review round 2 (F2): the target line/columns/replacement text are
-// overridable via a second `arguments[1]` object so callers can exercise a real
-// non-{1,1} range - a fixed line-0 edit made every caller's "real range" collide
-// with the {1,1} resource-op/whole-file default, so a test asserting {1,1}
-// passed whether or not the actual range plumbing worked. Omitted fields keep
-// the original line-0/0-5 default, so the pre-existing "applies a
-// server-initiated edit..." tests are unaffected.
-function buildApplyEditSpec(commandArguments) {
-	const uri = commandArguments?.[0];
-	const editOpts = commandArguments?.[1] ?? {};
-	const line = typeof editOpts.line === "number" ? editOpts.line : 0;
-	const startCharacter =
-		typeof editOpts.startCharacter === "number" ? editOpts.startCharacter : 0;
-	const endCharacter =
-		typeof editOpts.endCharacter === "number" ? editOpts.endCharacter : 5;
-	const newText =
-		typeof editOpts.newText === "string" ? editOpts.newText : "EDITED";
-	return { uri, line, startCharacter, endCharacter, newText };
-}
-
-function sendApplyEdit(spec) {
-	send({
-		jsonrpc: "2.0",
-		id: ++applyEditIdCounter,
-		method: "workspace/applyEdit",
-		params: {
-			edit: {
-				changes: {
-					[spec.uri]: [
-						{
-							range: {
-								start: { line: spec.line, character: spec.startCharacter },
-								end: { line: spec.line, character: spec.endCharacter },
-							},
-							newText: spec.newText,
-						},
-					],
-				},
-			},
-		},
-	});
-}
-
-// Execute command. "fake.applyEdit" exercises the server-initiated edit path:
+	// Execute command. "fake.applyEdit" exercises the server-initiated edit path:
 	// it sends a workspace/applyEdit request and only returns the executeCommand
 	// result once the client has responded (so tests are race-free).
 	if (data.method === "workspace/executeCommand") {

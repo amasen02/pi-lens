@@ -3120,3 +3120,208 @@ describe("per-path diagnostics versions (#1531)", () => {
 		expect(diagnosticsVersionForPath(state, KEY_A)).toBeGreaterThan(baselineA);
 	});
 });
+
+// #2479 review round 2. The frames of `runServerCommand` are NOT guaranteed
+// to be nested: `LSPClient.executeCommand` (clients/lsp/index.ts) and
+// `LSPService.executeCommand` fan out with no mutex, parallel
+// `lsp_navigation` calls with `apply: true` overlap freely, and #449
+// light-mode shares one client across agents. So three frames can OVERLAP and
+// settle out of order, and a per-frame save/restore stack then re-installs the
+// context of a call that has already SETTLED. `LspMutationContext` carries a
+// `cwd` plus a directly-threaded `runtime`/`cacheManager`, and
+// `readTurnState`/`appendProjectChange` are cwd-scoped, so a wrong owner does
+// not merely mislabel a receipt — it can route a live edit's bookkeeping into
+// ANOTHER project's change log. The remedy is ownership, not depth: only the
+// frame that takes the depth to 1 owns the slot, and a non-owner restores
+// what it saved ONLY while that owner is still live.
+describe("runServerCommand mutation-context ownership across overlapping frames (#2479 round 2)", () => {
+	const OVERLAP_CONTEXT_BASE = {
+		tool: "lsp_navigation:executeCommand",
+		source: "lsp-execute-command" as const,
+	};
+
+	function gateExecuteCommands(
+		state: LSPClientState,
+		gates: Record<string, { promise: Promise<unknown> }>,
+	): void {
+		vi.mocked(state.connection.sendRequest).mockImplementation(((
+			method: string,
+			params: { command?: string },
+		) => {
+			if (method === "workspace/executeCommand") {
+				const gate = gates[params?.command ?? ""];
+				if (gate) return gate.promise;
+			}
+			return Promise.resolve({ ok: true });
+		}) as never);
+	}
+
+	// F1. Three OVERLAPPING frames A, B, C. A settles first (3 → 2), then B
+	// (2 → 1). Only C is still in flight, but a naive save/restore stack has B
+	// putting back the context it saved on entry — A's — even though A has
+	// already returned. The window is still open (`serverEditsAllowed === 1`,
+	// C's), and the `workspace/applyEdit` handler reads the bare slot, so every
+	// edit C solicits from that point on would be bookkept through A's
+	// runtime/cacheManager/correlationId/source and into A's cwd. Before #2479
+	// this read `undefined` — an honest fallback; a wrong owner is strictly
+	// worse, which is why this is a regression bar and not merely a gap.
+	it("does not re-install a settled frame's context when an overlapping middle frame unwinds (#2479 F1)", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-2479-owner-"));
+		const filePath = path.join(root, "app.ts");
+		fs.writeFileSync(filePath, "const old = 1;\n", "utf8");
+		try {
+			const state = createMockState({
+				root,
+				advertisedCommands: new Set(["cmd.a", "cmd.b", "cmd.c"]),
+				// Mirror the real initial values of `createLSPClientState`.
+				activeMutationDepth: 0,
+				activeMutationContext: undefined,
+			});
+			const gateA = gatedPromise<unknown>();
+			const gateB = gatedPromise<unknown>();
+			const gateC = gatedPromise<unknown>();
+			gateExecuteCommands(state, {
+				"cmd.a": gateA,
+				"cmd.b": gateB,
+				"cmd.c": gateC,
+			});
+
+			// A carries a `readGuard` so "which context did the applyEdit
+			// handler actually bookkeep through" is directly observable, not
+			// inferred from the slot alone.
+			const writtenThroughA: string[] = [];
+			const contextA: LspMutationContext = {
+				...OVERLAP_CONTEXT_BASE,
+				cwd: path.join(root, "project-a"),
+				correlationId: "overlap-a",
+				readGuard: { recordWritten: (file) => writtenThroughA.push(file) },
+			};
+			const contextB: LspMutationContext = {
+				...OVERLAP_CONTEXT_BASE,
+				cwd: path.join(root, "project-b"),
+				correlationId: "overlap-b",
+			};
+			const contextC: LspMutationContext = {
+				...OVERLAP_CONTEXT_BASE,
+				cwd: path.join(root, "project-c"),
+				correlationId: "overlap-c",
+			};
+
+			// The depth bump and the slot write are synchronous — they run
+			// before the first `await` inside `runServerCommand` — so each
+			// frame is established the moment its promise is created.
+			const promiseA = runServerCommand(state, "cmd.a", [], 5000, contextA);
+			expect(state.activeMutationDepth).toBe(1);
+			expect(state.activeMutationContext).toBe(contextA);
+			const promiseB = runServerCommand(state, "cmd.b", [], 5000, contextB);
+			const promiseC = runServerCommand(state, "cmd.c", [], 5000, contextC);
+			expect(state.activeMutationDepth).toBe(3);
+			expect(state.serverEditsAllowed).toBe(3);
+			// Deeper frames deliberately do not cross-correlate.
+			expect(state.activeMutationContext).toBeUndefined();
+
+			// A settles FIRST (3 → 2). Its own window is closed from here on.
+			gateA.resolve({ ok: true });
+			await promiseA;
+			expect(state.activeMutationDepth).toBe(2);
+			expect(state.activeMutationContext).toBeUndefined();
+
+			// B settles (2 → 1). Only C is in flight now, so the slot must not
+			// name A, whose call has already returned.
+			gateB.resolve({ ok: true });
+			await promiseB;
+			expect(state.activeMutationDepth).toBe(1);
+			expect(state.serverEditsAllowed).toBe(1);
+			expect(state.activeMutationContext).toBeUndefined();
+
+			// And an edit C solicits inside its still-open window must take the
+			// honest fallback receipt of the handler, never the identity or the
+			// cwd of A.
+			setupIncomingHandlers(state, {});
+			const applyEditHandler = (
+				vi.mocked(state.connection.onRequest).mock.calls as unknown as Array<
+					[string, (...args: unknown[]) => unknown]
+				>
+			).find((call) => call[0] === "workspace/applyEdit")?.[1];
+			expect(applyEditHandler).toBeDefined();
+			await expect(
+				applyEditHandler!({
+					edit: {
+						changes: {
+							[pathToFileURL(filePath).href]: [
+								{
+									range: {
+										start: { line: 0, character: 6 },
+										end: { line: 0, character: 9 },
+									},
+									newText: "new",
+								},
+							],
+						},
+					},
+				}),
+			).resolves.toMatchObject({ applied: true });
+			expect(fs.readFileSync(filePath, "utf8")).toBe("const new = 1;\n");
+			// Nothing was bookkept through the already-returned A.
+			expect(writtenThroughA).toEqual([]);
+			expect(contextA.summaryEmitted).toBeUndefined();
+			expect(contextA.summaryCount).toBeUndefined();
+
+			gateC.resolve({ ok: true });
+			await promiseC;
+			expect(state.activeMutationDepth).toBe(0);
+			expect(state.serverEditsAllowed).toBe(0);
+			expect(state.activeMutationContext).toBeUndefined();
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	// F2. The minimal two-frame out-of-order settle, pinning the half the PR
+	// body previously claimed was already covered by the #1412 H2 case and the
+	// #2450 nested-fallback case. It is not: in every one of those, the frame
+	// that unwinds to 0 had saved `undefined`, so an UNCONDITIONAL restore with
+	// no owner check leaves them all green. Here A (the owner) settles first
+	// and B — which saved the context of A on entry — unwinds to 0 last: the
+	// slot must be empty, so no `runtime`/`cacheManager` belonging to a call
+	// that has already returned stays reachable from client state once no
+	// command is in flight.
+	it("leaves no context behind when the owner settles before an overlapping frame unwinds to 0 (#2479 F2)", async () => {
+		const state = createMockState({
+			advertisedCommands: new Set(["cmd.a", "cmd.b"]),
+			activeMutationDepth: 0,
+			activeMutationContext: undefined,
+		});
+		const gateA = gatedPromise<unknown>();
+		const gateB = gatedPromise<unknown>();
+		gateExecuteCommands(state, { "cmd.a": gateA, "cmd.b": gateB });
+
+		const contextA: LspMutationContext = {
+			...OVERLAP_CONTEXT_BASE,
+			cwd: path.join(os.tmpdir(), "pi-lens-2479-unwind-a"),
+			correlationId: "unwind-a",
+		};
+		const contextB: LspMutationContext = {
+			...OVERLAP_CONTEXT_BASE,
+			cwd: path.join(os.tmpdir(), "pi-lens-2479-unwind-b"),
+			correlationId: "unwind-b",
+		};
+
+		const promiseA = runServerCommand(state, "cmd.a", [], 5000, contextA);
+		const promiseB = runServerCommand(state, "cmd.b", [], 5000, contextB);
+		expect(state.activeMutationDepth).toBe(2);
+		expect(state.activeMutationContext).toBeUndefined();
+
+		gateA.resolve({ ok: true });
+		await promiseA;
+		expect(state.activeMutationDepth).toBe(1);
+
+		gateB.resolve({ ok: true });
+		await promiseB;
+		// No command in flight == no context, exactly — the invariant the
+		// `serverEditsAllowed` gate is paired with.
+		expect(state.activeMutationDepth).toBe(0);
+		expect(state.serverEditsAllowed).toBe(0);
+		expect(state.activeMutationContext).toBeUndefined();
+	});
+});
