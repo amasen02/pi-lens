@@ -115,21 +115,40 @@ export function getGlobalPiLensDir(): string {
 	return path.join(os.homedir(), ".pi-lens");
 }
 
-const WORKTREES_SEGMENT_RE = /(^|\/)\.claude\/worktrees(\/|$)/;
-
+// A REGEX LITERAL, not a module-scope `const`: `file-utils.ts` sits on a
+// pre-existing import cycle (`file-utils.js → …​ → log-cleanup.js →
+// file-utils.js`, already in `.dependency-cruiser-known-violations.json`),
+// so `log-cleanup.ts`'s own top-level `getGlobalPiLensDir()` call can reach
+// this function WHILE `file-utils.ts`'s own module body is still mid-init —
+// any `const`/`let` declared below this function would still be in the TDZ
+// at that moment and throw `ReferenceError` (caught live: exactly this
+// crashed `log-cleanup.js` on import before the fix below). A literal
+// re-evaluated per call has no such ordering dependency.
 function shouldRedirectGlobalDirToProbeHome(cwd: string): boolean {
 	if (process.env.PILENS_PROBE === "1") return true;
 	if (isTestMode()) return false;
-	if (WORKTREES_SEGMENT_RE.test(normalizeFilePath(cwd))) return true;
+	if (/(^|\/)\.claude\/worktrees(\/|$)/.test(normalizeFilePath(cwd))) {
+		return true;
+	}
 	return isUnderDir(cwd, os.tmpdir());
 }
 
-let probeHomeRedirectWarned = false;
-
+/**
+ * `globalThis`-keyed, not a module-scope `let` OR `const`: same TDZ hazard as
+ * the regex above — `Symbol.for(key)` itself is call-time-safe (it's
+ * process-wide interned by string, no module-scope binding involved), so the
+ * key is recomputed inline rather than cached in a top-level `const`. Same
+ * `Symbol.for` shape `clients/ndjson-logger.ts` already uses for its own
+ * process-global state, so a re-entrant/hot-reloaded module record can never
+ * retain a second, competing copy of this flag.
+ */
 function redirectGlobalDirToProbeHome(cwd: string): string {
 	const probeHome = path.join(cwd, ".pi-lens-probe-home");
-	if (!probeHomeRedirectWarned) {
-		probeHomeRedirectWarned = true;
+	const warnedKey = Symbol.for("pi-lens.file-utils.probeHomeRedirectWarned");
+	const globalState = globalThis as typeof globalThis &
+		Record<symbol, boolean | undefined>;
+	if (!globalState[warnedKey]) {
+		globalState[warnedKey] = true;
 		process.stderr.write(
 			`[pi-lens] PI_LENS_HOME is unset and cwd (${cwd}) looks like a probe/worktree context; redirecting the global pi-lens dir to ${probeHome} instead of the real home directory. Set PI_LENS_HOME to silence this.\n`,
 		);
