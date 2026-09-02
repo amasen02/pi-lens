@@ -497,7 +497,8 @@ export function configRecordOwner(
 ): ConfigRecordOwner | undefined {
 	const key = record.canonicalKey ?? record.key;
 	if (key.length === 0) return undefined;
-	const head = (key.startsWith("/") ? key.slice(1) : key).split(/[./]/)[0] ?? "";
+	const head =
+		(key.startsWith("/") ? key.slice(1) : key).split(/[./]/)[0] ?? "";
 	if (head.length === 0) return undefined;
 	return head === LSP_NAMESPACE_KEY || LEGACY_ROOT_LSP_KEYS.includes(head)
 		? "lsp"
