@@ -986,7 +986,8 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 	{
 		id: "go-vet:goClientAvailability",
 		module: "dispatch/runners/go-vet.ts",
-		state: "goClient's ToolchainAvailability latch (resolved go path, availability verdict)",
+		state:
+			"goClient's ToolchainAvailability latch (resolved go path, availability verdict)",
 		policy: "session_start",
 		resetName: "resetGoAvailability",
 		reason:

@@ -544,7 +544,9 @@ export function auditContainerClassExclusions(
 			);
 		}
 		if (reason.trim().length === 0) {
-			problems.push(`CONTAINER_CLASS_EXCLUSIONS["${name}"] has an empty reason`);
+			problems.push(
+				`CONTAINER_CLASS_EXCLUSIONS["${name}"] has an empty reason`,
+			);
 		}
 	}
 	return problems;
