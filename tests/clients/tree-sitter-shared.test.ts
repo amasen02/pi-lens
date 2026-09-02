@@ -1,8 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { LANGUAGES } from "../../clients/language-registry.js";
 import {
 	_resetSharedTreeSitterClientForTests,
+	COMPLEXITY_LANGUAGE_IDS,
 	getSharedTreeSitterClient,
 	getTreeSitterRuntimeStatus,
+	isComplexitySupportedFile,
 	isTreeSitterWasmAborted,
 	markTreeSitterWasmAborted,
 	resolveTreeSitterLanguage,
@@ -45,6 +48,49 @@ describe("resolveTreeSitterLanguage", () => {
 	it("returns undefined for unsupported extensions", () => {
 		expect(resolveTreeSitterLanguage("file.md")).toBeUndefined();
 		expect(resolveTreeSitterLanguage("file")).toBeUndefined();
+	});
+});
+
+/**
+ * #2467 review, F6: nothing shipped pinned the ONE thing
+ * `isComplexitySupportedFile` exists to be — the client-free mirror of
+ * `ComplexityClient.isSupportedFile` — or that `COMPLEXITY_LANGUAGE_IDS`
+ * still names grammars the canonical registry actually resolves to. Either
+ * one could drift silently: the client delegates back to this predicate
+ * today, so a future edit that breaks that delegation compiles clean, and a
+ * grammar rename in `language-registry.ts` would leave a `COMPLEXITY_LANGUAGE_IDS`
+ * entry that `resolveTreeSitterLanguage` can never produce, silently starving
+ * that language of complexity baselines.
+ */
+describe("isComplexitySupportedFile mirrors ComplexityClient.isSupportedFile (#2467 review, F6)", () => {
+	// Direct positive/negative assertions, not a comparison against
+	// `ComplexityClient.isSupportedFile` — that method PURELY delegates to
+	// `isComplexitySupportedFile` (see `complexity-client.ts`), so comparing
+	// the two is a tautology: gutting this predicate to `return false` makes
+	// both sides agree on `false` for every extension and the test stays
+	// green (caught in review round 1 of #2474's merge-with-master).
+	it("returns true for an extension whose language complexity supports", () => {
+		expect(isComplexitySupportedFile("src/file.ts")).toBe(true);
+		expect(isComplexitySupportedFile("src/file.py")).toBe(true);
+		expect(isComplexitySupportedFile("src/file.go")).toBe(true);
+		expect(isComplexitySupportedFile("src/file.rs")).toBe(true);
+	});
+
+	it("returns false for an extension the registry resolves but complexity does not support", () => {
+		// ".rb" resolves to a live grammar (see resolveTreeSitterLanguage above)
+		// but "ruby" is not in COMPLEXITY_LANGUAGE_IDS.
+		expect(isComplexitySupportedFile("src/file.rb")).toBe(false);
+	});
+
+	it("returns false for an extension the registry does not own at all", () => {
+		expect(isComplexitySupportedFile("src/file.md")).toBe(false);
+	});
+
+	it("every COMPLEXITY_LANGUAGE_IDS entry is a live registry grammar id", () => {
+		const liveGrammarIds = new Set(LANGUAGES.map((entry) => entry.grammar));
+		for (const languageId of COMPLEXITY_LANGUAGE_IDS) {
+			expect(liveGrammarIds.has(languageId)).toBe(true);
+		}
 	});
 });
 

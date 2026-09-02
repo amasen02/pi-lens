@@ -11,6 +11,7 @@
  * the full path (where those steps actually run instead of being skipped).
  */
 
+import { withResidentBootstrap } from "../support/bootstrap-access.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { LatencyEntry } from "../../clients/latency-logger.js";
 
@@ -81,7 +82,7 @@ function makeDefaultRuntime() {
 }
 
 function makeDeps(ctxCwd: string) {
-	return {
+	return withResidentBootstrap({
 		ctxCwd,
 		getFlag: () => false,
 		notify: vi.fn(),
@@ -127,7 +128,7 @@ function makeDeps(ctxCwd: string) {
 		resetDispatchBaselines: () => {},
 		resetLSPService: () => {},
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	} as any;
+	}) as any;
 }
 
 function skippedStepsRecords(): LatencyEntry[] {

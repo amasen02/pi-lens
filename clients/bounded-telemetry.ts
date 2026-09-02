@@ -53,6 +53,13 @@ import { type LatencyEntry, logLatency } from "./latency-logger.js";
  * must not also be written by a raw `logLatency` call somewhere else.
  */
 export const BOUNDED_TELEMETRY_PHASES = [
+	/**
+	 * #2467: a demand for the analyzer bootstrap clients was not served and
+	 * the caller proceeded without them. Rising-edge per demand reason, with
+	 * the ledger holding the exact count — a wedged or missing analyzer graph
+	 * must not turn every tool call into a log line.
+	 */
+	"bootstrap_clients_unavailable",
 	/** #1705: a deferred-format record whose origin worktree never claimed it. */
 	"agent_end_deferred_format_orphan_origin_mismatch",
 	/** #1713: a `textDocument`/`workspace` diagnostic pull abandoned at budget. */

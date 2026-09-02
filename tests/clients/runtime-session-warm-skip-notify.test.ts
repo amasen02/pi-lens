@@ -12,6 +12,7 @@
  *   - a normal (small, `canWarmCaches: true`) project never fires it.
  */
 
+import { withResidentBootstrap } from "../support/bootstrap-access.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -50,7 +51,7 @@ function makeDeps(
 	ctxCwd: string,
 	notify: (msg: string, level: string) => void,
 ) {
-	return {
+	return withResidentBootstrap({
 		ctxCwd,
 		getFlag: () => false,
 		notify,
@@ -95,7 +96,7 @@ function makeDeps(
 		cleanStaleTsBuildInfo: () => [],
 		resetDispatchBaselines: () => {},
 		resetLSPService: () => {},
-	} as any;
+	}) as any;
 }
 
 describe("warm-pipeline size-skip notify (#775)", () => {

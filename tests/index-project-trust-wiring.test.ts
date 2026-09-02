@@ -12,8 +12,9 @@ import { removeTempDirSync } from "./clients/test-utils.js";
 
 // Same two heavy seams tests/index-wiring.test.ts stubs, so firing
 // session_start stays a fast deterministic wiring check.
-vi.mock("../clients/bootstrap.js", () => ({
-	loadBootstrapClients: async () => ({
+vi.mock("../clients/bootstrap.js", async () => {
+	const { bootstrapSeamMock } = await import("./support/bootstrap-mock.js");
+	return bootstrapSeamMock(async () => ({
 		metricsClient: { reset: () => {} },
 		todoScanner: {},
 		biomeClient: { isAvailable: () => false },
@@ -39,8 +40,8 @@ vi.mock("../clients/bootstrap.js", () => ({
 			isSupportedFile: () => false,
 			analyzeFile: () => null,
 		},
-	}),
-}));
+	}));
+});
 vi.mock("../clients/runtime-session.js", () => ({
 	handleSessionStart: async () => {},
 }));

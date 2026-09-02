@@ -89,7 +89,10 @@ const EXEMPT_SITES: Readonly<Record<string, string>> = {
 		"(the issue asks for a FIFO sibling of BoundedLruCache, a K,V map). " +
 		"Named here rather than left invisible; a BoundedSet is the natural " +
 		"follow-up that would clear all four Set-shaped entries at once.",
-	"index.ts:546":
+	// Line-keyed, so it is recomputed from the MERGED file, never taken from
+	// either side: master moved it to 546 and this branch to 576, and the merge
+	// puts it at neither.
+	"index.ts:573":
 		"Set, not Map: `_lspConfigInitializedCwds` is membership-only — same " +
 		"reason as clients/lsp/session-roots.ts, whose SESSION_ROOT_CAP this " +
 		"cap is deliberately paired with. No BoundedSet exists; see that " +
