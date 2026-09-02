@@ -208,9 +208,14 @@ describe("tree-sitter runner — skip paths", () => {
 		expect(result.diagnostics).toHaveLength(0);
 	});
 
+	// `.md` has no tree-sitter grammar in the language registry. This used to
+	// use `.java`, which #2424 wired to the java grammar as one of its reconciled
+	// rows (the project scanner already resolved it; the shared ext->grammar map
+	// did not). The runner's appliesTo never included the java kind, so nothing
+	// but this direct call ever reached the skip path with a .java file.
 	it("skips unsupported file extension", async () => {
 		const runner = await loadRunnerWithClient(true, true);
-		const result = await runner.run(createCtx("/fake/file.java") as any);
+		const result = await runner.run(createCtx("/fake/file.md") as any);
 		expect(result.status).toBe("skipped");
 	});
 

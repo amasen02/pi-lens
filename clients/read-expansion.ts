@@ -8,7 +8,9 @@
  */
 
 import * as fs from "node:fs";
+import { extname } from "node:path";
 import { withBudget } from "./deadline-utils.js";
+import { EXTENSION_TO_GRAMMAR } from "./language-registry.js";
 import type { TreeSitterClient } from "./tree-sitter-client.js";
 
 /** Only expand reads smaller than this (lines). Larger reads don't benefit. */
@@ -20,54 +22,14 @@ const EXPANDED_SIZE_CAP_LINES = 300;
 /** Async budget for tree-sitter parse + walk. */
 export const EXPANSION_BUDGET_MS = 200;
 
-/** File extensions we can parse — mirrors tree-sitter runner. */
-const EXT_TO_LANG: Record<string, string> = {
-	".ts": "typescript",
-	".mts": "typescript",
-	".cts": "typescript",
-	".tsx": "tsx",
-	".js": "javascript",
-	".mjs": "javascript",
-	".cjs": "javascript",
-	".jsx": "javascript",
-	".py": "python",
-	".go": "go",
-	".rs": "rust",
-	".rb": "ruby",
-	".java": "java",
-	".kt": "kotlin",
-	".kts": "kotlin",
-	".dart": "dart",
-	".ex": "elixir",
-	".exs": "elixir",
-	".c": "c",
-	".h": "c",
-	".cc": "cpp",
-	".cpp": "cpp",
-	".cxx": "cpp",
-	".c++": "cpp",
-	".hh": "cpp",
-	".hpp": "cpp",
-	".hxx": "cpp",
-	".cs": "csharp",
-	".php": "php",
-	".phtml": "php",
-	".swift": "swift",
-	".lua": "lua",
-	".ml": "ocaml",
-	".mli": "ocaml",
-	".zig": "zig",
-	".sh": "bash",
-	".bash": "bash",
-};
-
 /**
- * Canonical set of source-code file extensions pi-lens understands, derived
- * from the same {@link EXT_TO_LANG} map the read-coverage path uses. Exported as
- * the single source of truth so language-spanning scanners cover every
- * supported language instead of a hardcoded subset (#262).
+ * The grammar this module would parse `filePath` with, or undefined when read
+ * expansion does not understand the extension. Exported so the
+ * language-identity golden snapshot can record this consumer's answer.
  */
-export const CODE_FILE_EXTENSIONS: readonly string[] = Object.keys(EXT_TO_LANG);
+export function readExpansionLanguage(filePath: string): string | undefined {
+	return EXTENSION_TO_GRAMMAR[extname(filePath).toLowerCase()];
+}
 
 /** AST node types considered "enclosing symbols" for coverage purposes. */
 const ENCLOSING_TYPES: Record<string, string[]> = {
@@ -307,7 +269,7 @@ export async function tryExpandRead(
 			return { ...result, durationMs: Date.now() - startedAt };
 		}
 
-		const languageId = EXT_TO_LANG[ext];
+		const languageId = readExpansionLanguage(filePath);
 		if (!languageId) return undefined;
 
 		const enclosingTypes = ENCLOSING_TYPES[languageId];
