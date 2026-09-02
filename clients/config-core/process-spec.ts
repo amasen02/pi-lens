@@ -31,11 +31,13 @@
  */
 
 import { incrementDegradationCount } from "../degradation-ledger.js";
+import { homeRelativePath } from "../path-utils.js";
 import {
 	getProjectTrustGeneration,
 	getProjectTrustState,
 } from "../project-trust.js";
 import {
+	compareKeys,
 	isRepoTier,
 	type Provenance,
 	type TrustDecision,
@@ -314,6 +316,7 @@ function refuse(
 		cause === "spec-trust"
 			? `${tier} config command refused: config trust is ${spec.trust}`
 			: `${tier} config command refused: host trust is now ${hostTrust}`;
+	const trustGeneration = getProjectTrustGeneration();
 	const refusal: TrustRefusal = {
 		kind: "trust-refusal",
 		cause,
@@ -322,19 +325,31 @@ function refuse(
 		command,
 		specTrust: spec.trust,
 		hostTrust,
-		trustGeneration: getProjectTrustGeneration(),
+		trustGeneration,
 	};
-	// Subject carries the tier and argv[0] only: enough to say WHICH command was
-	// refused, never enough to leak an argument or an env value.
+	// Subject carries the trust GENERATION, the tier, and argv[0] only: enough to
+	// say which command was refused and in which trust episode, never enough to
+	// leak an argument or an env value.
+	//
+	// The generation belongs in the SUBJECT, not only in the metadata (#2440
+	// review finding F6). `incrementDegradationCount` keys its tally on
+	// `kind\0subject` and writes a durable row on the first occurrence and at
+	// power-of-two milestones. A generation-free subject therefore made one
+	// unbroken count across every trust episode of a session: revoke, refuse
+	// three times, re-grant, revoke again, and the next refusal is count 4 — not
+	// a power of two, so the second episode produces NO durable row at all and
+	// the count a reader sees does not describe either episode. Re-arming the
+	// subject per generation makes each episode its own bounded, durably-recorded
+	// series, which is what a per-episode question needs.
 	incrementDegradationCount({
 		kind: TRUST_REFUSAL_KIND,
-		subject: `config-command:${tier}:${command}`,
+		subject: `config-command:g${trustGeneration}:${tier}:${command}`,
 		reason,
 		metadata: {
 			cause,
 			specTrust: spec.trust,
 			hostTrust,
-			trustGeneration: refusal.trustGeneration,
+			trustGeneration,
 			configKey: spec.provenance.key,
 		},
 	});
@@ -370,16 +385,22 @@ export function redactProcessSpec(spec: ProcessSpec): RedactedProcessSpec {
 	return {
 		command: spec.argv[0],
 		argvCount: spec.argv.length,
-		envNames: Object.keys(spec.env).sort(),
+		// `compareKeys`, not a bare `.sort()` (Sonar S2871) and not
+		// `localeCompare`: this projection is compared across machines, so its
+		// ordering may not depend on the machine's locale.
+		envNames: Object.keys(spec.env).sort(compareKeys),
 		envCount: Object.keys(spec.env).length,
 		cwdMode: spec.cwdMode,
 		inputMode: spec.inputMode,
 		timeoutMs: spec.timeoutMs,
 		tier: spec.provenance.tier,
 		configKey: spec.provenance.key,
+		// Home-relative for the same reason `provenanceView` is: a spec read from
+		// the operator's global config would otherwise put their account name on
+		// every diagnostic that named the file.
 		...(spec.provenance.file === undefined
 			? {}
-			: { file: spec.provenance.file }),
+			: { file: homeRelativePath(spec.provenance.file) }),
 		trust: spec.trust,
 	};
 }

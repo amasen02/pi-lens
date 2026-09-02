@@ -161,6 +161,34 @@ export function schemaType(
 }
 
 /**
+ * The `type` keywords the core knows how to act on.
+ *
+ * An unrecognized keyword is the SCHEMA's problem, not the user's, and both
+ * halves of the pipeline treat it identically: the node is opaque, so the walk
+ * dispatches on the value's own shape instead of on a word it cannot read
+ * (#2440 review). Asking `schemaType(node) !== undefined` was the older,
+ * asymmetric test — it let the validator walk a `type: "widget"` node field by
+ * field while the merger replaced it whole, so the same schema typo produced
+ * two different merge semantics.
+ */
+export const SCHEMA_TYPES: readonly string[] = [
+	"object",
+	"array",
+	"string",
+	"number",
+	"integer",
+	"boolean",
+	"null",
+];
+
+const SCHEMA_TYPE_SET: ReadonlySet<string> = new Set(SCHEMA_TYPES);
+
+/** True when the node declares a `type` keyword the core acts on. */
+export function isKnownSchemaType(declared: string | undefined): boolean {
+	return declared !== undefined && SCHEMA_TYPE_SET.has(declared);
+}
+
+/**
  * The subschema governing property `name`: its `properties` entry, else the
  * first `patternProperties` entry whose regex matches.
  *

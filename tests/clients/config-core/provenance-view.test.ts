@@ -1,5 +1,8 @@
+import * as os from "node:os";
+import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+	isOperatorTier,
 	isRepoTier,
 	provenanceFor,
 	provenanceView,
@@ -26,6 +29,24 @@ describe("the tier vocabulary is one ordering plus one classification (#2425)", 
 			"nested-project",
 		]);
 		expect(Object.keys(TIER_CLASS).sort()).toEqual([...SOURCE_TIERS].sort());
+	});
+
+	it("splits the non-repo tiers into shipped DEFAULTS and operator decisions", () => {
+		// #2440 review F3. The two predicates are not complements, and pinning
+		// that is the point: `!isRepoTier` used to answer "is this an operator
+		// tier", which quietly made every built-in denial permanent.
+		expect(SOURCE_TIERS.filter(isOperatorTier)).toEqual([
+			"global",
+			"env",
+			"cli",
+			"host",
+		]);
+		expect(TIER_CLASS.builtin).toBe("default");
+		expect(isOperatorTier("builtin")).toBe(false);
+		expect(isRepoTier("builtin")).toBe(false);
+		expect(new Set(Object.values(TIER_CLASS))).toEqual(
+			new Set(["default", "operator", "repo"]),
+		);
 	});
 });
 
@@ -73,6 +94,45 @@ describe("provenanceView is redacted by construction (#2415 AC 4)", () => {
 	it("sorts entries by key so two runs render identically", () => {
 		const keys = provenanceView(resolved).entries.map((entry) => entry.key);
 		expect(keys).toEqual([...keys].sort());
+	});
+});
+
+describe("a projection never carries the operator's home path (#2440 F5)", () => {
+	const home = os.homedir();
+	const globalConfig = path.join(home, ".pi-lens", "config.json");
+
+	it("rewrites a $HOME-anchored file to its ~ form", () => {
+		const { resolved } = resolveConfig({
+			schema: DEMO_CONFIG_SCHEMA,
+			sources: [
+				{
+					tier: "global",
+					file: globalConfig,
+					value: { lsp: { warmFiles: ["a.ts"] } },
+				},
+			],
+		});
+		const view = provenanceView(resolved);
+		const serialized = JSON.stringify(view);
+		expect(view.entries.length).toBeGreaterThan(0);
+		// The absolute path carries the account name; the `~` form carries the
+		// same information about WHICH file without it.
+		expect(serialized).not.toContain(home);
+		expect(serialized).toContain("~/.pi-lens/config.json");
+	});
+
+	it("leaves a path outside home alone rather than rewriting every path", () => {
+		const { resolved } = resolveConfig({
+			schema: DEMO_CONFIG_SCHEMA,
+			sources: [
+				{
+					tier: "project",
+					file: ".pi-lens.json",
+					value: { lsp: { warmFiles: ["a.ts"] } },
+				},
+			],
+		});
+		expect(JSON.stringify(provenanceView(resolved))).toContain(".pi-lens.json");
 	});
 });
 

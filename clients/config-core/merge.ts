@@ -23,7 +23,17 @@
  * keep caller order, which is how several `nested-project` files stay ordered
  * from outermost to innermost.
  *
- * Pure: no state, no I/O, no ledger writes.
+ * TWO BOUNDS ARE ENFORCED HERE AS WELL AS IN `normalize.ts`, and the duplication
+ * is deliberate (#2440 review). `merge()` is exported, and its input type says
+ * "the value AFTER `validate()`" — a sentence, not a compiler check. A caller
+ * that merges a hand-built value bypasses every guarantee the validator makes,
+ * so the merger enforces the prototype-key policy through the same `safeAssign`
+ * and counts its own recursion against the same `MAX_CONFIG_DEPTH`. One shared
+ * constant and one shared helper, two enforcement points; neither is a second
+ * copy of the rule.
+ *
+ * Pure: no state, no I/O, no ledger writes. Records, when the caller supplies a
+ * collector, describe what the two bounds refused.
  */
 
 import {
@@ -33,6 +43,17 @@ import {
 	resolveBooleanDeny,
 } from "./deny.js";
 import type { ConfigObject } from "./schema.js";
+import {
+	isUnsafeConfigKey,
+	MAX_CONFIG_DEPTH,
+	safeAssign,
+	UNSAFE_KEY_REASON,
+} from "./safe-object.js";
+import {
+	boundedKeyLabel,
+	MigrationRecordCollector,
+	migrationSubject,
+} from "./records.js";
 import {
 	type Provenance,
 	type Resolved,
@@ -45,6 +66,7 @@ import {
 	type ConfigValue,
 	denyPolicyOf,
 	isConfigObject,
+	isKnownSchemaType,
 	isPlainObject,
 	isSchemaNode,
 	itemsSchema,
@@ -74,6 +96,27 @@ interface Contribution {
 	readonly rank: number;
 }
 
+/** What the merger needs to describe a node it refused. */
+export interface MergeOptions {
+	/**
+	 * Where to put records for keys and depths the merger refused. Optional
+	 * because `merge`'s return type carries no record surface: a caller that
+	 * wants the explanation supplies the collector, and `resolveConfig` always
+	 * does. Without one the refusals still happen — they are simply unreported,
+	 * which is the honest consequence of an API with nowhere to report them.
+	 */
+	readonly collector?: MigrationRecordCollector;
+	/** The file label records carry when the merger is the one refusing. */
+	readonly file?: string;
+}
+
+/** Everything the recursion carries that is not the node itself. */
+interface MergeContext {
+	readonly provenance: Map<string, Provenance>;
+	readonly collector: MigrationRecordCollector;
+	readonly file: string;
+}
+
 /**
  * Merge normalized sources into one resolved config with per-leaf provenance.
  *
@@ -83,6 +126,7 @@ interface Contribution {
 export function merge<T = unknown>(
 	sources: readonly ConfigSource[],
 	schema: ConfigSchemaNode,
+	options: MergeOptions = {},
 ): Resolved<T> {
 	const ordered = [...sources]
 		.map((source, order) => ({ source, order }))
@@ -104,8 +148,32 @@ export function merge<T = unknown>(
 	}
 
 	const provenance = new Map<string, Provenance>();
-	const value = mergeNode(contributions, schema, "", provenance);
+	const context: MergeContext = {
+		provenance,
+		collector: options.collector ?? new MigrationRecordCollector(),
+		file: options.file ?? "",
+	};
+	const value = mergeNode(contributions, schema, "", context, 0);
 	return { value: value as T, provenance };
+}
+
+/** Record one node the merger's own bounds refused. Never carries a value. */
+function record(
+	context: MergeContext,
+	entry: {
+		code: "PILENS_CFG_0005" | "PILENS_CFG_0006";
+		key: string;
+		reason: string;
+	},
+): void {
+	const key = boundedKeyLabel(entry.key);
+	context.collector.add({
+		code: entry.code,
+		file: context.file,
+		key,
+		subject: migrationSubject(context.file, key),
+		reason: entry.reason,
+	});
 }
 
 function provenanceOf(contribution: Contribution, key: string): Provenance {
@@ -119,33 +187,46 @@ function provenanceOf(contribution: Contribution, key: string): Provenance {
 }
 
 function stamp(
-	provenance: Map<string, Provenance>,
+	context: MergeContext,
 	contribution: Contribution,
 	key: string,
 ): void {
-	provenance.set(key, provenanceOf(contribution, key));
+	context.provenance.set(key, provenanceOf(contribution, key));
 }
 
 function mergeNode(
 	contributions: readonly Contribution[],
 	schema: ConfigSchemaNode | undefined,
 	key: string,
-	provenance: Map<string, Provenance>,
+	context: MergeContext,
+	depth: number,
 ): ConfigValue | undefined {
 	if (contributions.length === 0) return undefined;
 
+	// The merger's own depth bound. `validate()` already truncated anything it
+	// walked, so this fires only for a value that reached `merge()` without it —
+	// which the exported signature permits and a review probe demonstrated.
+	if (depth > MAX_CONFIG_DEPTH) {
+		record(context, {
+			code: "PILENS_CFG_0005",
+			key,
+			reason: `config nesting exceeds ${MAX_CONFIG_DEPTH} levels; ignored`,
+		});
+		return undefined;
+	}
+
 	const denyPolicy = denyPolicyOf(schema);
-	if (denyPolicy) return mergeDeny(contributions, denyPolicy, key, provenance);
+	if (denyPolicy) return mergeDeny(contributions, denyPolicy, key, context);
 
 	if (isObjectNode(schema, contributions)) {
-		return mergeObject(contributions, schema, key, provenance);
+		return mergeObject(contributions, schema, key, context, depth);
 	}
 	if (isArrayNode(schema, contributions)) {
-		return mergeArray(contributions, schema, key, provenance);
+		return mergeArray(contributions, schema, key, context, depth);
 	}
 
 	const winner = contributions[contributions.length - 1];
-	stamp(provenance, winner, key);
+	stamp(context, winner, key);
 	return winner.value;
 }
 
@@ -161,7 +242,11 @@ function isObjectNode(
 ): boolean {
 	const declared = schemaType(schema);
 	if (declared === "object") return true;
-	if (declared !== undefined) return false;
+	// Only a RECOGNIZED non-object type rules object-ness out. An unrecognized
+	// keyword leaves the node opaque, and an opaque node is decided by the
+	// value's shape — the same rule `normalize.ts` walks by, so one schema typo
+	// cannot give the two halves different merge semantics.
+	if (isKnownSchemaType(declared)) return false;
 	if (schema && isSchemaNode(schema.properties)) return true;
 	return contributions.every((entry) => isPlainObject(entry.value));
 }
@@ -172,7 +257,7 @@ function isArrayNode(
 ): boolean {
 	const declared = schemaType(schema);
 	if (declared === "array") return true;
-	if (declared !== undefined) return false;
+	if (isKnownSchemaType(declared)) return false;
 	return contributions.every((entry) => Array.isArray(entry.value));
 }
 
@@ -180,7 +265,7 @@ function mergeDeny(
 	contributions: readonly Contribution[],
 	policy: "boolean-false" | "array-union",
 	key: string,
-	provenance: Map<string, Provenance>,
+	context: MergeContext,
 ): ConfigValue | undefined {
 	const denyContributions: DenyContribution[] = contributions.map((entry) => ({
 		tier: entry.source.tier,
@@ -193,7 +278,7 @@ function mergeDeny(
 			? resolveBooleanDeny(denyContributions)
 			: resolveArrayDeny(denyContributions);
 	const entry = denyProvenance(denyContributions, resolution, key);
-	if (entry) provenance.set(key, entry);
+	if (entry) context.provenance.set(key, entry);
 	return resolution.value;
 }
 
@@ -201,22 +286,36 @@ function mergeObject(
 	contributions: readonly Contribution[],
 	schema: ConfigSchemaNode | undefined,
 	key: string,
-	provenance: Map<string, Provenance>,
+	context: MergeContext,
+	depth: number,
 ): ConfigValue | undefined {
 	const objects = contributions.filter((entry) => isConfigObject(entry.value));
 	if (objects.length === 0) {
 		const winner = contributions[contributions.length - 1];
-		stamp(provenance, winner, key);
+		stamp(context, winner, key);
 		return winner.value;
 	}
 
 	// Field order: lowest tier's keys first, each nearer tier appending only the
 	// keys it introduces. A resolved config therefore reads in the order the
 	// user's own files introduced things.
+	//
+	// A prototype-modifying name is refused HERE, before it can become a child
+	// key: dropping it at the assignment alone would still have walked it and
+	// stamped provenance at a pointer no resolved value can be read from.
 	const names: string[] = [];
 	for (const entry of objects) {
 		for (const name of Object.keys(entry.value as ConfigObject)) {
-			if (!names.includes(name)) names.push(name);
+			if (names.includes(name)) continue;
+			if (isUnsafeConfigKey(name)) {
+				record(context, {
+					code: "PILENS_CFG_0006",
+					key: `${key}/${name}`,
+					reason: UNSAFE_KEY_REASON,
+				});
+				continue;
+			}
+			names.push(name);
 		}
 	}
 
@@ -237,9 +336,10 @@ function mergeObject(
 			childContributions,
 			propertySchema(schema, name),
 			childKey,
-			provenance,
+			context,
+			depth + 1,
 		);
-		if (merged !== undefined) out[name] = merged;
+		if (merged !== undefined) safeAssign(out, name, merged);
 	}
 	return out;
 }
@@ -248,44 +348,45 @@ function mergeArray(
 	contributions: readonly Contribution[],
 	schema: ConfigSchemaNode | undefined,
 	key: string,
-	provenance: Map<string, Provenance>,
+	context: MergeContext,
+	depth: number,
 ): ConfigValue | undefined {
 	const arrays = contributions.filter((entry) => Array.isArray(entry.value));
 	if (arrays.length === 0) {
 		const winner = contributions[contributions.length - 1];
-		stamp(provenance, winner, key);
+		stamp(context, winner, key);
 		return winner.value;
 	}
 	const strategy: MergeStrategy = mergeStrategyOf(schema);
 	const keyed = keyedField(strategy);
 	if (keyed !== undefined) {
-		return mergeKeyedArray(arrays, schema, keyed, key, provenance);
+		return mergeKeyedArray(arrays, schema, keyed, key, context, depth);
 	}
-	if (strategy === "append") return appendArrays(arrays, key, provenance);
+	if (strategy === "append") return appendArrays(arrays, key, context);
 
 	// `replace`: the highest-precedence contributor supplies the whole array,
 	// and one provenance entry at the array's own pointer says who. Per-element
 	// entries would be noise: every element has the same answer.
 	const winner = arrays[arrays.length - 1];
-	stamp(provenance, winner, key);
+	stamp(context, winner, key);
 	return [...(winner.value as ConfigValue[])];
 }
 
 function appendArrays(
 	arrays: readonly Contribution[],
 	key: string,
-	provenance: Map<string, Provenance>,
+	context: MergeContext,
 ): ConfigValue {
 	const out: ConfigValue[] = [];
 	for (const entry of arrays) {
 		for (const member of entry.value as ConfigValue[]) {
-			stamp(provenance, entry, `${key}/${out.length}`);
+			stamp(context, entry, `${key}/${out.length}`);
 			out.push(member);
 		}
 	}
 	// The array itself is attributed to its lowest-precedence contributor: with
 	// `append`, that is the tier the list STARTED at.
-	stamp(provenance, arrays[0], key);
+	stamp(context, arrays[0], key);
 	return out;
 }
 
@@ -303,7 +404,8 @@ function mergeKeyedArray(
 	schema: ConfigSchemaNode | undefined,
 	field: string,
 	key: string,
-	provenance: Map<string, Provenance>,
+	context: MergeContext,
+	depth: number,
 ): ConfigValue {
 	const items = itemsSchema(schema);
 	const order: string[] = [];
@@ -334,7 +436,13 @@ function mergeKeyedArray(
 
 	const out: ConfigValue[] = [];
 	const pushMerged = (group: readonly Contribution[]): void => {
-		const merged = mergeNode(group, items, `${key}/${out.length}`, provenance);
+		const merged = mergeNode(
+			group,
+			items,
+			`${key}/${out.length}`,
+			context,
+			depth + 1,
+		);
 		// An entry can only merge to `undefined` when its group is empty, which
 		// the construction above cannot produce; dropping it keeps the resolved
 		// list free of holes either way.
@@ -344,7 +452,7 @@ function mergeKeyedArray(
 	for (const entry of unkeyed) pushMerged([entry]);
 	// Attribute the list itself to its lowest-precedence contributor, matching
 	// `append`: a keyed list is a list every tier extends, not one a tier owns.
-	stamp(provenance, arrays[0], key);
+	stamp(context, arrays[0], key);
 	return out;
 }
 

@@ -1,3 +1,5 @@
+import * as os from "node:os";
+import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
 	getDegradationSummary,
@@ -267,7 +269,7 @@ describe("a refusal is recorded once, through the existing ledger kind (#2425)",
 		expect(group).toBeDefined();
 		expect(group?.count).toBe(1);
 		expect(group?.latestReasons[0].subject).toBe(
-			"config-command:project:pyright-langserver",
+			`config-command:g${getProjectTrustGeneration()}:project:pyright-langserver`,
 		);
 	});
 
@@ -297,6 +299,56 @@ describe("a refusal is recorded once, through the existing ledger kind (#2425)",
 		expect(later.ok).toBe(false);
 		if (later.ok) return;
 		expect(later.refusal.trustGeneration).toBeGreaterThan(before);
+	});
+
+	it("re-arms the count and the durable row for each trust EPISODE", () => {
+		// #2440 review F6. `incrementDegradationCount` tallies on `kind\0subject`
+		// and writes a durable row on the first occurrence and at power-of-two
+		// milestones. A generation-free subject made one unbroken series across
+		// every revoke/re-grant cycle, so the second episode's first refusal was
+		// count 4 — not a power of two, hence NO durable row for that episode at
+		// all, and a count that described neither.
+		setProjectTrustState("untrusted");
+		const firstGeneration = getProjectTrustGeneration();
+		for (let attempt = 0; attempt < 3; attempt += 1) {
+			toSpawnArgs(specFor("project", "untrusted"));
+		}
+		const firstSubject = `config-command:g${firstGeneration}:project:pyright-langserver`;
+		const afterFirst = getDegradationSummary().find(
+			(entry) => entry.kind === "trust-refusal",
+		);
+		expect(
+			afterFirst?.latestReasons.find(
+				(reason) => reason.subject === firstSubject,
+			)?.reason,
+		).toContain("(count: 3)");
+
+		// A revoke -> re-grant -> revoke cycle bumps the generation.
+		setProjectTrustState("trusted");
+		setProjectTrustState("untrusted");
+		const secondGeneration = getProjectTrustGeneration();
+		expect(secondGeneration).toBeGreaterThan(firstGeneration);
+
+		const refusal = toSpawnArgs(specFor("project", "untrusted"));
+		expect(refusal.ok).toBe(false);
+		const secondSubject = `config-command:g${secondGeneration}:project:pyright-langserver`;
+		const afterSecond = getDegradationSummary().find(
+			(entry) => entry.kind === "trust-refusal",
+		);
+		// The new episode starts its own series at 1 — which IS a power of two,
+		// so it also produces a durable row.
+		expect(
+			afterSecond?.latestReasons.find(
+				(reason) => reason.subject === secondSubject,
+			)?.reason,
+		).toContain("(count: 1)");
+		// The previous episode's series survives beside it rather than being
+		// continued by it.
+		expect(
+			afterSecond?.latestReasons.some(
+				(reason) => reason.subject === firstSubject,
+			),
+		).toBe(true);
 	});
 
 	it("records nothing when an operator-tier spec passes", () => {
@@ -343,5 +395,30 @@ describe("redactProcessSpec strips env values and the argv tail (#2415 AC 4)", (
 		expect(serialized).not.toContain("--header");
 		expect(serialized).not.toContain("--stdio");
 		expect(serialized).not.toContain("/usr/bin");
+	});
+
+	it("carries no absolute home path in the projected file (#2440 F5)", () => {
+		const home = os.homedir();
+		const spec = specFor("global", "trusted", {
+			provenance: {
+				tier: "global",
+				key: "/lsp/servers/0",
+				file: path.join(home, ".pi-lens", "config.json"),
+			},
+		});
+		const projection = redactProcessSpec(spec);
+		expect(projection.file).toBe("~/.pi-lens/config.json");
+		expect(JSON.stringify(projection)).not.toContain(home);
+	});
+
+	it("orders env names locale-independently (#2440 F4)", () => {
+		// Sonar S2871 wants a comparator; `localeCompare` would have been the
+		// obvious one and the wrong one, because its answer depends on the
+		// machine's locale and ICU build. The pinned order is code-unit order,
+		// where every uppercase letter precedes every lowercase one.
+		const spec = specFor("global", "trusted", {
+			env: { b: "1", A: "2", a: "3", B: "4", _: "5" },
+		});
+		expect(redactProcessSpec(spec).envNames).toEqual(["A", "B", "_", "a", "b"]);
 	});
 });

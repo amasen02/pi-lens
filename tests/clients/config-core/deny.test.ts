@@ -174,9 +174,10 @@ describe("monotonic deny: the one legitimate lift (#2425)", () => {
 		expect(resolved.provenance.get("/enabled")?.tier).toBe("project");
 	});
 
-	it("does NOT let an operator tier BELOW a repo denial re-enable it", () => {
+	it("does NOT let a built-in DEFAULT re-enable a repo denial", () => {
 		// A built-in default saying `true` is the absence of an opinion, not an
-		// operator overriding a repository.
+		// operator overriding a repository — and it is not an operator tier at
+		// all, so it cannot lift anything.
 		const resolved = merge(
 			[
 				{ tier: "builtin", value: { enabled: true } },
@@ -199,6 +200,99 @@ describe("monotonic deny: the one legitimate lift (#2425)", () => {
 			);
 			expect(resolved.value, tier).toEqual({ enabled: false });
 		}
+	});
+
+	it("does not let a nearer OPERATOR tier lift an operator denial either", () => {
+		// The spec letter, kept deliberately (#2440 review F3, docs section 5):
+		// `cli: true` does not out-rank `global: false`. The escape hatch for an
+		// operator who changed their mind is the operator-tier config that denied,
+		// not a second operator tier shouting over it.
+		const resolved = merge(
+			[
+				{ tier: "global", value: { enabled: false } },
+				{ tier: "cli", value: { enabled: true } },
+			],
+			DENY_ONLY_SCHEMA,
+		);
+		expect(resolved.value).toEqual({ enabled: false });
+		expect(resolved.provenance.get("/enabled")?.tier).toBe("global");
+	});
+});
+
+/**
+ * #2440 review finding F3. `builtin` used to sit in the operator class, so a
+ * denial pi-lens SHIPPED was unliftable by everyone including the person who
+ * installed pi-lens. The third class makes a shipped default a default again
+ * without letting repository content near the decision.
+ */
+describe("a built-in denial is a DEFAULT, not an operator decision (#2425)", () => {
+	it("lets the operator's own global config lift a built-in denial", () => {
+		const resolved = merge(
+			[
+				{ tier: "builtin", value: { enabled: false } },
+				{
+					tier: "global",
+					file: "~/.pi-lens/config.json",
+					value: { enabled: true },
+				},
+			],
+			DENY_ONLY_SCHEMA,
+		);
+		expect(resolved.value).toEqual({ enabled: true });
+		expect(resolved.provenance.get("/enabled")).toEqual({
+			tier: "global",
+			key: "/enabled",
+			file: "~/.pi-lens/config.json",
+		});
+	});
+
+	it("lets every operator tier lift a built-in denial", () => {
+		for (const tier of ["global", "env", "cli", "host"] as const) {
+			const resolved = merge(
+				[
+					{ tier: "builtin", value: { enabled: false } },
+					{ tier, value: { enabled: true } },
+				],
+				DENY_ONLY_SCHEMA,
+			);
+			expect(resolved.value, tier).toEqual({ enabled: true });
+			expect(resolved.provenance.get("/enabled")?.tier, tier).toBe(tier);
+		}
+	});
+
+	it("does NOT let a repo tier lift a built-in denial", () => {
+		for (const tier of ["project", "nested-project"] as const) {
+			const resolved = merge(
+				[
+					{ tier: "builtin", value: { enabled: false } },
+					{
+						tier,
+						file: ".pi-lens.json",
+						trust: "trusted",
+						value: { enabled: true },
+					},
+				],
+				DENY_ONLY_SCHEMA,
+			);
+			expect(resolved.value, tier).toEqual({ enabled: false });
+			// Attributed to the tier that DENIED, which is the answer to "why can
+			// I not turn this back on".
+			expect(resolved.provenance.get("/enabled")?.tier, tier).toBe("builtin");
+		}
+	});
+
+	it("keeps the repo tier out even when an operator tier ranks below the denial", () => {
+		// builtin:false + project:true, with nothing above project to lift it.
+		const resolved = merge(
+			[
+				{ tier: "builtin", value: { enabled: false } },
+				{ tier: "project", value: { enabled: true } },
+				{ tier: "nested-project", value: { enabled: true } },
+			],
+			DENY_ONLY_SCHEMA,
+		);
+		expect(resolved.value).toEqual({ enabled: false });
+		expect(resolved.provenance.get("/enabled")?.tier).toBe("builtin");
 	});
 });
 

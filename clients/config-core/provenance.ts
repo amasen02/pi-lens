@@ -13,17 +13,14 @@
  *
  * - `TIER_PRECEDENCE` decides who wins a plain value. Later beats earlier, so a
  *   CLI flag beats a project file beats a global file beats a built-in default.
- * - `TIER_CLASS` decides who may LIFT a deny. `operator` tiers are the ones the
- *   person running pi-lens controls: built-in defaults, their global config, the
- *   environment, the command line, the host. `repo` tiers are content that
- *   arrives with a checkout, which is exactly the content a user may never have
- *   read. `deny.ts` builds monotonic deny precedence on this split, and nothing
- *   else re-derives it.
+ * - `TIER_CLASS` decides who may LIFT a deny. `deny.ts` builds monotonic deny
+ *   precedence on this split, and nothing else re-derives it.
  *
  * Deliberately free of module state: every export is a pure function over its
  * arguments, so there is no latch here to re-arm at `session_start`.
  */
 
+import { homeRelativePath } from "../path-utils.js";
 import type { ProjectTrustState } from "../project-trust.js";
 
 /**
@@ -51,17 +48,37 @@ export type SourceTier = (typeof SOURCE_TIERS)[number];
  */
 export const TIER_PRECEDENCE: readonly SourceTier[] = SOURCE_TIERS;
 
-export type TierClass = "operator" | "repo";
+export type TierClass = "default" | "operator" | "repo";
 
 /**
- * Which tiers the operator controls, and which arrive with the repository.
+ * Who each tier speaks for. THREE classes, not two (#2440 review finding F3).
  *
- * `nested-project` is repo content for the same reason `project` is: it is a
- * file inside the checkout. `host` is operator content, because the host
- * application is the thing that decided the project's trust in the first place.
+ * - `repo` — content that arrives with a checkout, which is exactly the content
+ *   a user may never have read. `project` and `nested-project`, for the same
+ *   reason: both are files inside the checkout.
+ * - `operator` — a deliberate act by the person running pi-lens: their global
+ *   config, the environment, the command line, the host application. (`host` is
+ *   operator content because the host is the thing that decided the project's
+ *   trust in the first place.)
+ * - `default` — pi-lens's OWN shipped defaults. Nobody chose them.
+ *
+ * `builtin` was `operator` until this review round, and that conflation had a
+ * consequence nobody would have chosen deliberately: because `deny.ts` never
+ * lifts an operator denial, a built-in `enabled: false` — or any member pi-lens
+ * ships in a built-in deny list — became permanently unliftable BY ANYONE. Not
+ * by a project file, which is correct, but also not by the user's own global
+ * config, their environment, or an explicit command-line flag. A default the
+ * operator cannot override is not a default; it is a hard-coded decision
+ * wearing a config field's clothes, and the only escape would have been editing
+ * pi-lens's source.
+ *
+ * Splitting the class fixes it without weakening anything: a `default` denial
+ * is liftable by an OPERATOR tier and still unliftable by a `repo` tier, so
+ * shipping a conservative default stays safe against repository content while
+ * remaining a default to the person who installed the thing.
  */
 export const TIER_CLASS: Readonly<Record<SourceTier, TierClass>> = {
-	builtin: "operator",
+	builtin: "default",
 	global: "operator",
 	project: "repo",
 	"nested-project": "repo",
@@ -113,11 +130,16 @@ export function isRepoTier(tier: SourceTier): boolean {
 	return TIER_CLASS[tier] === "repo";
 }
 
-export function isSourceTier(value: unknown): value is SourceTier {
-	return (
-		typeof value === "string" &&
-		(SOURCE_TIERS as readonly string[]).includes(value)
-	);
+/**
+ * True for tiers the person running pi-lens set deliberately.
+ *
+ * NOT the complement of `isRepoTier`: `builtin` is neither. Asking this question
+ * with `!isRepoTier(tier)` is the exact bug F3 reported, so the affirmative
+ * predicate exists to make the third class impossible to overlook at a call
+ * site.
+ */
+export function isOperatorTier(tier: SourceTier): boolean {
+	return TIER_CLASS[tier] === "operator";
 }
 
 /** One row of the redacted provenance projection. */
@@ -143,13 +165,21 @@ export interface ProvenanceView {
  * config the caller already holds. #2415 AC 4 asks that the DIAGNOSTIC surface
  * leak nothing, and the way to guarantee that is to make the diagnostic surface
  * structurally incapable of carrying a value.
+ *
+ * `file` is rewritten home-relative (#2440 review finding F5). A global config
+ * path is `$HOME`-anchored by construction, so the un-rewritten projection put
+ * the operator's account name into every diagnostic that named it — a value the
+ * projection was never asked to carry and the one piece of environment a shared
+ * log reliably leaks.
  */
 export function provenanceView(resolved: Resolved<unknown>): ProvenanceView {
 	const entries = [...resolved.provenance.values()]
 		.map((entry) => ({
 			key: entry.key,
 			tier: entry.tier,
-			...(entry.file === undefined ? {} : { file: entry.file }),
+			...(entry.file === undefined
+				? {}
+				: { file: homeRelativePath(entry.file) }),
 			...(entry.trust === undefined ? {} : { trust: entry.trust }),
 		}))
 		.sort((left, right) => compareKeys(left.key, right.key));
@@ -179,7 +209,18 @@ export function provenanceFor(
 	}
 }
 
-function compareKeys(left: string, right: string): number {
+/**
+ * Code-unit ordering for any key a diagnostic or telemetry surface sorts.
+ *
+ * Exported so `process-spec.ts` sorts env names with it rather than with a bare
+ * `.sort()` (Sonar S2871) or with `localeCompare`. `localeCompare` would be the
+ * obvious substitute and the wrong one: its answer depends on the machine's
+ * locale and ICU build, so two runs of the same resolution could order the same
+ * env names differently and a telemetry diff would show a change that is not
+ * one. A projection meant to be compared across machines must be
+ * locale-independent.
+ */
+export function compareKeys(left: string, right: string): number {
 	if (left < right) return -1;
 	return left > right ? 1 : 0;
 }

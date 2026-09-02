@@ -104,6 +104,7 @@ this policy explicitly reserves the right to change.
 | `PILENS_CFG_0003` | A deprecated config **file location** was read inside its window. | Reserved. No emitter yet; same slice. |
 | `PILENS_CFG_0004` | A config field no schema property claims was dropped. | `validate()` (`clients/config-core/normalize.ts`) produces the record; `reportMigrationRecords` delivers it through `warnIgnoredConfigOnce` once a loader adopts the core (#2426). |
 | `PILENS_CFG_0005` | A config field's value did not match its schema and was dropped. | Same producer and same delivery path as `PILENS_CFG_0004`. |
+| `PILENS_CFG_0006` | A config key that would modify an object's prototype (`__proto__`, `constructor`, `prototype`) was refused. | Both halves of the config core, through the shared policy in `clients/config-core/safe-object.ts`. |
 
 A reserved code is registered and referenced by the deprecation registry, but
 nothing emits it today. That is deliberate: the number must be pinned before the
@@ -209,7 +210,7 @@ earlier one for the same leaf.
 
 | Tier | Class | Meaning |
 | --- | --- | --- |
-| `builtin` | operator | pi-lens's own defaults. |
+| `builtin` | **default** | pi-lens's own shipped defaults. |
 | `global` | operator | The user's machine-global config. |
 | `project` | **repo** | A config file inside the checkout. |
 | `nested-project` | **repo** | A config file in a nested package. |
@@ -217,9 +218,13 @@ earlier one for the same leaf.
 | `cli` | operator | Command-line arguments. |
 | `host` | operator | The host application's decision. |
 
-The class column is a second, independent axis. `repo` tiers carry content that
-arrived with a checkout — content a user may never have read — and only the
-class decides who may lift a denial.
+The class column is a second, independent axis, and it has **three** values, not
+two. `repo` tiers carry content that arrived with a checkout — content a user
+may never have read. `operator` tiers are a deliberate act by the person running
+pi-lens. `default` is pi-lens's own shipped opinion, which nobody chose. Only the
+class decides who may lift a denial; `builtin` being its own class is what keeps
+a shipped default overridable by the operator while still out of reach of
+repository content.
 
 ### Monotonic deny precedence
 
@@ -227,9 +232,9 @@ A schema node marked `x-deny` resolves by denial rules instead of
 last-tier-wins:
 
 - `x-deny: "boolean-false"` — a `false` from an **operator** tier is never
-  lifted. A `false` from a **repo** tier is lifted only by an explicit `true`
-  from an operator tier of higher precedence. A repo tier never lifts another
-  repo tier's denial.
+  lifted, by anything. A `false` from a `default` or `repo` tier is lifted only
+  by an explicit `true` from an **operator** tier of higher precedence. A repo
+  tier never lifts a denial at all, its own class included.
 - `x-deny: "array-union"` — the resolved list is the union of every tier's
   members. There is no vocabulary for un-denying a member, so a nearer tier that
   omits one is expressing nothing. This outranks the node's own
@@ -238,6 +243,47 @@ last-tier-wins:
 
 Provenance for a denied leaf names the tier that **made** the denial, not the
 last tier to restate it — the answer to "why can I not turn this back on".
+
+Two consequences are deliberate rulings rather than accidents of the algorithm,
+and both are load-bearing:
+
+**A built-in denial is a default, not a law.** `builtin: false` plus
+`global: true` resolves to `true`, attributed to `global`; `builtin: false` plus
+`project: true` stays `false`, attributed to `builtin`. When `builtin` sat in the
+operator class, a conservative default pi-lens shipped — an `enabled: false`, or
+any member of a built-in deny list — could never be lifted by anyone, including
+the person who installed pi-lens, and the only escape was editing pi-lens's
+source. A default the operator cannot override is not a default.
+
+**An operator denial is not liftable by a nearer operator tier.** `global: false`
+plus `cli: true` stays `false`. This is the spec letter and it is kept on
+purpose: a denial is a security decision, and letting one operator surface
+out-shout another would make the guarantee depend on which surface an attacker
+could reach (an inherited `PILENS_*` environment variable, a wrapper script's
+argv) rather than on what the operator decided. The escape hatch is an
+operator-tier **change** — edit the global config, unset the variable — never a
+repo-tier one.
+
+### Prototype-safe keys
+
+`__proto__`, `constructor`, and `prototype` are refused wherever a config
+supplies a key, in both halves of the pipeline, with a `PILENS_CFG_0006` record
+naming the key. No pi-lens setting is spelled that way, so there is nothing to
+preserve, and assigning one would change an object's behavior rather than its
+contents — a document that serializes as `{}` while answering an attacker's
+value on every field read.
+
+Both halves also bound their own recursion at `MAX_CONFIG_DEPTH` (32) and
+`resolveConfig` never throws: a config that cannot be resolved degrades to
+absent with records, never to a failed session.
+
+A schema node that declares no `type` — or a `type` keyword the core does not
+recognize — is **opaque**, and an opaque node is walked by the value's own
+shape rather than passed through. Its children are kept (that is what an opaque
+node means), but they are copied, depth-counted, key-checked, and recorded like
+any other. A schema that wants a genuinely free-form subtree should still say
+`additionalProperties: true`, which states the intent instead of relying on an
+omission.
 
 ### Merge strategies
 

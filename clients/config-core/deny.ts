@@ -7,9 +7,18 @@
  * repository can hand pi-lens a `.pi-lens.json` that re-enables a server the
  * user disabled globally, and nothing notices.
  *
- * The rule, in one sentence: a denial from an OPERATOR tier is never lifted,
- * and a denial from a REPO tier is lifted only by an explicit operator allow.
- * `provenance.ts` owns the operator/repo split; this module owns what it means.
+ * The rule, in one sentence: a denial from an OPERATOR tier is never lifted, and
+ * a denial from any other tier is lifted only by an explicit operator allow of
+ * higher precedence. `provenance.ts` owns the three-way tier classification;
+ * this module owns what it means.
+ *
+ * The third class is why the sentence says "any other tier" rather than "a repo
+ * tier" (#2440 review finding F3). `builtin` is `default`, not `operator`: a
+ * denial pi-lens itself ships is liftable by the person running pi-lens — their
+ * global config, their environment, their command line — and remains unliftable
+ * by anything that arrived with a checkout. Treating a shipped default as an
+ * operator decision made it permanent for everyone, which is a hard-coded
+ * decision rather than a default.
  *
  * The two shapes a denial takes (`schema.ts`'s `x-deny`):
  *
@@ -28,7 +37,7 @@
 
 import type { ConfigValue } from "./schema.js";
 import {
-	isRepoTier,
+	isOperatorTier,
 	type Provenance,
 	type SourceTier,
 	tierPrecedence,
@@ -85,13 +94,23 @@ function byPrecedence(
  * Resolve a `boolean-false` deny.
  *
  * - No `false` anywhere: ordinary last-tier-wins.
- * - An operator tier said `false`: DENIED, pinned. The winner is the
- *   LOWEST-precedence operator denial, because that is the answer to "who
- *   denied this" — the first authority to say no, not the last tier to repeat
- *   it.
- * - Only repo tiers said `false`: denied, unless an operator tier of HIGHER
- *   precedence than that denial explicitly said `true`. An operator overriding
- *   repository content is the one legitimate lift.
+ * - An OPERATOR tier said `false`: DENIED, pinned, unliftable by anything. The
+ *   winner is the LOWEST-precedence operator denial, because that is the answer
+ *   to "who denied this" — the first authority to say no, not the last tier to
+ *   repeat it. This holds even for a nearer operator tier: `cli: true` does not
+ *   lift `global: false`. The escape hatch for an operator who changes their
+ *   mind is to change the operator-tier config that denied, not to out-rank it
+ *   from another operator tier.
+ * - Otherwise every denial came from `default` or `repo` tiers, and an OPERATOR
+ *   tier ranked above the FIRST such denial lifts it by saying `true` outright.
+ *   That is what makes a built-in default a default (`builtin: false` +
+ *   `global: true` -> `true`) while keeping repository content out of the
+ *   decision (`builtin: false` + `project: true` -> `false`). A repo tier never
+ *   lifts anything, its own class included.
+ *
+ * The lift test asks `isOperatorTier`, NOT `!isRepoTier`. The negative spelling
+ * is what silently swept `builtin` into the operator class and made every
+ * shipped default permanent; the affirmative one cannot.
  *
  * Non-boolean contributions are ignored here: `normalize.ts` has already
  * dropped values that failed the schema, so anything left is a boolean.
@@ -113,20 +132,20 @@ export function resolveBooleanDeny(
 		};
 	}
 
-	const operatorDenial = denials.find(
-		(entry) => !isRepoTier(entry.contribution.tier),
+	const operatorDenial = denials.find((entry) =>
+		isOperatorTier(entry.contribution.tier),
 	);
 	if (operatorDenial) {
 		return { value: false, winner: operatorDenial.index, denied: true };
 	}
 
-	// Every denial came from repo content. An operator tier ranked above the
-	// FIRST such denial may lift it by saying `true` outright.
+	// Every denial came from a shipped default or from repo content. An operator
+	// tier ranked above the FIRST such denial may lift it by saying `true`.
 	const firstDenial = denials[0];
 	const lift = ordered.find(
 		(entry) =>
 			entry.contribution.value === true &&
-			!isRepoTier(entry.contribution.tier) &&
+			isOperatorTier(entry.contribution.tier) &&
 			tierPrecedence(entry.contribution.tier) >
 				tierPrecedence(firstDenial.contribution.tier),
 	);

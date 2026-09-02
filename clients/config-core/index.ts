@@ -32,6 +32,7 @@ export {
 	denyPolicyOf,
 	isDenyPolicy,
 	isConfigObject,
+	isKnownSchemaType,
 	isMergeStrategy,
 	isPlainObject,
 	isSchemaNode,
@@ -41,13 +42,15 @@ export {
 	type MergeStrategy,
 	mergeStrategyOf,
 	propertySchema,
+	SCHEMA_TYPES,
 	schemaType,
 	STABILITY_TIER_KEY,
 } from "./schema.js";
 
 export {
+	compareKeys,
+	isOperatorTier,
 	isRepoTier,
-	isSourceTier,
 	type Provenance,
 	type ProvenanceView,
 	type ProvenanceViewEntry,
@@ -64,6 +67,14 @@ export {
 } from "./provenance.js";
 
 export {
+	isUnsafeConfigKey,
+	MAX_CONFIG_DEPTH,
+	safeAssign,
+	UNSAFE_CONFIG_KEYS,
+	UNSAFE_KEY_REASON,
+} from "./safe-object.js";
+
+export {
 	type DenyContribution,
 	type DenyResolution,
 	denyProvenance,
@@ -72,13 +83,12 @@ export {
 } from "./deny.js";
 
 export {
-	MAX_CONFIG_DEPTH,
 	type NormalizedConfig,
 	type ValidateOptions,
 	validate,
 } from "./normalize.js";
 
-export { type ConfigSource, merge } from "./merge.js";
+export { type ConfigSource, merge, type MergeOptions } from "./merge.js";
 
 export {
 	boundedKeyLabel,
@@ -147,23 +157,52 @@ export interface ConfigResolution<T> {
  * One collector spans the whole resolution, so the record bound is per
  * resolution rather than per file. Sources are handed to `merge` in the order
  * given; `merge` sorts them by tier precedence itself.
+ *
+ * NEVER THROWS, and that is a contract rather than an observation (#2440
+ * review). `validate` already promised it and enforced it with its own guard,
+ * but the front door called `merge` outside any guard, so a value that reached
+ * the merger in a shape it could not survive — the review's probe was a
+ * 4000-deep blob under an opaque schema node — turned a config load into a
+ * `RangeError` that took the session with it. The bounds inside both halves are
+ * the real fix; this guard is the floor under them, so a future bug in either
+ * half degrades a config to absent instead of failing a session.
  */
 export function resolveConfig<T = unknown>(
 	options: ResolveConfigOptions,
 ): ConfigResolution<T> {
 	const collector = new MigrationRecordCollector(options.maxRecords);
-	const normalized: ConfigSource[] = options.sources.map((source) => ({
-		tier: source.tier,
-		...(source.file === undefined ? {} : { file: source.file }),
-		...(source.trust === undefined ? {} : { trust: source.trust }),
-		value: validate(source.value, options.schema, {
-			file: source.file ?? "",
-			collector,
-		}).value,
-	}));
-	return {
-		resolved: merge<T>(normalized, options.schema),
-		records: collector.records,
-		droppedRecordCount: collector.droppedCount,
-	};
+	try {
+		const normalized: ConfigSource[] = options.sources.map((source) => ({
+			tier: source.tier,
+			...(source.file === undefined ? {} : { file: source.file }),
+			...(source.trust === undefined ? {} : { trust: source.trust }),
+			value: validate(source.value, options.schema, {
+				file: source.file ?? "",
+				collector,
+			}).value,
+		}));
+		return {
+			resolved: merge<T>(normalized, options.schema, { collector }),
+			records: collector.records,
+			droppedRecordCount: collector.droppedCount,
+		};
+	} catch (error) {
+		// The error CLASS only, never its message, which could quote the file.
+		collector.add({
+			code: "PILENS_CFG_0005",
+			file: "",
+			key: "",
+			subject: "",
+			reason: `config resolution failed internally (${
+				error instanceof Error ? error.name : "unknown error"
+			}); configuration ignored`,
+		});
+		return {
+			// The empty resolution, built by the merger from no sources rather than
+			// asserted into existence: `merge([])` is already "nothing resolved".
+			resolved: merge<T>([], options.schema),
+			records: collector.records,
+			droppedRecordCount: collector.droppedCount,
+		};
+	}
 }

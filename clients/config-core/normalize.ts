@@ -6,7 +6,7 @@
  * shape). `merge.ts` then combines normalized configs across tiers, so the
  * merger never has to ask whether a value is the type it looks like.
  *
- * Three rules, all from `docs/public-api-stability.md`:
+ * Four rules, the first three from `docs/public-api-stability.md`:
  *
  * 1. NEVER THROW. A user's config file is untrusted input; a schema violation
  *    degrades that field to absent and records why. A throw here would take
@@ -17,6 +17,30 @@
  *    which is the failure users actually report.
  * 3. EVERY DROP IS RECORDED, with a stable `PILENS_CFG_*` code and a reason
  *    built from structure alone. No value ever reaches a record.
+ * 4. THE WALK NEVER STOPS EARLY, and a user subtree is never passed through.
+ *    Every node the validator returns was BUILT here, key by key, out of values
+ *    this module checked. There is no arm on which a caller's object becomes
+ *    part of the result by assertion.
+ *
+ * Rule 4 is the #2440 review finding, and it is worth stating why the two
+ * pass-through arms it replaces were wrong rather than merely untidy. A schema
+ * node that declares no `type` used to hand its value straight to the domain
+ * type with `as ConfigValue`. That single assertion cost three properties at
+ * once: the subtree's keys never met the prototype-key policy, so a
+ * `{"__proto__": {...}}` node reached `out[name] = …` in BOTH builders and
+ * re-parented the accumulator (serializing as `{}` while answering the
+ * attacker's value on every field read); the subtree's depth was never counted,
+ * so `MAX_CONFIG_DEPTH` bounded only the paths the schema happened to describe
+ * and a 4000-deep blob went to the merger intact and overflowed the stack there;
+ * and no record was produced for anything inside it, so the drop the pipeline
+ * promises to explain was invisible. An always-walking normalizer fixes all
+ * three by construction, which is the reason it is one normalizer and not three
+ * patches.
+ *
+ * An OPAQUE node is still walked OPEN, not closed: a schema that claims nothing
+ * about a node keeps that node's children, exactly as the pass-through did. What
+ * changes is that they are copied, depth-counted, key-checked, and recorded. A
+ * node that DOES name properties keeps its own (closed-by-default) policy.
  *
  * The walk is bounded on both axes that can grow: depth (a hand-written config
  * can nest arbitrarily) and record count (`MigrationRecordCollector`). Objects
@@ -25,15 +49,23 @@
  */
 
 import {
+	type ConfigObject,
 	type ConfigSchemaNode,
 	type ConfigValue,
 	additionalPropertyPolicy,
+	isKnownSchemaType,
 	isPlainObject,
 	isSchemaNode,
 	itemsSchema,
 	propertySchema,
 	schemaType,
 } from "./schema.js";
+import {
+	isUnsafeConfigKey,
+	MAX_CONFIG_DEPTH,
+	safeAssign,
+	UNSAFE_KEY_REASON,
+} from "./safe-object.js";
 import {
 	boundedKeyLabel,
 	jsonTypeName,
@@ -59,12 +91,11 @@ export interface NormalizedConfig {
 }
 
 /**
- * Deepest nesting the validator walks. A config is a settings document, not a
- * tree; 32 levels is far past anything a human writes and far short of a stack
- * overflow. Deeper nodes are dropped with a record rather than truncated
- * silently.
+ * Re-exported from `safe-object.ts`, which owns it because `merge.ts` enforces
+ * the same bound over values `validate()` may never have seen. Importers keep
+ * their existing specifier; there is still one constant.
  */
-export const MAX_CONFIG_DEPTH = 32;
+export { MAX_CONFIG_DEPTH };
 
 export interface ValidateOptions {
 	/** The file the raw config came from, for the records' `file` field. */
@@ -77,6 +108,14 @@ export interface ValidateOptions {
 const DROPPED = Symbol("dropped");
 
 type Walked = ConfigValue | typeof DROPPED;
+
+/**
+ * The schema an opaque node's children are walked with: it governs nothing and
+ * keeps everything. Spelled as a real node rather than `undefined` so the
+ * "open" decision is made once, at the one place that decides it, instead of
+ * being re-derived from an absent argument at every accessor.
+ */
+const OPEN_SCHEMA: ConfigSchemaNode = { additionalProperties: true };
 
 export function validate(
 	raw: unknown,
@@ -170,21 +209,90 @@ function walk(
 		return walkObject(value, schema, context, depth, onPath);
 	if (declared === "array")
 		return walkArray(value, schema, context, depth, onPath);
-	if (declared !== undefined)
-		return walkScalar(value, schema, context, declared);
-
-	// The opaque tail: the schema declares no `type`, so the value passes through
-	// as it stands. It reaches the domain type by assertion because the only
-	// producer is a JSON parser, which cannot make anything else.
-
-	// No `type` keyword: the schema is opaque about this node. Descend anyway
-	// when the VALUE is an object and the schema names properties, so a schema
-	// that omits the redundant `type: "object"` still gets field-wise treatment
-	// rather than silently becoming an opaque blob the merger replaces whole.
-	if (schema && isSchemaNode(schema.properties) && isPlainObject(value)) {
-		return walkObject(value, schema, context, depth, onPath);
+	if (isKnownSchemaType(declared)) {
+		return walkScalar(value, schema, context, declared as string);
 	}
-	return checkEnum(value, schema, context) ? (value as ConfigValue) : DROPPED;
+
+	// No `type` keyword, or one the core does not recognize: the schema is
+	// opaque about this node. The walk does not stop — see rule 4 in the module
+	// docs — it dispatches on the VALUE's shape instead, so the node is still
+	// copied, bounded, key-checked, and recorded. An unrecognized keyword is the
+	// schema's problem, not the user's, and `merge.ts` reads it the same way.
+	return walkOpaque(value, schema, context, depth, onPath);
+}
+
+/**
+ * Walk a node the schema says nothing (useful) about.
+ *
+ * The dispatch is on the value, because that is the only thing left to dispatch
+ * on. An object whose schema names no properties is walked OPEN — keeping its
+ * children is what the old pass-through did, and dropping them now would turn a
+ * defect fix into a silent feature removal. An object whose schema DOES name
+ * properties keeps its own policy, which is closed by default.
+ */
+function walkOpaque(
+	value: unknown,
+	schema: ConfigSchemaNode | undefined,
+	context: WalkContext,
+	depth: number,
+	onPath: Set<object>,
+): Walked {
+	if (isPlainObject(value)) {
+		const effective = claimsChildren(schema) ? schema : OPEN_SCHEMA;
+		return walkObject(value, effective, context, depth, onPath);
+	}
+	if (Array.isArray(value)) {
+		return walkArray(value, schema, context, depth, onPath);
+	}
+	return walkLeaf(value, schema, context);
+}
+
+/** True when the node declares something that governs its own children. */
+function claimsChildren(schema: ConfigSchemaNode | undefined): boolean {
+	if (!schema) return false;
+	return (
+		isSchemaNode(schema.properties) ||
+		isSchemaNode(schema.patternProperties) ||
+		schema.additionalProperties !== undefined
+	);
+}
+
+/**
+ * The one place a scalar enters the domain type, and it does so by NARROWING.
+ *
+ * `isConfigScalar` is a real predicate over the value, so nothing here asserts.
+ * A value the JSON domain has no room for — `undefined`, a function, a symbol, a
+ * bigint, `NaN`, an infinity — is dropped with a record rather than carried. A
+ * parser cannot produce one, but `validate`'s input is `unknown` and a caller
+ * handing in a live JS object can; `JSON.stringify` would silently turn `NaN`
+ * into `null` several layers downstream, which is exactly the kind of quiet
+ * corruption a validator exists to stop.
+ */
+function walkLeaf(
+	value: unknown,
+	schema: ConfigSchemaNode | undefined,
+	context: WalkContext,
+): Walked {
+	if (!isConfigScalar(value)) {
+		record(context, {
+			code: "PILENS_CFG_0005",
+			key: pointerOf(context.path),
+			reason: `config value is not valid JSON data (${jsonTypeName(
+				value,
+			)}); ignored`,
+		});
+		return DROPPED;
+	}
+	return checkEnum(value, schema, context) ? value : DROPPED;
+}
+
+function isConfigScalar(
+	value: unknown,
+): value is string | number | boolean | null {
+	if (value === null) return true;
+	const type = typeof value;
+	if (type === "string" || type === "boolean") return true;
+	return type === "number" && Number.isFinite(value);
 }
 
 function walkObject(
@@ -204,8 +312,12 @@ function walkObject(
 	}
 	const nextPath = onPath.add(value);
 	const policy = additionalPropertyPolicy(schema);
-	const out: Record<string, ConfigValue> = {};
+	const out: ConfigObject = {};
 	for (const [name, child] of Object.entries(value)) {
+		// The prototype-key check runs BEFORE the schema is consulted. A schema
+		// could name `__proto__` as a property, and an open node keeps every key
+		// it is given; neither may reach the accumulator.
+		if (rejectUnsafeKey(name, context)) continue;
 		const childSchema = propertySchema(schema, name);
 		let effective: ConfigSchemaNode | undefined = childSchema;
 		if (!childSchema) {
@@ -219,15 +331,30 @@ function walkObject(
 				context.path.pop();
 				continue;
 			}
+			// `keep` walks the child with no schema at all, which `walkOpaque`
+			// reads as fully open; `validate` walks it with the declared one.
 			effective = policy.kind === "validate" ? policy.schema : undefined;
 		}
 		context.path.push(name);
 		const walked = walk(child, effective, context, depth + 1, nextPath);
 		context.path.pop();
-		if (walked !== DROPPED) out[name] = walked;
+		if (walked !== DROPPED) safeAssign(out, name, walked);
 	}
 	nextPath.delete(value);
 	return out;
+}
+
+/** Record and refuse a prototype-modifying key. Returns true when refused. */
+function rejectUnsafeKey(name: string, context: WalkContext): boolean {
+	if (!isUnsafeConfigKey(name)) return false;
+	context.path.push(name);
+	record(context, {
+		code: "PILENS_CFG_0006",
+		key: pointerOf(context.path),
+		reason: UNSAFE_KEY_REASON,
+	});
+	context.path.pop();
+	return true;
 }
 
 function walkArray(
@@ -274,6 +401,16 @@ const SCALAR_CHECKS: Readonly<
 	null: (value): value is ConfigValue => value === null,
 };
 
+/**
+ * Check a node whose declared type is one of the five JSON scalars.
+ *
+ * `walk` has already established that `declared` is a recognized type and is
+ * neither `object` nor `array`, so the lookup always hits. That is why there is
+ * no pass-through arm here any more: the `!check` branch that used to return
+ * `value as ConfigValue` was the second of the two assertion sites F1 named,
+ * and the unrecognized-keyword case it existed for is now routed to
+ * `walkOpaque` by the caller.
+ */
 function walkScalar(
 	value: unknown,
 	schema: ConfigSchemaNode | undefined,
@@ -281,12 +418,6 @@ function walkScalar(
 	declared: string,
 ): Walked {
 	const check = SCALAR_CHECKS[declared];
-	// An unrecognized `type` keyword is the schema's problem, not the user's:
-	// pass the value through rather than rejecting a field nobody can satisfy.
-	// Same JSON-parser provenance as the opaque tail in `walk`.
-	if (!check) {
-		return checkEnum(value, schema, context) ? (value as ConfigValue) : DROPPED;
-	}
 	if (!check(value)) {
 		record(context, {
 			code: "PILENS_CFG_0005",

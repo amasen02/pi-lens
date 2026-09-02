@@ -122,6 +122,21 @@ export const CONFIG_DIAGNOSTIC_CODES = {
 	 * rejected value is a field the user meant and spelled wrongly.
 	 */
 	PILENS_CFG_0005: "config field value rejected by schema; ignored",
+	/**
+	 * A config KEY that would have modified an object's prototype was refused.
+	 *
+	 * `__proto__`, `constructor`, `prototype`. PRODUCED by both halves of the
+	 * config core (`normalize.ts` when validating, `merge.ts` when combining
+	 * tiers), through the shared policy in `config-core/safe-object.ts`.
+	 *
+	 * Kept distinct from `PILENS_CFG_0004` even though both describe a dropped
+	 * key, because the two mean different things to whoever reads the warning: an
+	 * unknown field is a typo the user should fix, while this one is a key no
+	 * pi-lens config can ever legitimately carry. A user who sees it in their own
+	 * hand-written file has a mistake; a user who sees it naming a file they did
+	 * not write has something worth looking at.
+	 */
+	PILENS_CFG_0006: "config key would modify the object prototype; ignored",
 } as const satisfies Record<`PILENS_CFG_${string}`, string>;
 
 export type ConfigDiagnosticCode = keyof typeof CONFIG_DIAGNOSTIC_CODES;

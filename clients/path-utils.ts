@@ -470,6 +470,43 @@ export function isAtOrAboveHomeDir(
 	return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
 }
 
+/**
+ * Rewrite a `$HOME`-anchored path to its `~` form for a DIAGNOSTIC surface.
+ *
+ * `~/.pi-lens/config.json` says everything an operator needs about which file
+ * won, and `C:/Users/jane.doe/.pi-lens/config.json` says that plus the
+ * account name. The second is the shape a global config path always has, so any
+ * projection that names one leaks an identifier by default rather than by
+ * accident (#2440 review finding F5).
+ *
+ * Deliberately NOT built on `normalizeFilePath`/`isUnderDir`: those resolve
+ * through `realpathSync`, and a redaction helper on a diagnostic path must be
+ * pure, total, and unable to throw for a file that no longer exists. This is a
+ * string rewrite and nothing else.
+ *
+ * A path that is not under home is returned UNCHANGED — separators included.
+ * Normalizing unrelated paths on the way past would make the helper's blast
+ * radius every path any projection ever carries, for no redaction benefit.
+ */
+export function homeRelativePath(
+	filePath: string,
+	homeDir: string = os.homedir(),
+): string {
+	if (filePath.length === 0) return filePath;
+	const candidate = toPosix(filePath);
+	const home = toPosix(homeDir).replace(/\/+$/, "");
+	if (home.length === 0) return filePath;
+	// Windows paths are case-insensitive, so the COMPARISON folds case there
+	// while the returned tail keeps the caller's own casing.
+	const fold = (text: string): string =>
+		process.platform === "win32" ? text.toLowerCase() : text;
+	const foldedHome = fold(home);
+	const foldedCandidate = fold(candidate);
+	if (foldedCandidate === foldedHome) return "~";
+	if (!foldedCandidate.startsWith(`${foldedHome}/`)) return filePath;
+	return `~${candidate.slice(home.length)}`;
+}
+
 export function isUnderDir(child: string, parent: string): boolean {
 	const normChild = normalizeFilePath(child);
 	const normParent = normalizeFilePath(parent);
