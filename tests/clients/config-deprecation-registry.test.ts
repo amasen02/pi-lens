@@ -8,10 +8,9 @@ import {
 	isConfigDiagnosticCode,
 } from "../../clients/config-diagnostic-codes.js";
 import {
-	GLOBAL_LSP_CONFIG_BASENAME,
-	LSP_CONFIG_PATHS,
-} from "../../clients/lsp/config.js";
-import { PROJECT_CONFIG_BASENAMES } from "../../clients/project-lens-config.js";
+	DECLARED_LEGACY_FILE_SURFACES,
+	REGISTERED_LEGACY_FILE_SURFACES,
+} from "../../clients/config-locations.js";
 import { assertNonEmptyScan } from "../support/sweep-kit.js";
 
 const REPO_ROOT = path.resolve(
@@ -131,11 +130,14 @@ function lspConfigInterfaceBody(): string {
 	return LSP_CONFIG_SOURCE.slice(start, end);
 }
 
-const KNOWN_CONFIG_FILES = new Set<string>([
-	...LSP_CONFIG_PATHS,
-	...PROJECT_CONFIG_BASENAMES,
-	`~/.pi-lens/${GLOBAL_LSP_CONFIG_BASENAME}`,
-]);
+/**
+ * The legacy locations the LOADERS actually read, as spelled literally in
+ * `config-locations.ts`'s location table (#2426). Not derived from the registry
+ * — that would make the comparison below circular. The table names its paths as
+ * string literals and tags each with the registry surface it claims to be; this
+ * test is what pins the two together in both directions.
+ */
+const KNOWN_CONFIG_FILES = new Set<string>(DECLARED_LEGACY_FILE_SURFACES);
 
 describe("deprecated config surface registry (#2418)", () => {
 	it("is non-empty", () => {
@@ -283,6 +285,19 @@ describe("deprecated config surface registry (#2418)", () => {
 			(row) => row.kind === "file" && !KNOWN_CONFIG_FILES.has(row.surface),
 		).map((row) => row.surface);
 		expect(unknown).toEqual([]);
+	});
+
+	it("reads every FILE location the registry deprecates (#2426)", () => {
+		// The other direction, and the one that actually bites: a row can go
+		// un-honored — deprecated on paper while the loader silently stopped
+		// reading it — and the check above would still pass.
+		const unread = REGISTERED_LEGACY_FILE_SURFACES.filter(
+			(surface) => !KNOWN_CONFIG_FILES.has(surface),
+		);
+		expect(unread).toEqual([]);
+		expect([...KNOWN_CONFIG_FILES].sort()).toEqual(
+			[...REGISTERED_LEGACY_FILE_SURFACES].sort(),
+		);
 	});
 
 	it("only deprecates KEYS the LSPConfig interface declares", () => {

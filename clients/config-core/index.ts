@@ -9,15 +9,27 @@
  *
  * `resolveConfig` runs both halves and is the front door. It is a pure function
  * of its arguments: no file reads, no ledger writes, no logging. Reporting is a
- * separate, explicit step (`reportMigrationRecords`), so a caller decides when a
- * user gets warned and under which subsystem — a library that warns on its own
- * would fragment the warn-once latch across every consumer.
+ * separate, explicit step — `reportPiLensConfigRecords` in
+ * `clients/config-resolve.ts` — so a caller decides when a user gets warned and
+ * under which subsystem; a library that warns on its own would fragment the
+ * warn-once latch across every consumer.
  *
- * NOTHING IN THIS PR WIRES A LOADER. The migration targets are
+ * That step used to live HERE, in `records.ts`, which meant this "pure" library
+ * imported `config-warn.js` and the degradation ledger (#2426). Purity was the
+ * claim and the import graph disagreed: it broke every suite that `vi.mock`s the
+ * ledger wholesale, and it closed seven import cycles the moment the first
+ * loader — all of which sit downstream of `file-utils.ts` — resolved through the
+ * core. The reporting function moved to the module that owns the loaders'
+ * subsystem vocabulary, and the one constant records needs from the ledger
+ * (`DEGRADATION_ENTRIES_PER_KIND`) moved to the `ledger-bounds.js` leaf that
+ * exists for exactly this. Nothing under `config-core/` imports a sink now.
+ *
+ * ALL THREE LOADERS ARE WIRED as of #2426, through `clients/config-resolve.ts`
+ * and the canonical schema in `clients/config-schema.ts`:
  * `clients/lsp/config.ts` (`loadLSPConfig`), `clients/lens-config.ts`
  * (`loadPiLensGlobalConfig`), and `clients/project-lens-config.ts`
- * (`loadPiLensProjectConfig`); #2426 adopts them, and #2416 brings the first
- * real schema. Zero runtime behavior change is an acceptance criterion here.
+ * (`loadPiLensProjectConfig`) are now projections of one resolution. #2416
+ * brings the `lsp.servers.<id>` shape the schema currently only reserves.
  */
 
 export {
@@ -92,7 +104,8 @@ export {
 // post-`validate()` value; nothing in the language enforces that a caller
 // who imports it directly honors the promise, and `merge()`'s own bounds are
 // a narrow backstop, not a second validator (see `merge.ts`'s module doc).
-// `resolveConfig` below is the one supported way in: it always validates
+// `resolveConfig` (re-exported at the bottom of this file, from `resolve.js`)
+// is the one supported way in: it always validates
 // every source before merging. `merge()` stays exported from `merge.ts`
 // itself — marked `@internal` there — for this module's own use and for
 // tests that probe it directly.
@@ -106,7 +119,6 @@ export {
 	type MigrationRecord,
 	MigrationRecordCollector,
 	migrationSubject,
-	reportMigrationRecords,
 } from "./records.js";
 
 export {
@@ -131,86 +143,15 @@ export {
 	type TrustRefusal,
 } from "./process-spec.js";
 
-import { type ConfigSource, merge } from "./merge.js";
-import { validate } from "./normalize.js";
-import type { Resolved } from "./provenance.js";
-import { MigrationRecordCollector, type MigrationRecord } from "./records.js";
-import type { ConfigSchemaNode } from "./schema.js";
-
-/** One source as the caller has it: parsed, not yet validated. */
-export interface RawConfigSource extends Omit<ConfigSource, "value"> {
-	/** Whatever the parser produced. */
-	readonly value: unknown;
-}
-
-export interface ResolveConfigOptions {
-	readonly sources: readonly RawConfigSource[];
-	readonly schema: ConfigSchemaNode;
-	/**
-	 * Cap on records across the WHOLE resolution, not per source. Ten broken
-	 * files must not multiply the bound by ten.
-	 */
-	readonly maxRecords?: number;
-}
-
-export interface ConfigResolution<T> {
-	readonly resolved: Resolved<T>;
-	readonly records: readonly MigrationRecord[];
-	readonly droppedRecordCount: number;
-}
-
-/**
- * Validate every source, then merge them.
- *
- * One collector spans the whole resolution, so the record bound is per
- * resolution rather than per file. Sources are handed to `merge` in the order
- * given; `merge` sorts them by tier precedence itself.
- *
- * NEVER THROWS, and that is a contract rather than an observation (#2440
- * review). `validate` already promised it and enforced it with its own guard,
- * but the front door called `merge` outside any guard, so a value that reached
- * the merger in a shape it could not survive — the review's probe was a
- * 4000-deep blob under an opaque schema node — turned a config load into a
- * `RangeError` that took the session with it. The bounds inside both halves are
- * the real fix; this guard is the floor under them, so a future bug in either
- * half degrades a config to absent instead of failing a session.
- */
-export function resolveConfig<T = unknown>(
-	options: ResolveConfigOptions,
-): ConfigResolution<T> {
-	const collector = new MigrationRecordCollector(options.maxRecords);
-	try {
-		const normalized: ConfigSource[] = options.sources.map((source) => ({
-			tier: source.tier,
-			...(source.file === undefined ? {} : { file: source.file }),
-			...(source.trust === undefined ? {} : { trust: source.trust }),
-			value: validate(source.value, options.schema, {
-				file: source.file ?? "",
-				collector,
-			}).value,
-		}));
-		return {
-			resolved: merge<T>(normalized, options.schema, { collector }),
-			records: collector.records,
-			droppedRecordCount: collector.droppedCount,
-		};
-	} catch (error) {
-		// The error CLASS only, never its message, which could quote the file.
-		collector.add({
-			code: "PILENS_CFG_0005",
-			file: "",
-			key: "",
-			subject: "",
-			reason: `config resolution failed internally (${
-				error instanceof Error ? error.name : "unknown error"
-			}); configuration ignored`,
-		});
-		return {
-			// The empty resolution, built by the merger from no sources rather than
-			// asserted into existence: `merge([])` is already "nothing resolved".
-			resolved: merge<T>([], options.schema),
-			records: collector.records,
-			droppedRecordCount: collector.droppedCount,
-		};
-	}
-}
+// `resolveConfig` and its types live in `./resolve.js` (#2426) so a caller can
+// import the front door without also importing this barrel's width — in
+// particular `process-spec.js` -> `project-trust.js`, which closed three
+// import cycles once the config loaders (all downstream of `file-utils.ts`)
+// started resolving through the core. The public surface is unchanged: this is
+// still where the supported entry point is exported from.
+export {
+	type ConfigResolution,
+	type RawConfigSource,
+	type ResolveConfigOptions,
+	resolveConfig,
+} from "./resolve.js";

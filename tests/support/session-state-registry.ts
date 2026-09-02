@@ -1282,7 +1282,13 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"cache-observability.ts": 2,
 	// #2418: the one warn-once latch behind all three config loaders, moved
 	// here out of lens-config.ts and project-lens-config.ts.
-	"config-warn.ts": 1,
+	// #2426: 1 -> 2. The second symbol is `DEPRECATION_NOUN_BY_CODE`, an
+	// import-time `Map` DERIVED from `DEPRECATED_CONFIG_SURFACES` — a lookup
+	// table over a frozen data leaf, not session state (SWEEP_HEURISTIC_LIMITS
+	// item 5: the scan cannot tell a constant `Map` from a mutable one). It is
+	// never written after module evaluation, so resetting it would be
+	// meaningless; the file's one real latch is still the warn-once Set above.
+	"config-warn.ts": 2,
 	"degradation-ledger.ts": 3,
 	"diagnostic-dispositions.ts": 1,
 	"diagnostic-line-freshness.ts": 1,
