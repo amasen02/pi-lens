@@ -105,24 +105,25 @@ describe("extractTomlTableSection indentation + CRLF (review round 2, F2)", () =
 
 describe("extractTomlTableSection presence vs content (review round 3, F1)", () => {
 	it("returns undefined when the table is absent", () => {
-		expect(extractTomlTableSection("[package]\nname = \"x\"\n", "workspace"))
-			.toBeUndefined();
+		expect(
+			extractTomlTableSection('[package]\nname = "x"\n', "workspace"),
+		).toBeUndefined();
 	});
 
-	it("returns \"\" (not undefined) when the table is present but empty and sits last in the file with NO trailing newline", () => {
+	it('returns "" (not undefined) when the table is present but empty and sits last in the file with NO trailing newline', () => {
 		const content = ["[package]", 'name = "x"', "", "[workspace]"].join("\n");
 		expect(content.endsWith("\n")).toBe(false);
 		expect(extractTomlTableSection(content, "workspace")).toBe("");
 	});
 
-	it("returns \"\" when the table heading carries a trailing comment and is immediately EOF", () => {
+	it('returns "" when the table heading carries a trailing comment and is immediately EOF', () => {
 		const content = ["[package]", 'name = "x"', "", "[workspace] # root"].join(
 			"\n",
 		);
 		expect(extractTomlTableSection(content, "workspace")).toBe("");
 	});
 
-	it("returns \"\" when the table heading has trailing whitespace and is immediately EOF", () => {
+	it('returns "" when the table heading has trailing whitespace and is immediately EOF', () => {
 		const content = ["[package]", 'name = "x"', "", "[workspace]   "].join(
 			"\n",
 		);
