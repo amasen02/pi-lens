@@ -86,6 +86,25 @@ Message-end stale attribution anchors the session id when a live ctx is handled,
   reserved-but-inert schema keys (documented, validated, unimplemented) over
   premature implementation; prefer no knob at all over a reserved one when no
   concrete consumer exists. Name the forcing function in the PR body.
+- **`clients/config-core/` is THE config seam.** Every loader, catalog, and
+  selector validates, merges, and explains its configuration through it (#2425)
+  — a fourth hand-written merge is a defect, not a design choice. It owns the
+  pipeline (`RawConfig` -> `validate(schema)` -> `NormalizedConfig` ->
+  `merge(sources)` -> `Resolved<T>`, with `resolveConfig` as the front door),
+  per-leaf provenance on the seven source tiers, monotonic deny precedence
+  (an operator-tier denial is never lifted; a repo-tier denial is lifted only by
+  a higher operator tier), per-node `x-merge-strategy`
+  (`replace`/`append`/`keyed:<field>`), the trust-gated `ProcessSpec` whose
+  `toSpawnArgs` refuses a `project`/`nested-project` command unless the spec's
+  recorded trust AND the host's live decision are both `trusted`, and bounded
+  redacted `MigrationRecord`s that reach the user only through
+  `warnIgnoredConfigOnce`. Schemas are plain JSON-Schema-shaped objects, so the
+  published artifact and the runtime validator are the same object. Semantics
+  are written down in `docs/public-api-stability.md` section 5. Migration
+  targets still on their own merge semantics: `clients/lsp/config.ts`
+  (`loadLSPConfig`), `clients/lens-config.ts` (`loadPiLensGlobalConfig`),
+  `clients/project-lens-config.ts` (`loadPiLensProjectConfig`) — #2426 adopts
+  them.
 - **Design the state space before coding.** For stateful, ordered, resource-mutating, or security-sensitive work, write the invariants, supported transitions, explicit deferrals, and a cross-product test matrix before implementation. Examples are not enough: cover operation order, preview/apply, validation/normalization/execution seams, failure atomicity, observability bounds, and OS/path/encoding axes. If adversarial review finds repeated cross-product defects, stop patching one symptom at a time and return to the model.
 - **Concurrency tests wait on the right clock.** Use `tests/clients/interleaving-kit.ts` for suspension and polling: every suspension belongs in `try/finally` with `release()` plus `restore()`, and waits on worker-thread or child-process progress must use the wall-time default. A custom tick yield is only valid for progress guaranteed to occur on the current event loop. Prefer a suspended call's `completed` promise over draining unrelated global work, and reset in-memory mirrors before asserting on durable disk state.
 - **Prove filesystem isolation before coding subagents touch Git.** A

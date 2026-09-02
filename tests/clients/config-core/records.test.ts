@@ -1,0 +1,104 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { resetIgnoredConfigWarnCache } from "../../../clients/config-warn.js";
+import {
+	getDegradationSummary,
+	resetDegradationLedger,
+} from "../../../clients/degradation-ledger.js";
+import { validate } from "../../../clients/config-core/normalize.js";
+import {
+	MigrationRecordCollector,
+	reportMigrationRecords,
+} from "../../../clients/config-core/records.js";
+import { DEMO_CONFIG_SCHEMA } from "../../support/config-core-fixtures.js";
+
+const NUL = String.fromCharCode(0);
+
+beforeEach(() => {
+	resetDegradationLedger();
+	resetIgnoredConfigWarnCache();
+	vi.spyOn(console, "warn").mockImplementation(() => {});
+	vi.spyOn(console, "error").mockImplementation(() => {});
+});
+
+afterEach(() => {
+	vi.restoreAllMocks();
+	resetIgnoredConfigWarnCache();
+	resetDegradationLedger();
+});
+
+describe("records reach the user through the ONE config warn seam (#2418/#2425)", () => {
+	it("writes a coded config-ignored row per rejected key", () => {
+		const result = validate(
+			{ nonsense: 1, lsp: { enabled: "yes" } },
+			DEMO_CONFIG_SCHEMA,
+			{ file: ".pi-lens.json" },
+		);
+		expect(result.records).toHaveLength(2);
+
+		reportMigrationRecords(result.records, "project-lens-config");
+
+		const group = getDegradationSummary().find(
+			(entry) => entry.kind === "config-ignored",
+		);
+		expect(group?.count).toBe(2);
+		expect(group?.latestReasons.map((entry) => entry.subject).sort()).toEqual(
+			[
+				`.pi-lens.json${NUL}/lsp/enabled`,
+				`.pi-lens.json${NUL}/nonsense`,
+			].sort(),
+		);
+	});
+
+	it("dedupes a repeated report on the ledger's own once-per-session key", () => {
+		const result = validate({ nonsense: 1 }, DEMO_CONFIG_SCHEMA, {
+			file: ".pi-lens.json",
+		});
+		reportMigrationRecords(result.records, "lens-config");
+		reportMigrationRecords(result.records, "lens-config");
+
+		const group = getDegradationSummary().find(
+			(entry) => entry.kind === "config-ignored",
+		);
+		expect(group?.count).toBe(1);
+	});
+
+	it("reports nothing for a clean config", () => {
+		const result = validate({ lsp: { enabled: true } }, DEMO_CONFIG_SCHEMA);
+		expect(result.records).toEqual([]);
+		reportMigrationRecords(result.records, "lsp-config");
+		expect(
+			getDegradationSummary().some((entry) => entry.kind === "config-ignored"),
+		).toBe(false);
+	});
+});
+
+describe("the record bound is counted, never silent (#2425)", () => {
+	it("keeps up to the limit and counts the rest", () => {
+		const collector = new MigrationRecordCollector(2);
+		for (let index = 0; index < 5; index += 1) {
+			collector.add({
+				code: "PILENS_CFG_0004",
+				file: "a.json",
+				key: `/k${index}`,
+				subject: `a.json${NUL}/k${index}`,
+				reason: "unknown config field; ignored",
+			});
+		}
+		expect(collector.records).toHaveLength(2);
+		expect(collector.droppedCount).toBe(3);
+		expect(collector.totalCount).toBe(5);
+	});
+
+	it("accepts a zero limit without throwing", () => {
+		const collector = new MigrationRecordCollector(0);
+		collector.add({
+			code: "PILENS_CFG_0005",
+			file: "a.json",
+			key: "/k",
+			subject: `a.json${NUL}/k`,
+			reason: "expected boolean, got string; ignored",
+		});
+		expect(collector.records).toEqual([]);
+		expect(collector.droppedCount).toBe(1);
+	});
+});
