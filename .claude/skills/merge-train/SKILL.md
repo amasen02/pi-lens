@@ -15,20 +15,26 @@ reviewed, zero unreviewed merges). Apply it to each PR in the queue.
    angles. Self-authored and small PRs get reviewed too — no exceptions.
 2. **Fix rounds.** Send findings back to the PR's original author agent when
    its worktree survives (SendMessage — cheapest context); otherwise spawn
-   `pi-lens-fixer` on the branch with the findings inlined. Reviewer
-   worktrees may be pruned after their report; **fixer worktrees stay until
-   the PR merges** (pruning breaks resume).
-   The hygiene sweep (#2435) respects this: `SubagentStop` never removes a
-   worktree. Fixer and reviewer trees are reaped by the `SessionStart` sweep —
+   `pi-lens-fixer` on the branch with the findings inlined.
+   **Since #2486, `SubagentStop` REAPS the stopped agent's own worktree**
+   (maintainer decision, 2026-09-02, reversing the earlier "never removes
+   here" rule, which left ten stale trees in one afternoon). So by default an
+   agent's tree is gone the moment it finishes, and SendMessage to it lands on
+   a branch with no checkout. Its branch survives — a tree is never removed
+   unless its HEAD is already in an `origin/*` ref — so nothing committed is
+   lost and a fresh `pi-lens-fixer` on the branch always works. If this
+   session intends to resume fixers by SendMessage, export
+   `PILENS_HYGIENE_KEEP_AGENT_TREES=1` for the session (or add
+   `--keep-agent-tree` to the registered hook) and the reap is off.
+   Kept trees are then reaped by the `SessionStart` sweep —
    which runs on `startup` and `resume` only, not on `/clear`, compaction or a
    fork — once they have been idle ≥30m and are clean and pushed. Idle is
    measured from the checkout directory and the worktree's HEAD (and its
    reflog), never from the git index, so the sweep's own dirty check cannot
-   make a finished tree look busy. By that point a resume is no longer live,
-   and a fresh fixer simply checks the branch out again for the next round.
+   make a finished tree look busy.
    A tree with uncommitted work, or with work not yet on an `origin/*` ref, is
-   never removed at any age — so a fix round in flight is safe by its own
-   state, not by the clock.
+   never removed at any age, by any sweep — so a fix round in flight is safe by
+   its own state, not by the clock.
 3. **Verify.** The SAME reviewer verifies each fix round with its own probes.
    Do not take the fixer's word; do not swap reviewers mid-PR.
 4. **Merge gate.** Merge only when: verdict is merge-ready; Unit tests and
