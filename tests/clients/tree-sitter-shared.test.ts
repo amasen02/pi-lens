@@ -1,10 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ComplexityClient } from "../../clients/complexity-client.js";
 import { LANGUAGES } from "../../clients/language-registry.js";
 import {
 	_resetSharedTreeSitterClientForTests,
 	COMPLEXITY_LANGUAGE_IDS,
-	EXT_TO_LANG,
 	getSharedTreeSitterClient,
 	getTreeSitterRuntimeStatus,
 	isComplexitySupportedFile,
@@ -65,14 +63,27 @@ describe("resolveTreeSitterLanguage", () => {
  * that language of complexity baselines.
  */
 describe("isComplexitySupportedFile mirrors ComplexityClient.isSupportedFile (#2467 review, F6)", () => {
-	it("agrees with the client on every extension the registry owns", () => {
-		const client = new ComplexityClient();
-		for (const ext of Object.keys(EXT_TO_LANG)) {
-			const filePath = `src/file${ext}`;
-			expect(isComplexitySupportedFile(filePath)).toBe(
-				client.isSupportedFile(filePath),
-			);
-		}
+	// Direct positive/negative assertions, not a comparison against
+	// `ComplexityClient.isSupportedFile` — that method PURELY delegates to
+	// `isComplexitySupportedFile` (see `complexity-client.ts`), so comparing
+	// the two is a tautology: gutting this predicate to `return false` makes
+	// both sides agree on `false` for every extension and the test stays
+	// green (caught in review round 1 of #2474's merge-with-master).
+	it("returns true for an extension whose language complexity supports", () => {
+		expect(isComplexitySupportedFile("src/file.ts")).toBe(true);
+		expect(isComplexitySupportedFile("src/file.py")).toBe(true);
+		expect(isComplexitySupportedFile("src/file.go")).toBe(true);
+		expect(isComplexitySupportedFile("src/file.rs")).toBe(true);
+	});
+
+	it("returns false for an extension the registry resolves but complexity does not support", () => {
+		// ".rb" resolves to a live grammar (see resolveTreeSitterLanguage above)
+		// but "ruby" is not in COMPLEXITY_LANGUAGE_IDS.
+		expect(isComplexitySupportedFile("src/file.rb")).toBe(false);
+	});
+
+	it("returns false for an extension the registry does not own at all", () => {
+		expect(isComplexitySupportedFile("src/file.md")).toBe(false);
 	});
 
 	it("every COMPLEXITY_LANGUAGE_IDS entry is a live registry grammar id", () => {
