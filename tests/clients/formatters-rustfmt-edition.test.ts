@@ -41,10 +41,7 @@ describe("rustfmtFormatter — Cargo edition carriage (#2466)", () => {
 		fs.mkdirSync(path.dirname(filePath), { recursive: true });
 		fs.writeFileSync(filePath, "fn main() {}\n");
 
-		const resolved = await rustfmtFormatter.resolveCommand?.(
-			filePath,
-			tmpDir,
-		);
+		const resolved = await rustfmtFormatter.resolveCommand?.(filePath, tmpDir);
 
 		// The load-bearing assertion: removing the `--edition 2024` carriage
 		// from the fix collapses this back to ["rustfmt", filePath] and this
@@ -81,10 +78,7 @@ describe("rustfmtFormatter — Cargo edition carriage (#2466)", () => {
 		const filePath = path.join(tmpDir, "loose.rs");
 		fs.writeFileSync(filePath, "fn main() {}\n");
 
-		const resolved = await rustfmtFormatter.resolveCommand?.(
-			filePath,
-			tmpDir,
-		);
+		const resolved = await rustfmtFormatter.resolveCommand?.(filePath, tmpDir);
 
 		expect(resolved).toBeNull();
 	});
@@ -99,10 +93,7 @@ describe("rustfmtFormatter — Cargo edition carriage (#2466)", () => {
 		fs.mkdirSync(path.dirname(filePath), { recursive: true });
 		fs.writeFileSync(filePath, "fn main() {}\n");
 
-		const resolved = await rustfmtFormatter.resolveCommand?.(
-			filePath,
-			tmpDir,
-		);
+		const resolved = await rustfmtFormatter.resolveCommand?.(filePath, tmpDir);
 
 		expect(resolved).toBeNull();
 	});

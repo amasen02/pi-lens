@@ -85,7 +85,10 @@ export function isTomlKeyWorkspaceInherited(
 	content: string,
 	key: string,
 ): boolean {
-	const dotted = new RegExp(`^[ \\t]*${key}\\.workspace[ \\t]*=[ \\t]*true`, "m");
+	const dotted = new RegExp(
+		`^[ \\t]*${key}\\.workspace[ \\t]*=[ \\t]*true`,
+		"m",
+	);
 	const inline = new RegExp(
 		`^[ \\t]*${key}[ \\t]*=[ \\t]*\\{[^}\\n]*\\bworkspace[ \\t]*=[ \\t]*true`,
 		"m",
