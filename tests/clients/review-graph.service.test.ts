@@ -35,6 +35,14 @@ vi.mock("../../clients/latency-logger.js", async (importOriginal) => {
 });
 
 describe("review graph service", () => {
+	afterEach(() => {
+		// Backstop for the Date.prototype.toISOString spy used below: if a
+		// test's awaited build rejects before its own try/finally restore
+		// runs, this still clears the pin before the next test in the file
+		// (#2446 F1).
+		vi.restoreAllMocks();
+	});
+
 	it("builds a TS graph and surfaces importers/callers without duplicate edges", async () => {
 		const env = setupTestEnvironment("pi-lens-review-graph-");
 		try {
@@ -746,17 +754,25 @@ describe("review graph service", () => {
 			// `buildGeneration` (`builder.ts`'s process-wide `_graphGenerationCounter`)
 			// is bumped only on a real re-extract (#459) and is the field that must
 			// move here.
-			vi.spyOn(Date.prototype, "toISOString").mockReturnValue(
-				initialGraph.builtAt,
-			);
-			const graph = await buildOrUpdateGraph(env.tmpDir, [aPath], facts);
-			vi.restoreAllMocks();
-			expect(getLastGraphBuildInfo()).toMatchObject({ mode: "incremental" });
-			expect(graph.builtAt).toBe(initialGraph.builtAt);
-			expect(graph.buildGeneration).not.toBe(initialGraph.buildGeneration);
-			const impact = computeImpactCascade(graph, aPath);
-			expect(impact.directImporters).toContain(normalizeMapKey(bPath));
-			expect(impact.directCallers).toContain(normalizeMapKey(bPath));
+			// #2446 F1: try/finally so a rejecting build still restores the
+			// process-global Date.prototype spy instead of leaking it to later
+			// tests in this file.
+			const isoSpy = vi
+				.spyOn(Date.prototype, "toISOString")
+				.mockReturnValue(initialGraph.builtAt);
+			try {
+				const graph = await buildOrUpdateGraph(env.tmpDir, [aPath], facts);
+				expect(getLastGraphBuildInfo()).toMatchObject({ mode: "incremental" });
+				// #2446 F2: assert the pin fired rather than the mocked artifact
+				// (`graph.builtAt`), so a future clock refactor doesn't red this.
+				expect(isoSpy).toHaveBeenCalled();
+				expect(graph.buildGeneration).not.toBe(initialGraph.buildGeneration);
+				const impact = computeImpactCascade(graph, aPath);
+				expect(impact.directImporters).toContain(normalizeMapKey(bPath));
+				expect(impact.directCallers).toContain(normalizeMapKey(bPath));
+			} finally {
+				vi.restoreAllMocks();
+			}
 		} finally {
 			env.cleanup();
 		}
