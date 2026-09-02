@@ -1152,20 +1152,75 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 		async () => {
 			// The gap the finding names: `isDirty()` runs during enrichment, and
 			// the actual `git worktree remove` is separated from it by
-			// `await readProcessTable` plus one `await terminatePid()` PER
-			// process the tree holds -- a check-then-act split by awaits with a
-			// kill in the gap. A held process inside the tree (real, not
-			// hand-fed) forces terminatePid's fixed grace-period await, giving a
-			// deterministic window for a write timed from the TEST process to
-			// land inside it, exactly as the reviewer's probe did.
+			// `await readProcessTable` (which calls `snapshotProcesses`) plus one
+			// `await terminatePid()` per process the tree holds -- a
+			// check-then-act split by awaits with a kill in the gap.
+			//
+			// This does NOT race a fixed wall-clock delay against the CLI's
+			// otherwise-opaque pipeline. An earlier version of this test did
+			// (200ms) and passed vacuously on the pre-fix code, for two
+			// independent reasons caught during verification: (1) it wrote
+			// keepalive.mjs UNTRACKED straight into the worktree root, so
+			// `git status` was already dirty at t=0 -- the ORIGINAL round-1
+			// enrichment-time `isDirty` caught that on its own, never
+			// exercising this gap at all; and (2) once that was fixed, this
+			// box's absolute timing put the final removal anywhere from ~700ms
+			// to ~1400ms out, too wide and too machine-dependent a spread for
+			// one fixed delay to land in reliably. Instead this hooks the
+			// process-table step itself (the finding's own suggested
+			// alternative): the fixture's copy of `process-scan.mjs` wraps
+			// `snapshotProcesses` with a fixed, generous artificial delay, so
+			// the enrichment-to-removal gap is a controlled window regardless
+			// of machine speed.
+			//
+			// keepalive.mjs is committed and pushed on the worktree's OWN
+			// branch before the race starts, not written straight into the
+			// tree afterward -- see (1) above.
+			fs.writeFileSync(
+				path.join(worktree, "keepalive.mjs"),
+				"setTimeout(() => {}, 30_000);\n",
+			);
+			git(["add", "keepalive.mjs"], worktree);
+			git(["commit", "-qm", "keepalive helper"], worktree);
+			git(["push", "-q", "-u", "origin", "pr-9001"], worktree);
+
+			const processScanPath = path.join(
+				repo,
+				"scripts",
+				"lib",
+				"process-scan.mjs",
+			);
+			const realProcessScanPath = path.join(
+				repo,
+				"scripts",
+				"lib",
+				"process-scan-real.mjs",
+			);
+			fs.renameSync(processScanPath, realProcessScanPath);
+			fs.writeFileSync(
+				processScanPath,
+				[
+					'import * as real from "./process-scan-real.mjs";',
+					'export * from "./process-scan-real.mjs";',
+					"// Deliberately delayed for review round 3, F1: widens the gap",
+					"// between enrichment's isDirty() and the final removal call to a",
+					"// fixed, machine-speed-independent window.",
+					"export async function snapshotProcesses(...args) {",
+					"\tawait new Promise((resolve) => setTimeout(resolve, 800));",
+					"\treturn real.snapshotProcesses(...args);",
+					"}",
+					"",
+				].join("\n"),
+			);
+
 			const helperScript = path.join(worktree, "keepalive.mjs");
-			fs.writeFileSync(helperScript, "setTimeout(() => {}, 30_000);\n");
 			const helper = spawn(process.execPath, [helperScript], {
 				cwd: worktree,
 				stdio: "ignore",
 			});
 			try {
 				const lateFile = path.join(worktree, "late-write.txt");
+				let wrote = false;
 				const cliRun = new Promise<void>((resolve, reject) => {
 					const child = spawn(
 						process.execPath,
@@ -1184,30 +1239,44 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 					child.stdin.write(subagentStopPayload(AGENT_ID));
 					child.stdin.end();
 				});
-				const write = new Promise<void>((resolve) => {
+				// Starts well after enrichment (a handful of git spawns against
+				// ONE candidate, observed under 100ms even on a loaded box) and
+				// keeps hammering every 20ms until the CLI exits -- comfortably
+				// inside the artificial 800ms process-table delay above, so some
+				// attempt is certain to land in the gap regardless of exactly
+				// when enrichment finishes.
+				const hammer = new Promise<void>((resolve) => {
 					setTimeout(() => {
-						try {
-							fs.writeFileSync(lateFile, "written after enrichment\n");
-						} catch {
-							/* the tree may already be gone on the pre-fix path */
-						}
-						resolve();
-					}, 200);
+						const timer = setInterval(() => {
+							try {
+								fs.writeFileSync(lateFile, "written after enrichment\n");
+								wrote = true;
+							} catch {
+								/* the tree may already be gone */
+							}
+						}, 20);
+						cliRun.finally(() => {
+							clearInterval(timer);
+							resolve();
+						});
+					}, 150);
 				});
-				await Promise.all([cliRun, write]);
+				await Promise.all([cliRun, hammer]);
 
-				// The late write must never be silently destroyed: either the
-				// removal is refused (tree AND file both survive), or the tree is
-				// gone and the write never had anywhere to land. What must not
-				// happen is "the tree is gone but the file existed a moment ago" --
-				// this only proves the direction that matters when the tree
-				// survives, which is the fixed outcome.
-				if (fs.existsSync(worktree)) {
-					expect(fs.existsSync(lateFile)).toBe(true);
-					expect(
-						ledgerRecords().find((record) => record.event === "hygiene.run"),
-					).toMatchObject({ removed: 0, keptReason: "dirty" });
-				}
+				// If the write never landed at all, the race window closed
+				// before it could be exercised -- that is a broken TEST, not a
+				// passing one, so it fails loudly rather than passing vacuously.
+				expect(
+					wrote,
+					"the late write never landed; the race window closed before the test could exercise it",
+				).toBe(true);
+				// The late write must never be silently destroyed: the removal
+				// is refused and BOTH the tree and the file survive.
+				expect(fs.existsSync(worktree)).toBe(true);
+				expect(fs.existsSync(lateFile)).toBe(true);
+				expect(
+					ledgerRecords().find((record) => record.event === "hygiene.run"),
+				).toMatchObject({ removed: 0, keptReason: "dirty" });
 			} finally {
 				helper.kill();
 			}

@@ -1569,7 +1569,14 @@ async function main(argv) {
 					`[hygiene] ${removal.path} became dirty after enrichment; ` +
 						"skipping removal",
 				);
-				lateDirty.add(removal.path);
+				// Keyed by `toComparablePath`, not the raw string: `removal.path`
+				// comes from `git worktree list` (forward slashes) while the run's
+				// `targetPath` is `--only`'s argv verbatim (backslashes on
+				// Windows) -- a raw-string `Set.has` below would silently miss
+				// every match and report `keptReason: null` for a run that DID
+				// catch a late write (the same path-key invariant this repo
+				// already learned the hard way for the read-guard's maps).
+				lateDirty.add(toComparablePath(removal.path));
 				records.push(
 					formatWorktreeRecord({
 						path: removal.path,
@@ -1704,7 +1711,7 @@ async function main(argv) {
 		!targetKey ||
 		candidates.some((c) => toComparablePath(c.path) === targetKey);
 	const keptReason =
-		targetPath && lateDirty.has(targetPath)
+		targetKey && lateDirty.has(targetKey)
 			? "dirty"
 			: targetPath && !targetRegistered && removedCount === 0
 				? "not-a-worktree"
