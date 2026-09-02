@@ -1042,6 +1042,62 @@ export function formatScanRecord(input) {
 }
 
 /**
+ * Reasons a hygiene invocation can end without doing any work. Spelled as a
+ * closed table so the ledger's `reason` field is a vocabulary a reader can
+ * enumerate, not free text (#2486).
+ */
+export const RUN_SKIP_REASONS = Object.freeze({
+	/** The payload on stdin carried no `agent_id` (see the SubagentStop schema). */
+	NO_AGENT_ID: "no-agent-id",
+	/**
+	 * `agent_id` was usable but `.claude/worktrees/agent-<id>` does not exist:
+	 * the agent was not worktree-isolated, or its tree is already gone. This is
+	 * the ORDINARY case for most subagents, and conflating it with
+	 * NO_AGENT_ID is what made #2486's "no log line at all" unreadable.
+	 */
+	AGENT_WORKTREE_MISSING: "agent-worktree-missing",
+	/** `git worktree list` failed or timed out, so there is nothing to plan over. */
+	WORKTREE_LIST_FAILED: "worktree-list-failed",
+	/** The argv did not parse; nothing ran. */
+	INVALID_ARGUMENTS: "invalid-arguments",
+});
+
+/**
+ * Build the ONE record every invocation writes, whatever it did (#2486).
+ *
+ * Before this, a sweep that returned early — no `agent_id`, an agent that was
+ * never worktree-isolated, a failed `git worktree list` — wrote nothing at
+ * all, and a sweep that simply found nothing to do wrote nothing either. The
+ * hooks run `--quiet` and Claude Code discards their stderr, so "the hook
+ * never fired", "the hook fired and could not identify a tree" and "the hook
+ * fired and everything was ineligible" were the same observation: an empty
+ * ledger. Defect shape 10 — an absence that cannot distinguish clean from
+ * unavailable.
+ *
+ * @param {{ hook?: string|null, outcome: "fired"|"skipped", reason?: string|null, worktree?: string|null, removed?: number, orphans?: number, rows?: number, dryRun?: boolean, budgetMs?: number, durationMs?: number, nowIso?: string }} input
+ * @returns {string}
+ */
+export function formatRunRecord(input) {
+	const count = (value) => Math.round(Number(value) || 0);
+	return JSON.stringify({
+		ts: input.nowIso ?? new Date().toISOString(),
+		event: "hygiene.run",
+		hook: input.hook ?? null,
+		outcome: input.outcome,
+		reason: input.reason ?? null,
+		worktree: input.worktree
+			? String(input.worktree).slice(0, MAX_RECORDED_COMMAND_CHARS)
+			: null,
+		removed: count(input.removed),
+		orphans: count(input.orphans),
+		rows: count(input.rows),
+		dryRun: Boolean(input.dryRun),
+		budgetMs: count(input.budgetMs),
+		durationMs: count(input.durationMs),
+	});
+}
+
+/**
  * Keep the ledger bounded: append `newLines`, then retain only the newest
  * `maxLines`. Pure so the retention arithmetic is testable without touching
  * a real log file.

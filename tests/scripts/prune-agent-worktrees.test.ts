@@ -11,6 +11,7 @@
  * is false under vitest.
  */
 
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -18,8 +19,12 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
 	DEFAULT_HOOK_BUDGET_MS,
 	DEFAULT_MANUAL_BUDGET_MS,
+	DEFAULT_SCAN_TIMEOUT_MS,
+	HOOK_TIMEOUT_MARGIN_MS,
+	HOOK_TIMEOUT_MS,
 	REMOVE_TIMEOUT_MS,
 	getHygieneLogPath,
+	hookBudgetMs,
 	parseArgs,
 	resolveHookPolicy,
 	worktreeActivityMs,
@@ -29,7 +34,7 @@ import {
 	DEFAULT_MIN_AGE_MS,
 	planWorktreePrune,
 } from "../../scripts/lib/worktree-hygiene.mjs";
-import { gitExecFileSync } from "../support/git-fixture-env.js";
+import { gitExecFileSync, gitFixtureEnv } from "../support/git-fixture-env.js";
 
 describe("parseArgs", () => {
 	it("defaults to a non-destructive-by-omission configuration", () => {
@@ -38,11 +43,26 @@ describe("parseArgs", () => {
 			dryRun: false,
 			minAgeMs: DEFAULT_MIN_AGE_MS,
 			budgetMs: null,
+			scanTimeoutMs: null,
 			only: null,
 			hook: null,
 			orphanSweep: true,
 			errors: [],
 		});
+	});
+
+	it("parses --scan-timeout-ms and rejects an unusable one", () => {
+		// The listing ceiling is the knob #2486 is about; it is separate from
+		// the sweep budget precisely so a short listing cannot squeeze the
+		// `git` calls that decide whether a tree is removable.
+		expect(parseArgs(["--scan-timeout-ms", "8s"])).toMatchObject({
+			scanTimeoutMs: 8_000,
+			errors: [],
+		});
+		expect(parseArgs(["--scan-timeout-ms", "0"]).errors).toEqual([
+			"invalid --scan-timeout-ms value: 0",
+		]);
+		expect(parseArgs(["--scan-timeout-ms", "soon"]).errors).toHaveLength(1);
 	});
 
 	it("parses the flags the hooks and a human actually pass", () => {
@@ -95,9 +115,15 @@ describe("parseArgs", () => {
 		]);
 	});
 
-	it("keeps the hook budget well under the 2s the issue requires", () => {
+	it("keeps a 2s floor for a hook whose timeout is unknown", () => {
+		// #2435 sized every hook run at 2s; #2486 made that the FLOOR and the
+		// answer for an unregistered event, with the real budget derived from
+		// the hook timeout (see hookBudgetMs below).
 		expect(DEFAULT_HOOK_BUDGET_MS).toBeLessThanOrEqual(2_000);
 		expect(DEFAULT_MANUAL_BUDGET_MS).toBeGreaterThan(DEFAULT_HOOK_BUDGET_MS);
+		expect(hookBudgetMs("who-knows", resolveHookPolicy("subagent-stop"))).toBe(
+			DEFAULT_HOOK_BUDGET_MS,
+		);
 	});
 });
 
@@ -193,6 +219,37 @@ describe("resolveHookPolicy (review S1/S8)", () => {
 			scopedToAgentTree: true,
 			maxRemovals: 0,
 		});
+	});
+
+	it("removes the trees a SubagentStop run explicitly names (#2486)", () => {
+		// The bare hook still removes nothing (above) — the settings.json line
+		// passes no --only. But #2486 found `--only` SILENTLY DROPPED here:
+		// the run printed "worktrees are never removed here" and exited 0, so
+		// ten finished agents' trees had to be cleared by hand. Naming a tree
+		// is an explicit act; the dirty/unpushed rails still apply.
+		const policy = resolveHookPolicy("subagent-stop", { only: ["/a", "/b"] });
+		expect(policy).toMatchObject({
+			removeWorktrees: true,
+			deleteBranches: true,
+			orphanSweep: true,
+			scopedToAgentTree: false,
+			maxRemovals: Number.POSITIVE_INFINITY,
+		});
+		// An empty or absent --only is NOT "named a tree".
+		expect(resolveHookPolicy("subagent-stop", { only: [] })).toBe(
+			resolveHookPolicy("subagent-stop"),
+		);
+		expect(resolveHookPolicy("subagent-stop", { only: null })).toBe(
+			resolveHookPolicy("subagent-stop"),
+		);
+	});
+
+	it("never lets --only widen what SessionStart may do", () => {
+		// session-start drops --only with a warning, so its policy must not
+		// change shape when one is passed.
+		expect(resolveHookPolicy("session-start", { only: ["/a"] })).toBe(
+			resolveHookPolicy("session-start"),
+		);
 	});
 
 	it("removes at most one tree per SessionStart run", () => {
@@ -447,4 +504,422 @@ describe("candidate enrichment order (review round 3, F1b)", () => {
 		expect(dirtyAt, "isDirty(row.path, …) call site").toBeGreaterThan(-1);
 		expect(activityAt).toBeLessThan(dirtyAt);
 	});
+});
+
+// ---------------------------------------------------------------------------
+// #2486 — the SubagentStop hook that silently reaped nothing
+// ---------------------------------------------------------------------------
+
+describe("hookBudgetMs (#2486)", () => {
+	it("mirrors the timeouts actually registered in .claude/settings.json", () => {
+		// Single source of truth: HOOK_TIMEOUT_MS is a mirror of the settings
+		// file, and a mirror that can drift is the defect this repo keeps
+		// finding. Reading the real file here is what pins it.
+		const settings = JSON.parse(
+			fs.readFileSync(
+				path.resolve(__dirname, "../../.claude/settings.json"),
+				"utf8",
+			),
+		);
+		expect(HOOK_TIMEOUT_MS["session-start"]).toBe(
+			settings.hooks.SessionStart[0].hooks[0].timeout * 1000,
+		);
+		expect(HOOK_TIMEOUT_MS["subagent-stop"]).toBe(
+			settings.hooks.SubagentStop[0].hooks[0].timeout * 1000,
+		);
+	});
+
+	it("sizes each hook's sweep budget to the timeout that will kill it", () => {
+		// #2486: both hooks shared a flat 2s budget. SessionStart then spent
+		// 800ms of enrichment on 12 trees and reported 6 `not-evaluated`, and
+		// SubagentStop could not fit a process listing that costs ~650ms
+		// median on Windows inside its share of the same 2s.
+		const sessionStart = resolveHookPolicy("session-start");
+		expect(hookBudgetMs("session-start", sessionStart)).toBe(
+			HOOK_TIMEOUT_MS["session-start"] -
+				REMOVE_TIMEOUT_MS -
+				HOOK_TIMEOUT_MARGIN_MS,
+		);
+		// A hook that removes must still fit its own removal inside the hook
+		// timeout: budget + one bounded removal + margin <= timeout.
+		expect(
+			hookBudgetMs("session-start", sessionStart) +
+				REMOVE_TIMEOUT_MS +
+				HOOK_TIMEOUT_MARGIN_MS,
+		).toBeLessThanOrEqual(HOOK_TIMEOUT_MS["session-start"]);
+
+		const subagentStop = resolveHookPolicy("subagent-stop");
+		expect(hookBudgetMs("subagent-stop", subagentStop)).toBe(
+			HOOK_TIMEOUT_MS["subagent-stop"] - HOOK_TIMEOUT_MARGIN_MS,
+		);
+		// ...and it must leave room for the listing it is there to run.
+		expect(hookBudgetMs("subagent-stop", subagentStop)).toBeGreaterThan(
+			DEFAULT_SCAN_TIMEOUT_MS,
+		);
+	});
+
+	it("gives an --only run the manual budget, not a floored hook budget", () => {
+		// The registered hook line never passes --only, so this form is always
+		// a caller at a terminal. Reserving 60s of removal out of a 15s
+		// timeout would floor the budget at 2s and leave every enrichment
+		// `git` call on its 250ms minimum — the dirty rail would then read
+		// "unreadable => dirty" and keep the very tree it was told to remove.
+		const policy = resolveHookPolicy("subagent-stop", { only: ["/a"] });
+		expect(policy.budgetSource).toBe("manual");
+		expect(hookBudgetMs("subagent-stop", policy)).toBe(
+			DEFAULT_MANUAL_BUDGET_MS,
+		);
+	});
+
+	it("keeps a bounded scan ceiling that fits inside every budget it is used in", () => {
+		// Measured 2026-09-02 on the #2486 box, 12 concurrent agent worktrees:
+		// min 584ms / median 651ms / max 707ms for one 467-row listing. The
+		// shipped 1200ms was ~1.8x the median and failed three times in one
+		// afternoon under build load.
+		expect(DEFAULT_SCAN_TIMEOUT_MS).toBeGreaterThanOrEqual(4_000);
+		for (const hook of ["subagent-stop", "session-start"] as const) {
+			expect(
+				hookBudgetMs(hook, resolveHookPolicy(hook)),
+			).toBeGreaterThanOrEqual(DEFAULT_SCAN_TIMEOUT_MS);
+		}
+	});
+});
+
+/**
+ * #2486 end to end: the hook, its payload, the rails and the ledger, driven
+ * through the REAL CLI against a throwaway repo.
+ *
+ * These have to be end-to-end. The bug was not in any pure seam — every one
+ * of them was already right (`planWorktreePrune` has always honoured `--only`
+ * over the age and lock rails). It was in the wiring: `main()` short-circuited
+ * to the scoped orphan sweep before `--only` was ever consulted, and returned
+ * without writing a ledger line at all when it could not derive a tree. Only a
+ * run of the whole program can catch that shape.
+ *
+ * The sandbox carries its own copy of the sweep under `<repo>/scripts/`,
+ * because the script derives REPO_ROOT from its own location: run from the
+ * real checkout it would plan over the real worktrees.
+ */
+describe("SubagentStop hook, end to end (#2486)", () => {
+	const AGENT_ID = "a0000000000000001";
+	let root = "";
+	let repo = "";
+	let ledgerDir = "";
+	let worktree = "";
+	let cli = "";
+
+	const git = (args: string[], cwd: string) =>
+		gitExecFileSync("git", args, {
+			cwd,
+			encoding: "utf8",
+			stdio: "pipe",
+		}) as string;
+
+	beforeEach(() => {
+		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-2486-"));
+		repo = path.join(root, "main");
+		ledgerDir = path.join(root, "ledger");
+		fs.mkdirSync(repo, { recursive: true });
+		fs.mkdirSync(ledgerDir, { recursive: true });
+
+		// A real `origin/*` ref, because the "pushed" rail is a containment
+		// query against one — a fixture without an origin would make every
+		// tree unpushed and every removal assertion vacuous.
+		const origin = path.join(root, "origin.git");
+		git(["init", "-q", "--bare", "-b", "master", origin], root);
+		git(["init", "-q", "-b", "master"], repo);
+		// Identities from tests/support/git-config-guard.ts KNOWN_FIXTURE_*.
+		git(["config", "user.email", "test@example.com"], repo);
+		git(["config", "user.name", "pi-lens test"], repo);
+		fs.writeFileSync(path.join(repo, "a.txt"), "hello\n");
+		git(["add", "a.txt"], repo);
+		git(["commit", "-qm", "init"], repo);
+		git(["remote", "add", "origin", origin], repo);
+		git(["push", "-q", "-u", "origin", "master"], repo);
+
+		const scriptsDir = path.resolve(__dirname, "../../scripts");
+		fs.mkdirSync(path.join(repo, "scripts", "lib"), { recursive: true });
+		cli = path.join(repo, "scripts", "prune-agent-worktrees.mjs");
+		fs.copyFileSync(path.join(scriptsDir, "prune-agent-worktrees.mjs"), cli);
+		for (const file of ["worktree-hygiene.mjs", "process-scan.mjs"]) {
+			fs.copyFileSync(
+				path.join(scriptsDir, "lib", file),
+				path.join(repo, "scripts", "lib", file),
+			);
+		}
+
+		worktree = path.join(repo, ".claude", "worktrees", `agent-${AGENT_ID}`);
+		git(["worktree", "add", "-q", "-b", "pr-9001", worktree], repo);
+	});
+
+	afterEach(() => {
+		fs.rmSync(root, { recursive: true, force: true });
+	});
+
+	/** The payload Claude Code actually sends (schema read from the shipped binary). */
+	function subagentStopPayload(agentId: string | null): string {
+		return JSON.stringify({
+			hook_event_name: "SubagentStop",
+			session_id: "s",
+			transcript_path: path.join(root, "transcript.jsonl"),
+			cwd: repo,
+			stop_hook_active: false,
+			...(agentId === null
+				? {}
+				: {
+						agent_id: agentId,
+						agent_type: "pi-lens-fixer",
+						agent_transcript_path: path.join(root, "agent.jsonl"),
+					}),
+		});
+	}
+
+	function runCli(
+		args: string[],
+		payload: string,
+		extraEnv: Record<string, string> = {},
+	): string {
+		return execFileSync(process.execPath, [cli, ...args], {
+			cwd: repo,
+			encoding: "utf8",
+			input: payload,
+			timeout: 90_000,
+			stdio: ["pipe", "pipe", "pipe"],
+			env: {
+				...gitFixtureEnv(root),
+				PILENS_DATA_DIR: ledgerDir,
+				...extraEnv,
+			},
+		});
+	}
+
+	function ledgerRecords(): Record<string, unknown>[] {
+		const file = path.join(ledgerDir, "hygiene.log");
+		if (!fs.existsSync(file)) return [];
+		return fs
+			.readFileSync(file, "utf8")
+			.split(/\r?\n/)
+			.filter((line) => line.trim() !== "")
+			.map((line) => JSON.parse(line) as Record<string, unknown>);
+	}
+
+	const eventsOf = (records: Record<string, unknown>[]) =>
+		records.map((record) => record.event);
+
+	it(
+		"removes the named tree even when the process scan is degraded",
+		{ timeout: 90_000 },
+		() => {
+			// THE #2486 regression. `--scan-timeout-ms 1` drives the real
+			// `skipped` branch of readProcessTable: listingOk false, an empty
+			// table, and a scan-degraded ledger record — the same downstream
+			// state a `listing-failed` timeout produces. The removal must still
+			// happen, and both facts must be on the record.
+			runCli(
+				[
+					"--hook",
+					"subagent-stop",
+					"--only",
+					worktree,
+					"--scan-timeout-ms",
+					"1",
+				],
+				subagentStopPayload(AGENT_ID),
+			);
+
+			expect(fs.existsSync(worktree)).toBe(false);
+			const records = ledgerRecords();
+			expect(eventsOf(records)).toContain("hygiene.scan-degraded");
+			expect(
+				records.find((record) => record.event === "hygiene.worktree-removed"),
+			).toMatchObject({ removed: true });
+			expect(
+				records.find((record) => record.event === "hygiene.run"),
+			).toMatchObject({ hook: "subagent-stop", outcome: "fired", removed: 1 });
+		},
+	);
+
+	it(
+		"removes the named tree on a healthy scan too",
+		{ timeout: 90_000 },
+		() => {
+			// The control for the case above: with the listing working, the
+			// same invocation removes the same tree and records NO degradation.
+			// Without it, "removes while degraded" could pass on a build that
+			// never scanned at all.
+			runCli(
+				["--hook", "subagent-stop", "--only", worktree],
+				subagentStopPayload(AGENT_ID),
+			);
+
+			expect(fs.existsSync(worktree)).toBe(false);
+			const records = ledgerRecords();
+			expect(eventsOf(records)).not.toContain("hygiene.scan-degraded");
+			const run = records.find((record) => record.event === "hygiene.run");
+			expect(run).toMatchObject({ outcome: "fired", removed: 1 });
+			// ...and the listing really ran, so "no degradation" is evidence
+			// rather than the absence of a scan.
+			expect(Number(run?.rows ?? 0)).toBeGreaterThan(0);
+		},
+	);
+
+	it.skipIf(process.platform !== "win32")(
+		"removes the named tree when the listing itself fails (#2486's own reason)",
+		{ timeout: 90_000 },
+		() => {
+			// The exact reason string from the reported hygiene.log, driven by
+			// a ceiling the REAL listing cannot meet: measured on this box the
+			// Windows listing costs ~524ms at its floor (~208ms powershell
+			// startup + ~316ms projected WQL query) and 584-707ms in practice,
+			// so a 400ms ceiling times the spawn out and `ok` comes back
+			// false. Windows-only because POSIX `ps` answers in ~15ms — the
+			// portable case above drives the same degraded state through the
+			// `skipped` branch instead (both yield listingOk=false and an
+			// empty table; only the reason string differs).
+			runCli(
+				[
+					"--hook",
+					"subagent-stop",
+					"--only",
+					worktree,
+					"--scan-timeout-ms",
+					"400",
+				],
+				subagentStopPayload(AGENT_ID),
+			);
+
+			expect(fs.existsSync(worktree)).toBe(false);
+			const records = ledgerRecords();
+			expect(
+				records.find((record) => record.event === "hygiene.scan-degraded"),
+			).toMatchObject({ reason: "listing-failed" });
+			expect(
+				records.find((record) => record.event === "hygiene.worktree-removed"),
+			).toMatchObject({ removed: true });
+		},
+	);
+
+	it(
+		"still refuses a dirty tree that --only names",
+		{ timeout: 90_000 },
+		() => {
+			// The rail --only never overrides. #2435's contract, unchanged.
+			fs.writeFileSync(path.join(worktree, "wip.txt"), "uncommitted\n");
+			runCli(
+				[
+					"--hook",
+					"subagent-stop",
+					"--only",
+					worktree,
+					"--scan-timeout-ms",
+					"1",
+				],
+				subagentStopPayload(AGENT_ID),
+			);
+
+			expect(fs.existsSync(worktree)).toBe(true);
+			expect(
+				ledgerRecords().find((record) => record.event === "hygiene.run"),
+			).toMatchObject({ outcome: "fired", removed: 0 });
+		},
+	);
+
+	it(
+		"still refuses an unpushed tree that --only names",
+		{ timeout: 90_000 },
+		() => {
+			fs.writeFileSync(path.join(worktree, "b.txt"), "local only\n");
+			git(["add", "b.txt"], worktree);
+			git(["commit", "-qm", "local"], worktree);
+			runCli(
+				[
+					"--hook",
+					"subagent-stop",
+					"--only",
+					worktree,
+					"--scan-timeout-ms",
+					"1",
+				],
+				subagentStopPayload(AGENT_ID),
+			);
+
+			expect(fs.existsSync(worktree)).toBe(true);
+			expect(
+				ledgerRecords().find((record) => record.event === "hygiene.run"),
+			).toMatchObject({ removed: 0 });
+		},
+	);
+
+	it(
+		"removes nothing when the hook fires without --only (review S1)",
+		{ timeout: 90_000 },
+		() => {
+			// Resume-by-SendMessage happens after SubagentStop, so the
+			// registered hook line — which passes no --only — must keep the
+			// tree. It still leaves a record saying it ran.
+			runCli(
+				["--hook", "subagent-stop", "--scan-timeout-ms", "1", "--quiet"],
+				subagentStopPayload(AGENT_ID),
+			);
+
+			expect(fs.existsSync(worktree)).toBe(true);
+			expect(
+				ledgerRecords().find((record) => record.event === "hygiene.run"),
+			).toMatchObject({
+				hook: "subagent-stop",
+				outcome: "fired",
+				removed: 0,
+				worktree,
+			});
+		},
+	);
+
+	it(
+		"records a skipped run when the payload carries no agent_id",
+		{ timeout: 90_000 },
+		() => {
+			// #2486: "agents finishing after 14:41 produced NO log line at
+			// all". The hooks run --quiet and Claude Code discards their
+			// stderr, so an early return left nothing to read.
+			runCli(["--hook", "subagent-stop", "--quiet"], subagentStopPayload(null));
+
+			expect(ledgerRecords()).toMatchObject([
+				{
+					event: "hygiene.run",
+					hook: "subagent-stop",
+					outcome: "skipped",
+					reason: "no-agent-id",
+				},
+			]);
+		},
+	);
+
+	it(
+		"distinguishes an agent that never had a worktree from a missing agent_id",
+		{ timeout: 90_000 },
+		() => {
+			// The ORDINARY case: most subagents are not worktree-isolated, so
+			// `.claude/worktrees/agent-<id>` simply does not exist. Reporting
+			// that as "no usable agent_id" is what made the empty ledger
+			// unreadable during the #2486 investigation.
+			runCli(
+				["--hook", "subagent-stop", "--quiet"],
+				subagentStopPayload("affffffffffffffff"),
+			);
+
+			expect(ledgerRecords()).toMatchObject([
+				{
+					event: "hygiene.run",
+					outcome: "skipped",
+					reason: "agent-worktree-missing",
+					worktree: path.join(
+						repo,
+						".claude",
+						"worktrees",
+						"agent-affffffffffffffff",
+					),
+				},
+			]);
+		},
+	);
 });

@@ -207,6 +207,27 @@ export function formatScanRecord(input: {
 	nowIso?: string;
 }): string;
 
+export const RUN_SKIP_REASONS: {
+	readonly NO_AGENT_ID: "no-agent-id";
+	readonly AGENT_WORKTREE_MISSING: "agent-worktree-missing";
+	readonly WORKTREE_LIST_FAILED: "worktree-list-failed";
+	readonly INVALID_ARGUMENTS: "invalid-arguments";
+};
+
+export function formatRunRecord(input: {
+	hook?: string | null;
+	outcome: "fired" | "skipped";
+	reason?: string | null;
+	worktree?: string | null;
+	removed?: number;
+	orphans?: number;
+	rows?: number;
+	dryRun?: boolean;
+	budgetMs?: number;
+	durationMs?: number;
+	nowIso?: string;
+}): string;
+
 export function pruneLogLines(
 	existingLines: string[],
 	newLines: string[],
