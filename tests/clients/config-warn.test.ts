@@ -1,3 +1,4 @@
+import * as vm from "node:vm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	CONFIG_DIAGNOSTIC_MARKER_PATTERN,
@@ -348,6 +349,44 @@ describe("warnIgnoredConfigOnce parse-error reason redaction (#2431)", () => {
 		expect(reason).toBe("SyntaxError at line 1 col 2");
 	});
 
+	// Review round 2, F2: `error instanceof SyntaxError` is realm-bound. A
+	// `JSON.parse` failure thrown inside a `vm` context (a different realm's
+	// `SyntaxError` constructor) fails that check and falls into the generic
+	// `error instanceof Error` branch, which only gets `redactSecrets` as a
+	// backstop — and V8's truncated parse-error snippet is far shorter than
+	// every scanner's `minSuffixLength` (16-40 chars), so it is NOT caught
+	// there either. The discriminator must duck-type on `error.name`.
+	it("normalizes a cross-realm SyntaxError (vm) the same as an in-realm one, no snippet", () => {
+		const TOKEN = `ghp_${"C".repeat(36)}`;
+		const context = vm.createContext({});
+		let error: unknown;
+		try {
+			// The same evidence shape as #2431's own fixture, but thrown inside a
+			// DIFFERENT V8 context so its `SyntaxError` is not this realm's.
+			vm.runInContext(`JSON.parse('{"piToken": ${TOKEN}}')`, context);
+		} catch (caught) {
+			error = caught;
+		}
+		expect(typeof error).toBe("object");
+		expect(error).not.toBeNull();
+		// Proof this is genuinely cross-realm: the in-process SyntaxError
+		// constructor does NOT recognize it (nor does the in-process Object —
+		// its prototype chain resolves through the vm context's own realm).
+		expect(error instanceof SyntaxError).toBe(false);
+		expect(error instanceof Object).toBe(false);
+		expect(String(error)).toContain("ghp_");
+
+		const reason = normalizeParseErrorReason(error);
+		// `redactSecrets` alone cannot be trusted here: V8's truncated snippet
+		// is shorter than every scanner `minSuffixLength` (16-40 chars), so a
+		// caller that fell through to the generic `redactSecrets(String(error))`
+		// backstop would still leak a usable token prefix. The discriminator
+		// must recognize this as a SyntaxError and strip the message entirely.
+		expect(reason).not.toContain(TOKEN);
+		expect(reason).not.toContain("ghp_");
+		expect(reason).toBe("SyntaxError");
+	});
+
 	it("routes a non-SyntaxError caught error (a fs error, a hand-thrown validation error) through redact/secrets.ts", () => {
 		// Not `JSON.parse`'s own SyntaxError, so the message is not DOCUMENTED
 		// to embed file content — but still defense-in-depth redacted (#2431
@@ -406,5 +445,33 @@ describe("warnIgnoredConfigOnce parse-error reason redaction (#2431)", () => {
 			reason: "widget.visible must be a boolean",
 		});
 		expect(notified[0].message).toContain("widget.visible must be a boolean");
+	});
+
+	// Review round 2, F1: `normalizeParseErrorReason` was never the only path
+	// into the three sinks. `project-lens-config.ts` and `lens-config.ts` both
+	// interpolate a user-authored KEY (or rule id) straight from the parsed
+	// JSON into a HAND-AUTHORED `reason` string (`unknown key "${key}" is not
+	// a recognized pi-lens setting`), which takes the plain-string branch at
+	// the top of `warnIgnoredConfigOnce` untouched by any redaction. A key or
+	// rule id named after a live credential (a `.pi-lens.json` a user pasted a
+	// token into as an object KEY, not just a value) reached the notification,
+	// the log, and the ledger reason verbatim.
+	it("redacts a secret-shaped KEY interpolated into a hand-authored reason string", () => {
+		const TOKEN = `ghp_${"B".repeat(36)}`;
+		warnIgnoredConfigOnce({
+			subsystem: "project-lens-config",
+			file: "/tmp/a.json",
+			reason: `unknown key "${TOKEN}" is not a recognized pi-lens setting (check for a typo); ignored`,
+		});
+		expect(notified).toHaveLength(1);
+		expect(notified[0].message).not.toContain(TOKEN);
+		expect(notified[0].message).not.toContain("ghp_");
+
+		expect(loggedExtension).toHaveLength(1);
+		expect(loggedExtension[0].message).not.toContain(TOKEN);
+		expect(JSON.stringify(loggedExtension[0].metadata)).not.toContain(TOKEN);
+
+		const group = configIgnoredGroup();
+		expect(group?.latestReasons[0]?.reason).not.toContain(TOKEN);
 	});
 });

@@ -71,18 +71,35 @@ const IGNORED_CONFIG_KIND = "config-ignored";
 const warnedIgnoredConfigs = new Set<string>();
 
 /**
- * Position `JSON.parse`'s own `SyntaxError#message` states, when it states
- * one. Two shapes ship across supported Node versions:
- *   `... at position N (line L column C)` — an offset AND a line/col;
- *   `... at position N`                   — offset only (older engines).
- * Neither shows up on the message V8 has emitted since ~Node 20 for a token
- * error — `Unexpected token 'x', "<snippet>"... is not valid JSON` — which
- * carries no position at all, only a slice of the source text being parsed.
- * That is the exact shape #2431's evidence hit (`ghp_SECRET` sitting in the
- * snippet on Node 24).
+ * The one shape `JSON.parse`'s own `SyntaxError#message` states a position
+ * in, on every supported Node (CI pins Node 22; V8 has emitted `at position N
+ * (line L column C)` for this shape since ~Node 20). V8 also emits a
+ * position-free shape for a token error — `Unexpected token 'x',
+ * "<snippet>"... is not valid JSON` — which carries no position at all, only
+ * a slice of the source text being parsed. That is the exact shape #2431's
+ * evidence hit (`ghp_SECRET` sitting in the snippet on Node 24).
  */
-const JSON_PARSE_POSITION =
-	/at position (\d+)(?: \(line (\d+) column (\d+)\))?/;
+const JSON_PARSE_POSITION = /at position \d+ \(line (\d+) column (\d+)\)/;
+
+/**
+ * True for `JSON.parse`'s own `SyntaxError`, including one thrown across a
+ * realm boundary (e.g. `vm.runInContext`), where BOTH `instanceof SyntaxError`
+ * and `instanceof Error` fail — a realm-bound object's prototype chain
+ * resolves through that OTHER realm's `Error.prototype`/`Object.prototype`,
+ * never this one's. Duck-typed on `name` and `message` instead, which are
+ * plain string own/inherited properties readable regardless of which realm's
+ * prototype chain the object carries.
+ */
+function isSyntaxError(
+	error: unknown,
+): error is { name: string; message: string } {
+	return (
+		typeof error === "object" &&
+		error !== null &&
+		(error as { name?: unknown }).name === "SyntaxError" &&
+		typeof (error as { message?: unknown }).message === "string"
+	);
+}
 
 /**
  * Normalize a caught parse/validation error into a bounded, snippet-free
@@ -98,18 +115,25 @@ const JSON_PARSE_POSITION =
  *
  * Every other caught error reaching this helper (a loader's own hand-thrown
  * validation error, an `fs` error) is not documented to embed file content,
- * but is still routed through the repo's own secret scanner as defense in
- * depth (#2431 AC3) rather than trusted on the strength of "it isn't
- * SyntaxError" alone.
+ * and is additionally routed through the repo's own secret scanner
+ * (`redactSecrets`) — but that scanner is a floor, not a guarantee: it only
+ * recognizes secrets shaped like its registered patterns and long enough to
+ * clear each pattern's `minSuffixLength` (16-40 chars), so a short truncated
+ * fragment of a real credential can still pass through untouched. It is
+ * still worth calling on this branch because most non-`SyntaxError` messages
+ * are hand-authored by this codebase, not engine dumps of file content — but
+ * `normalizeParseErrorReason`'s own guarantee (no message survives at all)
+ * applies only to the `SyntaxError` branch. `warnIgnoredConfigOnce` (the one
+ * caller) additionally redacts EVERY reason, including hand-authored ones,
+ * so a caller-composed string that happens to interpolate file content (a
+ * user-authored config KEY, a rule id) is still covered.
  */
 export function normalizeParseErrorReason(error: unknown): string {
-	if (error instanceof SyntaxError) {
+	if (isSyntaxError(error)) {
 		const match = JSON_PARSE_POSITION.exec(error.message);
-		if (!match) return error.constructor.name;
-		const [, offset, line, col] = match;
-		return line && col
-			? `${error.constructor.name} at line ${line} col ${col}`
-			: `${error.constructor.name} at offset ${offset}`;
+		return match
+			? `${error.name} at line ${match[1]} col ${match[2]}`
+			: error.name;
 	}
 	const message = error instanceof Error ? error.message : String(error);
 	return redactSecrets(message);
@@ -170,12 +194,18 @@ export function warnIgnoredConfigOnce(options: WarnIgnoredConfigOptions): void {
 	const { subsystem, file, key } = options;
 	const code: ConfigDiagnosticCode = options.code ?? IGNORED_CONFIG_CODE;
 	// The ONLY place a caught parse/read error becomes a string (#2431). A
-	// hand-authored reason passes through verbatim; a `{ parseError }` is
-	// normalized to error class + position, never the raw message.
-	const reason: string =
+	// `{ parseError }` is normalized to error class + position, never the raw
+	// message. A hand-authored reason is still `redactSecrets`-scrubbed here —
+	// review round 2, F1: several callers interpolate a user-authored KEY or
+	// rule id straight from the parsed config (`unknown key "${key}" is not a
+	// recognized pi-lens setting`), so "hand-authored" does not mean
+	// "content-free"; the ONE seam every caller shares is where that gets
+	// caught, not each of the ~8 call sites that format one of these strings.
+	const reason: string = redactSecrets(
 		typeof options.reason === "string"
 			? options.reason
-			: normalizeParseErrorReason(options.reason.parseError);
+			: normalizeParseErrorReason(options.reason.parseError),
+	);
 
 	// The durable half (#2418 F6), and it runs BEFORE the latch on purpose
 	// (#2418 review round 3, F1). The latch is a PROCESS-lifetime Set; the
