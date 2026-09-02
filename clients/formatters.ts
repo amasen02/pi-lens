@@ -1287,7 +1287,8 @@ export const ktfmtFormatter: FormatterInfo = {
 	async resolveCommand(filePath, _cwd) {
 		const styleFlag = await resolveKtfmtGradleStyle(filePath);
 		const inPath = await which("ktfmt");
-		if (inPath) return styleFlag ? [inPath, styleFlag, filePath] : [inPath, filePath];
+		if (inPath)
+			return styleFlag ? [inPath, styleFlag, filePath] : [inPath, filePath];
 		const { ensureTool } = await import("./installer/index.js");
 		const installed = await ensureTool("ktfmt");
 		// #2413: which() and ensureTool (PATH/global/managed + install) both

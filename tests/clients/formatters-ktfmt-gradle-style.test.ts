@@ -42,7 +42,10 @@ function makeFakeKtfmtExe(shimDir: string): void {
 	const exeName = isWin ? "ktfmt.cmd" : "ktfmt";
 	const filePath = path.join(shimDir, exeName);
 	fs.mkdirSync(shimDir, { recursive: true });
-	fs.writeFileSync(filePath, isWin ? "@echo off\r\n" : "#!/bin/sh\necho fake\n");
+	fs.writeFileSync(
+		filePath,
+		isWin ? "@echo off\r\n" : "#!/bin/sh\necho fake\n",
+	);
 	if (!isWin) fs.chmodSync(filePath, 0o755);
 }
 
@@ -73,10 +76,7 @@ describe("ktfmtFormatter — Gradle ktfmt{} style carriage (#2468)", () => {
 		fs.writeFileSync(filePath, "fun main() {}\n");
 
 		await withKtfmtOnPath(path.join(tmpDir, "shims"), async () => {
-			const resolved = await ktfmtFormatter.resolveCommand?.(
-				filePath,
-				tmpDir,
-			);
+			const resolved = await ktfmtFormatter.resolveCommand?.(filePath, tmpDir);
 			// The load-bearing assertion: removing the style-flag carriage from
 			// the fix collapses this back to [shimPath, filePath] and this line
 			// goes red.
