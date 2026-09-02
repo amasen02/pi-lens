@@ -36,6 +36,7 @@ import {
 	PINNED_LANGUAGE_IDS,
 	resolveLanguage,
 } from "../../clients/language-registry.js";
+import { symbolSearchFileMatchesLang } from "../../clients/lens-engine.js";
 import { LANGUAGE_EXTENSIONS } from "../../clients/lsp/language.js";
 import { tsLangForFile } from "../../clients/module-report.js";
 import { TREE_SITTER_EXT_TO_LANG } from "../../clients/project-diagnostics/scanner.js";
@@ -463,6 +464,31 @@ describe("consumer projections track the registry", () => {
 		 * scss/less/jsonc files never parse under the css/json grammars and
 		 * neither css nor json has symbol queries at all.
 		 */
+		/**
+		 * The same reconciled rows asserted THROUGH lens-engine's own filter, so
+		 * the guard covers the seam and not only the registry projection behind
+		 * it. Red on the pre-fold head, where the local table answered:
+		 * `.php3`/`.ru` false, `.scss`/`.jsonc`/`.sol` true.
+		 */
+		it("applies the reconciled decisions at the lens-engine seam", () => {
+			expect(symbolSearchFileMatchesLang("src/Legacy.php3", "php")).toBe(true);
+			expect(symbolSearchFileMatchesLang("config.ru", "ruby")).toBe(true);
+			expect(symbolSearchFileMatchesLang("styles/app.scss", "css")).toBe(false);
+			expect(symbolSearchFileMatchesLang("cfg/tsconfig.jsonc", "json")).toBe(
+				false,
+			);
+			expect(
+				symbolSearchFileMatchesLang("contracts/Token.sol", "solidity"),
+			).toBe(false);
+			// Unchanged rows still match.
+			expect(symbolSearchFileMatchesLang("src/App.tsx", "tsx")).toBe(true);
+			expect(symbolSearchFileMatchesLang("scripts/run.sh", "bash")).toBe(true);
+			expect(symbolSearchFileMatchesLang("src/main.ts", "typescript")).toBe(
+				true,
+			);
+			expect(symbolSearchFileMatchesLang("src/main.ts", "python")).toBe(false);
+		});
+
 		it("pins the reconciled lang -> extension decisions", () => {
 			// Narrowed: .scss/.less are their own registry entries with no grammar.
 			expect(extensionsForLanguageToken("css")).toEqual([".css"]);

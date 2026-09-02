@@ -31,12 +31,9 @@ const reads = vi.hoisted(() => [] as string[]);
 
 vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("node:fs")>();
-	const readFileSync = ((
-		target: Parameters<typeof actual.readFileSync>[0],
-		options?: Parameters<typeof actual.readFileSync>[1],
-	) => {
-		if (typeof target === "string") reads.push(target);
-		return actual.readFileSync(target, options);
+	const readFileSync = ((...args: Parameters<typeof actual.readFileSync>) => {
+		if (typeof args[0] === "string") reads.push(args[0]);
+		return actual.readFileSync(...args);
 	}) as typeof actual.readFileSync;
 	return { ...actual, default: { ...actual, readFileSync }, readFileSync };
 });

@@ -357,8 +357,15 @@ export interface SymbolSearchOptions {
  * The layering constraint was never a reason to duplicate the DATA, only a
  * reason not to import the tool's token list. `extensionsForLanguageToken`
  * resolves the token against the canonical registry instead.
+ *
+ * Exported so `tests/clients/language-registry-drift.test.ts` guards the SEAM
+ * and not just the projection behind it: a future local table reintroduced
+ * here would satisfy a registry-only assertion but fail this one.
  */
-function fileMatchesLang(file: string, lang: string): boolean {
+export function symbolSearchFileMatchesLang(
+	file: string,
+	lang: string,
+): boolean {
 	const exts = extensionsForLanguageToken(lang);
 	if (exts.length === 0) return false;
 	return exts.includes(path.extname(file).toLowerCase());
@@ -393,7 +400,7 @@ function buildSymbolSearchFileFilter(
 	if (!paths?.length && !lang) return undefined;
 	return (file: string) => {
 		if (paths?.length && !fileMatchesPathGlobs(file, cwd, paths)) return false;
-		if (lang && !fileMatchesLang(file, lang)) return false;
+		if (lang && !symbolSearchFileMatchesLang(file, lang)) return false;
 		return true;
 	};
 }
