@@ -2462,8 +2462,19 @@ The write-side counterpart of the read bridge is `clients/mutation-bridge.ts`:
 an in-process producer that writes a file outside the tool-event path calls
 `recordMutation` at `Symbol.for("pi-lens:mutation-bridge")` and gets the same
 bookkeeping; `ast_grep_replace apply:true` is the in-repo consumer.
-`tests/clients/mutating-tool-classification.test.ts` greps `clients/` and fails
-when a literal tool-name comparison reappears outside the seam.
+`tests/clients/mutating-tool-classification.test.ts` greps `clients/`, `tools/`
+and `index.ts` and fails when a mutation decision reappears outside the seam —
+`===`/`!==`/`==`/`!=` against `"write"`/`"edit"`/`"multiedit"` (any
+`…toolName`-shaped operand), an `isToolCallEventType` call, a `switch` over an
+expression ending in `.toolName`, a literal `["write", "edit"]`-style set with
+`.includes(`/`.has(`, and a local aliased from `<expr>.toolName` and compared to
+those literals later in the SAME file. Cross-file aliasing and helper-laundered
+comparisons are the guard's known blind spot; review covers those.
+Anchor resolution for `pi-hashline-edit-pro` (`clients/hashline-anchor.ts`)
+answers ONLY for a line whose canonical content occurs once in the file: the
+extension serves store-carried anchors (`mapStableHashes`), so a duplicate-line
+anchor otherwise resolves to a confident WRONG line and the guard acts on the
+wrong range. Unresolved is always a report, never a block.
 
 **PATH-KEY INVARIANT (hard-won — #210):** `ReadGuard` keys its `reads`/`edits`/`exemptions`/`pendingCreations`/`writtenThisSession` maps through `normalizeFilePath` (private `key()`), never the raw path. Read sources arrive with mixed separators/casing — the Read tool gives OS-native backslashes on Windows; search/LSP reads arrive slash-normalized from URIs — and `resolveToolCallFilePath` returns absolute paths verbatim. Keying on the raw string made a read recorded under one form invisible to an edit checked under another → false `zero_read` block despite the file having been read. **Any new map access MUST key through `key()`, and any new read-guard test MUST exercise cross-separator paths** (record one form, check the other) — same-form-on-both-sides is exactly what let #210 ship. Guarded by `tests/clients/read-guard-path-normalization.test.ts`.
 

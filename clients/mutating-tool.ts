@@ -519,17 +519,24 @@ function anchorUnresolved(
  * - `insert`: `{path, anchor, direction, lines}` — a zero-width insertion
  *   before or after one anchor line. The anchor line itself is the range the
  *   guard checks, because that is the line the agent must have read to name it.
- *   When the anchor has drifted, the guard's own content-verified relocation
- *   (`ReadGuard.findRelocation`, the #505 machinery) reports where the read
- *   content moved to and offers the auto-apply. The adapter deliberately does
- *   not re-implement that search.
+ *
+ * A drifted edit-pro anchor gets NO relocation (review round 3, finding F5).
+ * The #505 auto-apply runs through `relocateEditRange`, which rewrites the
+ * line numbers inside a `oldRange` or an `edits[].range` — neither of which an
+ * edit-pro request has. So for `{anchor, direction, lines}` the relocation
+ * call is a structural no-op, and this adapter deliberately does not build a
+ * second search to cover it: re-deriving "where did that content go" from a
+ * hash pi-lens cannot verify is exactly the guessing that finding F1 removed.
+ * A drifted anchor stays unresolved and observable; giving that shape a real
+ * net is #2430's job.
  *
  * Anchors are resolved by `clients/hashline-anchor.ts`, which reproduces the
  * extension's own hash function against the file's current content and answers
- * only on a UNIQUE match. An anchor that does not resolve leaves the mutation
- * classified with its lines unknown — never a block. See that module's header
- * for why pi-lens's recomputation can legitimately disagree with the live
- * extension, and why blocking on that disagreement would be wrong.
+ * only when the match is unique AND the matched line's content occurs once in
+ * the file. An anchor that does not resolve leaves the mutation classified
+ * with its lines unknown — never a block. See that module's header for the
+ * measurement behind the content-uniqueness gate, and for why blocking on
+ * pi-lens's disagreement with a third-party tool would be wrong.
  *
  * Upstream `swapReversedRanges` (`src/hashline/resolve.ts`) AUTOCORRECTS a
  * reversed pair rather than refusing it, so a resolved pair is normalized here

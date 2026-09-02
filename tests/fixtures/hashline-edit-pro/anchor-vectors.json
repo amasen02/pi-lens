@@ -8,7 +8,7 @@
       "src/hashline/alphabet.ts",
       "src/hashline/hash.ts",
       "src/hashline/hasher.ts",
-      "src/utils.ts (splitLines, truncateToBytes)",
+      "src/utils.ts (splitLines, truncateToBytes, getCached)",
       "src/constants.ts (MAX_HASH_SOURCE_BYTES)"
     ]
   },
@@ -172,6 +172,90 @@
         "OUf",
         "Axn",
         "Byo"
+      ]
+    },
+    "repeatedBlocks": {
+      "content": "export function alpha() {\n\tif (ready) {\n\t\tgo(1);\n\t}\n\treturn 0;\n}\n\nexport function beta() {\n\tif (ready) {\n\t\tgo(2);\n\t}\n\treturn 0;\n}\n\nexport function gamma() {\n\tif (ready) {\n\t\tgo(3);\n\t}\n\treturn 0;\n}\n\n",
+      "hashes": [
+        "Kil",
+        "dg7",
+        "mlq",
+        "vKS",
+        "EQj",
+        "AU6",
+        "AuN",
+        "ANE",
+        "BOF",
+        "IDn",
+        "JEo",
+        "KFp",
+        "LGq",
+        "MHr",
+        "iwq",
+        "jxr",
+        "mvZ",
+        "nwa",
+        "oxb",
+        "pyc",
+        "qzd"
+      ]
+    }
+  },
+  "storeCarried": {
+    "insertedFunctionAtTop": {
+      "description": "agent prepends a 4-line function; upstream carries every surviving anchor forward",
+      "before": "export function alpha() {\n\tif (ready) {\n\t\tgo(1);\n\t}\n\treturn 0;\n}\n\nexport function beta() {\n\tif (ready) {\n\t\tgo(2);\n\t}\n\treturn 0;\n}\n\nexport function gamma() {\n\tif (ready) {\n\t\tgo(3);\n\t}\n\treturn 0;\n}\n\n",
+      "after": "export function inserted() {\n\treturn 9;\n}\n\nexport function alpha() {\n\tif (ready) {\n\t\tgo(1);\n\t}\n\treturn 0;\n}\n\nexport function beta() {\n\tif (ready) {\n\t\tgo(2);\n\t}\n\treturn 0;\n}\n\nexport function gamma() {\n\tif (ready) {\n\t\tgo(3);\n\t}\n\treturn 0;\n}\n\n",
+      "removedHashes": [],
+      "hashesBefore": [
+        "Kil",
+        "dg7",
+        "mlq",
+        "vKS",
+        "EQj",
+        "AU6",
+        "AuN",
+        "ANE",
+        "BOF",
+        "IDn",
+        "JEo",
+        "KFp",
+        "LGq",
+        "MHr",
+        "iwq",
+        "jxr",
+        "mvZ",
+        "nwa",
+        "oxb",
+        "pyc",
+        "qzd"
+      ],
+      "hashesAfter": [
+        "vuB",
+        "8wx",
+        "AU6",
+        "AuN",
+        "Kil",
+        "dg7",
+        "mlq",
+        "vKS",
+        "EQj",
+        "LGq",
+        "MHr",
+        "ANE",
+        "BOF",
+        "IDn",
+        "JEo",
+        "KFp",
+        "pyc",
+        "qzd",
+        "iwq",
+        "jxr",
+        "mvZ",
+        "nwa",
+        "oxb",
+        "9xy",
+        "Ayz"
       ]
     }
   }

@@ -713,15 +713,89 @@ const LITERAL_COMPARISONS = [
 	/isToolCallEventType\(\s*[A-Za-z_$][\w$]*\s*,\s*"(?:write|edit|multiedit)"/,
 ];
 
+/**
+ * Review round 3, finding F2. Three forms the line-at-a-time comparison regexes
+ * above cannot see, all of them decisions the seam is supposed to own:
+ *
+ * 1. `switch (event.toolName) { case "write": … }` — the subject never sits
+ *    next to a literal, so no comparison regex fires. Flagged on the SUBJECT:
+ *    any `switch` over an expression ending in `.toolName` is branching on the
+ *    tool name, and that belongs in `classifyMutatingTool`.
+ * 2. `["write", "edit"].includes(name)` / `new Set(["write","edit"]).has(name)`
+ *    — a membership test against a literal set of mutation tool names. The
+ *    array must contain ONLY those literals, so `["edit", "command"]`
+ *    (`clients/lsp/client.ts`, an LSP `resolveSupport` capability list) is not
+ *    an offender.
+ * 3. `const t = event.toolName; … if (t !== "write")` — an alias whose name
+ *    carries no `toolName` substring. Handled as a two-pass file-scoped read:
+ *    collect the alias names declared from a `.toolName` expression, then look
+ *    for those names compared to the literals.
+ *
+ * KNOWN LIMITATION: pass 3 is file-scoped, not scope-aware. An alias assigned
+ * in one function and compared in another IS caught (the passes share a file),
+ * but an alias that crosses a FILE boundary — `export const t = e.toolName` in
+ * one module, compared in another — is not, and neither is one laundered
+ * through a helper (`nameOf(event) === "write"`). Those need a type-aware pass;
+ * the guard is a tripwire for the shapes the codebase has actually written,
+ * and `deps-centralization` plus review are the backstop for the rest.
+ */
+const SWITCH_ON_TOOL_NAME = /\bswitch\s*\(\s*[^)]*\.toolName\s*\)/;
+
+const MUTATION_LITERAL_SET_MEMBERSHIP =
+	/\[\s*"(?:write|edit|multiedit)"(?:\s*,\s*"(?:write|edit|multiedit)")*\s*,?\s*\](?:\s*as\s+const)?\s*\)?\s*\.\s*(?:includes|has)\s*\(/;
+
+const TOOL_NAME_ALIAS_DECL =
+	/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*[^;\n]*\.toolName\b/g;
+
+/** Aliases declared from a `.toolName` expression anywhere in one file. */
+function collectToolNameAliases(source: string): string[] {
+	const names = new Set<string>();
+	for (const match of source.matchAll(TOOL_NAME_ALIAS_DECL)) {
+		const name = match[1];
+		// `toolName`-shaped names are already covered by LITERAL_COMPARISONS;
+		// keeping them costs nothing and keeps the pass honest if that changes.
+		if (name) names.add(name);
+	}
+	return [...names];
+}
+
+function aliasComparisonPatterns(aliases: string[]): RegExp[] {
+	// `$` is legal in an identifier and is an anchor in a regex, so escape it.
+	return aliases.flatMap((raw) => {
+		const name = raw.replace(/\$/g, "\\$");
+		return [
+			new RegExp(`\\b${name}\\s*[=!]==?\\s*"(?:write|edit|multiedit)"`),
+			new RegExp(`"(?:write|edit|multiedit)"\\s*[=!]==?\\s*${name}\\b`),
+		];
+	});
+}
+
+/** Every offending line in one file's source, as `line-number: text`. */
+function findMutationLiteralOffenders(
+	source: string,
+): Array<{ line: number; text: string }> {
+	const patterns = [
+		...LITERAL_COMPARISONS,
+		SWITCH_ON_TOOL_NAME,
+		MUTATION_LITERAL_SET_MEMBERSHIP,
+		...aliasComparisonPatterns(collectToolNameAliases(source)),
+	];
+	const offenders: Array<{ line: number; text: string }> = [];
+	source.split("\n").forEach((text, index) => {
+		if (patterns.some((re) => re.test(text)))
+			offenders.push({ line: index + 1, text: text.trim() });
+	});
+	return offenders;
+}
+
 describe("#2423 grep guard — the seam is the only mutation decision point", () => {
 	it("keeps every declared exclusion a declaration, not a comparison", () => {
 		expect(DECLARED_EXCLUSIONS.length).toBeGreaterThan(0);
 		for (const { file, reason } of DECLARED_EXCLUSIONS) {
 			expect(fs.existsSync(file), `${file}: ${reason}`).toBe(true);
-			const hits = fs
-				.readFileSync(file, "utf8")
-				.split("\n")
-				.filter((line) => LITERAL_COMPARISONS.some((re) => re.test(line)));
+			const hits = findMutationLiteralOffenders(
+				fs.readFileSync(file, "utf8"),
+			).map((hit) => `${hit.line}: ${hit.text}`);
 			expect(hits, `${file}: ${reason}`).toEqual([]);
 		}
 	});
@@ -744,14 +818,13 @@ describe("#2423 grep guard — the seam is the only mutation decision point", ()
 		const offenders: string[] = [];
 		for (const file of files) {
 			if (path.resolve(file) === SEAM_FILE) continue;
-			const lines = fs.readFileSync(file, "utf8").split("\n");
-			lines.forEach((line, index) => {
-				if (LITERAL_COMPARISONS.some((re) => re.test(line))) {
-					offenders.push(
-						`${path.relative(REPO_ROOT, file)}:${index + 1}: ${line.trim()}`,
-					);
-				}
-			});
+			for (const hit of findMutationLiteralOffenders(
+				fs.readFileSync(file, "utf8"),
+			)) {
+				offenders.push(
+					`${path.relative(REPO_ROOT, file)}:${hit.line}: ${hit.text}`,
+				);
+			}
 		}
 		expect(offenders).toEqual([]);
 	});
@@ -767,23 +840,32 @@ describe("#2423 grep guard — the seam is the only mutation decision point", ()
 			'\t\tif (rtToolName === "edit" || rtToolName === "write") {',
 			'\tif ("write" === toolName) return;',
 			'\tif (isToolCallEventType("write", event as any)) {',
+			// Review round 3 (F2), the three probes the line regexes missed.
+			'\tconst t = event.toolName;\n\tif (t !== "write") return;',
+			'\tswitch (event.toolName) {\n\t\tcase "write":\n\t\t\treturn 1;\n\t}',
+			'\tif (["write", "edit"].includes(name)) return 1;',
+			// …and their near neighbours, so the new rules are not one-shape wide.
+			'\tlet name = (event as ToolEvent).toolName;\n\tif ("edit" === name) return;',
+			'\tswitch (deps.event.toolName) {\n\t\tcase "multiedit":\n\t\t\treturn 1;\n\t}',
+			'\tif (new Set(["write", "edit", "multiedit"]).has(name)) return 1;',
 		];
 		for (const sample of offenders) {
-			expect(
-				LITERAL_COMPARISONS.some((re) => re.test(sample)),
-				sample,
-			).toBe(true);
+			expect(findMutationLiteralOffenders(sample), sample).not.toEqual([]);
 		}
 		const allowed = [
 			'\tif (toolName === "lsp_navigation") return 1;',
 			'\tif (mutation.kind === "write") return 1;',
 			'\ttool: "write" | "edit";',
+			// A capability list that merely CONTAINS "edit" is not a mutation set.
+			'\t\t\tresolveSupport: { properties: ["edit", "command"] },',
+			// An alias off a `.toolName` expression that is never compared to a
+			// mutation literal must not trip pass 3.
+			"\tconst label = event.toolName;\n\tdbg(`tool=${label}`);",
+			// A switch on something else entirely.
+			'\tswitch (mutation.kind) {\n\t\tcase "write":\n\t\t\treturn 1;\n\t}',
 		];
 		for (const sample of allowed) {
-			expect(
-				LITERAL_COMPARISONS.some((re) => re.test(sample)),
-				sample,
-			).toBe(false);
+			expect(findMutationLiteralOffenders(sample), sample).toEqual([]);
 		}
 	});
 });

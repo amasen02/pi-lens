@@ -29,6 +29,23 @@ export interface HashlineAnchorVectors {
 	};
 	xxh32: Array<{ input: string; h32: number }>;
 	lineAnchors: Record<string, { content: string; hashes: string[] }>;
+	/**
+	 * One simulated edit per entry, run through the extension's own
+	 * `mapStableHashes` (review round 3, finding F1). `hashesAfter` is the
+	 * anchor list the extension's hash store SERVES after that edit — the
+	 * anchors an agent quotes back — which is not what recomputing from the
+	 * file's content produces for a duplicate-content line.
+	 */
+	storeCarried: Record<string, HashlineStoreCarried>;
+}
+
+export interface HashlineStoreCarried {
+	description: string;
+	before: string;
+	after: string;
+	removedHashes: string[];
+	hashesBefore: string[];
+	hashesAfter: string[];
 }
 
 let cached: HashlineAnchorVectors | undefined;
@@ -68,5 +85,32 @@ export function hashlineFixture(name: string): {
 			return anchor;
 		},
 		lineCount: entry.hashes.length,
+	};
+}
+
+/**
+ * One store-carried scenario: the file AFTER one edit, plus the anchors the
+ * extension's store hands out for it. `carriedAnchorFor(10)` is the anchor
+ * upstream attached to line 10 — which is the line pi-lens must either name
+ * correctly or refuse to name at all.
+ */
+export function hashlineStoreCarried(name: string): HashlineStoreCarried & {
+	afterLines: string[];
+	carriedAnchorFor: (line: number) => string;
+} {
+	const entry = loadHashlineAnchorVectors().storeCarried?.[name];
+	if (!entry) throw new Error(`unknown store-carried scenario "${name}"`);
+	const afterLines = entry.after.endsWith("\n")
+		? entry.after.split("\n").slice(0, -1)
+		: entry.after.split("\n");
+	return {
+		...entry,
+		afterLines,
+		carriedAnchorFor: (line: number) => {
+			const anchor = entry.hashesAfter[line - 1];
+			if (anchor === undefined)
+				throw new Error(`scenario "${name}" has no line ${line}`);
+			return anchor;
+		},
 	};
 }

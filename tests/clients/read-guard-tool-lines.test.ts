@@ -16,7 +16,10 @@ import {
 } from "../../clients/partial-edit-apply.js";
 import { logReadGuardEvent } from "../../clients/read-guard-logger.js";
 import { ReadGuard } from "../../clients/read-guard.js";
-import { hashlineFixture } from "../support/hashline-anchor-vectors.js";
+import {
+	hashlineFixture,
+	hashlineStoreCarried,
+} from "../support/hashline-anchor-vectors.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
 vi.mock("../../clients/read-guard-logger.js", async (importOriginal) => ({
@@ -1974,14 +1977,17 @@ describe("#2423 hashline-edit-pro adapter", () => {
 					toolName: "insert",
 					input: {
 						path: filePath,
-						anchor: anchorFor(7),
+						// Line 8 is `line 7`; line 7 is BLANK, and after review
+						// round 3 (F1) a duplicate-content line is deliberately
+						// unanswerable, so it cannot carry this case.
+						anchor: anchorFor(8),
 						direction: "before",
 						lines: ["// note"],
 					},
 				},
 				filePath,
 			);
-			expect(result.touchedLines).toEqual([7, 7]);
+			expect(result.touchedLines).toEqual([8, 8]);
 		} finally {
 			env.cleanup();
 		}
@@ -2055,6 +2061,71 @@ describe("#2423 hashline-edit-pro adapter", () => {
 					metadata: expect.objectContaining({
 						adapterSource: "hashline-edit-pro",
 						unresolvedReason: "remove_from:anchor_not_found",
+					}),
+				}),
+			);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	/**
+	 * Review round 3, finding F1, end to end.
+	 *
+	 * The anchors here are not invented: they come from running the extension's
+	 * own `mapStableHashes` over one simulated edit (the `storeCarried` block of
+	 * `tests/fixtures/hashline-edit-pro/anchor-vectors.json`), which is what the
+	 * hash store persists and serves on the next read.
+	 *
+	 * Before the fix, `remove_from` resolved correctly to line 9 and `remove_to`
+	 * — the `}` on line 10 — resolved to the `}` on line 17, so
+	 * `getTouchedLinesForGuard` returned `[9, 17]`: a nine-line range for a
+	 * two-line edit, handed straight to `readGuard.checkEdit`,
+	 * `cacheManager.addModifiedRange` and the `touched_lines_detected` record.
+	 */
+	it("never hands the guard a range built from a drifted store-carried anchor", () => {
+		const env = setupTestEnvironment("pi-lens-2423-pro-carried-");
+		try {
+			const scenario = hashlineStoreCarried("insertedFunctionAtTop");
+			const filePath = path.join(env.tmpDir, "target.ts");
+			fs.writeFileSync(filePath, scenario.after, "utf8");
+			// The two lines the agent means: `\treturn 0;` and the `}` closing it.
+			expect(scenario.afterLines[8]).toBe("\treturn 0;");
+			expect(scenario.afterLines[9]).toBe("}");
+
+			const result = getTouchedLinesForGuard(
+				{
+					toolName: "replace",
+					input: {
+						path: filePath,
+						remove_from: scenario.carriedAnchorFor(9),
+						remove_to: scenario.carriedAnchorFor(10),
+						replacement_lines: ["\treturn 1;", "}"],
+					},
+				},
+				filePath,
+				"session-2423-carried",
+				"corr-2423-carried",
+			);
+
+			// The wrong range specifically, and any range at all.
+			expect(result.touchedLines).not.toEqual([9, 17]);
+			expect(result.touchedLines).toBeUndefined();
+			expect(result.editRanges).toBeUndefined();
+			// Still never a block — an unresolved anchor is a report.
+			expect(result.preflightError).toBeUndefined();
+			expect(logReadGuardEvent).not.toHaveBeenCalledWith(
+				expect.objectContaining({ event: "edit_preflight_blocked" }),
+			);
+			expect(logReadGuardEvent).not.toHaveBeenCalledWith(
+				expect.objectContaining({ event: "touched_lines_detected" }),
+			);
+			expect(logReadGuardEvent).toHaveBeenCalledWith(
+				expect.objectContaining({
+					event: "touched_lines_missing",
+					metadata: expect.objectContaining({
+						adapterSource: "hashline-edit-pro",
+						unresolvedReason: "remove_from:content_not_unique",
 					}),
 				}),
 			);
