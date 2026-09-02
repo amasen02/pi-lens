@@ -17,7 +17,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { isTestMode } from "../env-utils.js";
-import { getGlobalPiLensDir } from "../file-utils.js";
+import { getGlobalPiLensDir, getGlobalPiLensLogDir } from "../file-utils.js";
 import { isFullyQualified } from "../path-utils.js";
 import { findGlobalBinary } from "../package-manager.js";
 import { redactSecrets } from "../redact/secrets.js";
@@ -56,7 +56,7 @@ function computeNeedsShell(resolvedCommand: string): boolean {
 
 const DEFAULT_STARTUP_FAILURE_WINDOW_MS = 50;
 const WINDOWS_NAV_STARTUP_FAILURE_WINDOW_MS = 500;
-const SESSIONSTART_LOG_DIR = getGlobalPiLensDir();
+const SESSIONSTART_LOG_DIR = getGlobalPiLensLogDir();
 const SESSIONSTART_LOG = path.join(SESSIONSTART_LOG_DIR, "sessionstart.log");
 const PI_LENS_BIN_DIR = path.join(getGlobalPiLensDir(), "bin");
 const PI_LENS_TOOLS_BIN_DIR = path.join(

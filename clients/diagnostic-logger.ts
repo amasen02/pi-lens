@@ -6,7 +6,7 @@
 
 import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
-import { getGlobalPiLensDir } from "./file-utils.js";
+import { getGlobalPiLensLogDir } from "./file-utils.js";
 import { getMaxLogSizeMB } from "./log-cleanup.js";
 import { createNdjsonLogger } from "./ndjson-logger.js";
 
@@ -67,7 +67,7 @@ export interface LogContext {
 }
 
 function getLogDir(): string {
-	return path.join(getGlobalPiLensDir(), "logs");
+	return path.join(getGlobalPiLensLogDir(), "logs");
 }
 
 function getLogFile(): string {

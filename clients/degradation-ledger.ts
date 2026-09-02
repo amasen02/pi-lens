@@ -23,6 +23,13 @@ import {
 	getProcessSingletonResets,
 	PROCESS_SINGLETON_RESET_KIND,
 } from "./process-singletons.js";
+// #2506: same inversion, same reason — `file-utils.ts` cannot import this
+// module (directly OR dynamically) without closing a no-client-cycles cycle
+// through the existing extension-log.ts/latency-logger.ts/safe-spawn.js path,
+// so `getGlobalPiLensLogDir()`'s probe-home-redirect event is written to this
+// zero-import leaf and read back here instead. See
+// `probe-home-state.ts`'s doc comment for the full account.
+import { getProbeHomeRedirectEvent } from "./probe-home-state.js";
 
 // Re-exported so existing importers keep one name for the ledger's bound.
 export { LEDGER_FIELD_MAX, truncateForLedger };
@@ -695,7 +702,37 @@ export type DegradationKind =
 	 * unanswerable, since the ledger could no longer tell a rejection from a
 	 * long list. One row per file per session.
 	 */
-	| "config-notice-suppressed";
+	| "config-notice-suppressed"
+	/**
+	 * `getGlobalPiLensLogDir()` (`clients/file-utils.ts`, #2506) redirected the
+	 * LOG/ledger root away from the real `~/.pi-lens` because `PI_LENS_HOME`
+	 * was unset outside test mode and the process's `cwd` looked like a
+	 * probe context (inside a specific `.claude/worktrees/<worktree>/` or under
+	 * `os.tmpdir()`), or `PILENS_PROBE=1` forced the redirect. Without this kind
+	 * a probe run outside vitest that forgot to pin `PI_LENS_HOME` would
+	 * silently write into the maintainer's real telemetry with no durable trace
+	 * — the exact gap that let two review probes leave 42 fixture rows in real
+	 * `~/.pi-lens` files on 2026-09-02. Subject is the redirected probe-home
+	 * path.
+	 *
+	 * Scope note (#2506 round 3): only the log family moves.
+	 * `getGlobalPiLensDir()` — installed tools, `bin/`, `instances.json`, the
+	 * orphan-backstop lease, the probe cache, the global `config.json`, LSP
+	 * server storage — stays cwd-independent, so a pi session running from a
+	 * worktree keeps its tools and stays visible to the machine-wide registry.
+	 * This row therefore means "telemetry was diverted", never "this session
+	 * lost its tools".
+	 *
+	 * Never written via `recordDegradation`/`recordDegradationOnce` like every
+	 * other kind above — the same `log-sink-write-failure`/
+	 * `process-singleton-reset` shape: it is folded into
+	 * `getDegradationSummary()` at READ time from `probe-home-state.ts`'s own
+	 * process-scoped event, because `file-utils.ts` cannot import this module
+	 * (directly OR dynamically) without closing a `no-client-cycles` violation
+	 * through the existing `extension-log.ts`/`latency-logger.ts`/
+	 * `safe-spawn.js` cycle. See `probe-home-state.ts`'s doc comment.
+	 */
+	| "global-dir-probe-redirect";
 
 export interface DegradationRecord {
 	kind: unknown;
@@ -969,6 +1006,25 @@ export function getDegradationSummary(): DegradationGroup[] {
 			})),
 		});
 	}
+	// #2506, same read-time fold: `getGlobalPiLensLogDir()`'s probe-home redirect
+	// fires at most once per process (see `file-utils.ts`), so this is a
+	// presence check, not a tally.
+	const probeHomeRedirect = getProbeHomeRedirectEvent();
+	if (probeHomeRedirect) {
+		summary.push({
+			kind: "global-dir-probe-redirect",
+			count: 1,
+			droppedCount: 0,
+			latestReasons: [
+				{
+					subject: truncateForLedger(probeHomeRedirect.probeHome),
+					reason: truncateForLedger(
+						`PI_LENS_HOME unset outside test mode with cwd in a worktree/tmp probe context (${probeHomeRedirect.cwd}); LOGS redirected away from the real home directory (tools, bin and instances.json are unaffected)`,
+					),
+				},
+			],
+		});
+	}
 	return summary;
 }
 
@@ -1060,6 +1116,13 @@ export function resetDegradationLedger(): void {
 	// session (one entry per family, capped at 16), so leaving it costs a fixed
 	// handful of lines and keeps a process-scope fact visible for the process's
 	// life. Deliberate exception to catalog shape 17, not an oversight.
+	//
+	// `getProbeHomeRedirectEvent()` (#2506) is the same shape as the
+	// process-singleton case above and for the same reason: the redirect is
+	// resolved at most once per PROCESS (memoized in the `globalThis` slot
+	// `probe-home-state.ts` owns, not a session-scoped one), so it cannot
+	// recur within this process's life either — clearing it here would hide
+	// the fact from every session after the first in the same probe process.
 }
 
 // Re-exported so every existing importer keeps its specifier. The value now

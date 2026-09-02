@@ -56,7 +56,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { getGlobalPiLensDir } from "./file-utils.js";
+import { getGlobalPiLensLogDir } from "./file-utils.js";
 
 /** Bounded tail-read budget PER source log file — never a full-file scan. */
 export const SMELLS_TAIL_BYTES_PER_FILE = 64 * 1024;
@@ -181,7 +181,7 @@ function isOpengrepRespawn(entry: Record<string, unknown>): boolean {
  * up to ~10MB) source files are. `root` is injectable for tests.
  */
 export function countRecentSmells(
-	root: string = getGlobalPiLensDir(),
+	root: string = getGlobalPiLensLogDir(),
 	sessionStartMs?: number,
 ): SmellsRollupCounts {
 	const sinceMs = sessionStartMs ?? Date.now() - SMELLS_ROLLING_WINDOW_MS;
