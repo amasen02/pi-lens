@@ -2516,11 +2516,19 @@ export function setupIncomingHandlers(
 				(state.activeMutationDepth ?? 0) === 1
 					? state.activeMutationContext
 					: undefined;
+			// `workspace/applyEdit` is only ever honored inside the
+			// `serverEditsAllowed` window this handler just checked, which is
+			// opened exclusively by an executeCommand call — so a fallback here is
+			// always executeCommand-solicited, never a bare edit (#2450). This
+			// fallback context carries no runtime/cacheManager (there is no live
+			// reference to those singletons at this call site); lsp-mutation.ts's
+			// bookkeepLspMutation falls back to the mutation bridge for exactly
+			// that reason rather than silently dropping the write's bookkeeping.
 			const telemetryContext: LspMutationContext = context ?? {
 				cwd: state.root,
 				correlationId: newLspMutationCorrelationId(),
 				tool: "lsp-workspace-applyEdit",
-				source: "lsp-edit",
+				source: "lsp-execute-command",
 			};
 			try {
 				await applyWorkspaceEdit(

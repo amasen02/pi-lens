@@ -11,6 +11,7 @@ import {
 } from "./project-changes.js";
 import type { AppliedWorkspaceEdit } from "./lsp/edits.js";
 import { normalizeMapKey } from "./path-utils.js";
+import { getMutationBridge } from "./mutation-bridge.js";
 
 export interface LspMutationRuntime {
 	bumpFileSeq?: (filePath: string) => { projectSeq: number; fileSeq: number };
@@ -40,7 +41,14 @@ export interface LspMutationContext {
 	cwd: string;
 	correlationId: string;
 	tool: string;
-	source: "lsp-edit" | "autofix";
+	/**
+	 * `"lsp-edit"` is the generic/legacy value; `"lsp-rename"` and
+	 * `"lsp-execute-command"` name the specific LSP operation that produced the
+	 * write, so the change-log receipt tells a rename apart from an
+	 * executeCommand-solicited edit instead of collapsing both onto one generic
+	 * tag (#2450).
+	 */
+	source: "lsp-edit" | "lsp-rename" | "lsp-execute-command" | "autofix";
 	runtime?: LspMutationRuntime;
 	readGuard?: { recordWritten: (filePath: string) => void };
 	cacheManager?: LspMutationCacheManager;
@@ -211,6 +219,22 @@ function bookkeepLspMutation(
 	fileDetails: AppliedWorkspaceEdit["fileDetails"],
 ): void {
 	const details = uniqueDetails(files, fileDetails);
+	// The direct path below needs `context.runtime` (the receipt) and
+	// `context.cacheManager` (the turn-state entry) threaded in by the caller.
+	// One caller structurally cannot: `workspace/applyEdit`'s server-initiated-edit
+	// handler (clients/lsp/client.ts) builds its own fallback `LspMutationContext`
+	// with neither, because there is no live reference to the runtime/cache-manager
+	// singletons at that call site. Rather than silently drop bookkeeping for that
+	// write, fall back to the mutation bridge (#2423) — mounted once at extension
+	// activation with live getters closing over the SAME singletons — which is
+	// exactly the seam built for "a producer that cannot reach the bookkeeping
+	// surfaces directly". This keeps `recordLspMutation` the ONE call site every
+	// LSP-applied edit bookkeeps through; the bridge is this function's OWN
+	// fallback, not a second seam other code reaches for on its behalf (#2450).
+	// Only the receipt (recordProjectMutation) and the turn-state entry
+	// (cacheManager.addModifiedRange) need the bridge fallback: the read-guard
+	// stamp is independent of them and already tolerates either being absent.
+	const useBridgeFallback = !context.runtime || !context.cacheManager;
 	for (const detail of details) {
 		const filePath = path.resolve(detail.filePath);
 		if (context.readGuard) {
@@ -221,6 +245,24 @@ function bookkeepLspMutation(
 					`lsp mutation read-guard stamp failed for ${filePath}: ${err}`,
 				);
 			}
+		}
+		if (useBridgeFallback) {
+			const bridge = getMutationBridge();
+			try {
+				bridge?.recordMutation({
+					filePath,
+					kind: "edit",
+					editRanges: detail.range
+						? [[detail.range.start, detail.range.end]]
+						: undefined,
+					consumer: context.tool,
+				});
+			} catch (err) {
+				context.dbg?.(
+					`lsp mutation bridge fallback failed for ${filePath}: ${err}`,
+				);
+			}
+			continue;
 		}
 		const runtime = context.runtime;
 		// One mutation seam (#2000 phase 1): bump + receipt + change-log live in

@@ -1093,11 +1093,16 @@ export function createLspNavigationTool(
 				["rename", "rename_file", "executeCommand"].includes(operation)
 			) {
 				const cwd = ctx.cwd || ".";
+				// Name the specific LSP operation in the receipt rather than a
+				// generic "lsp-edit" tag, so a rename's change-log entry reads
+				// differently from an executeCommand-solicited edit (#2450).
+				const mutationSource =
+					operation === "executeCommand" ? "lsp-execute-command" : "lsp-rename";
 				mutationContext = {
 					cwd,
 					correlationId: newLspMutationCorrelationId(_toolCallId),
-					tool: "lsp_navigation",
-					source: "lsp-edit",
+					tool: `lsp_navigation:${operation}`,
+					source: mutationSource,
 					...mutationDeps,
 					readGuard: getFlag("no-read-guard", cwd)
 						? undefined

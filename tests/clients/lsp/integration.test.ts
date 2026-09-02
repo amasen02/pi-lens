@@ -25,6 +25,12 @@ import { createLSPClient } from "../../../clients/lsp/client.js";
 import { launchLSP, stopLSP } from "../../../clients/lsp/launch.js";
 import { spawnFakeLspServer } from "../../support/fake-lsp-server.js";
 import { removeTempDirSync } from "../test-utils.js";
+import { CacheManager } from "../../../clients/cache-manager.js";
+import { registerMutationBridge } from "../../../clients/mutation-bridge.js";
+import { normalizeMapKey } from "../../../clients/path-utils.js";
+import { readChangesSince } from "../../../clients/project-changes.js";
+import { countFileLines } from "../../../clients/read-guard-tool-lines.js";
+import { RuntimeCoordinator } from "../../../clients/runtime-coordinator.js";
 
 describe("LSP Client Integration", () => {
 	let client: Awaited<ReturnType<typeof createLSPClient>> | undefined;
@@ -919,5 +925,103 @@ describe("LSP Client Integration — batched watched-files (#271)", () => {
 		// Wait out the debounce window — nothing should have been enqueued/sent.
 		await new Promise((r) => setTimeout(r, 200));
 		expect(received).toHaveLength(0);
+	});
+});
+
+describe("LSP Client Integration — mutation-bridge fallback for server-initiated edits (#2450)", () => {
+	// `executeCommand(command, args)` — the 2-arg form, no `mutationContext` — is
+	// a real production shape (clients/lsp/tsserver-sync.ts calls it that way),
+	// and the fake server's "fake.applyEdit" command still solicits a real
+	// `workspace/applyEdit` for it. Before #2450, `workspace/applyEdit`'s
+	// fallback `LspMutationContext` (clients/lsp/client.ts) carried no
+	// `runtime`/`cacheManager`, so `bookkeepLspMutation` skipped every
+	// bookkeeping step for a write that reached disk — no read-guard stamp,
+	// no turn-state entry, no change-log receipt. This proves the mutation
+	// bridge fallback (clients/lsp-mutation.ts `bookkeepLspMutation`) closes
+	// that gap using the SAME seam every other LSP-applied edit bookkeeps
+	// through, not a parallel one.
+	let proc: Awaited<ReturnType<typeof launchLSP>> | undefined;
+	let client: Awaited<ReturnType<typeof createLSPClient>> | undefined;
+	let tmpDir: string;
+	let filePath: string;
+	let prevDataDir: string | undefined;
+
+	beforeEach(async () => {
+		tmpDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-bridge-fallback-"),
+		);
+		filePath = path.join(tmpDir, "target.ts");
+		fs.writeFileSync(filePath, "hello world", "utf-8");
+		prevDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(tmpDir, "data");
+		proc = await spawnFakeLspServer({ cwd: tmpDir });
+		client = await createLSPClient({
+			serverId: "fake-bridge-fallback",
+			process: proc,
+			root: tmpDir,
+		});
+	});
+
+	afterEach(async () => {
+		try {
+			if (client) await client.shutdown();
+		} catch {
+			/* ignore */
+		}
+		try {
+			if (proc) await stopLSP(proc);
+		} catch {
+			/* ignore */
+		}
+		client = undefined;
+		proc = undefined;
+		if (prevDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+		else process.env.PILENS_DATA_DIR = prevDataDir;
+		removeTempDirSync(tmpDir);
+	});
+
+	it("records turn-state and a change-log receipt for a server-initiated applyEdit with no mutationContext threaded through executeCommand", async () => {
+		const runtime = new RuntimeCoordinator();
+		runtime.projectRoot = tmpDir;
+		runtime.setTelemetryIdentity({ sessionId: "s-2450-fallback" });
+		runtime.beginTurn();
+		const cacheManager = new CacheManager(false);
+		registerMutationBridge({
+			getRuntime: () => runtime as never,
+			getCacheManager: () => cacheManager,
+			getProjectRoot: () => tmpDir,
+			getDispatchCwd: () => tmpDir,
+			countFileLines,
+			isRecordable: () => true,
+			dbg: () => {},
+		});
+
+		// Same call shape as "applies a server-initiated edit solicited during
+		// executeCommand" above: no mutationContext argument.
+		const res = await client!.executeCommand("fake.applyEdit", [
+			pathToFileURL(filePath).href,
+		]);
+		expect(res.executed).toBe(true);
+		expect(fs.readFileSync(filePath, "utf-8")).toBe("EDITED world");
+
+		const receipts = runtime.getMutationsSince(0);
+		expect(receipts.map((r) => r.filePath)).toEqual([
+			normalizeMapKey(filePath),
+		]);
+		// The bridge names the LSP handler that recorded it — not a generic
+		// "settled sweep"/unattributed tag, and not silently absent.
+		expect(receipts[0].source).toBe("agent-tool:lsp-workspace-applyEdit");
+
+		// The durable change-log entry carries the REAL range the edit touched
+		// (line 0 → 1-based {1,1}), not a synthetic whole-file default.
+		const changes = readChangesSince(tmpDir, 0);
+		expect(changes).toHaveLength(1);
+		expect(changes[0].source).toBe("agent-tool:lsp-workspace-applyEdit");
+		expect(changes[0].changedRange).toEqual({ start: 1, end: 1 });
+
+		const turnFiles = cacheManager.readTurnState(tmpDir).files ?? {};
+		const keys = Object.keys(turnFiles);
+		expect(keys).toHaveLength(1);
+		expect(keys[0]).toContain("target.ts");
 	});
 });

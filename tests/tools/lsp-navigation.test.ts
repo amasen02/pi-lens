@@ -4,6 +4,10 @@ import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { removeTempDirSync } from "../clients/test-utils.js";
+import { CacheManager } from "../../clients/cache-manager.js";
+import { normalizeMapKey } from "../../clients/path-utils.js";
+import { readChangesSince } from "../../clients/project-changes.js";
+import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 
 const mocked = vi.hoisted(() => ({
 	service: null as unknown,
@@ -311,10 +315,13 @@ describe("lsp_navigation tool", () => {
 			"_typescript.organizeImports",
 			["file:///x.ts"],
 		]);
+		// #2450: the mutation context names the specific LSP operation
+		// (executeCommand vs rename) instead of a generic "lsp-edit" tag, so the
+		// eventual change-log receipt tells them apart.
 		expect(executeCall?.[3]).toMatchObject({
 			correlationId: "exec-apply",
-			tool: "lsp_navigation",
-			source: "lsp-edit",
+			tool: "lsp_navigation:executeCommand",
+			source: "lsp-execute-command",
 		});
 	});
 
@@ -1277,6 +1284,108 @@ describe("lsp_navigation tool", () => {
 			);
 			expect(result.isError).toBe(true);
 			expect(result.details?.failureKind).toBe("lsp_error");
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
+	});
+
+	it("#2450: a two-file rename leaves both files in turn-state.json with LSP-rename provenance", async () => {
+		const tmpDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-nav-2450-"),
+		);
+		const fileA = path.join(tmpDir, "a.ts");
+		const fileB = path.join(tmpDir, "b.ts");
+		fs.writeFileSync(fileA, "const oldName = 1;\n");
+		fs.writeFileSync(fileB, "import { oldName } from './a';\n");
+
+		const runtime = new RuntimeCoordinator();
+		runtime.projectRoot = tmpDir;
+		runtime.setTelemetryIdentity({ sessionId: "s-2450-rename" });
+		runtime.beginTurn();
+		const cacheManager = new CacheManager(false);
+
+		const tool = createLspNavigationTool((flag) => flag === "lens-lsp", {
+			runtime: runtime as never,
+			cacheManager,
+			readGuard: { recordWritten: () => {} },
+			dbg: () => {},
+		});
+
+		(mocked.service as { rename: ReturnType<typeof vi.fn> }).rename = vi
+			.fn()
+			.mockResolvedValue({
+				changes: {
+					[pathToFileURL(fileA).href]: [
+						{
+							range: {
+								start: { line: 0, character: 6 },
+								end: { line: 0, character: 13 },
+							},
+							newText: "newName",
+						},
+					],
+					[pathToFileURL(fileB).href]: [
+						{
+							range: {
+								start: { line: 0, character: 9 },
+								end: { line: 0, character: 16 },
+							},
+							newText: "newName",
+						},
+					],
+				},
+			});
+
+		try {
+			const result = await tool.execute(
+				"rename-two-files",
+				{
+					operation: "rename",
+					path: fileA,
+					line: 1,
+					character: 7,
+					newName: "newName",
+					apply: true,
+				},
+				new AbortController().signal,
+				null,
+				{ cwd: tmpDir },
+			);
+
+			expect(result.isError).toBeUndefined();
+			expect(fs.readFileSync(fileA, "utf-8")).toBe("const newName = 1;\n");
+			expect(fs.readFileSync(fileB, "utf-8")).toBe(
+				"import { newName } from './a';\n",
+			);
+
+			// Both files land in turn-state.json — not just whichever one the
+			// agent had already read/written — BEFORE any turn-boundary sweep.
+			const turnFiles = cacheManager.readTurnState(tmpDir).files ?? {};
+			const keys = Object.keys(turnFiles);
+			expect(keys).toHaveLength(2);
+			for (const file of [fileA, fileB]) {
+				const key = keys.find(
+					(k) =>
+						normalizeMapKey(file).endsWith(k) || k === normalizeMapKey(file),
+				);
+				expect(key, `expected a turn-state entry for ${file}`).toBeDefined();
+				const entry = turnFiles[key as string];
+				// Real ranges from the computed fileDetails — never the {1,1}
+				// resource-op default a text edit should never fall back to.
+				expect(entry.modifiedRanges).toEqual([{ start: 1, end: 1 }]);
+			}
+
+			// The receipt names the LSP operation — "lsp-rename" — instead of the
+			// generic "lsp-edit" tag every LSP mutation used to collapse onto.
+			const changes = readChangesSince(tmpDir, 0);
+			expect(changes).toHaveLength(2);
+			expect(changes.map((c) => c.source)).toEqual([
+				"lsp-rename",
+				"lsp-rename",
+			]);
+			expect(new Set(changes.map((c) => c.filePath))).toEqual(
+				new Set([fileA, fileB].map((f) => path.resolve(f))),
+			);
 		} finally {
 			removeTempDirSync(tmpDir);
 		}
