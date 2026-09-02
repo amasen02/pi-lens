@@ -62,7 +62,11 @@ instructions say so.
    `finding-delivery-gate`, `session-state-conformance`,
    `bounded-telemetry-sweep`, `bus-producer-coverage`, `deps-centralization`,
    `freshness-sweep`, `managed-tool-seam-coverage`, `profiling-coverage`,
-   `module-instance-coverage`, `sweep-floor-coverage`. The full suite is CI's
+   `module-instance-coverage`, `sweep-floor-coverage` — and that list is a
+   floor, not the set: run EVERY `tests/config/*.test.ts` sweep regardless of
+   which tree it walks (`git-fixture-governance` and `lsp-spawn-heavy-coverage`
+   walk `scripts/` and `tests/`; #2438 shipped red because a scripts-only PR
+   read the clients/-walking list as not applying). The full suite is CI's
    job.
 6. If the issue asks for a class sweep, run it and report coverage honestly:
    what you searched, what you found, what you deliberately left.
