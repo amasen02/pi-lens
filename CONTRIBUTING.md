@@ -88,7 +88,7 @@ This avoids spending time on a direction the maintainers may not accept.
 
 - [ ] The change has a clear purpose and a focused diff
 - [ ] New logic has tests (happy path, edge cases, regression test for bugs)
-- [ ] `npm run lint` passes (`tsc` type-checks the whole repo including tests)
+- [ ] `npm run lint` passes (`tsc` type-checks the whole repo including tests, plus `oxlint` via `npm run lint:js` over plain `.mjs`/`.cjs`/`.js`)
 - [ ] Targeted test files for the touched seams pass locally after `npm run build`; the full suite is CI's job
 - [ ] `npm run build:dist` succeeds if you changed code under `clients/`, `commands/`, `tools/`, or `index.ts`
 - [ ] `package-lock.json` is in sync with `package.json` (run `npm install` after dep changes)

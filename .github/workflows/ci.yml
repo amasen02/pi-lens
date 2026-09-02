@@ -229,7 +229,11 @@ jobs:
       - name: Audit production dependencies
         run: npm audit --omit=dev --audit-level=high
 
-      - name: TypeScript lint
+      # `npm run lint` chains tsc (the TS project) with `lint:js` (oxlint over
+      # scripts/**/*.mjs, root *.mjs, tests/**/*.mjs, and other non-TS JS) —
+      # #2439: tsc alone never covered plain .mjs, so an undefined identifier
+      # there passed both this step and CI.
+      - name: TypeScript & JS lint
         run: npm run lint
 
       # Catches accidental duplicate ast-grep rule bodies across language

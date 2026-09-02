@@ -40,7 +40,7 @@ for (const dir of TARGET_DIRS) {
 			.split("\n")
 			.filter(Boolean);
 		pyFiles.push(...found);
-	} catch (e) {}
+	} catch {}
 }
 
 console.log(`Found ${pyFiles.length} Python files (including tests)`);
@@ -77,7 +77,7 @@ for (let i = 0; i < pyFiles.length; i++) {
 					text: f.text?.slice(0, 120) ?? "",
 				});
 			}
-		} catch (e) {}
+		} catch {}
 	}
 }
 
