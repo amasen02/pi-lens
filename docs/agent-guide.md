@@ -196,6 +196,15 @@ pi-lens writes to files **outside your own tool calls** (`docs/features.md`
   Deferred is the default for every edit-shaped tool pi-lens cannot place,
   because formatting between the steps of a multi-call rewrite fights the tool
   that is still writing.
+- **A tool whose shape is unrecognized too:** pi-lens watches instead of
+  guessing (`clients/observed-mutation.ts`). A call that names a file gets a
+  bounded pre/post snapshot, anything that changed is replayed through the same
+  chain, and the tool is then remembered as mutating — for this session on the
+  first sighting, persisted under the project's data directory on the second,
+  so a later session classifies it by name with no snapshot. A call that names
+  no file is caught at `agent_settled` by a hash check over the files pi-lens
+  has already read, written, diagnosed or opened on a language server; a file it
+  has never seen has no baseline, so that last-resort net does not cover it.
 - The conservative actionable-warnings autofix (LSP quickfixes, hard-capped)
   is unchanged: it always runs at `agent_end`.
 

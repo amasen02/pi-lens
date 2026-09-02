@@ -126,6 +126,18 @@ export const BOUNDED_TELEMETRY_PHASES = [
 	"lsp_scanner_coverage_gap",
 	/** #2358: a busy CPU discriminator deferred notify-stall teardown. */
 	"lsp_notify_stall_cpu_busy",
+	/**
+	 * #2430: an observational pre/post snapshot was declined or cut short — the
+	 * per-turn budget was already spent, the capture timed out, or the turn was
+	 * aborted. Every unclassified tool call in a busy turn can reach this, so
+	 * it is capped per turn with the ledger holding the exact count.
+	 */
+	"observed_mutation_budget_exhausted",
+	/**
+	 * #2430: the `agent_settled` tracked-file sweep could not complete within
+	 * its bound. Once per settle at most, capped for the same reason.
+	 */
+	"observed_sweep_skipped_budget",
 ] as const;
 
 export type BoundedPhase = (typeof BOUNDED_TELEMETRY_PHASES)[number];

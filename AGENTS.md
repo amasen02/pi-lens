@@ -2449,7 +2449,8 @@ state → deferred queue → `agent_settled` drain) used to hang below fifteen
 independent literal comparisons, so a host or extension edit tool under any
 other name was dropped before the first bookkeeping call, with its path already
 resolved. The seam answers with a `kind` (`write` or `edit`), a `provenance`
-(`builtin`, `bash-derived`, `declared`, `bridge`), and any lines a shape adapter
+(`builtin`, `bash-derived`, `declared`, `bridge`, plus `observed`, `learned` and
+`settled-sweep` from the #2430 net below), and any lines a shape adapter
 resolved. It recognizes pi's built-ins from a table and a third-party tool from
 its INPUT SHAPE through the ordered `MUTATION_SHAPE_ADAPTERS` registry, where
 the first non-`undefined` result wins. A new mutating-tool shape is a new
@@ -2462,6 +2463,35 @@ The write-side counterpart of the read bridge is `clients/mutation-bridge.ts`:
 an in-process producer that writes a file outside the tool-event path calls
 `recordMutation` at `Symbol.for("pi-lens:mutation-bridge")` and gets the same
 bookkeeping; `ast_grep_replace apply:true` is the in-repo consumer.
+
+**OBSERVATIONAL MUTATION NET (#2430):** the name table and the shape registry
+are finite and the population of third-party edit tools is not, so a fourth
+tier WATCHES. When `classifyMutatingTool` returns `undefined` for a call whose
+input still carries a path-shaped field, `clients/observed-mutation.ts` takes a
+bounded pre-snapshot (that path's directory plus the tracked-file set, never a
+workspace walk) and diffs it at the `tool_result`; whatever changed is replayed
+through the mutation bridge as `kind: "edit"` with `provenance: "observed"` and
+`editRanges` derived from the read-guard's stored per-line hashes.
+`clients/mutation-attribution.ts` then remembers the tool: `provenance:
+"learned"` for the session on the first observation, persisted under
+`getProjectDataDir(cwd)` on the second, so later sessions classify it by name
+with NO snapshot — and one `unclassified-mutating-tool` degradation per tool
+keeps the registry gap visible. A tool that names no file is caught by the
+`agent_settled` sweep, which runs BEFORE the deferred drain, hash-checks only
+files pi-lens has already read, written, diagnosed or opened on a language
+server, and re-baselines after the drain so pi-lens's own formatter output is
+never read as third-party drift; a file it has never seen has no baseline and is
+not covered, by design. Do not add a second scanner: the snapshot and diff
+primitives are `captureFileStatsForPaths` / `diffFileStats` in
+`clients/opaque-mutation-scan.ts`, shared with the #2000 bash recovery so the
+two paths cannot disagree about what "changed" means. Every capture carries a
+timeout AND an abort race, a file cap, a hash-byte budget and a per-turn
+wall-clock budget; exceeding any of them writes a bounded
+`observed_mutation_budget_exhausted` record and an `observed-mutation-budget`
+ledger tally, never a silent skip. Steady-state cost is zero for a classified
+`write`/`edit` (the net is gated on `classifyMutatingTool` having returned
+`undefined`) and ~44ms for one armed observation, paid at most twice per tool
+name per session.
 `tests/clients/mutating-tool-classification.test.ts` greps `clients/`, `tools/`
 and `index.ts` and fails when a mutation decision reappears outside the seam —
 `===`/`!==`/`==`/`!=` against `"write"`/`"edit"`/`"multiedit"` (any

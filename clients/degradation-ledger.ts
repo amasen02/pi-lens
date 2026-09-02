@@ -22,6 +22,21 @@ import {
 export { LEDGER_FIELD_MAX, truncateForLedger };
 
 export type DegradationKind =
+	/**
+	 * #2430: a tool mutated a tracked file but matched no built-in name and no
+	 * mutation shape adapter, so pi-lens could only find the change by diffing
+	 * the disk around the call. Subject is the tool name, recorded ONCE per
+	 * tool, so a session report names every gap in the classification registry
+	 * instead of leaving the observational net's work invisible.
+	 */
+	| "unclassified-mutating-tool"
+	/**
+	 * #2430: an observational capture — the pre-snapshot, the post-diff, or the
+	 * `agent_settled` sweep — hit its per-turn wall-clock budget, timed out, or
+	 * was aborted. The net then has NO opinion about that call, which must be
+	 * visible rather than read as "nothing changed" (catalog shape 10).
+	 */
+	| "observed-mutation-budget"
 	| "trust-refusal"
 	| "mode-suppression"
 	| "ts-idle-eviction"

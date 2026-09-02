@@ -19,7 +19,15 @@ import {
 import { normalizeForGuardMatch } from "./host-edit-normalize.js";
 import { retargetReplacementIndentation } from "./indent-retarget.js";
 import { LANGUAGE_POLICY } from "./language-policy.js";
-import { classifyMutatingTool } from "./mutating-tool.js";
+import {
+	classifyMutatingTool,
+	readMutationPathField,
+} from "./mutating-tool.js";
+import {
+	armObservedMutation,
+	OBSERVED_TRACKED_MAX_FILES,
+} from "./observed-mutation.js";
+import { collectTrackedPaths } from "./observed-mutation-sources.js";
 import type { LSPShutdownOptions } from "./lsp/client.js";
 import { getLSPService } from "./lsp/index.js";
 import {
@@ -319,6 +327,12 @@ interface ToolCallEvent {
 
 interface ToolCallCtx {
 	cwd?: string;
+	/**
+	 * This turn's abort signal, when the host supplies one. #2430 races every
+	 * observational snapshot against it so an interrupted turn cancels the walk
+	 * instead of finishing it for nobody.
+	 */
+	signal?: AbortSignal;
 	ui?: {
 		setStatus: (id: string, text: string | undefined) => void;
 		theme: {
@@ -590,6 +604,46 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 			}
 		}
 	}
+	// #2430: the observational net. A call the seam could NOT classify, whose
+	// input still names a file, gets a bounded pre-snapshot so the tool_result
+	// side can see whether it actually wrote anything. `bash` is excluded
+	// because it already has its own (wider, git-first) baseline above, and a
+	// classified mutation never reaches here at all — that is what keeps the
+	// cost of a plain write/edit at zero.
+	//
+	// The eligibility check inside `armObservedMutation` is a map lookup, so an
+	// ineligible tool (already attributed, or twice observed clean) pays that
+	// and nothing else.
+	if (
+		mutation === undefined &&
+		toolName !== "bash" &&
+		!getFlag("no-read-guard")
+	) {
+		const observedRawPath = readMutationPathField(event);
+		const observedPath = observedRawPath
+			? resolveToolCallFilePath(observedRawPath, ctx.cwd, runtime.projectRoot)
+					?.path
+			: undefined;
+		if (observedPath) {
+			await armObservedMutation({
+				toolCallId: resolveToolCallCorrelationId(event),
+				toolName,
+				targetPath: observedPath,
+				cwd: ctx.cwd ?? runtime.projectRoot,
+				sessionGeneration: runtime.sessionGeneration,
+				turnIndex: runtime.turnIndex,
+				getTrackedPaths: () =>
+					collectTrackedPaths({
+						readGuard: runtime.readGuard,
+						cwd: ctx.cwd ?? runtime.projectRoot,
+						limit: OBSERVED_TRACKED_MAX_FILES,
+					}),
+				signal: ctx.signal,
+				dbg,
+			});
+		}
+	}
+
 	if (
 		getFlag("lens-guard") &&
 		isGitCommitOrPushAttempt(toolName, event.input)

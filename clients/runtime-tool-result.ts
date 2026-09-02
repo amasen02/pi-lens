@@ -45,6 +45,15 @@ import {
 	type MutatingToolClassification,
 	type MutationKind,
 } from "./mutating-tool.js";
+import {
+	noteMutationHandled,
+	settleObservedMutation,
+} from "./observed-mutation.js";
+import {
+	replayThroughMutationBridge,
+	storedLineHashesFor,
+} from "./observed-mutation-sources.js";
+import { getAmbientAbortSignal } from "./safe-spawn.js";
 import { resolveToolCallCorrelationId } from "./tool-event.js";
 import {
 	boundedIndexesForCount,
@@ -926,6 +935,34 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		sessionId: deps.sessionId,
 		recognizeOnly: true,
 	});
+	// #2430: settle the observational baseline BEFORE the classification gate
+	// returns. On the FIRST call of an unknown tool nothing below this line will
+	// run — that is the bug — so the disk diff is the only thing that can put
+	// the file in `turn-state.json`, and it replays through the mutation bridge
+	// to get the identical bookkeeping a `write` gets. From the SECOND call the
+	// attribution classifies the tool by name, no snapshot is armed, and this
+	// settle is a single map miss.
+	if (!getFlag("no-read-guard")) {
+		const observed = await settleObservedMutation({
+			toolCallId: resolveToolCallCorrelationId(event),
+			toolName: event.toolName,
+			sessionGeneration: runtime.sessionGeneration,
+			turnIndex: runtime.turnIndex,
+			signal: getAmbientAbortSignal(),
+			record: replayThroughMutationBridge,
+			getStoredLineHashes: (candidate) =>
+				storedLineHashesFor(deps.readGuard, candidate),
+			isRecordable: (candidate) =>
+				!isExternalOrVendorFile(candidate, workspaceRoot) &&
+				!isPathIgnoredByProject(candidate, workspaceRoot, false),
+			dbg,
+		});
+		if (observed.replayed > 0) {
+			dbg(
+				`tool_result: observed ${observed.replayed} mutation(s) from unclassified tool "${event.toolName}"`,
+			);
+		}
+	}
 	if (mutation === undefined) {
 		dbg(
 			`tool_result: skipped turn tracking - toolName="${event.toolName}" is not a classified mutation`,
@@ -946,6 +983,10 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		);
 		return;
 	}
+	// #2430: a classified mutation is accounted for by the chain below, so the
+	// `agent_settled` sweep must re-baseline this file rather than report the
+	// same bytes as unexplained drift.
+	noteMutationHandled(filePath);
 	const readGuardCorrelationId = getReadGuardCorrelationId(event);
 	const resultDetails = (event.details ?? {}) as Record<string, unknown>;
 	const isPartialApplyResult = resultDetails.piLensPartialApply === true;

@@ -1,0 +1,301 @@
+/**
+ * #2430 acceptance — an unknown tool with a `path` field reaches the pipeline.
+ *
+ * These cases drive the production entry points (`handleToolCall`,
+ * `handleToolResult`) against a real `CacheManager`, a real
+ * `RuntimeCoordinator` and a real mutation bridge, and assert on
+ * `turn-state.json` and the change log. Nothing here imports a helper that
+ * only the fix defines, so each case fails on an ASSERTION against pre-fix
+ * code rather than on a missing module.
+ */
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import { CacheManager } from "../../clients/cache-manager.js";
+import { classifyMutatingTool } from "../../clients/mutating-tool.js";
+import {
+	MUTATION_BRIDGE_KEY,
+	registerMutationBridge,
+} from "../../clients/mutation-bridge.js";
+import { resetMutationAttribution } from "../../clients/mutation-attribution.js";
+import { resetObservedMutationNet } from "../../clients/observed-mutation.js";
+import { readChangesSince } from "../../clients/project-changes.js";
+import { countFileLines } from "../../clients/read-guard-tool-lines.js";
+import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
+import { handleToolCall } from "../../clients/runtime-tool-call.js";
+import { handleToolResult } from "../../clients/runtime-tool-result.js";
+import { setupTestEnvironment } from "./test-utils.js";
+
+vi.mock("../../clients/pipeline.js", () => ({
+	runPipeline: vi.fn(async () => ({
+		output: "",
+		hasBlockers: false,
+		isError: false,
+		fileModified: false,
+	})),
+}));
+
+vi.mock("../../clients/lsp/index.js", () => ({
+	getLSPService: () => ({
+		touchFile: vi.fn(async () => undefined),
+		getWarmClientForFile: vi.fn(async () => undefined),
+		getOpenDocumentPaths: () => [],
+	}),
+	resetLSPService: () => {},
+	notifyExternalFileChange: vi.fn(async () => undefined),
+}));
+
+vi.mock("../../clients/bootstrap.js", () => ({
+	loadBootstrapClients: async () => ({
+		complexityClient: {
+			isSupportedFile: () => false,
+			analyzeFile: async () => null,
+		},
+		biomeClient: {},
+		ruffClient: {},
+		metricsClient: {},
+		agentBehaviorClient: { recordToolCall: () => [], formatWarnings: () => "" },
+	}),
+}));
+
+const SOURCE = ["const a = 1;", "const b = 2;", "const c = 3;", ""].join("\n");
+
+/**
+ * The bridge is a process-global, first-wins singleton, so it is mounted once
+ * per test FILE (vitest's forks pool gives each file its own process) over
+ * mutable holders the individual cases swap.
+ */
+let liveRuntime: RuntimeCoordinator | undefined;
+let liveCacheManager: CacheManager | undefined;
+let liveRoot = "";
+
+if (!(MUTATION_BRIDGE_KEY in (globalThis as object))) {
+	registerMutationBridge({
+		getRuntime: () => liveRuntime as never,
+		getCacheManager: () => liveCacheManager as never,
+		getProjectRoot: () => liveRoot,
+		getDispatchCwd: () => liveRoot,
+		countFileLines,
+		isRecordable: () => true,
+		dbg: () => {},
+	});
+}
+
+beforeEach(() => {
+	resetObservedMutationNet();
+	resetMutationAttribution();
+});
+
+function patchEvent(
+	filePath: string,
+	toolCallId: string,
+): Record<string, unknown> {
+	// A tool pi-lens has never met: an unknown NAME, and an input shape no
+	// adapter in `MUTATION_SHAPE_ADAPTERS` recognizes. The only thing the seam
+	// can see is that it names a file.
+	return {
+		toolName: "patch_file",
+		toolCallId,
+		input: { path: filePath, patch: "@@ -2 +2 @@" },
+		content: [{ type: "text", text: "patched" }],
+	};
+}
+
+function toolCallDeps(args: {
+	event: Record<string, unknown>;
+	cwd: string;
+	runtime: RuntimeCoordinator;
+	cacheManager: CacheManager;
+}): Parameters<typeof handleToolCall>[0] {
+	return {
+		event: args.event,
+		ctx: { cwd: args.cwd },
+		lensEnabled: true,
+		getFlag: (name: string) => name === "no-lsp",
+		dbg: () => {},
+		runtime: args.runtime,
+		cacheManager: args.cacheManager,
+		ensureLSPConfigInitialized: async () => {},
+		updateLspStatus: () => {},
+		resetLSPService: () => {},
+	} as unknown as Parameters<typeof handleToolCall>[0];
+}
+
+function toolResultDeps(args: {
+	event: Record<string, unknown>;
+	runtime: RuntimeCoordinator;
+	cacheManager: CacheManager;
+}): Parameters<typeof handleToolResult>[0] {
+	return {
+		event: args.event,
+		getFlag: (name: string) => name === "no-lsp",
+		dbg: () => {},
+		runtime: args.runtime,
+		cacheManager: args.cacheManager,
+		biomeClient: {},
+		ruffClient: {},
+		metricsClient: {},
+		resetLSPService: () => {},
+		agentBehaviorRecord: () => [],
+		formatBehaviorWarnings: () => "",
+	} as unknown as Parameters<typeof handleToolResult>[0];
+}
+
+function newSession(tmpDir: string): {
+	runtime: RuntimeCoordinator;
+	cacheManager: CacheManager;
+} {
+	const cacheManager = new CacheManager(false);
+	const runtime = new RuntimeCoordinator();
+	runtime.projectRoot = tmpDir;
+	runtime.setTelemetryIdentity({ sessionId: "s-2430" });
+	runtime.beginTurn();
+	liveRuntime = runtime;
+	liveCacheManager = cacheManager;
+	liveRoot = tmpDir;
+	return { runtime, cacheManager };
+}
+
+describe("#2430 acceptance 1 — the FIRST call of an unknown tool lands in turn state", () => {
+	it("observes the write and records it as an edit with the tool's own attribution", async () => {
+		const env = setupTestEnvironment("pi-lens-2430-first-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		try {
+			const filePath = path.join(env.tmpDir, "observed.ts");
+			fs.writeFileSync(filePath, SOURCE);
+			const { runtime, cacheManager } = newSession(env.tmpDir);
+
+			const event = patchEvent(filePath, "call-2430-first");
+			await handleToolCall(
+				toolCallDeps({ event, cwd: env.tmpDir, runtime, cacheManager }),
+			);
+
+			// The unknown tool executes and rewrites line 2.
+			fs.writeFileSync(
+				filePath,
+				["const a = 1;", "const b = 222;", "const c = 3;", ""].join("\n"),
+			);
+
+			await handleToolResult(toolResultDeps({ event, runtime, cacheManager }));
+
+			const turnState = cacheManager.readTurnState(env.tmpDir);
+			const files = Object.keys(turnState.files ?? {});
+			expect(files.length).toBeGreaterThan(0);
+			expect(files.some((entry) => entry.includes("observed.ts"))).toBe(true);
+
+			// The change log names the tool rather than collapsing onto agent-edit.
+			expect(readChangesSince(env.tmpDir, 0)).toMatchObject([
+				{ source: "agent-tool:patch_file" },
+			]);
+
+			// Deferred, never immediate — an unknown edit-shaped tool takes the
+			// safe timing, so the agent_settled drain formats it.
+			expect(runtime.pendingDeferredFormatCount).toBeGreaterThan(0);
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+});
+
+describe("#2430 acceptance 2 — the SECOND call is classified without a snapshot", () => {
+	it("classifies the same tool by name once one mutation has been observed", async () => {
+		const env = setupTestEnvironment("pi-lens-2430-second-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		try {
+			const filePath = path.join(env.tmpDir, "twice.ts");
+			fs.writeFileSync(filePath, SOURCE);
+			const { runtime, cacheManager } = newSession(env.tmpDir);
+
+			const first = patchEvent(filePath, "call-2430-a");
+			// Before any observation the seam has no opinion at all: this is the
+			// #2423 gap #2430 exists to close.
+			expect(classifyMutatingTool(first)).toBeUndefined();
+
+			await handleToolCall(
+				toolCallDeps({ event: first, cwd: env.tmpDir, runtime, cacheManager }),
+			);
+			fs.writeFileSync(filePath, `${SOURCE}const d = 4;\n`);
+			await handleToolResult(
+				toolResultDeps({ event: first, runtime, cacheManager }),
+			);
+
+			const second = patchEvent(filePath, "call-2430-b");
+			expect(classifyMutatingTool(second)).toMatchObject({
+				toolName: "patch_file",
+				kind: "edit",
+				provenance: "learned",
+			});
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+});
+
+describe("#2430 — the net does not arm for a classified tool", () => {
+	it("takes no snapshot for a plain `write`, so the hot path is unchanged", async () => {
+		const env = setupTestEnvironment("pi-lens-2430-hotpath-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		try {
+			const filePath = path.join(env.tmpDir, "written.ts");
+			fs.writeFileSync(filePath, SOURCE);
+			const { runtime, cacheManager } = newSession(env.tmpDir);
+
+			const statSpy = vi.spyOn(fs.promises, "stat");
+			await handleToolCall(
+				toolCallDeps({
+					event: {
+						toolName: "write",
+						toolCallId: "call-2430-write",
+						input: { path: filePath, content: SOURCE },
+					},
+					cwd: env.tmpDir,
+					runtime,
+					cacheManager,
+				}),
+			);
+			const observedStats = statSpy.mock.calls.length;
+			statSpy.mockRestore();
+
+			// The seam classifies `write`, so `armObservedMutation` is never
+			// reached and the snapshot's stat storm never happens. Anything above
+			// a handful here means the net armed for a classified tool.
+			expect(observedStats).toBeLessThan(4);
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+});
+
+describe("#2430 item 3 — the settled sweep is wired ahead of the deferred drain", () => {
+	it("runs the sweep before the drain and re-baselines after it", () => {
+		// A source-level wiring assertion, for the same reason
+		// `tests/index-loop-block-wiring.test.ts` uses one: `agent_settled` is a
+		// host event this suite cannot fire, and the ORDER is the contract —
+		// a sweep after the drain would queue every drifted file one whole run
+		// late.
+		const indexSource = fs.readFileSync(
+			path.join(import.meta.dirname, "..", "..", "index.ts"),
+			"utf-8",
+		);
+		const sweepAt = indexSource.indexOf(
+			"await runObservedSettledSweepSafely(ctx)",
+		);
+		const drainAt = indexSource.indexOf("await runDeferredMutationDrain(ctx)");
+		const refreshAt = indexSource.indexOf(
+			"await refreshObservedLedgerSafely(ctx)",
+		);
+		expect(sweepAt).toBeGreaterThan(-1);
+		expect(drainAt).toBeGreaterThan(sweepAt);
+		expect(refreshAt).toBeGreaterThan(drainAt);
+	});
+});

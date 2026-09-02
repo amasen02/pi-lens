@@ -112,6 +112,48 @@ export interface CaptureOptions {
 	withHashes?: boolean;
 }
 
+/**
+ * Stat (and optionally hash) an EXPLICIT file list into a snapshot.
+ *
+ * Extracted from `captureFileStats` so the observational net (#2430) reuses
+ * exactly this identity function — same key form, same hash algorithm, same
+ * byte budget — instead of hand-rolling a second scanner whose diff could
+ * disagree with `diffFileStats`. The walk-and-cap half stays in
+ * `captureFileStats`; a caller that already knows its file set skips it.
+ *
+ * `hashBudgetBytes` defaults to {@link OPAQUE_HASH_BUDGET_BYTES}. A file past
+ * the budget simply carries no hash, and its comparison degrades to
+ * mtime+size — the same documented limitation the walking capture has.
+ */
+export async function captureFileStatsForPaths(
+	files: Iterable<string>,
+	options: CaptureOptions & { hashBudgetBytes?: number } = {},
+): Promise<FileStatsSnapshot> {
+	const hashBudget = options.hashBudgetBytes ?? OPAQUE_HASH_BUDGET_BYTES;
+	const snapshot: FileStatsSnapshot = new Map();
+	let hashBytesSpent = 0;
+	for (const file of files) {
+		try {
+			const stat = await fs.promises.stat(file);
+			if (!stat.isFile()) continue;
+			const entry: FileStatEntry = {
+				mtimeMs: stat.mtimeMs,
+				size: stat.size,
+			};
+			if (options.withHashes && hashBytesSpent + stat.size <= hashBudget) {
+				entry.hash = createHash("sha256")
+					.update(await fs.promises.readFile(file))
+					.digest("hex");
+				hashBytesSpent += stat.size;
+			}
+			snapshot.set(normalizeMapKey(path.resolve(file)), entry);
+		} catch {
+			// Vanished mid-walk: absent from both snapshots = unchanged-by-absence.
+		}
+	}
+	return snapshot;
+}
+
 export async function captureFileStats(
 	root: string,
 	options: CaptureOptions = {},
@@ -133,29 +175,7 @@ export async function captureFileStats(
 				scannedCount: files.length,
 			};
 		}
-		const snapshot: FileStatsSnapshot = new Map();
-		let hashBytesSpent = 0;
-		for (const file of files) {
-			try {
-				const stat = await fs.promises.stat(file);
-				const entry: FileStatEntry = {
-					mtimeMs: stat.mtimeMs,
-					size: stat.size,
-				};
-				if (
-					options.withHashes &&
-					hashBytesSpent + stat.size <= OPAQUE_HASH_BUDGET_BYTES
-				) {
-					entry.hash = createHash("sha256")
-						.update(await fs.promises.readFile(file))
-						.digest("hex");
-					hashBytesSpent += stat.size;
-				}
-				snapshot.set(normalizeMapKey(path.resolve(file)), entry);
-			} catch {
-				// Vanished mid-walk: absent from both snapshots = unchanged-by-absence.
-			}
-		}
+		const snapshot = await captureFileStatsForPaths(files, options);
 		return { snapshot, scannedCount: snapshot.size };
 	} catch {
 		return { unknownReason: "walk-failed", scannedCount: 0 };
