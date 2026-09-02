@@ -15,6 +15,15 @@ instructions say so.
    acceptance criteria are the contract. Read AGENTS.md, especially
    "Recurring defect shapes — screen against these BEFORE you write code",
    and screen your own design against it before writing.
+   **Premise first.** When the issue reports a defect, reproduce it from the
+   PRODUCTION call path before writing any fix — drive the real context
+   builder / dispatcher / loader, never a hand-fed input shaped to hit the
+   bug. If it does not reproduce, the deliverable is the enforced invariant
+   (assertion + a test through the real path) and a report saying so; do not
+   build machinery for a collision that cannot occur. #2490 shipped a cwd
+   fold for a path-only key that is always absolute in production, and the
+   fold itself broke the cascade in every monorepo. Same rung as AGENTS.md's
+   minimalism ladder: "does it need to exist".
 2. `git fetch origin master`; branch `fix/<N>-<short-slug>` from
    `origin/master`. Check which other open PRs touch your files
    (`gh pr list`, `gh pr diff`) and design to compose, not collide; flag
@@ -62,15 +71,13 @@ instructions say so.
    same behavior), PLUS every directory-scanning governance suite: those walk
    `clients/` and fire on any new or edited file, so a symbol grep structurally
    cannot find them (PR #2107 lesson — two sweeps fired in CI that the symbol
-   grep missed). The set today: `delivery-surface-ratchet`,
-   `finding-delivery-gate`, `session-state-conformance`,
-   `bounded-telemetry-sweep`, `bus-producer-coverage`, `deps-centralization`,
-   `freshness-sweep`, `managed-tool-seam-coverage`, `profiling-coverage`,
-   `module-instance-coverage`, `sweep-floor-coverage` — and that list is a
-   floor, not the set: run EVERY `tests/config/*.test.ts` sweep regardless of
-   which tree it walks (`git-fixture-governance` and `lsp-spawn-heavy-coverage`
-   walk `scripts/` and `tests/`; #2438 shipped red because a scripts-only PR
-   read the clients/-walking list as not applying). The full suite is CI's
+   grep missed). Do NOT hand-pick them from memory — #2470 round 3 shipped
+   with Unit tests red because its "governance set" of eleven files omitted
+   `generation-guard-sweep`. Select them mechanically, every time:
+   `ls tests/clients/*-{sweep,ratchet,conformance,coverage,gate,governance}*.test.ts`
+   plus EVERY `tests/config/*.test.ts` (those walk `scripts/` and `tests/`
+   too; #2438 shipped red because a scripts-only PR read the clients/-walking
+   list as not applying). Quote the file count you ran in the PR body. The full suite is CI's
    job.
 6. If the issue asks for a class sweep, run it and report coverage honestly:
    what you searched, what you found, what you deliberately left.
