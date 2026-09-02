@@ -76,26 +76,44 @@ const EXEMPT_SITES: Readonly<Record<string, string>> = {
 	'clients/safe-spawn.ts:"/F", "/T", "/PID"':
 		"killPidTreeSync runs from process exit and signal handlers. The process is already tearing down, so there is no event loop left to protect, and a timeout would only orphan the kill it was asked to perform.",
 	"clients/safe-spawn.ts:spawnCmd, spawnArgs,":
-		"safeSpawn's Windows-resolved-path spawnSync fallback (the PATH+PATHEXT resolved-path branch) spreads the CALLER's options, which is where the timeout comes from. Its three in-repo callers: isCommandAvailable (safe-spawn.ts:2218, timeout: 5000), findCommand (safe-spawn.ts:2230, timeout: 5000), and test-runner-client.ts's detectRunner (test-runner-client.ts:671, timeout: 2000).",
+		"safeSpawn's Windows-resolved-path spawnSync fallback (the PATH+PATHEXT resolved-path branch) spreads the CALLER's options, which is where the timeout comes from. Its three in-repo callers: isCommandAvailable and findCommand in safe-spawn.ts (timeout: 5000 each), and test-runner-client.ts's detectRunner (timeout: 2000).",
 	"clients/safe-spawn.ts:// Explicit override, not just the spread above":
-		"safeSpawn's plain-command spawnSync fallback (the non-Windows-resolved branch) spreads the CALLER's options for the identical reason as the Windows-resolved-path sibling above: the timeout comes from the caller. Same three in-repo callers — isCommandAvailable and findCommand (timeout: 5000 each) and test-runner-client.ts's detectRunner (timeout: 2000).",
+		"safeSpawn's plain-command spawnSync fallback (the non-Windows-resolved branch) spreads the CALLER's options for the identical reason as the Windows-resolved-path sibling above: the timeout comes from the caller. Same three in-repo callers — isCommandAvailable and findCommand in safe-spawn.ts (timeout: 5000 each), and test-runner-client.ts's detectRunner (timeout: 2000).",
 };
 
 /**
  * Slice from `(` to its matching `)`, so a multi-line options object is read
  * whole rather than by a line-bounded regex that a formatted call defeats.
+ *
+ * The depth scan walks `masked` (comment/string-blanked, offset-preserving —
+ * see `stripSource` in `analyzeFile`) and the returned slice is taken from
+ * `raw` at the same offsets. #2487 review round 4 F1: an earlier version
+ * scanned `raw` directly, so a literal `(` inside a string or comment
+ * ARGUMENT (e.g. `spawnSync(shellPath, ["-c", "grep '(' /etc/hosts"], {...})`)
+ * unbalanced the depth count. The scan never found depth 0 before EOF, so
+ * the "argument list" ran off the end of the call, past the real closing
+ * paren, and could swallow an unrelated LATER call's `timeout:` — silently
+ * reclassifying a genuinely unbounded call as bounded. Scanning `masked`
+ * means a paren inside a string or comment body is blanked out and cannot
+ * perturb the depth count, while the slice still comes from `raw` so an
+ * in-argument comment (like the plain-command safe-spawn fallback's) stays
+ * visible to `exemptionKey`.
  */
-function callArguments(source: string, openParenIndex: number): string {
+function callArguments(
+	masked: string,
+	raw: string,
+	openParenIndex: number,
+): string {
 	let depth = 0;
-	for (let i = openParenIndex; i < source.length; i++) {
-		const ch = source[i];
+	for (let i = openParenIndex; i < masked.length; i++) {
+		const ch = masked[i];
 		if (ch === "(") depth++;
 		else if (ch === ")") {
 			depth--;
-			if (depth === 0) return source.slice(openParenIndex + 1, i);
+			if (depth === 0) return raw.slice(openParenIndex + 1, i);
 		}
 	}
-	return source.slice(openParenIndex + 1);
+	return raw.slice(openParenIndex + 1);
 }
 
 interface CallSite {
@@ -110,10 +128,14 @@ interface CallSite {
 	 * arguments, which is how two textually distinct `spawnSync` calls with
 	 * merely a shared spread (`...(options as SpawnOptions)`) collided on one
 	 * exemption key — the preamble was never the discriminator, the arguments
-	 * always were. Scoping the match to the call's own arguments makes that
-	 * collision structurally impossible: a snippet chosen to be unique
-	 * WITHIN one call's arguments cannot also occur within a sibling call's
-	 * arguments unless the two calls are genuinely identical.
+	 * always were. Scoping the match to the call's own arguments makes THAT
+	 * collision structurally impossible — but only because `callArguments`
+	 * depth-scans the MASKED source (#2487 review round 4 F1): a depth scan
+	 * over raw source is unbalanced by a bare `(` inside a string or comment
+	 * argument, which runs the slice past the real closing paren and can pull
+	 * in unrelated later source (see `callArguments`'s own doc comment).
+	 * "NOTHING outside the parens" holds only because the scan itself is
+	 * paren-blind to string and comment bodies.
 	 */
 	args: string;
 	bounded: boolean;
@@ -156,7 +178,7 @@ function analyzeFile(rel: string, raw: string): CallSite[] {
 		const pattern = new RegExp(`(?<![\\w$.])${fn}\\s*\\(`, "g");
 		for (const match of masked.matchAll(pattern)) {
 			const openParen = masked.indexOf("(", match.index);
-			const args = callArguments(raw, openParen);
+			const args = callArguments(masked, raw, openParen);
 			sites.push({
 				id: `${rel}:${raw.slice(0, match.index).split("\n").length} ${fn}`,
 				file: rel,
@@ -249,6 +271,67 @@ describe("#1980 every synchronous child-process call bounds the event-loop park"
 		// silently cover some future call it was never reasoned about.
 		expect(audit.staleExemptions).toEqual([]);
 		expect(audit.reasonlessExemptions).toEqual([]);
+	});
+});
+
+describe("#2487 review round 4 F1: a paren inside a string/comment argument cannot unbalance the depth scan", () => {
+	// Reviewer's probe against bb752de8's shipped `callArguments`, which
+	// depth-scanned RAW source: a literal `(` inside a string argument (a
+	// shell command line quoting a paren, which is ordinary shell syntax) is
+	// invisible to a naive depth count, so the scan never finds depth 0
+	// before EOF and the "argument list" runs off the end of the real call,
+	// through the rest of the file, and can swallow a later, unrelated
+	// call's `timeout:` — silently reclassifying a genuinely unbounded call
+	// as bounded. A real production fixture (not a hand-fed input): a
+	// `spawnSync` invoking a shell with a quoted parenthesis in its command
+	// string, exactly the shape `clients/safe-spawn.ts` callers pass through
+	// (e.g. a grep pattern), followed by an unrelated bounded call.
+	const FIXTURE_FILE = "clients/safe-spawn.ts";
+	const FIXTURE_SOURCE = [
+		"function runShellProbe() {",
+		'	const result = spawnSync(shellPath, ["-c", "grep \'(\' /etc/hosts"], {',
+		"		shell: false,",
+		"	});",
+		"}",
+		"",
+		"function runBoundedProbe() {",
+		"	spawnSync(otherCmd, otherArgs, { timeout: 5000 });",
+		"}",
+		"",
+	].join("\n");
+
+	it("ATTACK_STRING_PAREN_COLLAPSE: the unbounded call stays unbounded, named by its own file:line", () => {
+		const sites = analyzeFile(FIXTURE_FILE, FIXTURE_SOURCE);
+		expect(sites.map((s) => s.id)).toEqual([
+			"clients/safe-spawn.ts:2 spawnSync", // the shell-probe call — genuinely unbounded
+			"clients/safe-spawn.ts:8 spawnSync", // the bounded call — must stay bounded, not be consumed
+		]);
+		// Pre-fix (bb752de8), the shell-probe call's depth scan is unbalanced
+		// by the `(` inside `"grep '(' /etc/hosts"`, runs off the end of its
+		// own call, and absorbs `runBoundedProbe`'s `{ timeout: 5000 }` into
+		// its own "arguments" — so `bounded` reads true for a call that has
+		// no `timeout:` anywhere in its own parens.
+		const shellProbe = sites.find(
+			(s) => s.id === "clients/safe-spawn.ts:2 spawnSync",
+		);
+		expect(shellProbe?.bounded).toBe(false);
+		expect(shellProbe?.args).not.toContain("timeout");
+
+		const unbounded = sites.filter((s) => !s.bounded);
+		const flagged = unbounded.map((site) => ({
+			key: exemptionKey(site) ?? site.id,
+			detail: site.id,
+		}));
+		const audit = auditRegistry({
+			sweepName: "sync child-process timeout sweep",
+			flagged,
+			registered: [],
+			exemptions: EXEMPT_SITES,
+		});
+		// RED (pre-fix this passes with unaccounted: [] because the call
+		// misreads as bounded) — the unbounded shell-probe call must be
+		// caught, named by its own file:line.
+		expect(audit.unaccounted).toEqual(["clients/safe-spawn.ts:2 spawnSync"]);
 	});
 });
 

@@ -563,6 +563,13 @@ export function auditRegistry(input: RegistryAuditInput): RegistryAudit {
 	// (`...#3`) printed with no file:line, so the natural remediation excused
 	// the wrong call site. Built once, over every entry, first occurrence
 	// wins (a duplicate key's collision is already reported separately, above).
+	//
+	// Used by `unaccounted` ONLY (#2487 review round 4 F2). A stale
+	// exemption's key is, by construction, one `flaggedEntries` never
+	// contains (that is what "stale" means: the scan no longer flags it), so
+	// it can never have an entry in `detailByKey` — calling this lookup for
+	// `staleExemptions` was dead code that always fell through to the bare
+	// key. `staleExemptions` prints the bare key directly below instead.
 	const detailByKey = new Map<string, string>();
 	for (const entry of flaggedEntries) {
 		if (
@@ -597,7 +604,7 @@ export function auditRegistry(input: RegistryAuditInput): RegistryAudit {
 		problems.push(
 			`${input.sweepName}: ${staleExemptions.length} exemption(s) name an item the ` +
 				"scan no longer flags — remove them, a stale exemption is dead weight, not a screen:\n" +
-				staleExemptions.map((item) => `  ${describe(item)}`).join("\n"),
+				staleExemptions.map((item) => `  ${item}`).join("\n"),
 		);
 	}
 

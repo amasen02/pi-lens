@@ -442,6 +442,28 @@ describe("sweep-kit: auditRegistry", () => {
 		expect(audit.reasonlessExemptions).toEqual(["b.ts"]);
 	});
 
+	// #2487 review round 4 F2. `describe`'s object-`FlaggedEntry` detail
+	// lookup (round 3 F1's fix) had no test that actually exercises it: the
+	// review found replacing `describe` with the identity function left
+	// every test in this file green. This pins the behavior directly —
+	// passing a `{ key, detail }` entry whose detail differs from its key
+	// must surface that detail, parenthesized, in the `unaccounted` message.
+	// Reds if `describe` regresses to returning the bare key.
+	it("BLOCKING (#2487 round 4 F2): an unaccounted object-form entry's detail appears in the message, not just its key", () => {
+		const audit = auditRegistry({
+			sweepName: "probe sweep",
+			flagged: [
+				{ key: "collidingKey", detail: "clients/real-file.ts:42 realFn" },
+			],
+			registered: [],
+			exemptions: {},
+		});
+		expect(audit.unaccounted).toEqual(["collidingKey"]);
+		expect(audit.problems.join("\n")).toContain(
+			"collidingKey (clients/real-file.ts:42 realFn)",
+		);
+	});
+
 	// #1755 review F1. `item in exemptions` walks the prototype chain, so an
 	// item NAMED like an Object.prototype member exempts itself against a map
 	// that never mentions it — and staleExemptions (own keys only) can never
