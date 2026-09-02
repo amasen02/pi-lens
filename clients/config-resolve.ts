@@ -65,7 +65,9 @@ import {
 // supported way into the pipeline — `merge()` is deliberately not imported here.
 import { type RawConfigSource, resolveConfig } from "./config-core/resolve.js";
 import {
+	MAX_MIGRATION_RECORDS,
 	type MigrationRecord,
+	MigrationRecordCollector,
 	migrationSubject,
 } from "./config-core/records.js";
 import type { Provenance, SourceTier } from "./config-core/provenance.js";
@@ -115,6 +117,23 @@ export interface ConfigDocument {
 	readonly value: unknown;
 }
 
+/**
+ * A config document that exists on disk but could not be read or parsed.
+ *
+ * Carries the LOCATION and the TIER, not just the path (#2445): which
+ * subsystem owns the failure is a property of the FILE, not of whichever
+ * loader happened to open it. `loadLSPConfig` resolves `~/.pi-lens/config.json`
+ * and `.pi-lens.json` too, and reporting those under `lsp-config` told a user
+ * their "LSP config" was invalid when the file they had broken was the pi-lens
+ * global or project config.
+ */
+export interface ConfigReadFailure {
+	readonly file: string;
+	readonly location: ConfigLocation;
+	readonly tier: SourceTier;
+	readonly error: unknown;
+}
+
 export interface ResolvePiLensConfigOptions {
 	/** Directory the project/nested tiers are discovered from. */
 	readonly cwd?: string;
@@ -124,8 +143,12 @@ export interface ResolvePiLensConfigOptions {
 	readonly globalDir?: string;
 	/** The `$HOME` ceiling for the project walk. Test seam. */
 	readonly homeDir?: string;
-	/** Called for a file that exists but could not be read or parsed. */
-	readonly onReadError?: (file: string, error: unknown) => void;
+	/**
+	 * Called for a file that exists but could not be read or parsed. Production
+	 * callers pass {@link reportConfigReadFailure}, which derives the reporting
+	 * subsystem from the failing DOCUMENT.
+	 */
+	readonly onReadError?: (failure: ConfigReadFailure) => void;
 }
 
 export interface PiLensConfigResolution {
@@ -166,7 +189,7 @@ function collectDocuments(
 	dir: string,
 	locations: readonly ConfigLocation[],
 	tier: SourceTier,
-	onReadError: ((file: string, error: unknown) => void) | undefined,
+	onReadError: ((failure: ConfigReadFailure) => void) | undefined,
 ): ConfigDocument[] {
 	const documents: ConfigDocument[] = [];
 	for (const location of locations) {
@@ -174,7 +197,7 @@ function collectDocuments(
 		const outcome = readConfigDocument(file);
 		if (outcome.status === "missing") continue;
 		if (outcome.status === "error") {
-			onReadError?.(file, outcome.error);
+			onReadError?.({ file, location, tier, error: outcome.error });
 			continue;
 		}
 		documents.push({ tier, file, location, value: outcome.value });
@@ -209,7 +232,7 @@ export function collectPiLensConfigDocuments(
 			const outcome = readConfigDocument(file);
 			if (outcome.status === "missing") continue;
 			if (outcome.status === "error") {
-				onReadError?.(file, outcome.error);
+				onReadError?.({ file, location, tier: "global", error: outcome.error });
 				continue;
 			}
 			documents.push({ tier: "global", file, location, value: outcome.value });
@@ -260,14 +283,17 @@ export function resolvePiLensConfig(
 	return {
 		value: resolution.resolved.value ?? {},
 		provenance: resolution.resolved.provenance,
-		records: [
-			...resolution.records,
-			...deprecationRecords(
-				documents,
-				options.homeDir ?? os.homedir(),
-				canonicalGlobalFile(options),
-			),
-		],
+		records: boundedResolutionRecords(
+			[
+				...resolution.records,
+				...deprecationRecords(
+					documents,
+					options.homeDir ?? os.homedir(),
+					canonicalGlobalFile(options),
+				),
+			],
+			documents,
+		),
 		documents,
 	};
 }
@@ -295,10 +321,77 @@ export function resolveOnePiLensConfigDocument(
 	});
 	return {
 		value: resolution.resolved.value ?? {},
-		records: [
-			...resolution.records,
-			...deprecationRecords([document], homeDir),
-		],
+		records: boundedResolutionRecords(
+			[...resolution.records, ...deprecationRecords([document], homeDir)],
+			[document],
+		),
+	};
+}
+
+/**
+ * The label a whole-resolution failure names when no document can anchor it.
+ * A resolution over zero sources cannot fail, so this is the floor rather than
+ * a case production reaches.
+ */
+const RESOLUTION_FAILURE_LABEL = "(config resolution)";
+
+/**
+ * Bound a resolution's records AT THE SOURCE, and attribute the ones that name
+ * no file (#2426 review round 4, F5 + S1).
+ *
+ * Two obligations that have to happen together, because both are about the
+ * record list a loader is handed rather than about any one producer:
+ *
+ * 1. THE BOUND. `resolveConfig` bounds what its OWN two halves emit, but the
+ *    deprecation records were concatenated on afterwards, outside any
+ *    collector — so a legacy file's key count, which is user input, set the
+ *    notification count. One collector over the combined list restores the
+ *    per-resolution bound `MigrationRecordCollector` exists to enforce. The
+ *    last slot is reserved for the count of what the bound discarded, so a
+ *    drop is reported rather than silent.
+ * 2. THE ANCHOR. `config-core`'s internal-failure record carries `file: ""`,
+ *    `key: ""` and no tier, which rendered as `ignoring invalid LSP config :
+ *    …` — no file, and three notices, because a record naming no key is
+ *    reported by every subsystem that could have produced it. Anchoring it to
+ *    the resolution's highest-precedence document (the file whose values would
+ *    have won, and the one a user editing config is looking at) gives the
+ *    notice a path and a tier, and the tier picks ONE reporting subsystem.
+ */
+function boundedResolutionRecords(
+	records: readonly MigrationRecord[],
+	documents: readonly ConfigDocument[],
+): readonly MigrationRecord[] {
+	const anchor = documents[documents.length - 1];
+	// One slot held back so an overflow can be COUNTED inside the same bound.
+	const collector = new MigrationRecordCollector(MAX_MIGRATION_RECORDS - 1);
+	for (const record of records) collector.add(anchored(record, anchor));
+	if (collector.droppedCount === 0) return collector.records;
+	const file = anchor?.file ?? RESOLUTION_FAILURE_LABEL;
+	return [
+		...collector.records,
+		{
+			code: "PILENS_CFG_0007",
+			file,
+			key: "",
+			subject: migrationSubject(file, ""),
+			reason: `${collector.droppedCount} further config notices for this resolution were suppressed by the per-resolution bound of ${MAX_MIGRATION_RECORDS}`,
+			...(anchor ? { tier: anchor.tier } : {}),
+		},
+	];
+}
+
+/** Give a record that names neither a file nor a key the resolution's anchor. */
+function anchored(
+	record: MigrationRecord,
+	anchor: ConfigDocument | undefined,
+): MigrationRecord {
+	if (record.file.length > 0 || record.key.length > 0) return record;
+	const file = anchor?.file ?? RESOLUTION_FAILURE_LABEL;
+	return {
+		...record,
+		file,
+		subject: migrationSubject(file, ""),
+		...(anchor ? { tier: anchor.tier } : {}),
 	};
 }
 
@@ -379,10 +472,59 @@ function topLevelKeys(value: unknown): string[] {
 		: [];
 }
 
+/** The `properties` key names of a JSON-Schema-shaped node. */
+function schemaPropertyKeys(node: unknown): string[] {
+	const properties = (node as { properties?: unknown } | undefined)?.properties;
+	return properties !== null &&
+		typeof properties === "object" &&
+		!Array.isArray(properties)
+		? Object.keys(properties as Record<string, unknown>)
+		: [];
+}
+
 /**
- * One record per `(file, key)` — never one per file, and never one per nested
- * leaf. A per-file record cannot tell a user which setting to move; a per-leaf
- * record would re-nag once per custom server.
+ * The top-level keys a pi-lens config document may legitimately carry — READ
+ * OFF the canonical schema rather than restated, so a section added to a
+ * registry is recognized here for free (`config-schema.ts` derives its property
+ * list from those registries).
+ */
+const CANONICAL_TOP_LEVEL_KEYS: ReadonlySet<string> = new Set(
+	schemaPropertyKeys(PI_LENS_CONFIG_SCHEMA),
+);
+
+/**
+ * The same, for an LSP-SCOPED legacy file (`pi-lsp.json`, `.pi-lens/lsp.json`,
+ * `~/.pi-lens/lsp.json`): that whole file is what a canonical file now holds
+ * under `lsp`, so its recognized ROOT keys are the `lsp` namespace's own.
+ */
+const LSP_DOCUMENT_KEYS: ReadonlySet<string> = new Set(
+	schemaPropertyKeys(
+		(PI_LENS_CONFIG_SCHEMA as { properties?: Record<string, unknown> })
+			.properties?.[LSP_NAMESPACE_KEY],
+	),
+);
+
+function recognizedKeysFor(location: ConfigLocation): ReadonlySet<string> {
+	return location.lspScoped ? LSP_DOCUMENT_KEYS : CANONICAL_TOP_LEVEL_KEYS;
+}
+
+/**
+ * One record per `(file, key)` — never one per nested leaf, and only for a key
+ * pi-lens actually RECOGNIZES (#2426 review round 4, F2/F5).
+ *
+ * A per-leaf record would re-nag once per custom server. A record for every
+ * top-level key, which is what this emitted before, was worse in both
+ * directions: the count was user input, so a 100-key legacy file produced 100
+ * "move it" notices on top of the 98 typo notices the project loader already
+ * emits for the same keys; and each one told the user to MOVE a key that is
+ * not a pi-lens setting at all, which is advice that cannot be followed. A key
+ * no schema property claims gets the loaders' typo diagnostic and nothing
+ * else.
+ *
+ * The unrecognized keys are still accounted for, in ONE whole-file record
+ * naming their count — the file is at a deprecated location whatever its keys
+ * spell, and a user who moves only the keys named here has to know the rest
+ * were left behind deliberately.
  */
 export function deprecationRecords(
 	documents: readonly ConfigDocument[],
@@ -393,7 +535,13 @@ export function deprecationRecords(
 	for (const document of documents) {
 		if (document.location.legacy) {
 			const destination = canonicalDestination(document, homeDir, globalFile);
+			const recognized = recognizedKeysFor(document.location);
+			let unrecognized = 0;
 			for (const key of topLevelKeys(document.value)) {
+				if (!recognized.has(key)) {
+					unrecognized += 1;
+					continue;
+				}
 				const canonicalKey = canonicalKeyFor(document, key);
 				records.push(
 					record({
@@ -408,6 +556,29 @@ export function deprecationRecords(
 							windowSuffix(document.location.surface),
 					}),
 				);
+			}
+			if (unrecognized > 0) {
+				const plural = unrecognized === 1 ? "it was" : "they were";
+				records.push({
+					code: "PILENS_CFG_0003",
+					file: document.file,
+					key: "",
+					// An LSP-scoped legacy file moves WHOLESALE into the `lsp`
+					// namespace, so naming that namespace is literally true here — and
+					// it is what routes this record to the LSP loader's subsystem, the
+					// same key-derived ownership every other record uses.
+					...(document.location.lspScoped
+						? { canonicalKey: LSP_NAMESPACE_KEY }
+						: {}),
+					subject: migrationSubject(document.file, ""),
+					tier: document.tier,
+					reason:
+						`this file is at a deprecated location; move it to ${destination}. ` +
+						(unrecognized === 1
+							? "1 of its top-level keys is not a recognized pi-lens setting"
+							: `${unrecognized} of its top-level keys are not recognized pi-lens settings`) +
+						`, and ${plural} not migrated${windowSuffix(document.location.surface)}`,
+				});
 			}
 			continue;
 		}
@@ -523,15 +694,19 @@ function piLensSubsystemFor(
  *
  * An `lsp` owner always reports under `lsp-config`, regardless of tier — the
  * LSP loader is the one home for every LSP setting. A `pi-lens` owner reports
- * under the tier-appropriate pi-lens loader; when the tier is unknown (a
- * merge-level bound refusal with no single source), it goes to BOTH pi-lens
- * subsystems rather than guessing. An unattributable record (owner
- * `undefined`) goes to `lsp-config` plus the tier-appropriate pi-lens
- * subsystem (or both, tier unknown) — every subsystem that could plausibly
- * have produced it, the same "reported by all" contract the type's doc
- * comment states.
+ * under the tier-appropriate pi-lens loader.
+ *
+ * An unattributable record (owner `undefined` — the whole-file failures both
+ * halves of the core emit with `key: ""`) reports under the ONE subsystem its
+ * TIER names, when a tier is known (#2426 review round 4, S1). Round 3 sent it
+ * to every subsystem that could plausibly have produced it, which turned one
+ * internal failure into three notices, one of them announcing an "LSP config"
+ * problem in a file with no LSP settings in it. `boundedResolutionRecords`
+ * anchors those records to the resolution's own highest-precedence document
+ * precisely so the tier is known; the report-by-all fallback survives only for
+ * a record that names no source at all.
  */
-function subsystemsFor(
+function configRecordSubsystems(
 	record: MigrationRecord,
 ): readonly IgnoredConfigSubsystem[] {
 	const owner = configRecordOwner(record);
@@ -541,7 +716,42 @@ function subsystemsFor(
 		: ["lens-config", "project-lens-config"];
 	if (owner === "lsp") return ["lsp-config"];
 	if (owner === "pi-lens") return piLensSubsystems;
+	if (piLens) return [piLens];
 	return ["lsp-config", ...piLensSubsystems];
+}
+
+/**
+ * WHICH subsystem owns a config file that could not be read or parsed (#2445).
+ *
+ * Derived from the DOCUMENT — its location and its tier — for the same reason
+ * `configRecordSubsystems` derives ownership from the record: `loadLSPConfig`
+ * opens the pi-lens global and project configs too, and labelling their parse
+ * failures "ignoring invalid LSP config" told a user to look at an LSP setting
+ * when what they had broken was `~/.pi-lens/config.json`. An LSP-SCOPED file
+ * (`pi-lsp.json`, `lsp.json`) is the LSP loader's whatever tier it sits at.
+ */
+function configFileSubsystem(
+	location: ConfigLocation,
+	tier: SourceTier,
+): IgnoredConfigSubsystem {
+	if (location.lspScoped) return "lsp-config";
+	return tier === "global" ? "lens-config" : "project-lens-config";
+}
+
+/**
+ * Report an unreadable/unparsable config document under its OWNING subsystem.
+ *
+ * `{ parseError }`, never a pre-stringified message: `warnIgnoredConfigOnce` is
+ * the one seam that decides how much of a `JSON.parse` `SyntaxError#message`
+ * (which embeds a snippet of the file being parsed, #2431) survives into the
+ * log line, the ledger row and the notification.
+ */
+export function reportConfigReadFailure(failure: ConfigReadFailure): void {
+	warnIgnoredConfigOnce({
+		subsystem: configFileSubsystem(failure.location, failure.tier),
+		file: failure.file,
+		reason: { parseError: failure.error },
+	});
 }
 
 /**
@@ -566,7 +776,7 @@ export function reportPiLensConfigRecords(
 	records: readonly MigrationRecord[],
 ): void {
 	for (const record of records) {
-		for (const subsystem of subsystemsFor(record)) {
+		for (const subsystem of configRecordSubsystems(record)) {
 			warnIgnoredConfigOnce({
 				subsystem,
 				file: record.file,

@@ -2,7 +2,6 @@ import {
 	resetIgnoredConfigWarnCache,
 	warnIgnoredConfigOnce,
 } from "./config-warn.js";
-import * as fs from "node:fs";
 import * as path from "node:path";
 import {
 	assignFlagConfigSection,
@@ -18,12 +17,15 @@ import {
 	CANONICAL_GLOBAL_CONFIG_FILE,
 	getPiLensGlobalConfigPath,
 	GLOBAL_CONFIG_LOCATIONS,
+	LEGACY_ROOT_LSP_KEYS,
 } from "./config-locations.js";
 // Re-exported so this module's own, pre-existing import sites (`./lens-config.js`
 // / `../lens-config.js`) keep working. The function itself now lives in
 // `config-locations.ts` (#2426 review round 3, S1) — see the doc comment there.
 export { getPiLensGlobalConfigPath } from "./config-locations.js";
 import {
+	readConfigDocument,
+	reportConfigReadFailure,
 	reportPiLensConfigRecords,
 	resolveOnePiLensConfigDocument,
 } from "./config-resolve.js";
@@ -171,9 +173,39 @@ function asConfigObject(value: unknown): Record<string, unknown> | undefined {
 export function loadPiLensGlobalConfig(
 	configPath = getPiLensGlobalConfigPath(),
 ): PiLensGlobalConfig | undefined {
+	const location = globalCanonicalLocation();
+	// #2445: this used to be `JSON.parse(fs.readFileSync(...))` inside a bare
+	// `catch { return undefined; }`, so a malformed `~/.pi-lens/config.json`
+	// produced ZERO signal of its own — no log line, no ledger row, no
+	// notification. The only thing a user saw was the LSP loader's report of the
+	// SAME file, mislabelled "ignoring invalid LSP config", because that loader
+	// resolves the canonical global too. Both halves are fixed together: the
+	// read/parse failure is reported here, under `lens-config`, and
+	// `reportConfigReadFailure` derives the subsystem from the DOCUMENT so the
+	// LSP loader's report of this file lands under `lens-config` as well and the
+	// warn-once latch collapses the two into one honest notice.
+	const outcome = readConfigDocument(configPath);
+	if (outcome.status === "missing") return undefined;
+	if (outcome.status === "error") {
+		reportConfigReadFailure({
+			file: configPath,
+			location,
+			tier: "global",
+			error: outcome.error,
+		});
+		return undefined;
+	}
 	try {
-		const parsed = JSON.parse(fs.readFileSync(configPath, "utf-8")) as unknown;
-		if (!parsed || typeof parsed !== "object") return undefined;
+		const parsed = outcome.value;
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+			// The other half of the same silence: a file that PARSES but is a list
+			// or a scalar is not a config either, and was dropped without a word.
+			warnInvalidGlobalConfigOnce(
+				configPath,
+				"top-level value must be an object",
+			);
+			return undefined;
+		}
 
 		// Through the #2425 core (#2426). The canonical global file is resolved as
 		// a single `global`-tier source against the canonical schema, so the depth
@@ -185,7 +217,7 @@ export function loadPiLensGlobalConfig(
 		const document = {
 			tier: "global" as const,
 			file: configPath,
-			location: globalCanonicalLocation(),
+			location,
 			value: parsed,
 		};
 		const resolved = resolveOnePiLensConfigDocument(document);
@@ -287,9 +319,22 @@ export function loadPiLensGlobalConfig(
 		// (`GLOBAL_NON_FLAG_CONFIG_SECTIONS`, which co-locates `$schema` and the
 		// hand-parsed namespaces beside the registry). Adding a flag needs no
 		// edit here; adding a namespace is a one-line edit in that one constant.
+		//
+		// `LEGACY_ROOT_LSP_KEYS` joins them for #2426 review round 4, F1. The four
+		// legacy root LSP keys are read out of THIS file by the LSP loader and
+		// their values are applied, exactly as they are in a project
+		// `.pi-lens.json` — where `PROJECT_FOREIGN_CONFIG_NAMESPACES` has
+		// tolerated them since #2426. The global scan never got the same
+		// treatment, so `~/.pi-lens/config.json` with a root `warmFiles` both
+		// honored the setting and called it a typo in the same session. Spread
+		// from the registry-derived list rather than restated: `lens-config.ts`
+		// already imports `config-locations.ts`, which derives it from
+		// `DEPRECATED_CONFIG_SURFACES`, so the accepted set and the removal
+		// schedule cannot drift apart and there is no second copy of the names.
 		const knownGlobalConfigKeys = new Set<string>([
 			...flagConfigSectionKeys(LENS_FLAGS),
 			...GLOBAL_NON_FLAG_CONFIG_SECTIONS,
+			...LEGACY_ROOT_LSP_KEYS,
 		]);
 		for (const key of Object.keys(raw)) {
 			if (!knownGlobalConfigKeys.has(key)) {

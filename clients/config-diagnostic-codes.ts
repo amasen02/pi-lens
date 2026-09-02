@@ -141,6 +141,25 @@ export const CONFIG_DIAGNOSTIC_CODES = {
 	 * not write has something worth looking at.
 	 */
 	PILENS_CFG_0006: "config key would modify the object prototype; ignored",
+	/**
+	 * Further config notices were suppressed by a per-resolution bound.
+	 *
+	 * The record count a config file can produce is USER INPUT — one key, one
+	 * record — so both the shared resolution (`clients/config-resolve.ts`) and
+	 * the project loader's own unknown-key scan
+	 * (`clients/project-lens-config.ts`) collect into a bounded
+	 * `MigrationRecordCollector` and hold one slot back for this code. It is the
+	 * difference between a bound that is honest and one that drops notices
+	 * silently: a user who sees it knows the list they were shown is partial,
+	 * and how much of it is missing.
+	 *
+	 * Registered as its own code rather than folded into `PILENS_CFG_0001`
+	 * because the user action differs — nothing about the config is wrong, the
+	 * OUTPUT was truncated, and the fix is to read the file rather than to
+	 * change it.
+	 */
+	PILENS_CFG_0007:
+		"further config notices suppressed by the per-resolution bound",
 } as const satisfies Record<`PILENS_CFG_${string}`, string>;
 
 export type ConfigDiagnosticCode = keyof typeof CONFIG_DIAGNOSTIC_CODES;

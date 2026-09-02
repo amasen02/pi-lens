@@ -115,6 +115,12 @@ these dates instantiate.
 A `.pi-lens.json` that mixes both spellings is fine while you migrate: the
 canonical key wins, and the keys you have not moved yet keep working.
 
+Only keys pi-lens actually recognizes get "move it to …" advice. A key in a
+legacy file that is not a pi-lens setting at all — a typo, or a leftover from
+another tool — cannot be migrated anywhere, so it gets the ordinary
+unrecognized-key notice (`PILENS_CFG_0001`) and is counted in ONE whole-file
+`PILENS_CFG_0003` notice for the file rather than being told to move.
+
 ## When a config is ignored
 
 A file that cannot be read or parsed is **ignored, never partially applied** —
@@ -123,6 +129,11 @@ pi-lens runs on defaults for it and says so once, with the code
 dropped on its own (`PILENS_CFG_0005`), and an unrecognized field is dropped
 with a message naming the key (`PILENS_CFG_0004`). Nothing about your config is
 ever ignored silently.
+
+The number of notices one file can produce is bounded, because the number of
+keys in it is not: past the bound the remainder is summarised in a single
+`PILENS_CFG_0007` notice giving the count that was suppressed, so a truncated
+list always says that it is truncated.
 
 ## See also
 

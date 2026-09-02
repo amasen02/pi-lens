@@ -56,15 +56,13 @@
  * clients/lsp/server.ts (e.g. "rust", "nix", "bash", "python", "go", "ts").
  */
 
-import {
-	resetIgnoredConfigWarnCache,
-	warnIgnoredConfigOnce,
-} from "../config-warn.js";
+import { resetIgnoredConfigWarnCache } from "../config-warn.js";
 import * as os from "node:os";
 import path from "node:path";
 import { BoundedLruCache } from "../bounded-cache.js";
 import {
 	lspSectionOf,
+	reportConfigReadFailure,
 	reportPiLensConfigRecords,
 	resolvePiLensConfig,
 } from "../config-resolve.js";
@@ -127,24 +125,6 @@ interface RegisteredLSPConfig {
 
 // --- Config Loading ---
 
-function warnInvalidLSPConfig(configPath: string, error: unknown): void {
-	// One shared seam for all three config loaders (#2418): it owns the
-	// warn-once latch, the extension.log line, the durable `config-ignored`
-	// ledger row, and the stable-coded user notification. The rendered prose is
-	// unchanged — `ignoring invalid LSP config <path>: <reason>`.
-	//
-	// `{ parseError: error }`, not a pre-stringified message: `error` here is
-	// either a caught `JSON.parse` `SyntaxError` (whose message embeds a
-	// snippet of the source file being parsed on Node >=20, #2431) or a caught
-	// `fs.readFile` error, and `warnIgnoredConfigOnce` is the one seam that
-	// decides how much of either survives into the three sinks it owns.
-	warnIgnoredConfigOnce({
-		subsystem: "lsp-config",
-		file: configPath,
-		reason: { parseError: error },
-	});
-}
-
 /**
  * For tests that need to force the warn-once cache to reset between cases —
  * the LSP loader's counterpart to `resetGlobalConfigWarnCache` in
@@ -203,7 +183,12 @@ export async function loadLSPConfig(
 		// can exercise a relocated `PI_LENS_HOME` without reaching the real one.
 		globalConfigPath: getPiLensGlobalConfigPath(homeDir),
 		homeDir,
-		onReadError: warnInvalidLSPConfig,
+		// The subsystem comes from the failing DOCUMENT, not from this loader
+		// (#2445). This resolution opens `~/.pi-lens/config.json` and
+		// `.pi-lens.json` as well as the LSP-scoped files, and reporting all of
+		// them as `lsp-config` announced an "invalid LSP config" for a file whose
+		// contents are pi-lens settings. An LSP-scoped file still reports here.
+		onReadError: reportConfigReadFailure,
 	});
 	// EVERY record this resolution produced (#2426 review round 3, F1) — not
 	// filtered to what this loader "owns". `reportPiLensConfigRecords` derives

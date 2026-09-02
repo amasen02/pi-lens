@@ -16,7 +16,12 @@
 import { type ConfigSource, merge } from "./merge.js";
 import { validate } from "./normalize.js";
 import type { Resolved } from "./provenance.js";
-import { MigrationRecordCollector, type MigrationRecord } from "./records.js";
+import {
+	MigrationRecordCollector,
+	type MigrationRecord,
+	migrationSubject,
+} from "./records.js";
+import type { SourceTier } from "./provenance.js";
 import type { ConfigSchemaNode } from "./schema.js";
 
 /** One source as the caller has it: parsed, not yet validated. */
@@ -57,6 +62,28 @@ export interface ConfigResolution<T> {
  * the real fix; this guard is the floor under them, so a future bug in either
  * half degrades a config to absent instead of failing a session.
  */
+/**
+ * The highest-precedence source's file and tier — the one whose values would
+ * have won, and so the file a user looking at a failed resolution should open.
+ *
+ * Read DEFENSIVELY because its only caller is a catch block: whatever made the
+ * resolution throw may equally make reading a source's own fields throw, and a
+ * guard that throws while explaining a throw is no guard at all.
+ */
+function anchorSource(
+	sources: readonly RawConfigSource[] | undefined,
+): { readonly file: string; readonly tier: SourceTier } | undefined {
+	try {
+		const last = sources?.[sources.length - 1];
+		return last === undefined || typeof last.file !== "string"
+			? undefined
+			: { file: last.file, tier: last.tier };
+	} catch {
+		// pi-lens-ignore: missing-error-propagation — the anchor is best-effort
+		return undefined;
+	}
+}
+
 export function resolveConfig<T = unknown>(
 	options: ResolveConfigOptions,
 ): ConfigResolution<T> {
@@ -79,14 +106,24 @@ export function resolveConfig<T = unknown>(
 		};
 	} catch (error) {
 		// The error CLASS only, never its message, which could quote the file.
+		//
+		// ANCHORED to the resolution's highest-precedence source (#2426 review
+		// round 4, S1). This record used to carry `file: ""` and no tier, which
+		// rendered as `ignoring invalid LSP config : …` — no path for the user to
+		// open — and, naming neither a key nor a tier, was reported by every
+		// config subsystem at once, so one internal failure became three notices.
+		// The sources are right here; nothing downstream can recover them.
+		const anchor = anchorSource(options.sources);
+		const file = anchor?.file ?? "";
 		collector.add({
 			code: "PILENS_CFG_0005",
-			file: "",
+			file,
 			key: "",
-			subject: "",
+			subject: migrationSubject(file, ""),
 			reason: `config resolution failed internally (${
 				error instanceof Error ? error.name : "unknown error"
 			}); configuration ignored`,
+			...(anchor ? { tier: anchor.tier } : {}),
 		});
 		return {
 			// The empty resolution, built by the merger from no sources rather than

@@ -105,6 +105,7 @@ this policy explicitly reserves the right to change.
 | `PILENS_CFG_0004` | A config field no schema property claims was dropped. | `validate()` (`clients/config-core/normalize.ts`) produces the record; `reportPiLensConfigRecords` (`clients/config-resolve.ts`) delivers it through `warnIgnoredConfigOnce` (#2426). |
 | `PILENS_CFG_0005` | A config field's value did not match its schema and was dropped. | Same producer and same delivery path as `PILENS_CFG_0004`. |
 | `PILENS_CFG_0006` | A config key that would modify an object's prototype (`__proto__`, `constructor`, `prototype`) was refused. | Both halves of the config core, through the shared policy in `clients/config-core/safe-object.ts`. |
+| `PILENS_CFG_0007` | Further config notices were suppressed by a per-resolution bound, and this one carries the count. | The bounded `MigrationRecordCollector` in `clients/config-resolve.ts` (the shared resolution) and in `clients/project-lens-config.ts` (that loader's own unknown-key scan). |
 
 A reserved code is registered and referenced by the deprecation registry, but
 nothing emits it today. That is deliberate: the number must be pinned before the
