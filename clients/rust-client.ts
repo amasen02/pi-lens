@@ -90,4 +90,9 @@ export class RustClient {
 	isRustFile(filePath: string): boolean {
 		return path.extname(filePath).toLowerCase() === ".rs";
 	}
+
+	/** Forget the memoized cargo path and latched availability verdict — #2455. */
+	resetAvailability(): void {
+		this.availability.reset();
+	}
 }

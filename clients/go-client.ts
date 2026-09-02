@@ -89,4 +89,9 @@ export class GoClient {
 	isGoFile(filePath: string): boolean {
 		return path.extname(filePath).toLowerCase() === ".go";
 	}
+
+	/** Forget the memoized go path and latched availability verdict — #2455. */
+	resetAvailability(): void {
+		this.availability.reset();
+	}
 }

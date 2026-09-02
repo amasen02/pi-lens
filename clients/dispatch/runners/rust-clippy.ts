@@ -28,6 +28,24 @@ import { createCwdCachedProbe } from "./utils/runner-helpers.js";
 
 const rustClient = new RustClient();
 
+/**
+ * Forget `rustClient`'s memoized cargo path and latched availability verdict
+ * — #2455 fix round 2. A probe-class "missing" verdict never expires
+ * (`isLatchingOutcome`), and this module-scope client was invisible to the
+ * session-state sweep (its own `clear`/`delete`-less shape) until #2455
+ * widened the detector to any class declared in `clients/`. Same #1496/#1535
+ * shape as `resetZizmorTokenAvailability`; wired into `handleSessionStart`
+ * beside it (`clients/runtime-session.ts`) so a Rust toolchain installed
+ * mid-process is observed by the next session instead of staying "missing"
+ * for the rest of the process's life. `clippyAvailabilityByCargo` below is a
+ * separate, already-covered latch — it rides `createCwdCachedProbe`'s shared
+ * `availabilityGeneration` counter (see `runner-helpers.ts`'s
+ * `resetDispatchAvailabilityState`), not this reset.
+ */
+export function resetRustAvailability(): void {
+	rustClient.resetAvailability();
+}
+
 // Cached per-cwd `cargo clippy --version` probe (#120). Before this, the
 // probe fired on every Rust file save in a project where clippy was already
 // installed.

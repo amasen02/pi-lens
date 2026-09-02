@@ -30,6 +30,7 @@ import {
 } from "../support/session-state-registry.js";
 import {
 	SWEEP_HEURISTIC_LIMITS,
+	auditContainerClassExclusions,
 	callsWithinFunction,
 	callsWithinSessionStartClosure,
 	clientSourceFiles,
@@ -881,6 +882,272 @@ describe("session-state scan — new repo-local collection classes need no detec
 				const candidates = scanSessionStateCandidates(dir);
 				const perCall = candidates.find((c) => c.file === "per-call.ts");
 				expect(perCall?.containers ?? []).toEqual([]);
+			},
+		);
+	});
+});
+
+describe("session-state scan — class-declaration shape matrix (#2455 fix round 2, F2)", () => {
+	function withFixtureTree(
+		files: Record<string, string>,
+		run: (dir: string) => void,
+	): void {
+		const dir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-session-state-shapes-"),
+		);
+		try {
+			for (const [name, contents] of Object.entries(files)) {
+				fs.writeFileSync(path.join(dir, name), contents);
+			}
+			run(dir);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	}
+
+	// Every shape the round-1 `^export class NAME(?:<[^>]*>)?...` regex missed
+	// (the reviewer's MISS list): a non-exported class visible only through a
+	// separate `export { A }` / `export { A as B }` list, `export default
+	// class`, `export abstract class`, `export default abstract class`, and a
+	// nested generic in either the class's own type parameters or its
+	// `extends` target — round 1's `[^>]*` stopped at the first `>`, one short
+	// of the real end, and silently failed to match the whole declaration.
+	const NAMED_CLASSES_MODULE = [
+		"export class ExportedPlain {",
+		"\tclear(): void {}",
+		"}",
+		"",
+		"export abstract class ExportedAbstract {",
+		"\tclear(): void {}",
+		"}",
+		"",
+		// Non-exported, re-exported under its own name.
+		"class BareReexported {",
+		"\tdelete(key: string): boolean {",
+		"\t\treturn true;",
+		"\t}",
+		"}",
+		"export { BareReexported };",
+		"",
+		// Non-exported, re-exported under an ALIAS — the caller elsewhere
+		// constructs `new AliasedName(...)`, never `new BareAliased(...)`.
+		"class BareAliased {",
+		"\tdelete(key: string): boolean {",
+		"\t\treturn true;",
+		"\t}",
+		"}",
+		"export { BareAliased as AliasedName };",
+		"",
+		// Nested generic in the class's OWN type parameter list — round 1's
+		// `(?:<[^>]*>)?` after the name stopped at the `>` inside `Map<K, V>`,
+		// one short of the outer `>>`, and the whole declaration regex failed
+		// to match.
+		"export class NestedOwnGeneric<T extends Map<string, number>> {",
+		"\tclear(): void {}",
+		"}",
+		"",
+		// Nested generic in the `extends` target, same failure mode. The base
+		// class need not exist for THIS class's own name to be captured —
+		// round 2 no longer resolves `extends` at all.
+		"export class NestedExtendsGeneric extends UnknownBase<Map<string, number>> {",
+		"\tclear(): void {}",
+		"}",
+		"",
+	].join("\n");
+
+	const DEFAULT_CLASS_MODULE = [
+		"export default class DefaultNamed {",
+		"\tclear(): void {}",
+		"}",
+		"",
+	].join("\n");
+
+	const DEFAULT_ABSTRACT_CLASS_MODULE = [
+		"export default abstract class DefaultAbstractNamed {",
+		"\tclear(): void {}",
+		"}",
+		"",
+	].join("\n");
+
+	const HOLDER_MODULE = [
+		"import {",
+		"\tExportedPlain,",
+		"\tExportedAbstract,",
+		"\tBareReexported,",
+		"\tAliasedName,",
+		"\tNestedOwnGeneric,",
+		"\tNestedExtendsGeneric,",
+		'} from "./named-classes.js";',
+		'import DefaultNamed from "./default-class.js";',
+		'import DefaultAbstractNamed from "./default-abstract-class.js";',
+		"",
+		"const a = new ExportedPlain();",
+		"const b = new ExportedAbstract();",
+		"const c = new BareReexported();",
+		"const d = new AliasedName();",
+		"const e = new NestedOwnGeneric<string, number>();",
+		"const f = new NestedExtendsGeneric();",
+		"const g = new DefaultNamed();",
+		"const h = new DefaultAbstractNamed();",
+		"",
+		"export function resetShapeHolder(): void {",
+		"\ta.clear();",
+		"\tb.clear();",
+		'\tc.delete("k");',
+		'\td.delete("k");',
+		"\te.clear();",
+		"\tf.clear();",
+		"\tg.clear();",
+		"\th.clear();",
+		"}",
+		"",
+	].join("\n");
+
+	it("flags a module-level `new` for every class-declaration export shape", () => {
+		withFixtureTree(
+			{
+				"named-classes.ts": NAMED_CLASSES_MODULE,
+				"default-class.ts": DEFAULT_CLASS_MODULE,
+				"default-abstract-class.ts": DEFAULT_ABSTRACT_CLASS_MODULE,
+				"holder.ts": HOLDER_MODULE,
+			},
+			(dir) => {
+				const candidates = scanSessionStateCandidates(dir);
+				const holder = candidates.find((c) => c.file === "holder.ts");
+				expect(holder?.containers).toEqual([
+					"a",
+					"b",
+					"c",
+					"d",
+					"e",
+					"f",
+					"g",
+					"h",
+				]);
+			},
+		);
+	});
+
+	it("MUTATION: reverting to the round-1 `^export class` regex misses every shape but the first", () => {
+		// Named directly rather than imported, so this test cannot silently stop
+		// covering the mutation if the production regex is ever refactored under
+		// a different name.
+		const round1Regex =
+			/^export class ([A-Za-z_$][\w$]*)(?:<[^>]*>)?(?:\s+extends\s+([A-Za-z_$][\w$]*)(?:<[^>]*>)?)?(?:\s+implements\s+[^{]*)?\s*\{/gm;
+		const found = [...NAMED_CLASSES_MODULE.matchAll(round1Regex)].map(
+			(m) => m[1],
+		);
+		// Round 1 requires the LITERAL text "export class", so even
+		// ExportedAbstract ("export abstract class") fails it; ExportedPlain is
+		// the only shape with no generic and no re-export indirection the old
+		// regex could still reach.
+		expect(found).toEqual(["ExportedPlain"]);
+	});
+});
+
+describe("session-state scan — CONTAINER_CLASS_EXCLUSIONS guards (#2455 fix round 2, F3)", () => {
+	function withFixtureTree(
+		files: Record<string, string>,
+		run: (dir: string) => void,
+	): void {
+		const dir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-session-state-exclusions-"),
+		);
+		try {
+			for (const [name, contents] of Object.entries(files)) {
+				fs.writeFileSync(path.join(dir, name), contents);
+			}
+			run(dir);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	}
+
+	it("the real CONTAINER_CLASS_EXCLUSIONS table has no problems (empty today)", () => {
+		expect(auditContainerClassExclusions()).toEqual([]);
+	});
+
+	it("reds on a stale entry — a class name the live scan does not find", () => {
+		// The reviewer's exact probe: before this guard existed, a nonexistent
+		// class name paired with an empty-string reason changed nothing
+		// observable, because the exclusion deleted a key that was never in the
+		// declared-class Set to begin with — the sweep stayed green.
+		withFixtureTree(
+			{
+				"real-class.ts": [
+					"export class RealClass {",
+					"\tclear(): void {}",
+					"}",
+					"",
+				].join("\n"),
+			},
+			(dir) => {
+				const problems = auditContainerClassExclusions(
+					{ NonexistentClass: "a real reason, just naming the wrong class" },
+					dir,
+				);
+				expect(problems).toEqual([
+					'CONTAINER_CLASS_EXCLUSIONS names "NonexistentClass", which the live class scan does not find — stale entry (renamed, deleted, or never existed)',
+				]);
+			},
+		);
+	});
+
+	it("reds on an empty reason, even for a class the scan genuinely finds", () => {
+		withFixtureTree(
+			{
+				"real-class.ts": [
+					"export class RealClass {",
+					"\tclear(): void {}",
+					"}",
+					"",
+				].join("\n"),
+			},
+			(dir) => {
+				const problems = auditContainerClassExclusions({ RealClass: "" }, dir);
+				expect(problems).toEqual([
+					'CONTAINER_CLASS_EXCLUSIONS["RealClass"] has an empty reason',
+				]);
+			},
+		);
+	});
+
+	it("the reviewer's exact probe: a nonexistent class with an EMPTY reason reds on BOTH counts", () => {
+		withFixtureTree(
+			{
+				"real-class.ts": [
+					"export class RealClass {",
+					"\tclear(): void {}",
+					"}",
+					"",
+				].join("\n"),
+			},
+			(dir) => {
+				const problems = auditContainerClassExclusions(
+					{ NonexistentClass: "" },
+					dir,
+				);
+				expect(problems).toHaveLength(2);
+			},
+		);
+	});
+
+	it("passes clean for a real class name with a real reason", () => {
+		withFixtureTree(
+			{
+				"real-class.ts": [
+					"export class RealClass {",
+					"\tclear(): void {}",
+					"}",
+					"",
+				].join("\n"),
+			},
+			(dir) => {
+				const problems = auditContainerClassExclusions(
+					{ RealClass: "proven stateless — no instance fields at all" },
+					dir,
+				);
+				expect(problems).toEqual([]);
 			},
 		);
 	});

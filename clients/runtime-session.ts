@@ -15,7 +15,9 @@ import {
 } from "./degradation-ledger.js";
 import type { DependencyChecker } from "./dependency-checker.js";
 import { getDiagnosticTracker } from "./diagnostic-tracker.js";
+import { resetGoAvailability } from "./dispatch/runners/go-vet.js";
 import { resetPsScriptAnalyzerAvailability } from "./dispatch/runners/psscriptanalyzer.js";
+import { resetRustAvailability } from "./dispatch/runners/rust-clippy.js";
 import { resetInstallRetryLatches } from "./dispatch/runners/utils/availability-policy.js";
 import { resetLazyInstallAttempts } from "./dispatch/runners/utils/lazy-installer.js";
 import { resetDispatchAvailabilityState } from "./dispatch/runners/utils/runner-helpers.js";
@@ -2205,6 +2207,15 @@ export async function handleSessionStart(
 	// login` and starts a fresh session still reads the previous session's
 	// stale "no token" verdict until the cooldown (if any) happens to expire.
 	resetZizmorTokenAvailability();
+	// #2455 fix round 2: same #1266/#1535 shape, one caller later — GoClient
+	// and RustClient each hold their own `createAvailabilityLatch()` outside
+	// the dispatch generation counter above (they predate `createCwdCachedProbe`
+	// and were invisible to the session-state sweep until the detector widened
+	// to any class declared in `clients/`). A "missing" verdict never expires
+	// on its own, so without these a go/cargo install between sessions stayed
+	// unobserved for the rest of the process's life.
+	resetGoAvailability();
+	resetRustAvailability();
 	// psscriptanalyzer's three latches (interpreter, module, -File exec) are
 	// module-local, so the generation counter above does not reach them
 	// (#1490, #1540).

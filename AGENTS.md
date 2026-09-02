@@ -3233,16 +3233,28 @@ primary activation owns the tally, and a secondary must never clear it.
 
 `tests/support/session-state-scan.ts`'s container detector recognises a
 module-level `const`/`let` bound to `new <Ctor>(...)` where `<Ctor>` is a
-built-in (`Map`/`Set`/`WeakMap`/`WeakSet`) or `containerClassNames()` — every
-class exported from `clients/` that owns a `clear()`/`delete()` method,
-resolved directly or through an `extends` chain, scanned live once per run
-instead of hand-listed. #2442's `BoundedFifoMap`/`BoundedLruCache` migration
-had to be added to a hard-coded alternation by hand before the scan could see
-it again; #2455 replaced the alternation with this scan so a NEW repo-local
-collection wrapper is recognised the moment it is written. A class that
-structurally qualifies but provably holds no session state gets a documented
-`CONTAINER_CLASS_EXCLUSIONS` entry rather than a special case at the call
-site — empty today.
+built-in (`Map`/`Set`/`WeakMap`/`WeakSet`) or ANY class declared anywhere in
+`clients/`, regardless of export shape (`export class`, `export default
+class`, `export abstract class`, a bare non-exported `class` later re-exported
+via `export { A }` / `export { A as B }`), scanned live once per run instead
+of hand-listed. #2442's `BoundedFifoMap`/`BoundedLruCache` migration had to be
+added to a hard-coded alternation by hand before the scan could see it again;
+#2455 fix round 1 replaced the alternation with a live scan gated on the class
+owning a `clear()`/`delete()` method (directly or through an `extends`
+chain) — round 2 found that gate was ITSELF a miss: `FactStore`'s own clear
+methods are named `clearAll`/`deleteFileFact`, not `clear`/`delete`, so two of
+its five production module-scope instances (`dispatch/integration.ts`,
+`mcp/analyze.ts`) stayed invisible. Round 2 dropped the method-name gate for
+the issue's own primary wording — "declared in `clients/`" — which also
+deleted the `extends`-chain walk and its cycle guard (nothing left to resolve
+without a method filter). A class that structurally qualifies but is proven
+NOT to hold session state gets a documented `CONTAINER_CLASS_EXCLUSIONS`
+entry rather than a special case at the call site — empty today; both a stale
+entry (names a class the live scan no longer finds) and a reason-less entry
+red via `auditContainerClassExclusions()`. Known boundary the predicate still
+cannot see (`SWEEP_HEURISTIC_LIMITS`): a `new` bound to a constructor
+IMPORTED from outside `clients/` (a node_modules class), or built via a
+factory function instead of a bare `new Ctor(...)` call.
 
 ## Issue triage & labels
 

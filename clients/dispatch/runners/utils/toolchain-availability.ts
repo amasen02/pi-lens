@@ -44,6 +44,15 @@ export interface ToolchainAvailability {
 	findPath: () => Promise<string | null>;
 	/** Availability verdict, behind the transient-aware latch. */
 	isAvailable: () => Promise<boolean>;
+	/**
+	 * Forget the memoized path and the latched verdict. #2455 fix round 2: a
+	 * "missing" verdict for a probe-class failure never expires
+	 * (`isLatchingOutcome` — anything but `transient`), so without this a
+	 * toolchain installed mid-process stayed invisible for the rest of the
+	 * process's life, the same #1496/#1535 shape `resetZizmorTokenAvailability`
+	 * exists for. Callers wire this per session, not per process.
+	 */
+	reset: () => void;
 }
 
 const toolchainProbeFlights =
@@ -140,5 +149,10 @@ export function createToolchainAvailability(
 		return ensureFlight.run("availability", resolveAvailability);
 	}
 
-	return { findPath, isAvailable };
+	function reset(): void {
+		toolPath = null;
+		availabilityLatch.reset();
+	}
+
+	return { findPath, isAvailable, reset };
 }

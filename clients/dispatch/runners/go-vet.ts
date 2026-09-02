@@ -20,6 +20,21 @@ import { PRIORITY } from "../priorities.js";
 
 const goClient = new GoClient();
 
+/**
+ * Forget `goClient`'s memoized go path and latched availability verdict —
+ * #2455 fix round 2. A probe-class "missing" verdict never expires
+ * (`isLatchingOutcome`), and this module-scope client was invisible to the
+ * session-state sweep (its own `clear`/`delete`-less shape) until #2455
+ * widened the detector to any class declared in `clients/`. Same #1496/#1535
+ * shape as `resetZizmorTokenAvailability`; wired into `handleSessionStart`
+ * beside it (`clients/runtime-session.ts`) so a go toolchain installed
+ * mid-process is observed by the next session instead of staying "missing"
+ * for the rest of the process's life.
+ */
+export function resetGoAvailability(): void {
+	goClient.resetAvailability();
+}
+
 const goVetRunner: RunnerDefinition = {
 	id: "go-vet",
 	appliesTo: ["go"],
