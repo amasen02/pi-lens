@@ -17,7 +17,7 @@ const SCRUBBED = [
 const CONFIG_KV_PATTERN = /^GIT_CONFIG_(?:KEY|VALUE)_\d+$/;
 
 export function envFor(cwd, overrides) {
-	const env = { ...process.env, ...(overrides ?? {}) };
+	const env = { ...process.env, ...overrides };
 	for (const name of SCRUBBED) delete env[name];
 	for (const key of Object.keys(env))
 		if (CONFIG_KV_PATTERN.test(key)) delete env[key];

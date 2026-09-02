@@ -66,7 +66,7 @@ for (let i = 0; i < tsFiles.length; i++) {
 					text: f.text?.slice(0, 120) ?? "",
 				});
 			}
-		} catch (e) {}
+		} catch {}
 	}
 	processed++;
 }

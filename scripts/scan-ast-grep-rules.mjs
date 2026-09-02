@@ -10,7 +10,7 @@
  *   node scripts/scan-ast-grep-rules.mjs --rules prefer-structured-clone .
  */
 
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { join, resolve, relative, extname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { load as yamlLoad } from "js-yaml";
@@ -154,15 +154,6 @@ function* walkFiles(dir) {
 }
 
 // ── Pattern matching via NAPI ─────────────────────────────────────────────────
-function matchPattern(sgRoot, pattern) {
-	if (!pattern || typeof pattern !== "string") return [];
-	try {
-		return sgRoot.findAll({ rule: { pattern } });
-	} catch {
-		return [];
-	}
-}
-
 function matchRule(sgRoot, ruleSpec, constraints) {
 	try {
 		const config = { rule: ruleSpec };

@@ -105,7 +105,7 @@ function assignHash(used, baseIdx, hint) {
 }
 function lineHashesPure(content) {
   const lines = splitLines(content);
-  const hashes = new Array(lines.length);
+  const hashes = Array.from({ length: lines.length });
   const used = new Uint32Array(BITSET_WORDS);
   const hint = { value: 0 };
   const hashSourceCache = new Map();
@@ -147,7 +147,7 @@ function nearestNew(candidates, target) {
 function mapStableHashes(oldContent, oldHashes, newContent, removedHashes) {
   const oldLines = splitLines(oldContent);
   const newLines = splitLines(newContent);
-  const newHashes = new Array(newLines.length);
+  const newHashes = Array.from({ length: newLines.length });
   const used = new Uint32Array(BITSET_WORDS);
   const hint = { value: 0 };
   const hashSourceCache = new Map();

@@ -40,7 +40,6 @@
  * Requires `npm run build:dist` (imports from dist/). Measures only
  * already-installed servers unless --install is passed.
  */
-import { execFileSync } from "node:child_process";
 import { gitExecFileSync } from "./lib/git-fixture-env.mjs";
 import * as fs from "node:fs";
 import * as os from "node:os";
