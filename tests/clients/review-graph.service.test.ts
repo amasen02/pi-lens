@@ -7,7 +7,10 @@ import { FactStore } from "../../clients/dispatch/fact-store.js";
 import { getProjectDataDir } from "../../clients/file-utils.js";
 import { _resetUntrackedIgnoredCacheForTests } from "../../clients/git-tracked-ignore.js";
 import { logLatency } from "../../clients/latency-logger.js";
-import { normalizeMapKey } from "../../clients/path-utils.js";
+import {
+	combineCwdScopedKey,
+	normalizeMapKey,
+} from "../../clients/path-utils.js";
 import {
 	buildOrUpdateGraph,
 	computeImpactCascade,
@@ -73,7 +76,10 @@ describe("review graph service", () => {
 
 			const facts = new FactStore();
 			facts.setBoundedSessionFact(
-				`session.reviewGraph.changedSymbols:${normalizeMapKey(aPath)}`,
+				`session.reviewGraph.changedSymbols:${combineCwdScopedKey(
+					normalizeMapKey(env.tmpDir),
+					normalizeMapKey(aPath),
+				)}`,
 				["alpha"],
 			);
 
@@ -674,7 +680,10 @@ describe("review graph service", () => {
 
 			const facts = new FactStore();
 			facts.setBoundedSessionFact(
-				`session.reviewGraph.changedSymbols:${normalizeMapKey(modelsPath)}`,
+				`session.reviewGraph.changedSymbols:${combineCwdScopedKey(
+					normalizeMapKey(env.tmpDir),
+					normalizeMapKey(modelsPath),
+				)}`,
 				["User"],
 			);
 
@@ -708,7 +717,10 @@ describe("review graph service", () => {
 
 			const facts = new FactStore();
 			facts.setBoundedSessionFact(
-				`session.reviewGraph.changedSymbols:${normalizeMapKey(aPath)}`,
+				`session.reviewGraph.changedSymbols:${combineCwdScopedKey(
+					normalizeMapKey(env.tmpDir),
+					normalizeMapKey(aPath),
+				)}`,
 				["alpha"],
 			);
 
@@ -798,7 +810,10 @@ describe("review graph service", () => {
 
 			const facts = new FactStore();
 			facts.setBoundedSessionFact(
-				`session.reviewGraph.changedSymbols:${normalizeMapKey(changedPath)}`,
+				`session.reviewGraph.changedSymbols:${combineCwdScopedKey(
+					normalizeMapKey(env.tmpDir),
+					normalizeMapKey(changedPath),
+				)}`,
 				["changed"],
 			);
 			const graph = await buildOrUpdateGraph(env.tmpDir, [changedPath], facts);

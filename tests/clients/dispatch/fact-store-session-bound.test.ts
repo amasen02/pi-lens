@@ -18,7 +18,10 @@ import type {
 	RunnerGroup,
 } from "../../../clients/dispatch/types.js";
 import { createMockRunner } from "../../mocks/runner-factory.js";
-import { normalizeMapKey } from "../../../clients/path-utils.js";
+import {
+	combineCwdScopedKey,
+	normalizeMapKey,
+} from "../../../clients/path-utils.js";
 import { recordEntitySnapshotDiff } from "../../../clients/review-graph/service.js";
 // Side-effect import: loading integration.ts runs its module-scope
 // `setFactStoreEvictionReporter(...)` call, wiring the REAL production
@@ -263,6 +266,7 @@ describe("FactStore session-fact bound (#2282)", () => {
 	// every entity in `added`, which reads downstream as "the whole file
 	// changed" and schedules a blast-radius run for a file nothing touched.
 	describe("evicted entity snapshots do not invert to a whole-file change", () => {
+		const CWD = "/repo";
 		const TARGET = "/repo/src/Target.ts";
 		const snapshot = () =>
 			new Map([
@@ -274,31 +278,36 @@ describe("FactStore session-fact bound (#2282)", () => {
 		it("reports no diff for a snapshot the cap evicted, not every symbol", () => {
 			const store = new FactStore("dispatch");
 
-			expect(recordEntitySnapshotDiff(store, TARGET, snapshot()).added).toEqual(
-				["function:alpha", "function:beta", "class:Gamma"],
-			);
-			expect(recordEntitySnapshotDiff(store, TARGET, snapshot()).added).toEqual(
-				[],
-			);
+			expect(
+				recordEntitySnapshotDiff(store, CWD, TARGET, snapshot()).added,
+			).toEqual(["function:alpha", "function:beta", "class:Gamma"]);
+			expect(
+				recordEntitySnapshotDiff(store, CWD, TARGET, snapshot()).added,
+			).toEqual([]);
 
 			for (const p of batchPaths("snapshot-evict", MAX_SESSION_RECORDS + 500))
 				store.setBoundedSessionFact(p, []);
 
-			const afterEviction = recordEntitySnapshotDiff(store, TARGET, snapshot());
+			const afterEviction = recordEntitySnapshotDiff(
+				store,
+				CWD,
+				TARGET,
+				snapshot(),
+			);
 			expect(afterEviction).toEqual({ added: [], removed: [], modified: [] });
 		});
 
 		it("re-seeds the evicted snapshot so the next real edit still diffs", () => {
 			const store = new FactStore("dispatch");
-			recordEntitySnapshotDiff(store, TARGET, snapshot());
+			recordEntitySnapshotDiff(store, CWD, TARGET, snapshot());
 			for (const p of batchPaths("snapshot-reseed", MAX_SESSION_RECORDS + 500))
 				store.setBoundedSessionFact(p, []);
-			recordEntitySnapshotDiff(store, TARGET, snapshot());
+			recordEntitySnapshotDiff(store, CWD, TARGET, snapshot());
 
 			const edited = snapshot();
 			edited.set("function:beta", "h2-edited");
 
-			expect(recordEntitySnapshotDiff(store, TARGET, edited)).toEqual({
+			expect(recordEntitySnapshotDiff(store, CWD, TARGET, edited)).toEqual({
 				added: [],
 				removed: [],
 				modified: ["function:beta"],
@@ -314,9 +323,12 @@ describe("FactStore session-fact bound (#2282)", () => {
 			const backslashPath = "/repo/src\\nested\\Target.ts";
 			expect(normalizeMapKey(backslashPath)).not.toBe(backslashPath);
 
-			recordEntitySnapshotDiff(store, backslashPath, snapshot());
+			recordEntitySnapshotDiff(store, CWD, backslashPath, snapshot());
 
-			const readKey = `session.reviewGraph.changedSymbols:${normalizeMapKey(backslashPath)}`;
+			const readKey = `session.reviewGraph.changedSymbols:${combineCwdScopedKey(
+				normalizeMapKey(CWD),
+				normalizeMapKey(backslashPath),
+			)}`;
 			expect(store.getBoundedSessionFact<string[]>(readKey)).toEqual([
 				"alpha",
 				"beta",
@@ -341,9 +353,12 @@ describe("FactStore session-fact bound (#2282)", () => {
 				normalizeMapKey(readSpelling),
 			);
 
-			recordEntitySnapshotDiff(store, writeSpelling, snapshot());
+			recordEntitySnapshotDiff(store, CWD, writeSpelling, snapshot());
 
-			const readKey = `session.reviewGraph.changedSymbols:${normalizeMapKey(readSpelling)}`;
+			const readKey = `session.reviewGraph.changedSymbols:${combineCwdScopedKey(
+				normalizeMapKey(CWD),
+				normalizeMapKey(readSpelling),
+			)}`;
 			expect(store.getBoundedSessionFact<string[]>(readKey)).toEqual([
 				"alpha",
 				"beta",
@@ -364,9 +379,11 @@ describe("FactStore session-fact bound (#2282)", () => {
 			const reSpelling = "c:/repo/2355/src/target.ts";
 			expect(normalizeMapKey(firstSpelling)).toBe(normalizeMapKey(reSpelling));
 
-			recordEntitySnapshotDiff(store, firstSpelling, snapshot());
+			recordEntitySnapshotDiff(store, CWD, firstSpelling, snapshot());
 
-			expect(recordEntitySnapshotDiff(store, reSpelling, snapshot())).toEqual({
+			expect(
+				recordEntitySnapshotDiff(store, CWD, reSpelling, snapshot()),
+			).toEqual({
 				added: [],
 				removed: [],
 				modified: [],

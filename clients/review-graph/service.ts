@@ -1,5 +1,5 @@
 import type { FactStore } from "../dispatch/fact-store.js";
-import { normalizeMapKey } from "../path-utils.js";
+import { combineCwdScopedKey, normalizeMapKey } from "../path-utils.js";
 import {
 	computeImpactCascade as computeImpactCascadeImpl,
 	computeTransitiveImpact as computeTransitiveImpactImpl,
@@ -52,15 +52,24 @@ export function computeTransitiveImpact(
 
 export function recordEntitySnapshotDiff(
 	facts: FactStore,
+	cwd: string,
 	filePath: string,
 	nextSnapshot: Map<string, string>,
 ): { added: string[]; removed: string[]; modified: string[] } {
-	// Normalize once at this boundary, then reuse the folded path for both
-	// per-file facts. An unnormalized write is a key the builder reader can never
-	// hit, and an unnormalized snapshot forks a second empty diff (#2355).
-	const normalizedFilePath = normalizeMapKey(filePath);
-	const snapshotKey = `${ENTITY_SNAPSHOT_PREFIX}${normalizedFilePath}`;
-	const changedSymbolsKey = `${CHANGED_SYMBOLS_PREFIX}${normalizedFilePath}`;
+	// Normalize once at this boundary, then reuse the folded cwd+path key for
+	// both per-file facts. An unnormalized write is a key the builder reader can
+	// never hit, and an unnormalized snapshot forks a second empty diff (#2355).
+	// Folding `cwd` in (not just `filePath`) matters because `facts` can be a
+	// store that outlives one project root, e.g. `clients/mcp/analyze.ts`'s
+	// module-scope `warmGraphFacts` — without it, two project roots that share
+	// a relative path would diff one project's file against the other's stored
+	// snapshot (#2477).
+	const scopedKey = combineCwdScopedKey(
+		normalizeMapKey(cwd),
+		normalizeMapKey(filePath),
+	);
+	const snapshotKey = `${ENTITY_SNAPSHOT_PREFIX}${scopedKey}`;
+	const changedSymbolsKey = `${CHANGED_SYMBOLS_PREFIX}${scopedKey}`;
 	const stored = facts.getBoundedSessionFact<Map<string, string>>(snapshotKey);
 	// An evicted snapshot is unknown, not empty. Diffing against an empty Map
 	// puts every entity in `added`, which reads downstream as "the whole file

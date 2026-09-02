@@ -254,6 +254,30 @@ export function normalizeMapKey(filePath: string): string {
 }
 
 /**
+ * Fold an already-`normalizeMapKey`-normalized cwd and file path into one
+ * map/FactStore key. A store whose lifetime outlives a single project root
+ * (e.g. `clients/mcp/analyze.ts`'s module-scope `warmGraphFacts`, which can
+ * serve `analyze` calls for any number of different cwds over its process
+ * lifetime) must not key a per-file entry by path alone — two project roots
+ * that happen to share a relative path would otherwise diff one project's
+ * file against the other's stored snapshot (#2477).
+ *
+ * Both arguments must already be normalized by the caller: a per-file loop
+ * over an already-canonical cwd must normalize the cwd ONCE outside the loop
+ * and pass the result here on every iteration, never re-normalize the same
+ * cwd per file (the shape-1 "path-keyed map" multiplier — see AGENTS.md's
+ * recurring-defect catalog). The NUL separator cannot appear in a real
+ * filesystem path, so no `(cwd, filePath)` pair's concatenation can collide
+ * with a different pair's.
+ */
+export function combineCwdScopedKey(
+	normalizedCwd: string,
+	normalizedFilePath: string,
+): string {
+	return `${normalizedCwd} ${normalizedFilePath}`;
+}
+
+/**
  * Human-facing path relative to a project root when the file is inside it.
  *
  * Parses by path SHAPE, not host OS (refs #1150/#1152, shape-2 class #1163):
