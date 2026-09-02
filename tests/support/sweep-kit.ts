@@ -72,6 +72,20 @@
  *    silently tags the NEXT seam instead. Defense: a bounded blank-line gap
  *    (`maxBlankGap`, default 1) and outright rejection of inline tags — see
  *    {@link bindTagsToSeams}.
+ * - **Positional-ordinal disambiguation** (#2487 review round 3). A prior
+ *    version of this kit shipped `disambiguateFlaggedKeys`, which numbered
+ *    colliding occurrences `key`, `key#2`, `key#3`, ... by SCAN POSITION, not
+ *    by occurrence identity. A new colliding call inserted BETWEEN two already
+ *    exempted ones shifts every ordinal after it, so an exemption reasoned
+ *    about one call site silently rides a different one — one round it failed
+ *    loud with no file:line to act on, another round it stayed fully green
+ *    while an unreviewed unbounded call shipped. Removed outright: fix the
+ *    KEY GENERATOR so genuinely distinct call sites derive genuinely distinct
+ *    keys (`tests/config/sync-child-process-timeout.test.ts`'s `exemptionKey`
+ *    now matches each call's own ARGUMENTS against a discriminating snippet,
+ *    not a position-dependent ordinal), and let `requireUniqueFlagged` fail
+ *    loud — by file:line, via `FlaggedEntry.detail` — on any collision the
+ *    generator still produces.
  *
  * ## Known limits, named rather than papered over
  *
@@ -384,39 +398,6 @@ export function stableOccurrenceKey(
 	return symbol ? `${relPath}#${symbol}:${hash}` : `${relPath}#${hash}`;
 }
 
-/**
- * Give each occurrence sharing a key a distinguishing ordinal suffix, in the
- * order given — `key` for the first, `key#2` for the second, `key#3` for the
- * third, and so on. A key seen only once is left bare.
- *
- * For a caller whose own key derivation CAN legitimately collide across two
- * genuinely separate, individually-reasoned occurrences (#2487 review F1 —
- * `clients/safe-spawn.ts` has two `spawnSync` calls that both spread
- * `...(options as SpawnOptions)`, so `sync-child-process-timeout.test.ts`'s
- * substring-matched exemption key names both identically): call this AFTER
- * building the flagged list and BEFORE auditing, and add one exemption entry
- * per ordinal. The first occurrence keeps the bare key, so an exemption
- * written before this helper existed still matches it with no re-key; every
- * occurrence after the first needs its own `#n` exemption entry, reasoned
- * explicitly. A THIRD, unreviewed occurrence sharing the same base key then
- * lands on an ordinal nothing exempts — caught as unaccounted, which is the
- * property per-occurrence keying exists to guarantee. Order matters: pass
- * entries in a stable, deterministic order (source-scan order is fine) so the
- * ordinal a given occurrence gets does not depend on iteration order.
- */
-export function disambiguateFlaggedKeys(
-	entries: readonly { key: string; detail: string }[],
-): { key: string; detail: string }[] {
-	const seen = new Map<string, number>();
-	return entries.map((entry) => {
-		const ordinal = (seen.get(entry.key) ?? 0) + 1;
-		seen.set(entry.key, ordinal);
-		return ordinal === 1
-			? entry
-			: { key: `${entry.key}#${ordinal}`, detail: entry.detail };
-	});
-}
-
 // ── 2. Registry semantics ───────────────────────────────────────────────────
 
 /**
@@ -574,6 +555,29 @@ export function auditRegistry(input: RegistryAuditInput): RegistryAudit {
 	// `Object.keys` (own properties only), so it could never report the phantom
 	// exemption as stale either. No sweep's id namespace collides today, but the
 	// kit is built for six more with arbitrary id namespaces.
+	// Detail lookup for readable messages (#2487 review round 3 F1). A caller
+	// that passes the object `FlaggedEntry` form gives each key a
+	// human-readable detail — a file:line, typically — and a problem message
+	// should NAME the site rather than print a bare key nobody can act on.
+	// Round 3's probe 1 was exactly this: an unaccounted ordinal key
+	// (`...#3`) printed with no file:line, so the natural remediation excused
+	// the wrong call site. Built once, over every entry, first occurrence
+	// wins (a duplicate key's collision is already reported separately, above).
+	const detailByKey = new Map<string, string>();
+	for (const entry of flaggedEntries) {
+		if (
+			entry.detail &&
+			entry.detail !== entry.key &&
+			!detailByKey.has(entry.key)
+		) {
+			detailByKey.set(entry.key, entry.detail);
+		}
+	}
+	const describe = (item: string): string => {
+		const detail = detailByKey.get(item);
+		return detail ? `${item} (${detail})` : item;
+	};
+
 	const unaccounted = flagged.filter(
 		(item) => !registered.has(item) && !Object.hasOwn(exemptions, item),
 	);
@@ -581,7 +585,7 @@ export function auditRegistry(input: RegistryAuditInput): RegistryAudit {
 		problems.push(
 			`${input.sweepName}: ${unaccounted.length} flagged item(s) are neither ` +
 				"registered nor exempted:\n" +
-				unaccounted.map((item) => `  ${item}`).join("\n") +
+				unaccounted.map((item) => `  ${describe(item)}`).join("\n") +
 				(input.remediation ? `\n\n${input.remediation}` : ""),
 		);
 	}
@@ -593,7 +597,7 @@ export function auditRegistry(input: RegistryAuditInput): RegistryAudit {
 		problems.push(
 			`${input.sweepName}: ${staleExemptions.length} exemption(s) name an item the ` +
 				"scan no longer flags — remove them, a stale exemption is dead weight, not a screen:\n" +
-				staleExemptions.map((item) => `  ${item}`).join("\n"),
+				staleExemptions.map((item) => `  ${describe(item)}`).join("\n"),
 		);
 	}
 

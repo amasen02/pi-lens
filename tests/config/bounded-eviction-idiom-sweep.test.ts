@@ -58,7 +58,6 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
 	auditRegistry,
-	disambiguateFlaggedKeys,
 	listSourceFiles,
 	relativePosix,
 	stableOccurrenceKey,
@@ -319,20 +318,42 @@ describe("#2442 no new hand-rolled evict-oldest idiom outside bounded-cache.ts",
 		});
 		expect(laundered.problems.join("\n")).toContain("collide");
 
-		// The remedy this sweep ships: disambiguate before exempting, and give
-		// EACH occurrence its own reasoned entry. That passes.
-		const disambiguated = disambiguateFlaggedKeys(twinOccurrences);
-		expect(disambiguated.map((e) => e.key)).toEqual([
-			twinOccurrences[0]!.key,
-			`${twinOccurrences[0]!.key}#2`,
-		]);
+		// The remedy this sweep ships (#2487 review round 3 F1): NOT an
+		// auto-numbered ordinal — `disambiguateFlaggedKeys` shipped that and was
+		// deleted, because numbering by SCAN POSITION let a genuinely new,
+		// unreviewed occurrence ride an existing exemption's ordinal the moment
+		// it landed between two already-exempted ones (proved against
+		// `sync-child-process-timeout.test.ts`'s real collision in that same
+		// review round). The actual remedy is the message's own instruction:
+		// "give each occurrence a distinguishing key ... before exempting
+		// either" — a human edits the flagged line's own text so its content
+		// hash genuinely differs, which is what distinguishes two occurrences
+		// that a mechanical scan cannot tell apart on its own.
+		const distinguishedSource = source.replace(
+			"\tevictSecond() {\n\t\tfor (const k of this.map.keys()) {",
+			"\tevictSecond() {\n\t\tfor (const key of this.map.keys()) {",
+		);
+		const distinguishedLines = distinguishedSource.split("\n");
+		const distinguishedEvictionLines = findEvictionLines(distinguishedSource);
+		expect(distinguishedEvictionLines).toEqual([3, 9]); // same lines...
+		const distinguishedOccurrences = distinguishedEvictionLines.map((line) => ({
+			key: stableOccurrenceKey(rel, distinguishedLines, line - 1),
+			detail: `${rel}:${line}`,
+		}));
+		// ...but no longer the same KEY: `key` vs `k` changed the flagged
+		// line's own text, so its content hash — not its position — differs.
+		expect(distinguishedOccurrences[0]!.key).not.toBe(
+			distinguishedOccurrences[1]!.key,
+		);
 		const properlyExempted = auditRegistry({
 			sweepName: "probe twin sweep",
-			flagged: disambiguated,
+			flagged: distinguishedOccurrences,
 			registered: [],
 			exemptions: {
-				[disambiguated[0]!.key]: "reviewed exemption for occurrence 1 of 2",
-				[disambiguated[1]!.key]: "reviewed exemption for occurrence 2 of 2",
+				[distinguishedOccurrences[0]!.key]:
+					"reviewed exemption for evictFirst's occurrence",
+				[distinguishedOccurrences[1]!.key]:
+					"reviewed exemption for evictSecond's occurrence",
 			},
 		});
 		expect(properlyExempted.problems).toEqual([]);
