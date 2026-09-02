@@ -700,4 +700,21 @@ describe("SCAN_LANGUAGE_PRIORITY (#2434 fold)", () => {
 		const missing = [...allGolden].filter((ext) => !allProjected.has(ext));
 		expect(missing).toEqual([]);
 	});
+
+	// #2434 scope item 3: clients/lsp/server.ts's AST_GREP_KINDS carried a dead
+	// "solidity" entry — not a FileKind, so KIND_EXTENSIONS never had a row for
+	// it and it contributed zero extensions before or after removal (the
+	// deletion is a no-op on AstGrepServer.extensions, which is why a runtime
+	// assertion on that list can't guard the regression). Source-grep instead.
+	it("clients/lsp/server.ts's AST_GREP_KINDS names no phantom 'solidity' entry", () => {
+		const source = readFileSync(
+			new URL("../../clients/lsp/server.ts", import.meta.url),
+			"utf8",
+		);
+		const match = source.match(
+			/const AST_GREP_KINDS = \[([\s\S]*?)\] as const;/,
+		);
+		expect(match, "AST_GREP_KINDS declaration not found").not.toBeNull();
+		expect(match?.[1]).not.toContain("solidity");
+	});
 });
