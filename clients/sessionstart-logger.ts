@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
 import { getGlobalPiLensDir } from "./file-utils.js";
+import { getMaxLogSizeMB } from "./log-cleanup.js";
 import { createNdjsonLogger } from "./ndjson-logger.js";
 
 export const SESSIONSTART_LOG_FILE = path.join(
@@ -9,7 +10,15 @@ export const SESSIONSTART_LOG_FILE = path.join(
 );
 
 // All ordinary writers share this queue, preserving their in-process order.
-const writer = createNdjsonLogger({ filePath: SESSIONSTART_LOG_FILE });
+// Bounded like every other global sink (#2505): an unbounded sink has no
+// size check on the write path at all, so it grows until the
+// once-per-process session-start sweep happens to look at it — which, in a
+// long-lived process (the warm MCP server), may be never.
+const writer = createNdjsonLogger({
+	filePath: SESSIONSTART_LOG_FILE,
+	maxBytes: getMaxLogSizeMB() * 1024 * 1024,
+	backupPath: `${SESSIONSTART_LOG_FILE}.1`,
+});
 
 export function logSessionStart(message: string): void {
 	if (isTestMode()) return;
