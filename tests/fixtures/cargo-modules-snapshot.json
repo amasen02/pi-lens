@@ -135,6 +135,7 @@
 			],
 			"dependents": {}
 		},
+		"tests/fixtures/cargo-workspace-modules/adv-i-empty-workspace-eof": null,
 		"tests/fixtures/cargo-workspace-modules/synthetic-workspace": {
 			"modules": [
 				{

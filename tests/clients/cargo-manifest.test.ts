@@ -12,12 +12,20 @@
  * - F2: `extractTomlTableSection`'s heading/terminator regexes were anchored
  *   at column 0 (`^\[`), so an indented (but valid) TOML heading either failed
  *   to match at all (heading case) or failed to terminate the previous
- *   table's slice (sub-table terminator case); the CRLF `\r` also sat between
- *   the matched heading text and the `$` anchor, breaking the match outright.
+ *   table's slice (sub-table terminator case). The SAME `[ \t]*` anchor fix
+ *   is also what makes a CRLF manifest read correctly — ECMAScript's
+ *   multiline `$`/`^` already treat a bare `\r` as a line terminator on its
+ *   own, so the CRLF test below passes even without the `\r\n`→`\n`
+ *   normalize `clients/cargo-manifest.ts` also runs (kept as defensive
+ *   belt-and-braces, not a fix for a real match failure — review round 3
+ *   correction).
  * - F4: `readCargoWorkspaceMembers` read `members` unscoped — the first
  *   `members = [...]` line anywhere in the file, not specifically the one
  *   under `[workspace]` — the exact "same-named key under an unrelated
  *   table" defect shape `readCargoPackageName` was already fixed for.
+ * - Review round 3, F1: `extractTomlTableSection` returned `""` for BOTH
+ *   "table absent" and "table present but empty" — see the
+ *   `extractTomlTableSection` presence-vs-content describe block below.
  */
 import { describe, expect, it } from "vitest";
 import {
@@ -92,6 +100,33 @@ describe("extractTomlTableSection indentation + CRLF (review round 2, F2)", () =
 		expect(extractTomlTableSection(content, "package")).toContain(
 			'name = "commented-heading"',
 		);
+	});
+});
+
+describe("extractTomlTableSection presence vs content (review round 3, F1)", () => {
+	it("returns undefined when the table is absent", () => {
+		expect(extractTomlTableSection("[package]\nname = \"x\"\n", "workspace"))
+			.toBeUndefined();
+	});
+
+	it("returns \"\" (not undefined) when the table is present but empty and sits last in the file with NO trailing newline", () => {
+		const content = ["[package]", 'name = "x"', "", "[workspace]"].join("\n");
+		expect(content.endsWith("\n")).toBe(false);
+		expect(extractTomlTableSection(content, "workspace")).toBe("");
+	});
+
+	it("returns \"\" when the table heading carries a trailing comment and is immediately EOF", () => {
+		const content = ["[package]", 'name = "x"', "", "[workspace] # root"].join(
+			"\n",
+		);
+		expect(extractTomlTableSection(content, "workspace")).toBe("");
+	});
+
+	it("returns \"\" when the table heading has trailing whitespace and is immediately EOF", () => {
+		const content = ["[package]", 'name = "x"', "", "[workspace]   "].join(
+			"\n",
+		);
+		expect(extractTomlTableSection(content, "workspace")).toBe("");
 	});
 });
 

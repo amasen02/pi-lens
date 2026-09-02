@@ -151,4 +151,21 @@ describe("adversarial fixtures (#2473 review round 2, F1-F4)", () => {
 		expect(graph).not.toBeNull();
 		expect(graph?.modules.has("foo")).toBe(true);
 	});
+
+	it("F1 (review round 3): an EMPTY [workspace] table with no trailing newline at EOF is still classified as cargo, not npm", () => {
+		// `adv-i-empty-workspace-eof/Cargo.toml`'s `[workspace]` heading is the
+		// LAST bytes of the file (no trailing newline, no `members` key) — an
+		// empty-but-PRESENT table. `extractTomlTableSection` used to return the
+		// same `""` sentinel for this as for "table absent", so
+		// `detectWorkspaceType` fell through past Cargo.toml to the sibling
+		// package.json's `workspaces` glob and misclassified the project as
+		// npm, surfacing the npm member "foo". Fixed: Cargo.toml correctly
+		// short-circuits detection as "cargo" — since this workspace declares
+		// no explicit `members`, `scanCargoModules` finds none and
+		// `buildModuleGraph` returns `null`, but "foo" must never appear (that
+		// would mean detection fell through to npm again).
+		clearModuleGraphCache();
+		const graph = buildModuleGraph(fixtureDir("adv-i-empty-workspace-eof"));
+		expect(graph).toBeNull();
+	});
 });
