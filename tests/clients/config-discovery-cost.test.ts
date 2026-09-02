@@ -82,9 +82,8 @@ afterEach(async () => {
 	else process.env.PI_LENS_CONFIG_PATH = previousConfigPath;
 	if (previousHome === undefined) delete process.env.PI_LENS_HOME;
 	else process.env.PI_LENS_HOME = previousHome;
-	const { resetProjectLensConfigCache } = await import(
-		"../../clients/project-lens-config.js"
-	);
+	const { resetProjectLensConfigCache } =
+		await import("../../clients/project-lens-config.js");
 	resetProjectLensConfigCache();
 	const { removeTempDirSync } = await import("./test-utils.js");
 	for (const dir of roots.splice(0)) removeTempDirSync(dir);
