@@ -40,8 +40,11 @@ interface CachedBaseline {
 }
 
 /** Nearest `sgconfig.y[a]ml` walking up from `startDir`, or undefined if none. */
-export function findLocalSgconfig(startDir: string): string | undefined {
-	return findLocalToolConfig(startDir, SGCONFIG_NAMES);
+export function findLocalSgconfig(
+	startDir: string,
+	homeDir: string = os.homedir(),
+): string | undefined {
+	return findLocalToolConfig(startDir, SGCONFIG_NAMES, { homeDir });
 }
 
 function canonicalDir(dir: string): string {

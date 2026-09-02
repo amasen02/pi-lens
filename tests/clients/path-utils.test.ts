@@ -394,6 +394,45 @@ describe("findLocalToolConfig (refs #680)", () => {
 		]);
 		expect(found).toBeUndefined();
 	});
+
+	// #2472 review F2: findLocalToolConfig climbed to the filesystem root
+	// with NO $HOME ceiling before this fold — the same #250/#253 defect
+	// class `findNearestMarkerRoot` already guards against. Default-on per
+	// the finding: an injected `options.homeDir` stops the climb even when
+	// the real config sits one level above it, and a caller that omits
+	// `options` gets the SAME guard via the real `os.homedir()`.
+	it("stops the ancestor climb at options.homeDir even when a config sits one level above it", () => {
+		const env = setupTestEnvironment("pi-lens-find-tool-config-homeceiling-");
+		try {
+			fs.writeFileSync(path.join(env.tmpDir, "typos.toml"), "");
+			const homeDir = path.join(env.tmpDir, "home");
+			const startDir = path.join(homeDir, "project", "src");
+			fs.mkdirSync(startDir, { recursive: true });
+
+			const found = findLocalToolConfig(startDir, ["typos.toml"], {
+				homeDir,
+			});
+			expect(found).toBeUndefined();
+
+			// Cross-form (forward-slash) startDir must be guarded identically.
+			const crossFormStartDir = startDir.split(path.sep).join("/");
+			expect(
+				findLocalToolConfig(crossFormStartDir, ["typos.toml"], { homeDir }),
+			).toBeUndefined();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("is at-or-above os.homedir() by default when options is omitted (default-on ceiling)", () => {
+		// Not injecting homeDir: the real os.homedir() is the ceiling. A
+		// climb starting AT os.homedir() itself must never return a config
+		// found above it (isAtOrAboveHomeDir's own "===" branch).
+		const found = findLocalToolConfig(os.homedir(), [
+			"this-config-name-will-not-collide-XYZZY-pi-lens.toml",
+		]);
+		expect(found).toBeUndefined();
+	});
 });
 
 describe("findNearestMarkerRoot (refs #625)", () => {

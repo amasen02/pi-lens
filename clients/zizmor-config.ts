@@ -1,3 +1,4 @@
+import * as os from "node:os";
 import * as path from "node:path";
 import { type SpawnResult, safeSpawnAsync } from "./safe-spawn.js";
 import { findLocalToolConfig } from "./path-utils.js";
@@ -32,8 +33,13 @@ export const LOCAL_ZIZMOR_CONFIG_NAMES = [
 	"zizmor.yaml",
 ] as const;
 
-export function findLocalZizmorConfig(startDir: string): string | undefined {
-	return findLocalToolConfig(startDir, LOCAL_ZIZMOR_CONFIG_NAMES);
+export function findLocalZizmorConfig(
+	startDir: string,
+	homeDir: string = os.homedir(),
+): string | undefined {
+	return findLocalToolConfig(startDir, LOCAL_ZIZMOR_CONFIG_NAMES, {
+		homeDir,
+	});
 }
 
 // zizmor's own input collection (see `zizmor --collect`) only ever audits three

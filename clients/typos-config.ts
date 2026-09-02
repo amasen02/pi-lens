@@ -1,3 +1,4 @@
+import * as os from "node:os";
 import { findLocalToolConfig } from "./path-utils.js";
 
 /**
@@ -21,6 +22,9 @@ export const LOCAL_TYPOS_CONFIG_NAMES = [
 	".typos.toml",
 ] as const;
 
-export function findLocalTyposConfig(startDir: string): string | undefined {
-	return findLocalToolConfig(startDir, LOCAL_TYPOS_CONFIG_NAMES);
+export function findLocalTyposConfig(
+	startDir: string,
+	homeDir: string = os.homedir(),
+): string | undefined {
+	return findLocalToolConfig(startDir, LOCAL_TYPOS_CONFIG_NAMES, { homeDir });
 }

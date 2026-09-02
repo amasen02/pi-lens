@@ -369,7 +369,15 @@ export function findNearestContaining(
  * directory in `names` order. Single source of truth for the "walk up
  * looking for one of these config filenames" loop that `opengrep-config.ts`,
  * `typos-config.ts`, `zizmor-config.ts`, and `sgconfig.ts` each hand-rolled
- * independently (refs #680).
+ * independently (refs #680), and that `php-cs-fixer-config.ts` now delegates
+ * to as well (refs #2472 review F2).
+ *
+ * Applies the SAME `$HOME` ceiling as `findNearestMarkerRoot` — via
+ * `isAtOrAboveHomeDir`, default-ON — so a config found at or above the
+ * user's home directory is never returned; that directory has escaped the
+ * project workspace (the #250/#253 class). `options.boundaries` is honored
+ * identically to `findNearestMarkerRoot` for callers that need a stop marker
+ * (e.g. `.git`) before continuing further up.
  *
  * Distinct from `findNearestContaining`, which returns the containing
  * directory rather than the matched file path — use that one when the caller
@@ -382,12 +390,17 @@ export function findNearestContaining(
 export function findLocalToolConfig(
 	startDir: string,
 	names: readonly string[],
+	options: FindNearestMarkerRootOptions = {},
 ): string | undefined {
+	const boundaries = options.boundaries ?? [];
+	const homeDir = path.resolve(options.homeDir ?? os.homedir());
 	for (const dir of walkUpDirs(startDir || process.cwd())) {
+		if (isAtOrAboveHomeDir(dir, homeDir)) return undefined;
 		for (const name of names) {
 			const candidate = path.join(dir, name);
 			if (existsSync(candidate)) return candidate;
 		}
+		if (boundaries.some((m) => existsSync(path.join(dir, m)))) return undefined;
 	}
 	return undefined;
 }

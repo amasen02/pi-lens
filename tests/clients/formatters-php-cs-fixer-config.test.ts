@@ -174,7 +174,8 @@ describe("phpCsFixerFormatter — ancestor config carriage (#2472)", () => {
 		// Mutation-proof HOME-ceiling fixture (mirrors formatters-rustfmt-
 		// edition.test.ts's F5): the true config sits ABOVE an injected
 		// `homeDir`, with the formatted file BELOW it. If the
-		// `isAtOrAboveHomeDir` guard inside `findNearestMarkerRoot` were
+		// `isAtOrAboveHomeDir` guard inside `findLocalToolConfig` (refs #2472
+		// review F2, folded from a private `findNearestMarkerRoot` call) were
 		// neutered, the climb would sail past the injected home, find the
 		// outer config, and this assertion would go red.
 		const tmpDir = newTmpDir("pi-lens-phpcsfixer-homeceiling-");
@@ -190,5 +191,11 @@ describe("phpCsFixerFormatter — ancestor config carriage (#2472)", () => {
 		const resolved = resolvePhpCsFixerConfig(filePath, homeDir);
 
 		expect(resolved).toBeUndefined();
+
+		// Cross-form (forward-slash) filePath must be guarded identically.
+		const crossFormFilePath = filePath.split(path.sep).join("/");
+		expect(
+			resolvePhpCsFixerConfig(crossFormFilePath, homeDir),
+		).toBeUndefined();
 	});
 });

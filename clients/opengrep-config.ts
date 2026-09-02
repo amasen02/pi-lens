@@ -1,3 +1,4 @@
+import * as os from "node:os";
 import * as path from "node:path";
 import { findLocalToolConfig } from "./path-utils.js";
 
@@ -23,8 +24,13 @@ export const LOCAL_OPENGREP_CONFIG_NAMES = [
 	"semgrep.yaml",
 ] as const;
 
-export function findLocalOpengrepConfig(startDir: string): string | undefined {
-	return findLocalToolConfig(startDir, LOCAL_OPENGREP_CONFIG_NAMES);
+export function findLocalOpengrepConfig(
+	startDir: string,
+	homeDir: string = os.homedir(),
+): string | undefined {
+	return findLocalToolConfig(startDir, LOCAL_OPENGREP_CONFIG_NAMES, {
+		homeDir,
+	});
 }
 
 function isRegistryOrAutoConfig(config: string): boolean {

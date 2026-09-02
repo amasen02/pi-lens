@@ -1405,7 +1405,13 @@ export const phpCsFixerFormatter: FormatterInfo = {
 		const binary =
 			(await findInVendorBin("php-cs-fixer", cwd)) ??
 			(await which("php-cs-fixer"));
-		if (!binary) return null;
+		// #2413/#2472 review F4: both probes (vendor/bin, then PATH) have
+		// PROVEN the binary is absent — returning `null` here would fall back
+		// to the static `command` above, which is the SAME bare
+		// `php-cs-fixer` this just failed to find, spawning it only to
+		// re-observe the ENOENT already known. Report the proven-missing
+		// state instead so `formatFile` skips the wasted spawn.
+		if (!binary) return FORMATTER_UNAVAILABLE;
 		return configPath
 			? [binary, "fix", "--config", configPath, filePath]
 			: [binary, "fix", filePath];

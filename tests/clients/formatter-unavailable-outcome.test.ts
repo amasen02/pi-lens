@@ -88,6 +88,30 @@ describe("formatFile classifies an unavailable tool distinctly from a failure (#
 		}
 	});
 
+	it("real php-cs-fixer with no vendor/bin and no PATH binary resolves to unavailable, never spawning fix (#2472 review F4)", async () => {
+		const env = setupTestEnvironment("pi-lens-unavail-phpcsfixer-");
+		try {
+			const filePath = path.join(env.tmpDir, "app.php");
+			fs.writeFileSync(filePath, "<?php\n");
+
+			// No vendor/bin/php-cs-fixer under the temp dir, and every
+			// `where php-cs-fixer` probe exits 1 (the beforeEach default) — both
+			// probes `resolveCommand` runs have proven the binary absent. Pre-fix
+			// this returned `null`, which falls back to the static bare
+			// `php-cs-fixer` command and re-spawns the exact binary just proven
+			// missing (one wasted spawn caught by the tool-not-found belt).
+			const { formatFile, phpCsFixerFormatter } = await loadFormatters();
+			const result = await formatFile(filePath, phpCsFixerFormatter);
+
+			expect(result.outcome).toBe("unavailable");
+			expect(result.success).toBe(true);
+			// A which-probe is allowed; a FORMAT spawn of php-cs-fixer is not.
+			expect(formatSpawns()).toEqual([]);
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("static-fallback spawn tool-not-found is unavailable, not a failure (belt)", async () => {
 		const env = setupTestEnvironment("pi-lens-unavail-belt-");
 		try {
