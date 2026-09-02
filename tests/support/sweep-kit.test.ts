@@ -21,6 +21,7 @@ import {
 	auditRegistry,
 	bindTagsToSeams,
 	checkSeamEvidence,
+	findEnclosingSymbol,
 	findSeams,
 	findUnregisteredSeams,
 	hasNearbyCallSite,
@@ -28,6 +29,7 @@ import {
 	occurrenceLines,
 	relativePosix,
 	scanTaggedSeams,
+	stableOccurrenceKey,
 	stripSource,
 	tagPattern,
 } from "./sweep-kit.js";
@@ -248,6 +250,125 @@ describe("sweep-kit: listSourceFiles", () => {
 			exclude: (rel) => rel === "skip-me.ts",
 		}).map((p) => relativePosix(root, p));
 		expect(found).toEqual(["a.ts", "nested/b.ts", "nested/c.mjs"]);
+	});
+});
+
+describe("sweep-kit: findEnclosingSymbol / stableOccurrenceKey (#2475)", () => {
+	/** Shaped exactly like a real bounded-eviction-idiom flagged site. */
+	const FIXTURE_LINES = [
+		"const other = 1;",
+		"",
+		"export function registerThing(x: string): void {",
+		"\tstore.add(x);",
+		"\twhile (store.size > CAP) {",
+		"\t\tconst oldest = store.values().next().value;",
+		"\t\tif (oldest === undefined) break;",
+		"\t\tstore.delete(oldest);",
+		"\t}",
+		"}",
+	];
+	const FLAGGED_LINE_INDEX = 5; // "const oldest = store.values()...", 0-based
+
+	it("walks up to the nearest top-level declaration", () => {
+		expect(findEnclosingSymbol(FIXTURE_LINES, FLAGGED_LINE_INDEX)).toBe(
+			"registerThing",
+		);
+	});
+
+	it("never resolves the flagged line to ITSELF, even when the line is itself const-shaped", () => {
+		// The idiom's own shape (`const oldest = ...`) matches the declaration
+		// pattern; a top-level occurrence with nothing above it must fall back to
+		// the hash, not claim itself as its own enclosing declaration.
+		expect(
+			findEnclosingSymbol(["const oldest = store.values().next().value;"], 0),
+		).toBeUndefined();
+	});
+
+	it("does not stop at a nested local — a loop-local `let` must not outrank the enclosing function", () => {
+		// This is the exact shape `clients/debug-handles.ts:118`'s real flagged
+		// site has: an indented `let evictKey` sits two lines above the flagged
+		// `for`, inside the SAME function as `recordTrackedInit`. The first draft
+		// of the pattern matched any indentation and resolved to `evictKey`.
+		const lines = [
+			"function recordTrackedInit(): void {",
+			"\tif (map.size >= CAP) {",
+			"\t\tlet evictKey: number | undefined;",
+			"\t\tfor (const key of map.keys()) {",
+			"\t\t\tevictKey = key;",
+			"\t\t}",
+			"\t}",
+			"}",
+		];
+		expect(findEnclosingSymbol(lines, 3)).toBe("recordTrackedInit");
+	});
+
+	it("a key is UNCHANGED when an unrelated line is inserted ABOVE the flagged site — #2475's whole point", () => {
+		const before = stableOccurrenceKey(
+			"fixture.ts",
+			FIXTURE_LINES,
+			FLAGGED_LINE_INDEX,
+		);
+
+		// Simulate an unrelated PR inserting one line above the flagged site —
+		// exactly what #2459, #2449, and #2474 each did to a real EXEMPT_SITES
+		// entry, forcing an unrelated re-key every time.
+		const after = [
+			...FIXTURE_LINES.slice(0, 2),
+			"const inserted = 2; // unrelated line landed by another PR",
+			...FIXTURE_LINES.slice(2),
+		];
+		const newFlaggedIndex = FLAGGED_LINE_INDEX + 1;
+		expect(after[newFlaggedIndex]).toBe(FIXTURE_LINES[FLAGGED_LINE_INDEX]);
+
+		const afterKey = stableOccurrenceKey("fixture.ts", after, newFlaggedIndex);
+		expect(afterKey).toBe(before);
+
+		// Control: quote the OLD `path:line` scheme reproducing the exact bug —
+		// the real red-first proof (inserting one comment line above
+		// `clients/lsp/session-roots.ts:51` on pre-fix code) turned
+		// `clients/lsp/session-roots.ts:51` into `:52` and broke the sweep
+		// (`AssertionError: clients/lsp/session-roots.ts:52 is in an exempted
+		// file but is not itself exempted`). This assertion is that same shape,
+		// held here as a permanent guard against reverting to it.
+		const oldStyleBefore = `fixture.ts:${FLAGGED_LINE_INDEX + 1}`;
+		const oldStyleAfter = `fixture.ts:${newFlaggedIndex + 1}`;
+		expect(oldStyleAfter).not.toBe(oldStyleBefore);
+	});
+
+	it("a key CHANGES when the flagged line's own text changes — deleting/rewriting the site still reds", () => {
+		const before = stableOccurrenceKey(
+			"fixture.ts",
+			FIXTURE_LINES,
+			FLAGGED_LINE_INDEX,
+		);
+
+		const editedLines = [...FIXTURE_LINES];
+		editedLines[FLAGGED_LINE_INDEX] =
+			"\t\tconst oldest = store.keys().next().value;"; // .values() -> .keys()
+		expect(
+			stableOccurrenceKey("fixture.ts", editedLines, FLAGGED_LINE_INDEX),
+		).not.toBe(before);
+	});
+
+	it("a key CHANGES when the enclosing function is renamed", () => {
+		const before = stableOccurrenceKey(
+			"fixture.ts",
+			FIXTURE_LINES,
+			FLAGGED_LINE_INDEX,
+		);
+
+		const renamedLines = [...FIXTURE_LINES];
+		renamedLines[2] = "export function registerOtherThing(x: string): void {";
+		expect(
+			stableOccurrenceKey("fixture.ts", renamedLines, FLAGGED_LINE_INDEX),
+		).not.toBe(before);
+	});
+
+	it("falls back to a bare content hash with no enclosing declaration", () => {
+		const lines = ["const oldest = store.values().next().value;"];
+		expect(stableOccurrenceKey("fixture.ts", lines, 0)).toMatch(
+			/^fixture\.ts#[0-9a-f]{8}$/,
+		);
 	});
 });
 

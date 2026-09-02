@@ -94,6 +94,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { lineContentHash } from "../../clients/read-guard.js";
 import { toPosix } from "../../clients/path-utils.js";
 
 // ── 1. Source scanning ──────────────────────────────────────────────────────
@@ -297,6 +298,78 @@ export function listSourceFiles(
 /** `root`-relative posix path for an absolute path. */
 export function relativePosix(root: string, absolute: string): string {
 	return toPosix(path.relative(root, absolute));
+}
+
+/**
+ * Nearest named function/class/const-or-let declaration STRICTLY ABOVE
+ * `lineIndex` (0-based) in `lines` — a cheap line-scan heuristic, not a
+ * parser. Built for {@link stableOccurrenceKey}: keying a per-occurrence
+ * exemption on this name survives a line inserted anywhere else in the file,
+ * because the declaration's TEXT, not its line number, is what the walk
+ * matches (#2475 — the bounded-eviction-idiom sweep's `path:line` exemptions
+ * used to re-key on every unrelated insertion above a flagged site).
+ *
+ * Declarations are matched by shape at the start of the line: `function`/
+ * `class` (with `export`/`default`/`abstract`/`async` modifiers), or a
+ * `const`/`let` bound to a name. The walk goes upward and returns the FIRST
+ * match — the nearest enclosing declaration, on the assumption true of every
+ * #2442 site: a flagged statement sits directly inside the body of the
+ * declaration immediately above it. `maxLookback` bounds the walk so one
+ * pathological file can't turn this into an O(fileSize) scan per occurrence.
+ *
+ * Matched at column 0 ONLY — no leading whitespace. This repo's shipped
+ * source declares every top-level function/class/const at column 0, so
+ * anchoring there is what keeps a nested LOCAL (`let evictKey` two lines
+ * above a flagged `for` loop, indented inside an `if` inside the function)
+ * from winning over the function that actually encloses the flagged site —
+ * the first draft matched any indentation and resolved
+ * `clients/debug-handles.ts`'s flagged line to `evictKey`, a loop-local
+ * variable, instead of `recordTrackedInit`. The trade is real: a declaration
+ * nested inside a class or namespace is invisible to this pattern and falls
+ * back to the content hash in {@link stableOccurrenceKey}, same as a
+ * module-scope site with no enclosing declaration at all.
+ */
+const DECLARATION_PATTERN =
+	/^(?:export\s+)?(?:default\s+)?(?:abstract\s+)?(?:async\s+)?(?:function\s*\*?\s+|class\s+)([A-Za-z_$][\w$]*)|^(?:export\s+)?(?:const|let)\s+([A-Za-z_$][\w$]*)\s*[:=]/;
+
+export function findEnclosingSymbol(
+	lines: readonly string[],
+	lineIndex: number,
+	maxLookback = 400,
+): string | undefined {
+	// Starts ABOVE lineIndex, never on it: a flagged occurrence that itself
+	// happens to read as `const x = ...` (the eviction idiom's own shape) must
+	// never resolve to ITSELF as its own "enclosing" declaration.
+	const floor = Math.max(0, lineIndex - maxLookback);
+	for (let i = lineIndex - 1; i >= floor; i--) {
+		const match = DECLARATION_PATTERN.exec(lines[i] ?? "");
+		if (match) return match[1] ?? match[2];
+	}
+	return undefined;
+}
+
+/**
+ * A per-occurrence exemption key immune to line-number churn (#2475): the
+ * enclosing declaration's NAME when {@link findEnclosingSymbol} finds one —
+ * readable, and stable under any edit that doesn't touch the declaration or
+ * the flagged line itself — with a short content hash of the flagged line's
+ * OWN text always appended (`lineContentHash`, already used by read-guard's
+ * line-move relocation for exactly this "survive line movement, catch
+ * content movement" property). The hash does two jobs: it disambiguates two
+ * flagged occurrences that share one enclosing declaration (the name alone
+ * cannot), and it is the WHOLE key when no declaration is found at all (a
+ * top-level flagged site). Either way, editing the flagged line's own text —
+ * as opposed to inserting a line elsewhere in the file — correctly changes
+ * the key, which is the direction that must re-trigger review.
+ */
+export function stableOccurrenceKey(
+	relPath: string,
+	lines: readonly string[],
+	lineIndex: number,
+): string {
+	const symbol = findEnclosingSymbol(lines, lineIndex);
+	const hash = lineContentHash(lines[lineIndex] ?? "");
+	return symbol ? `${relPath}#${symbol}:${hash}` : `${relPath}#${hash}`;
 }
 
 // ── 2. Registry semantics ───────────────────────────────────────────────────
