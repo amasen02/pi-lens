@@ -2569,9 +2569,9 @@ export function _getSpotlessGradleReadCountForTests(): number {
  * not a Groovy/Kotlin parser. In particular, statically disabled constructs
  * such as `if (false) { ktlint() }` remain a documented false-positive.
  *
- * Exported (with `namedGradleBlockBodies` below) so `clients/gradle-ktfmt-
- * style.ts` (#2468) reuses this exact pre-pass for the top-level `ktfmt { }`
- * extension block instead of a second hand-rolled Gradle lexer — the same
+ * Exported (with `gradleBlockRanges` below) so `clients/gradle-ktfmt-
+ * style.ts` (#2468) reuses this exact pre-pass for the `ktfmt { }` extension
+ * block instead of a second hand-rolled Gradle lexer — the same
  * single-source-of-truth reuse `clients/cargo-manifest.ts` did for TOML
  * parsing (#2466).
  */
@@ -2645,37 +2645,89 @@ export interface GradleBlockRange {
 }
 
 /**
+ * A `GradleBlockRange` plus the identifier that introduced it — `""` when the
+ * brace pair has none (a bare lambda, an `if (…) { }` body, or the block of a
+ * call whose argument list ends in `)`, e.g. `project(":app") { }`).
+ */
+export interface NamedGradleBlockRange extends GradleBlockRange {
+	name: string;
+}
+
+const GRADLE_IDENTIFIER_CHAR = /[A-Za-z0-9_$]/;
+
+/**
+ * The identifier immediately preceding a `{`, or `""`. Mirrors the
+ * `\b<name>\s*\{` shape the named lookup used before it became a filter over
+ * this scanner: whitespace (including newlines) between the name and the
+ * brace is skipped, and `.` ends the identifier so `com.ncorti.ktfmt { }`
+ * still reads as `ktfmt` while `something_ktfmt { }` does not.
+ */
+function gradleBlockNameBefore(source: string, open: number): string {
+	let index = open - 1;
+	while (index >= 0 && /\s/.test(source[index])) index -= 1;
+	const end = index + 1;
+	while (index >= 0 && GRADLE_IDENTIFIER_CHAR.test(source[index])) index -= 1;
+	return source.slice(index + 1, end);
+}
+
+/**
+ * Body ranges of EVERY brace pair in `source`, in source order, each labelled
+ * with the identifier that introduced it.
+ *
+ * This is the repo's only Gradle brace scanner: `namedGradleBlockRanges` and
+ * `namedGradleBlockBodies` are filters over it. Scanning every pair — rather
+ * than only the pairs whose name a caller thought to ask about — is what lets
+ * `clients/gradle-ktfmt-style.ts` (#2468 review round 3) answer "what block
+ * ENCLOSES this one?" instead of only "is it inside the one name I checked?".
+ * The distinction is load-bearing there: `configure(subprojects.filter { … })
+ * { ktfmt { } }`, `project(":app") { ktfmt { } }` and a convention-plugin
+ * wrapper all have to be recognized as *some* enclosing scope the resolver
+ * cannot evaluate, so it can fail closed rather than treat the block as
+ * top-level.
+ *
+ * Unbalanced braces are best-effort: an unmatched `}` is ignored and an
+ * unclosed `{` yields no range, exactly as the previous per-name depth scan
+ * behaved.
+ */
+export function gradleBlockRanges(source: string): NamedGradleBlockRange[] {
+	const ranges: NamedGradleBlockRange[] = [];
+	const opens: number[] = [];
+	for (let index = 0; index < source.length; index += 1) {
+		const char = source[index];
+		if (char === "{") {
+			opens.push(index);
+			continue;
+		}
+		if (char !== "}") continue;
+		const open = opens.pop();
+		if (open === undefined) continue;
+		ranges.push({
+			name: gradleBlockNameBefore(source, open),
+			start: open + 1,
+			end: index,
+		});
+	}
+	// Pairs are completed innermost-first; callers want source order.
+	return ranges.sort((a, b) => a.start - b.start);
+}
+
+/**
  * Body ranges of every `<name> { ... }` block, in source order.
  *
  * The offsets exist so a caller can ask where a block sits RELATIVE to
- * another one — `clients/gradle-ktfmt-style.ts` (#2468 review round 2) needs
- * to know whether a `ktfmt { }` block is nested inside `subprojects { }`
- * (Gradle applies it to the children, NOT to the project declaring it), and
- * containment of two ranges is the only reliable way to answer that; matching
- * body TEXT would collide whenever two blocks happen to have identical
- * bodies. `namedGradleBlockBodies` stays the ergonomic form for callers that
- * only need the text, and delegates here so there is exactly ONE Gradle
- * brace scanner in the repo.
+ * another one — `clients/gradle-ktfmt-style.ts` (#2468) needs to know which
+ * block encloses a `ktfmt { }` one, because Gradle's `subprojects { }`
+ * applies it to the children and NOT to the project declaring it, while
+ * `allprojects { }` applies to both. Containment of two ranges is the only
+ * reliable way to answer that; matching body TEXT would collide whenever two
+ * blocks happen to have identical bodies. `namedGradleBlockBodies` stays the
+ * ergonomic form for callers that only need the text.
  */
 export function namedGradleBlockRanges(
 	source: string,
 	name: string,
 ): GradleBlockRange[] {
-	const ranges: GradleBlockRange[] = [];
-	const startPattern = new RegExp(`\\b${name}\\s*\\{`, "g");
-	for (const match of source.matchAll(startPattern)) {
-		const open = source.indexOf("{", match.index);
-		let depth = 1;
-		for (let index = open + 1; index < source.length; index += 1) {
-			if (source[index] === "{") depth += 1;
-			if (source[index] === "}") depth -= 1;
-			if (depth === 0) {
-				ranges.push({ start: open + 1, end: index });
-				break;
-			}
-		}
-	}
-	return ranges;
+	return gradleBlockRanges(source).filter((range) => range.name === name);
 }
 
 /** Exported for `clients/gradle-ktfmt-style.ts` (#2468) — see the note above. */

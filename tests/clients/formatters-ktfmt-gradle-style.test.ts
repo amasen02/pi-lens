@@ -296,7 +296,71 @@ describe("resolveKtfmtGradleStyle — Gradle project scoping (#2468 review round
 	});
 
 	it("continues the climb past a module ktfmt { } block that declares only non-style settings", async () => {
+		// The climb past a style-less nearer gradle directory is what B1 needs.
+		// The DECLARING block here is `subprojects { }` — after review round 3
+		// that is the only top-of-tree form (with `allprojects { }`) that
+		// Gradle actually propagates down into a module, so it is the only one
+		// that can keep this case green.
 		const root = newTmpDir("pi-lens-ktfmt-inherit-");
+		fs.writeFileSync(
+			path.join(root, "build.gradle.kts"),
+			"subprojects {\n  ktfmt {\n    googleStyle()\n  }\n}\n",
+		);
+		const moduleDir = path.join(root, "app");
+		fs.mkdirSync(moduleDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(moduleDir, "build.gradle.kts"),
+			"ktfmt {\n  maxWidth.set(100)\n}\n",
+		);
+		const filePath = writeKt(moduleDir, "src", "Main.kt");
+
+		const resolved = await resolveKtfmtGradleStyle(
+			filePath,
+			path.dirname(root),
+		);
+
+		expect(resolved).toBe("--google-style");
+	});
+
+	it("P1: a root TOP-LEVEL ktfmt { } block does not reach a module that declares no ktfmt block at all", async () => {
+		// Review round 3, F1. Round 2 shipped a documented HEURISTIC that
+		// handed a top-level `ktfmt { }` style to every descendant declaring
+		// no style of its own. Gradle does not do that: the ktfmt-gradle
+		// plugin gives each project its OWN `KtfmtExtension` seeded with the
+		// plugin conventions, so a module that applies the plugin and calls no
+		// style function formats under ktfmt's DEFAULT — which is exactly the
+		// bare invocation pi-lens made before #2468. The heuristic therefore
+		// manufactured a NEW pi-lens/Gradle disagreement the pre-fix code did
+		// not have: pi-lens writes `--google-style`, and `./gradlew ktfmtCheck`
+		// then rejects the very file pi-lens just formatted.
+		const root = newTmpDir("pi-lens-ktfmt-toplevel-noblock-");
+		fs.writeFileSync(
+			path.join(root, "build.gradle.kts"),
+			'plugins {\n  id("com.ncorti.ktfmt.gradle") version "0.21.0"\n}\n\n' +
+				"ktfmt {\n  googleStyle()\n}\n",
+		);
+		const moduleDir = path.join(root, "app");
+		fs.mkdirSync(moduleDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(moduleDir, "build.gradle.kts"),
+			'plugins {\n  id("com.ncorti.ktfmt.gradle")\n}\n',
+		);
+		const filePath = writeKt(moduleDir, "src", "Main.kt");
+
+		const resolved = await resolveKtfmtGradleStyle(
+			filePath,
+			path.dirname(root),
+		);
+
+		expect(resolved).toBeUndefined();
+	});
+
+	it("P2: a root TOP-LEVEL ktfmt { } block does not reach a module whose own ktfmt { } declares only non-style settings", async () => {
+		// The P1 shape with the module spelling its style-less configuration
+		// out in its own `ktfmt { }` block instead of omitting it: same Gradle
+		// semantics (the module's extension keeps the plugin conventions),
+		// same required answer.
+		const root = newTmpDir("pi-lens-ktfmt-toplevel-nonstyle-");
 		fs.writeFileSync(
 			path.join(root, "build.gradle.kts"),
 			"ktfmt {\n  googleStyle()\n}\n",
@@ -314,7 +378,7 @@ describe("resolveKtfmtGradleStyle — Gradle project scoping (#2468 review round
 			path.dirname(root),
 		);
 
-		expect(resolved).toBe("--google-style");
+		expect(resolved).toBeUndefined();
 	});
 
 	it("applies allprojects { ktfmt { } } to BOTH the declaring project and its modules", async () => {
@@ -360,5 +424,168 @@ describe("resolveKtfmtGradleStyle — Gradle project scoping (#2468 review round
 		);
 
 		expect(resolved).toBe("--kotlinlang-style");
+	});
+});
+
+/**
+ * Review round 3, F1/F2/S1. Round 2 decided a `ktfmt { }` block's reach with
+ * one negative test — "is it inside `subprojects { }`?" — and gave DESCENDANT
+ * scope to everything else. Two consequences, both proven below:
+ *
+ * - a top-level `ktfmt { }` leaked into modules (F1: P1/P2 above, and P3's
+ *   order sensitivity here);
+ * - `allprojects { }` was never actually read, so ANY unrecognized enclosing
+ *   block — `configure(subprojects.filter { … }) { }`, `project(":app") { }`,
+ *   `tasks.register(…) { }`, a convention-plugin wrapper — silently granted
+ *   BOTH scopes (F2), which is B2's bug in three further spellings.
+ *
+ * The fix classifies each `ktfmt { }` by its ACTUAL brace nesting on the
+ * stripped source: no enclosing block → the declaring project only;
+ * `allprojects` → declaring project and descendants; `subprojects` →
+ * descendants only; anything else → NEITHER, i.e. fall back to the bare
+ * (`--meta-style`-equivalent) invocation pi-lens made before #2468.
+ *
+ * `homeDir` is pinned to the fixture root's parent in every case, as in the
+ * round-2 block above.
+ */
+describe("resolveKtfmtGradleStyle — enclosing-block scope (#2468 review round 3)", () => {
+	interface ScopeFixture {
+		rootFile: string;
+		moduleFile: string;
+		homeDir: string;
+	}
+
+	/**
+	 * A two-project build: `root` holds the build file under test, `app` is a
+	 * module whose own build file applies the plugin and declares no style.
+	 */
+	function makeScopeFixture(prefix: string, rootBuild: string): ScopeFixture {
+		const root = newTmpDir(prefix);
+		fs.writeFileSync(
+			path.join(root, "settings.gradle.kts"),
+			'rootProject.name = "demo"\ninclude(":app")\n',
+		);
+		fs.writeFileSync(path.join(root, "build.gradle.kts"), rootBuild);
+		const moduleDir = path.join(root, "app");
+		fs.mkdirSync(moduleDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(moduleDir, "build.gradle.kts"),
+			'plugins {\n  id("com.ncorti.ktfmt.gradle")\n}\n',
+		);
+		const writeAt = (dir: string, name: string): string => {
+			const filePath = path.join(dir, "src", "main", "kotlin", name);
+			fs.mkdirSync(path.dirname(filePath), { recursive: true });
+			fs.writeFileSync(filePath, "fun main() {}\n");
+			return filePath;
+		};
+		return {
+			rootFile: writeAt(root, "Root.kt"),
+			moduleFile: writeAt(moduleDir, "Main.kt"),
+			homeDir: path.dirname(root),
+		};
+	}
+
+	const SUBPROJECTS_KOTLINLANG =
+		"subprojects {\n" +
+		'  apply(plugin = "com.ncorti.ktfmt.gradle")\n' +
+		"  ktfmt {\n    kotlinLangStyle()\n  }\n" +
+		"}\n";
+	const TOP_LEVEL_GOOGLE = "ktfmt {\n  googleStyle()\n}\n";
+
+	it("P3a: subprojects-then-top-level — the module gets the subprojects style, the root its own", async () => {
+		// Round 2 assigned `descendants` from EVERY ktfmt block in source
+		// order, so the trailing top-level `googleStyle()` overwrote the
+		// module's `subprojects { kotlinLangStyle() }`: two blocks that reach
+		// disjoint sets of projects were made to fight over one slot, and the
+		// SOURCE ORDER of unrelated scopes decided which project got the wrong
+		// flag.
+		const { rootFile, moduleFile, homeDir } = makeScopeFixture(
+			"pi-lens-ktfmt-order-sub-first-",
+			`${SUBPROJECTS_KOTLINLANG}\n${TOP_LEVEL_GOOGLE}`,
+		);
+
+		expect(await resolveKtfmtGradleStyle(moduleFile, homeDir)).toBe(
+			"--kotlinlang-style",
+		);
+		expect(await resolveKtfmtGradleStyle(rootFile, homeDir)).toBe(
+			"--google-style",
+		);
+	});
+
+	it("P3b: top-level-then-subprojects — the same answers, order-independently", async () => {
+		const { rootFile, moduleFile, homeDir } = makeScopeFixture(
+			"pi-lens-ktfmt-order-top-first-",
+			`${TOP_LEVEL_GOOGLE}\n${SUBPROJECTS_KOTLINLANG}`,
+		);
+
+		expect(await resolveKtfmtGradleStyle(moduleFile, homeDir)).toBe(
+			"--kotlinlang-style",
+		);
+		expect(await resolveKtfmtGradleStyle(rootFile, homeDir)).toBe(
+			"--google-style",
+		);
+	});
+
+	it("P4: configure(subprojects.filter { … }) { ktfmt { } } reaches neither project", async () => {
+		// A real convention-plugin spelling. pi-lens cannot evaluate the
+		// predicate, so it cannot know WHICH projects this configures — and a
+		// scope it cannot compute must fall back to the bare invocation, not
+		// be handed to every project. Round 2 gave it both scopes because the
+		// `subprojects` token here is a receiver expression (`subprojects
+		// .filter`), not a `subprojects { }` block, so the one negative test
+		// it ran did not fire.
+		const { rootFile, moduleFile, homeDir } = makeScopeFixture(
+			"pi-lens-ktfmt-configure-filter-",
+			'configure(subprojects.filter { it.name != "buildSrc" }) {\n' +
+				"  ktfmt {\n    googleStyle()\n  }\n" +
+				"}\n",
+		);
+
+		expect(await resolveKtfmtGradleStyle(moduleFile, homeDir)).toBeUndefined();
+		expect(await resolveKtfmtGradleStyle(rootFile, homeDir)).toBeUndefined();
+	});
+
+	it('P5: project(":app") { ktfmt { } } reaches neither project by inheritance', async () => {
+		// `project(":app") { }` configures exactly one named project. Resolving
+		// the path back to that project is a settings.gradle `include(…)`
+		// question pi-lens does not answer, so this is a fail-closed case too —
+		// but round 2 gave it BOTH scopes, which is wrong for the root in the
+		// same way B2 was.
+		const { rootFile, moduleFile, homeDir } = makeScopeFixture(
+			"pi-lens-ktfmt-project-block-",
+			'project(":app") {\n  ktfmt {\n    googleStyle()\n  }\n}\n',
+		);
+
+		expect(await resolveKtfmtGradleStyle(moduleFile, homeDir)).toBeUndefined();
+		expect(await resolveKtfmtGradleStyle(rootFile, homeDir)).toBeUndefined();
+	});
+
+	it("P6: tasks.register(…) { ktfmt { } } reaches neither project", async () => {
+		const { rootFile, moduleFile, homeDir } = makeScopeFixture(
+			"pi-lens-ktfmt-task-block-",
+			'tasks.register("formatEverything") {\n' +
+				"  ktfmt {\n    googleStyle()\n  }\n" +
+				"}\n",
+		);
+
+		expect(await resolveKtfmtGradleStyle(moduleFile, homeDir)).toBeUndefined();
+		expect(await resolveKtfmtGradleStyle(rootFile, homeDir)).toBeUndefined();
+	});
+
+	it("S1: an UNRECOGNIZED wrapper in allprojects' place reaches neither project", async () => {
+		// The `allprojects { }` case above was decorative until this one
+		// existed: round 2 never called `namedGradleBlockRanges(…,
+		// "allprojects")`, so swapping `allprojects` for a name the resolver
+		// has never heard of produced the identical (both-scopes) answer and
+		// the allprojects assertion could not fail for the right reason. With
+		// the enclosing-block classifier, this is the negative twin that makes
+		// it load-bearing.
+		const { rootFile, moduleFile, homeDir } = makeScopeFixture(
+			"pi-lens-ktfmt-unknown-wrapper-",
+			"zzUnknownWrapper {\n  ktfmt {\n    kotlinLangStyle()\n  }\n}\n",
+		);
+
+		expect(await resolveKtfmtGradleStyle(moduleFile, homeDir)).toBeUndefined();
+		expect(await resolveKtfmtGradleStyle(rootFile, homeDir)).toBeUndefined();
 	});
 });

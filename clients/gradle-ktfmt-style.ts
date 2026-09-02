@@ -25,7 +25,7 @@
  * single-source-of-truth reuse `clients/cargo-manifest.ts` did for TOML
  * parsing in `clients/formatters.ts`'s rustfmt `--edition` carriage (#2466).
  *
- * ## Project scoping (#2468 review round 2)
+ * ## Project scoping (#2468 review rounds 2 and 3)
  *
  * A Gradle build file configures more than the directory it sits in, and the
  * multi-module layout the plugin is actually used in puts the style in the
@@ -35,26 +35,43 @@
  * wrong in both directions: a module inherited nothing (the #2468 defect
  * survived for the common layout) while the ROOT's own sources were handed a
  * `subprojects { }`-scoped style that Gradle never applies to them. This
- * module therefore classifies each `ktfmt { }` block by the block enclosing
- * it, and climbs past directories that declare no style for the project
- * being formatted:
+ * module therefore classifies each `ktfmt { }` block by the block ENCLOSING
+ * it — the actual brace nesting on the stripped source, not a single
+ * hard-coded name test — and climbs past directories that declare no style
+ * for the project being formatted:
  *
+ * - no enclosing block (a top-level `ktfmt { }`) → the DECLARING directory
+ *   only. Gradle does not inherit here: the plugin gives each project its own
+ *   `KtfmtExtension` instance seeded with the plugin conventions (verified at
+ *   the SHA above), so a module that applies the plugin and calls no style
+ *   function really does format under ktfmt's default — which is exactly the
+ *   bare invocation this resolver falls back to. Round 2 spread a top-level
+ *   block over style-less descendants as a documented heuristic; that
+ *   manufactured a NEW pi-lens/Gradle disagreement (pi-lens writes
+ *   `--google-style`, `./gradlew ktfmtCheck` then rejects the file pi-lens
+ *   just formatted) which the pre-#2468 bare invocation did not have, so it
+ *   is gone. Aligning with `hasKtfmtConfig`'s wider climb does not justify
+ *   it: that election answers "is ktfmt the formatter for this file", not
+ *   "which style"; where Gradle carries no style down, the bare invocation IS
+ *   the correct carriage of `--meta-style`.
  * - `subprojects { ktfmt { … } }` → DESCENDANT directories only, never the
- *   declaring one. This half is exact: `subprojects` configures the children
- *   and nothing else.
+ *   declaring one. `subprojects` configures the children and nothing else.
  * - `allprojects { ktfmt { … } }` → the declaring directory AND descendants.
- * - a top-level `ktfmt { }` → the declaring directory, and — as a documented
- *   HEURISTIC — descendants that declare no style of their own. Gradle
- *   itself does not inherit here: each project gets its own `KtfmtExtension`
- *   instance with the plugin's conventions (verified at the SHA above), so a
- *   module with the plugin applied but no style call really does format
- *   under the plugin default. pi-lens cannot evaluate a build script to tell
- *   those apart, and this is the same scope `hasKtfmtConfig` already uses to
- *   ELECT ktfmt for such a file (it climbs to the root and matches `ktfmt`
- *   anywhere): resolving the style over a narrower scope than the selection
- *   that got us here is precisely the detected-but-not-carried split #2468
- *   exists to close. The cost is bounded and one-directional — the only
- *   projects affected are ones whose ancestor picked a style explicitly.
+ * - anything else enclosing it — `configure(subprojects.filter { … }) { }`,
+ *   `project(":app") { }`, `tasks.register(…) { }`, a convention-plugin
+ *   wrapper, or more than one nested block — reaches NEITHER scope. pi-lens
+ *   cannot evaluate a build script, so a scope it cannot compute fails closed
+ *   to the bare invocation rather than being granted to every project.
+ *
+ * KNOWN GAP (#2468 review round 3, F3): the first gradle directory found by
+ * the climb is treated as the project that OWNS the file. A module directory
+ * that is `include(…)`d by `settings.gradle(.kts)` but holds NO build file of
+ * its own therefore resolves hop 0 to an ANCESTOR, and asks it for `own`
+ * scope when `descendants` is what Gradle would apply — so a root
+ * `subprojects { ktfmt { … } }` is missed for such a module. Closing it means
+ * reading `settings.gradle`'s `include(…)` list to map a directory to a
+ * Gradle project, which this module does not do. The miss is fail-safe: the
+ * result is the pre-#2468 bare invocation, never a wrong flag.
  */
 
 import * as os from "node:os";
@@ -62,8 +79,8 @@ import * as path from "node:path";
 import { readTextFileOrUndefined } from "./cargo-manifest.js";
 import { findNearestMarkerRoot } from "./path-utils.js";
 import {
-	type GradleBlockRange,
-	namedGradleBlockRanges,
+	gradleBlockRanges,
+	type NamedGradleBlockRange,
 	stripGradleCommentsAndStrings,
 } from "./tool-policy.js";
 
@@ -131,30 +148,68 @@ function styleFromKtfmtBlockBody(body: string): KtfmtGradleStyle | undefined {
 	return style;
 }
 
-function isInsideAny(
-	range: GradleBlockRange,
-	enclosing: readonly GradleBlockRange[],
-): boolean {
-	return enclosing.some(
-		(outer) => range.start >= outer.start && range.end <= outer.end,
+/**
+ * Which projects a `ktfmt { }` block reaches. `undefined` from
+ * `scopeOfKtfmtBlock` means NEITHER — a scope this resolver cannot compute,
+ * which falls back to the bare invocation.
+ */
+type KtfmtBlockScope = "own" | "descendants" | "both";
+
+/**
+ * The Gradle blocks whose scope is exactly expressible here. Every other
+ * enclosing block — including one we simply have not heard of — is a scope
+ * pi-lens cannot evaluate, and is NOT silently promoted to project-wide.
+ */
+const SCOPE_BY_ENCLOSING_BLOCK: Readonly<Record<string, KtfmtBlockScope>> = {
+	subprojects: "descendants",
+	allprojects: "both",
+};
+
+/**
+ * Classify one `ktfmt { }` block by the block that encloses it.
+ *
+ * `blocks` is every brace pair in the stripped source, so "enclosing" is
+ * literal containment, not a guess from a name test: `range` strictly inside
+ * `outer` means `outer.start < range.start` (an enclosing body always opens
+ * before the body it contains) and `outer.end >= range.end`.
+ *
+ * More than one enclosing block (`subprojects { afterEvaluate { ktfmt { } } }`)
+ * fails closed too. Composing scopes through an arbitrary intermediate is
+ * exactly the kind of build-script evaluation this lexical pass cannot do,
+ * and the cost of the conservative answer is the pre-#2468 bare invocation.
+ */
+function scopeOfKtfmtBlock(
+	range: NamedGradleBlockRange,
+	blocks: readonly NamedGradleBlockRange[],
+): KtfmtBlockScope | undefined {
+	const enclosing = blocks.filter(
+		(outer) => outer.start < range.start && outer.end >= range.end,
 	);
+	if (enclosing.length === 0) return "own";
+	if (enclosing.length > 1) return undefined;
+	return SCOPE_BY_ENCLOSING_BLOCK[enclosing[0].name];
 }
 
 function stylesFromGradleContent(content: string): GradleKtfmtStyles {
 	const stripped = stripGradleCommentsAndStrings(content);
-	const subprojects = namedGradleBlockRanges(stripped, "subprojects");
+	const blocks = gradleBlockRanges(stripped);
 	const styles: GradleKtfmtStyles = {};
 	// Source order, so a later block overwrites an earlier one for the scope
 	// it reaches — the same last-call-wins rule that applies inside one body.
-	for (const range of namedGradleBlockRanges(stripped, "ktfmt")) {
+	// Each scope is written independently: two blocks that reach DISJOINT sets
+	// of projects (a `subprojects { }` one and a top-level one) must not fight
+	// over a single slot, or the source order of unrelated scopes decides
+	// which project gets the wrong flag.
+	for (const range of blocks) {
+		if (range.name !== "ktfmt") continue;
+		const scope = scopeOfKtfmtBlock(range, blocks);
+		if (!scope) continue;
 		const style = styleFromKtfmtBlockBody(
 			stripped.slice(range.start, range.end),
 		);
 		if (!style) continue;
-		styles.descendants = style;
-		// `subprojects { }` is the one enclosing form that excludes the
-		// declaring project. Top-level and `allprojects { }` both reach it.
-		if (!isInsideAny(range, subprojects)) styles.own = style;
+		if (scope !== "descendants") styles.own = style;
+		if (scope !== "own") styles.descendants = style;
 	}
 	return styles;
 }
@@ -185,9 +240,11 @@ async function stylesForGradleDir(
  *   `settings.gradle(.kts)` file via the shared `findNearestMarkerRoot`
  *   walker (home-ceiling guarded, depth-capped — AGENTS.md
  *   walk-confinement; never a private walk-up loop). That first directory is
- *   the project that OWNS the file, so its `own`-scope declaration applies;
- *   every further hop is an ancestor, so only its `descendants`-scope
- *   declaration does.
+ *   TAKEN to be the project that OWNS the file, so its `own`-scope
+ *   declaration applies; every further hop is an ancestor, so only its
+ *   `descendants`-scope declaration does. See the module header's KNOWN GAP
+ *   note for the `include(…)`-only module directory where that identification
+ *   is wrong (fail-safe: a missed flag, never a wrong one).
  * - A nested module's OWN style declaration still wins over an ancestor's —
  *   the climb only continues past a gradle directory that declares NO style
  *   applying to this file, so nearest-wins is unchanged where a nearer
