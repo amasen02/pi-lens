@@ -803,6 +803,16 @@ describe("#2464 — the observed-settle path also dispatches pipeline analysis",
 				});
 			}
 
+			// 0. Still one change-log receipt per physical edit. This is the
+			//    assertion that keeps the observed block's `return` load-bearing:
+			//    a formatting pipeline moves the bytes, so the already-analysed
+			//    latch does NOT match on the way down and the classified chain
+			//    would run its own whole-file recording if the return were removed.
+			//    The no-op pipeline every other case uses cannot see that, because
+			//    the latch masks it there.
+			expect(
+				readChangesSince(env.tmpDir, 0).map((change) => change.source),
+			).toEqual(["agent-tool:patch_retry", "agent-tool:patch_retry"]);
 			// 1. The staleness stamp is re-taken over the file the pipeline itself
 			//    rewrote, so the agent's next edit is judged by read coverage.
 			expect(recordWritten).toHaveBeenCalledWith(path.resolve(filePath));
