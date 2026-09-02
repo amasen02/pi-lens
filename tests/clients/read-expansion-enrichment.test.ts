@@ -60,8 +60,9 @@ vi.mock("../../clients/read-guard-logger.js", async (importOriginal) => {
 	};
 });
 
-vi.mock("../../clients/bootstrap.js", () => ({
-	loadBootstrapClients: async () => ({
+vi.mock("../../clients/bootstrap.js", async () => {
+	const { bootstrapSeamMock } = await import("../support/bootstrap-mock.js");
+	return bootstrapSeamMock(async () => ({
 		complexityClient: {
 			isSupportedFile: () => false,
 			analyzeFile: async () => null,
@@ -70,8 +71,8 @@ vi.mock("../../clients/bootstrap.js", () => ({
 		ruffClient: {},
 		metricsClient: {},
 		agentBehaviorClient: { recordToolCall: () => {}, formatWarnings: () => "" },
-	}),
-}));
+	}));
+});
 
 const dbgLines: string[] = [];
 

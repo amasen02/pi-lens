@@ -599,6 +599,35 @@ export type DegradationKind =
 	 */
 	| "ast-grep-napi-html-script-scan-failed"
 	/**
+	 * A demand for the analyzer bootstrap clients (`clients/bootstrap.ts`)
+	 * could not be served, so the caller PROCEEDED WITHOUT them (#2467). The
+	 * subject is the demand reason — `session-start-scans`,
+	 * `tool-call-complexity-baseline`, … — so the ledger still answers WHICH
+	 * consumer degraded after the bounded records stop; `unavailableReason` in
+	 * the record says which of four SEAM causes fired (the primary session was
+	 * shutting down, the caller's wall-clock ceiling elapsed, the load itself
+	 * rejected, or the strike latch had already closed). A fifth possible
+	 * reason, `aborted` — the caller's OWN signal firing (Escape, a turn
+	 * ending) — is deliberately never written here: that is the caller
+	 * choosing to stop waiting, not the seam degrading, and counting it would
+	 * make a user's cancel read as an unhealthy analyzer graph. Counted rather
+	 * than once-per-session: the load is retried on the next demand, so the
+	 * number of failed demands is the observability question. Fail-open is the
+	 * whole point — without this kind, an analyzer silently not running and an
+	 * analyzer finding nothing read identically (AGENTS.md shape 10).
+	 */
+	| "analyzer-bootstrap-unavailable"
+	/**
+	 * The analyzer bootstrap stopped rebuilding after
+	 * `BOOTSTRAP_FAILURE_STRIKE_LIMIT` consecutive failed loads (#2467 review).
+	 * Recorded ONCE per session, because that is exactly what it reports: a
+	 * state change, not a rate. The per-demand degradations that follow keep
+	 * arriving under `analyzer-bootstrap-unavailable` with
+	 * `unavailableReason: "latched"`, so the ledger still answers both "how
+	 * often did a consumer degrade" and "why did it stop even trying".
+	 */
+	| "analyzer-bootstrap-latched"
+	/**
 	 * A config file the user wrote — or one key inside it — was rejected and
 	 * IGNORED, so pi-lens ran on defaults instead of on what the user asked for
 	 * (#2418). Written only through `warnIgnoredConfigOnce`

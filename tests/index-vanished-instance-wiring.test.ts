@@ -22,8 +22,9 @@ import { removeTempDirSync } from "./clients/test-utils.js";
  * process.kill(pid, 0) seam; it never relies on the runner's process table.
  */
 
-vi.mock("../clients/bootstrap.js", () => ({
-	loadBootstrapClients: async () => ({
+vi.mock("../clients/bootstrap.js", async () => {
+	const { bootstrapSeamMock } = await import("./support/bootstrap-mock.js");
+	return bootstrapSeamMock(async () => ({
 		metricsClient: { reset: () => {} },
 		todoScanner: {},
 		biomeClient: { isAvailable: () => false },
@@ -43,8 +44,8 @@ vi.mock("../clients/bootstrap.js", () => ({
 		rustClient: { isAvailableAsync: async () => false },
 		agentBehaviorClient: { recordToolCall: () => {}, formatWarnings: () => "" },
 		complexityClient: { isSupportedFile: () => false, analyzeFile: () => null },
-	}),
-}));
+	}));
+});
 vi.mock("../clients/runtime-session.js", () => ({
 	handleSessionStart: async () => {},
 }));

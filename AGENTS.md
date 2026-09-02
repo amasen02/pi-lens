@@ -965,6 +965,59 @@ The LSP service follows it through `clients/lsp-lazy.ts` for async pipeline,
 session, and warm-attach consumers. The `index.ts` status/reset adapter remains
 eager because its synchronous shutdown/status contracts are host-visible; do
 not make those callbacks async without updating their ordering contract/tests.
+The seventeen analyzer clients follow it through `clients/bootstrap.ts` (#2467).
+Activation binds only the `SessionBootstrapAccess` seam; `handleSessionStart`
+receives that seam instead of constructed clients and its two client resets go
+through `peekBootstrapClients()`, which never starts a load — an unconstructed
+client has no session state to re-arm. `SessionStartDeps` carries the seam as ONE required field; a
+caller that already holds concrete clients (`clients/mcp/session.ts`, every
+test fixture) wraps them with `residentBootstrapAccess`. Do not reintroduce
+per-client fields beside the seam — the shape must not admit two answers.
+Demand goes through
+`requestBootstrapClients()`, which is bounded on BOTH axes (a wall-clock
+ceiling and an abort race) and fails OPEN: `null` means the caller
+proceeds without those analyzers, counted once per demand reason under the
+`analyzer-bootstrap-unavailable` ledger kind. The abort half is the seam's OWN
+session-teardown signal, folded in for every demand;
+`SessionBootstrapAccess.request` deliberately takes NO signal parameter,
+because session start is not turn-scoped work — a `session_start` landing
+mid-turn (sequential replacement, `/new`) arrives with the outgoing turn's
+ambient signal installed, and binding it cancelled every startup scan with no
+retry. Only genuinely turn-scoped callers (the `tool_call` complexity
+baseline) pass `getAmbientAbortSignal()`. `loadBootstrapClients()` stays
+the strict form for callers that cannot proceed without the clients. Concurrent
+demands share one `createSingleFlight` flight, a rejected load is retried by
+the next demand, and `markAnalyzerBootstrapShutdown()` (primary
+`session_shutdown`) refuses NEW loads without invalidating a waiter already in
+flight — nor a NEW demand through the STRICT accessor that joins a flight
+already running. `markAnalyzerBootstrapShutdown()` also aborts the seam's own
+teardown signal, which every BOUNDED demand races (#2467 review, F1); a
+`requestBootstrapClients()` call made AFTER shutdown therefore fails open
+immediately via that signal, whether or not a flight happens to still be
+running — the "still joins" guarantee is the strict accessor's alone.
+`resetAnalyzerBootstrapSessionState()` re-arms that gate at
+`session_start`. Retry is bounded: after `BOOTSTRAP_FAILURE_STRIKE_LIMIT` (3)
+consecutive failed builds the seam stops rebuilding and fails open
+immediately, recorded once under `analyzer-bootstrap-latched` and re-armed at
+`session_start` — a module that cannot resolve under the host's package
+layout fails identically every time, so re-running seventeen dynamic imports
+plus `collectInstallDiagnostics` per demand bought nothing. A `null` from
+`requestBootstrapClients()` is counted under `analyzer-bootstrap-unavailable`
+for every seam-caused reason (shutdown, timeout, a rejected load, the strike
+latch) but NOT for `aborted` — the caller's own signal firing is a deliberate
+cancel, not the seam degrading, and counting it would read as an unhealthy
+analyzer graph in `pilens_health` (#2467 review, F5).
+`bootstrap_clients_load` is emitted by `clients/bootstrap.ts`
+where the load actually runs, stamped with the attempt number, NOT by
+`handleSessionStart`.
+A demand must sit BELOW every guard that can answer without the clients:
+`handleToolCallImpl` asks `isComplexitySupportedFile`
+(`clients/tree-sitter-shared.ts`, projected from the canonical extension
+registry and the exported `COMPLEXITY_LANGUAGE_IDS` union that keys
+`LANGUAGE_NODES`) before demanding anything, so a Markdown/JSON/YAML/CSS read
+never loads the graph. Asking the CLIENT's `isSupportedFile` there would mean
+loading the graph to learn the answer is no — and since only a produced
+baseline memoizes the file, the load would repeat on every later read.
 
 **Multi-formatter extension policies resolve to one formatter (#1306):** explicit project configuration wins, and every policy with multiple candidates must name one unique `defaultFormatter` as its deterministic overlap tie-break. Kotlin Spotless selection is parsed from `build.gradle{.kts}` and `settings.gradle{.kts}` `spotless { kotlin { ... } }` blocks through `getSpotlessKotlinFormatter`; never add independent ktlint/ktfmt detection at a caller. Its small lexical pre-pass blanks comments and quoted strings before brace scanning (disabled `if (false)` blocks remain an explicit non-goal), and Gradle reads are memoized by path plus `mtimeMs` so repeated per-file selection does not repeat config I/O while mid-session edits invalidate naturally.
 

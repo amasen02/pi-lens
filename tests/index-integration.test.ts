@@ -167,8 +167,10 @@ describe("index.ts integration", () => {
 				},
 			);
 
-			vi.doMock("../clients/bootstrap.js", () => ({
-				loadBootstrapClients: async () => ({
+			vi.doMock("../clients/bootstrap.js", async () => {
+				const { bootstrapSeamMock } =
+					await import("./support/bootstrap-mock.js");
+				return bootstrapSeamMock(async () => ({
 					metricsClient: { reset: () => {} },
 					todoScanner: {},
 					biomeClient: { isAvailable: () => false },
@@ -194,8 +196,8 @@ describe("index.ts integration", () => {
 						isSupportedFile: () => false,
 						analyzeFile: () => null,
 					},
-				}),
-			}));
+				}));
+			});
 			vi.doMock("../clients/runtime-session.js", () => ({
 				handleSessionStart: handleSessionStartMock,
 			}));
@@ -957,8 +959,10 @@ describe("index.ts integration", () => {
 				}),
 				resetLSPService,
 			}));
-			vi.doMock("../clients/bootstrap.js", () => ({
-				loadBootstrapClients: async () => ({
+			vi.doMock("../clients/bootstrap.js", async () => {
+				const { bootstrapSeamMock } =
+					await import("./support/bootstrap-mock.js");
+				return bootstrapSeamMock(async () => ({
 					knipClient: {
 						isAvailable: () => false,
 						analyze: async () => ({
@@ -969,8 +973,8 @@ describe("index.ts integration", () => {
 					},
 					depChecker: { isAvailable: () => false },
 					testRunnerClient: { detectRunner: () => null },
-				}),
-			}));
+				}));
+			});
 
 			const { default: registerExtension } = await import("../index.js");
 			const { pi, handlers } = createMockPi({ "no-lsp": false });
@@ -1273,8 +1277,10 @@ describe("index.ts integration", () => {
 					telemetrySessionId = "test-session";
 				},
 			}));
-			vi.doMock("../clients/bootstrap.js", () => ({
-				loadBootstrapClients: async () => ({
+			vi.doMock("../clients/bootstrap.js", async () => {
+				const { bootstrapSeamMock } =
+					await import("./support/bootstrap-mock.js");
+				return bootstrapSeamMock(async () => ({
 					metricsClient: { reset: () => {} },
 					todoScanner: {},
 					biomeClient: { isAvailable: () => false },
@@ -1300,8 +1306,8 @@ describe("index.ts integration", () => {
 						isSupportedFile: () => false,
 						analyzeFile: () => null,
 					},
-				}),
-			}));
+				}));
+			});
 
 			const { default: registerExtension } = await import("../index.js");
 			const { pi, handlers } = createMockPi({ "no-lsp": true });
@@ -1374,8 +1380,10 @@ describe("index.ts integration", () => {
 					telemetrySessionId = "test-session";
 				},
 			}));
-			vi.doMock("../clients/bootstrap.js", () => ({
-				loadBootstrapClients: async () => ({
+			vi.doMock("../clients/bootstrap.js", async () => {
+				const { bootstrapSeamMock } =
+					await import("./support/bootstrap-mock.js");
+				return bootstrapSeamMock(async () => ({
 					metricsClient: { reset: () => {} },
 					todoScanner: {},
 					biomeClient: { isAvailable: () => false },
@@ -1401,8 +1409,8 @@ describe("index.ts integration", () => {
 						isSupportedFile: () => false,
 						analyzeFile: () => null,
 					},
-				}),
-			}));
+				}));
+			});
 
 			const { default: registerExtension } = await import("../index.js");
 			const { pi, handlers } = createMockPi({ "no-lsp": true });
@@ -1480,8 +1488,10 @@ describe("index.ts integration", () => {
 					telemetrySessionId = "test-session";
 				},
 			}));
-			vi.doMock("../clients/bootstrap.js", () => ({
-				loadBootstrapClients: async () => ({
+			vi.doMock("../clients/bootstrap.js", async () => {
+				const { bootstrapSeamMock } =
+					await import("./support/bootstrap-mock.js");
+				return bootstrapSeamMock(async () => ({
 					metricsClient: { reset: () => {} },
 					todoScanner: {},
 					biomeClient: { isAvailable: () => false },
@@ -1507,8 +1517,8 @@ describe("index.ts integration", () => {
 						isSupportedFile: () => false,
 						analyzeFile: () => null,
 					},
-				}),
-			}));
+				}));
+			});
 
 			const { default: registerExtension } = await import("../index.js");
 			const { pi, handlers } = createMockPi({ "no-lsp": true });
@@ -1599,8 +1609,10 @@ describe("index.ts integration", () => {
 					telemetrySessionId = "test-session";
 				},
 			}));
-			vi.doMock("../clients/bootstrap.js", () => ({
-				loadBootstrapClients: async () => ({
+			vi.doMock("../clients/bootstrap.js", async () => {
+				const { bootstrapSeamMock } =
+					await import("./support/bootstrap-mock.js");
+				return bootstrapSeamMock(async () => ({
 					metricsClient: { reset: () => {} },
 					todoScanner: {},
 					biomeClient: { isAvailable: () => false },
@@ -1626,8 +1638,8 @@ describe("index.ts integration", () => {
 						isSupportedFile: () => false,
 						analyzeFile: () => null,
 					},
-				}),
-			}));
+				}));
+			});
 			vi.doMock("../clients/lsp/index.js", async () => ({
 				getLSPService: () => ({ touchFile: touchFileMock }),
 				resetLSPService: () => {},
@@ -1701,8 +1713,10 @@ describe("index.ts integration", () => {
 					telemetrySessionId = "test-session";
 				},
 			}));
-			vi.doMock("../clients/bootstrap.js", () => ({
-				loadBootstrapClients: async () => ({
+			vi.doMock("../clients/bootstrap.js", async () => {
+				const { bootstrapSeamMock } =
+					await import("./support/bootstrap-mock.js");
+				return bootstrapSeamMock(async () => ({
 					metricsClient: { reset: () => {} },
 					todoScanner: {},
 					biomeClient: { isAvailable: () => false },
@@ -1728,8 +1742,8 @@ describe("index.ts integration", () => {
 						isSupportedFile: () => false,
 						analyzeFile: () => null,
 					},
-				}),
-			}));
+				}));
+			});
 			vi.doMock("../clients/lsp/index.js", async () => ({
 				getLSPService: () => ({ touchFile: touchFileMock }),
 				resetLSPService: () => {},
@@ -1798,8 +1812,10 @@ describe("index.ts integration", () => {
 					telemetrySessionId = "test-session";
 				},
 			}));
-			vi.doMock("../clients/bootstrap.js", () => ({
-				loadBootstrapClients: async () => ({
+			vi.doMock("../clients/bootstrap.js", async () => {
+				const { bootstrapSeamMock } =
+					await import("./support/bootstrap-mock.js");
+				return bootstrapSeamMock(async () => ({
 					metricsClient: { reset: () => {} },
 					todoScanner: {},
 					biomeClient: { isAvailable: () => false },
@@ -1825,8 +1841,8 @@ describe("index.ts integration", () => {
 						isSupportedFile: () => false,
 						analyzeFile: () => null,
 					},
-				}),
-			}));
+				}));
+			});
 			vi.doMock("../clients/lsp/index.js", async () => ({
 				getLSPService: () => ({ touchFile: touchFileMock }),
 				resetLSPService: () => {},
@@ -1940,8 +1956,10 @@ describe("index.ts integration", () => {
 					}),
 				}),
 			}));
-			vi.doMock("../clients/bootstrap.js", () => ({
-				loadBootstrapClients: async () => ({
+			vi.doMock("../clients/bootstrap.js", async () => {
+				const { bootstrapSeamMock } =
+					await import("./support/bootstrap-mock.js");
+				return bootstrapSeamMock(async () => ({
 					metricsClient: { reset: () => {} },
 					todoScanner: {},
 					biomeClient: { isAvailable: () => false },
@@ -1967,8 +1985,8 @@ describe("index.ts integration", () => {
 						isSupportedFile: () => false,
 						analyzeFile: () => null,
 					},
-				}),
-			}));
+				}));
+			});
 
 			const { default: registerExtension } = await import("../index.js");
 			const { pi, commands } = createMockPi();
@@ -2066,8 +2084,9 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 	});
 
 	function mockSuiteDeps() {
-		vi.doMock("../clients/bootstrap.js", () => ({
-			loadBootstrapClients: async () => ({
+		vi.doMock("../clients/bootstrap.js", async () => {
+			const { bootstrapSeamMock } = await import("./support/bootstrap-mock.js");
+			return bootstrapSeamMock(async () => ({
 				metricsClient: { reset: () => {} },
 				todoScanner: {},
 				biomeClient: { isAvailable: () => false },
@@ -2086,8 +2105,8 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 					isSupportedFile: () => false,
 					analyzeFile: () => null,
 				},
-			}),
-		}));
+			}));
+		});
 		// handleTurnEnd is a heavyweight, separately-tested pass
 		// (knip/madge/tests/actionable warnings — clients/runtime-turn.ts,
 		// exercised by its own suite). Stub it to a no-op so this suite

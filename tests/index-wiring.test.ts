@@ -51,8 +51,9 @@ import { removeTempDirSync } from "./clients/test-utils.js";
 // Mock out the two heavy real-work seams the same way
 // tests/index-integration.test.ts does, so firing session_start here stays a
 // fast, deterministic wiring check rather than a real scan/LSP-bootstrap.
-vi.mock("../clients/bootstrap.js", () => ({
-	loadBootstrapClients: async () => ({
+vi.mock("../clients/bootstrap.js", async () => {
+	const { bootstrapSeamMock } = await import("./support/bootstrap-mock.js");
+	return bootstrapSeamMock(async () => ({
 		metricsClient: { reset: () => {} },
 		todoScanner: {},
 		biomeClient: { isAvailable: () => false },
@@ -78,8 +79,8 @@ vi.mock("../clients/bootstrap.js", () => ({
 			isSupportedFile: () => false,
 			analyzeFile: () => null,
 		},
-	}),
-}));
+	}));
+});
 vi.mock("../clients/runtime-session.js", () => ({
 	handleSessionStart: async () => {},
 }));
