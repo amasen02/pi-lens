@@ -80,6 +80,11 @@ describe("lsp launch", () => {
 		}));
 		vi.doMock("../../../clients/file-utils.js", () => ({
 			getGlobalPiLensDir: () => tempDir,
+			// #2506: sessionstart.log now resolves through the LOG dir, so the
+			// double must move it too — the assertion below reads
+			// `<tempDir>/sessionstart.log`, which is only where launch.ts writes
+			// if this resolver points at tempDir as well.
+			getGlobalPiLensLogDir: () => tempDir,
 		}));
 
 		try {

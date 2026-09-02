@@ -1,10 +1,10 @@
 import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
-import { getGlobalPiLensDir } from "./file-utils.js";
+import { getGlobalPiLensLogDir } from "./file-utils.js";
 import { createNdjsonLogger } from "./ndjson-logger.js";
 import { normalizeFilePath } from "./path-utils.js";
 
-const AW_LOG_DIR = getGlobalPiLensDir();
+const AW_LOG_DIR = getGlobalPiLensLogDir();
 const AW_LOG_FILE = path.join(AW_LOG_DIR, "actionable-warnings.log");
 const AW_LOG_BACKUP_FILE = path.join(AW_LOG_DIR, "actionable-warnings.log.1");
 const MAX_LOG_BYTES = Math.max(

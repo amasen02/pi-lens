@@ -1273,6 +1273,8 @@ export const EXEMPT_SESSION_STATE_FILES: Readonly<Record<string, string>> = {
 	"config-warn.ts":
 		"ignored-config warn-once NOTIFICATION latch, tied to the config file it warned about; the per-session ledger row is bounded by the degradation ledger, not by this Set",
 	"instance-registry.ts": "instance-registry enablement flag",
+	"probe-home-state.ts":
+		"#2506: the globalThis-keyed probe-home-redirect RESOLUTION (the memoized decision plus the degradation event it produced), the same shape as process-singletons.ts's container just below — a PROCESS boundary, not a session one. getGlobalPiLensLogDir()'s redirect decision is fixed by cwd/env at process start and is memoized once, so a session_start reset would only hide the fact from every session after the first in the same probe process. No module-scope binding holding the SYMBOL: file-utils.ts writes this slot directly (it cannot even import this leaf — log-cleanup.ts's eager top-level getGlobalPiLensLogDir() call reaches the resolver through the pre-existing extension-log.ts/latency-logger.ts/safe-spawn.js cycle while file-utils.ts is still mid-init, when an import binding is itself uninitialized), so every Symbol.for call is inlined per invocation instead.",
 	"process-singletons.ts":
 		"the globalThis-keyed container for process-scope state (#2146). It owns storage, never lifecycle: every family keeps whatever boundary it already had, and each one is a PROCESS boundary rather than a session boundary. session-lifecycle.ts releases its registration at the primary's own session_shutdown (releasePrimarySession), not at session_start. startup-timing.ts's host-ready anchor is registered here as policy process_lifetime with a ForTests-only reset, because resetting it at a session boundary would fabricate host stalls from the original process boot. The instance-registry mutation tail must outlive every session by construction. A reset in this module would therefore wipe state no session boundary owns. Its only module-scope binding is the Symbol.for container key, a constant.",
 	"session-lifecycle.ts":
@@ -1525,6 +1527,11 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	// is what flags this file now.
 	"path-attribution-telemetry.ts": 0,
 	"project-changes.ts": 0,
+	// #2506: no module-scope binding holding the container symbol (every call
+	// recomputes its key inline) — the scan sees no container here. The
+	// exported PROBE_HOME_RESOLUTION_KEY is a plain string constant read only
+	// by tests, never a mutable module-scope container.
+	"probe-home-state.ts": 0,
 	// #2146: the container key is a Symbol.for constant, so the scan sees no
 	// mutable module-scope container here.
 	"process-singletons.ts": 0,

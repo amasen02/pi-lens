@@ -1,12 +1,12 @@
 import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
-import { getGlobalPiLensDir } from "./file-utils.js";
+import { getGlobalPiLensLogDir } from "./file-utils.js";
 import { createNdjsonLogger } from "./ndjson-logger.js";
 import type { TreeSitterParseCacheStats } from "./tree-sitter-client.js";
 import { getMaxLogSizeMB } from "./log-cleanup.js";
 import { normalizeLoggedPath } from "./path-utils.js";
 
-const TREE_SITTER_LOG_DIR = getGlobalPiLensDir();
+const TREE_SITTER_LOG_DIR = getGlobalPiLensLogDir();
 const TREE_SITTER_LOG_FILE = path.join(TREE_SITTER_LOG_DIR, "tree-sitter.log");
 
 const writer = createNdjsonLogger({
