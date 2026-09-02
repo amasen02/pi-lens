@@ -592,7 +592,18 @@ describe("isDirty (review round 3, F2)", () => {
 	});
 
 	afterEach(() => {
-		fs.rmSync(root, { recursive: true, force: true });
+		// `maxRetries`/`retryDelay` (not just `force`): on Windows a directory
+		// that was very recently a live process's cwd (the F1 case's held
+		// helper, any spawned CLI still tearing down) can stay briefly locked
+		// after the process exits -- an EPERM/EBUSY race independent of
+		// whether this test itself killed anything, so it is handled here
+		// once for every case in this describe block rather than per-test.
+		fs.rmSync(root, {
+			recursive: true,
+			force: true,
+			maxRetries: 5,
+			retryDelay: 200,
+		});
 	});
 
 	it('reads a clean porcelain output as "clean"', () => {
@@ -898,7 +909,18 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 	});
 
 	afterEach(() => {
-		fs.rmSync(root, { recursive: true, force: true });
+		// `maxRetries`/`retryDelay` (not just `force`): on Windows a directory
+		// that was very recently a live process's cwd (the F1 case's held
+		// helper, any spawned CLI still tearing down) can stay briefly locked
+		// after the process exits -- an EPERM/EBUSY race independent of
+		// whether this test itself killed anything, so it is handled here
+		// once for every case in this describe block rather than per-test.
+		fs.rmSync(root, {
+			recursive: true,
+			force: true,
+			maxRetries: 5,
+			retryDelay: 200,
+		});
 	});
 
 	/**
@@ -1278,7 +1300,21 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 					ledgerRecords().find((record) => record.event === "hygiene.run"),
 				).toMatchObject({ removed: 0, keptReason: "dirty" });
 			} finally {
-				helper.kill();
+				// Await the actual exit, not just the kill signal: `afterEach`
+				// removes the whole fixture root right after this test returns,
+				// and on Windows a directory that was a live process's cwd stays
+				// briefly locked (EPERM on `fs.rmSync`) until the OS has fully
+				// released the handle -- a real flake this test hit under
+				// parallel load once the fire-and-forget `kill()` outran that
+				// release.
+				await new Promise<void>((resolve) => {
+					if (helper.exitCode !== null || helper.signalCode !== null) {
+						resolve();
+						return;
+					}
+					helper.once("exit", () => resolve());
+					helper.kill();
+				});
 			}
 		},
 	);
