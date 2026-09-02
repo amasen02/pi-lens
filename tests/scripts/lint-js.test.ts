@@ -140,6 +140,18 @@ describe("lint:js (#2439 — oxlint wired over .mjs/.cjs)", () => {
 				timeout: SPAWN_TIMEOUT_MS,
 			});
 			expect(result.status, result.stdout + result.stderr).toBe(0);
+
+			// #2461 round-2 (F1-r2): a narrowed target (e.g. swapping the trailing
+			// whole-repo `.` for `scripts`, or any other subdirectory) still exits 0
+			// on this clean tree, so the assertion above alone does not catch a
+			// scope regression — it would silently stop linting clients/tools/mcp
+			// again while this test stays green. Assert the real argv still targets
+			// the whole repo.
+			const pkg = JSON.parse(
+				fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf8"),
+			);
+			const lintJs: string = pkg.scripts["lint:js"];
+			expect(lintJs.trim()).toMatch(/\s\.\s*$/);
 		},
 		SPAWN_TIMEOUT_MS + 5_000,
 	);

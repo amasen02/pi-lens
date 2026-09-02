@@ -54,6 +54,13 @@ export function createDebounceScheduler<T>(args: {
 	}
 
 	function flushAll(): void {
+		// Iterates `pending.keys()` live (a `Map` iterator reflects mutation
+		// during iteration): `flush` deletes the current key before calling
+		// `write`, which is safe, but the injected `write` callback must NOT
+		// synchronously call `schedule` again for a key not yet visited — that
+		// would insert into `pending` mid-iteration and the live iterator would
+		// pick it up, flushing a payload the caller expected to survive as
+		// "still pending" after this call returns.
 		for (const key of pending.keys()) flush(key);
 	}
 

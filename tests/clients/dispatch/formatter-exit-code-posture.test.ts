@@ -253,6 +253,21 @@ describe("formatFile is strict by default at the seam (#1337)", () => {
 		expect(firstDiagnosticLine(undefined)).toBeUndefined();
 	});
 
+	// #2461 round-2 (S3-r2b): this used to strip ANSI via a private,
+	// letters-only `[A-Za-z]`-final-byte regex (a third stripper, obfuscated
+	// via `String.fromCharCode(27)` to dodge no-control-regex) that missed the
+	// full ECMA-48 CSI grammar `sanitize.ts`'s `stripAnsi` already handles —
+	// so a private-mode sequence like a cursor-hide (`\x1b[?25l`, common
+	// terminal-progress noise) survived into the user-visible diagnostic.
+	// Routed through `stripAnsi` instead.
+	it("strips a private-mode CSI sequence (cursor hide) from the surfaced diagnostic", async () => {
+		const esc = String.fromCharCode(27);
+		const { firstDiagnosticLine } = await loadFormatters();
+		expect(firstDiagnosticLine(`${esc}[?25lerror: bad flag${esc}[0m`)).toBe(
+			"error: bad flag",
+		);
+	});
+
 	it("still reports a clean unchanged file when the exit is zero", async () => {
 		const env = setupTestEnvironment("pi-lens-exit-posture-ok-");
 		try {
