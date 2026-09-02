@@ -40,27 +40,56 @@ const PACKAGE_VERSION = (
 	) as { version: string }
 ).version;
 
-/**
- * The union of every Changelog `Deprecated` section: the released ones in
- * `CHANGELOG.md` plus the not-yet-rolled-up `.changelog/` fragments that
- * declare `section: Deprecated`. A row must be announced in one of them —
- * #2418 policy point 4 makes the announcement data, not etiquette.
- */
-function deprecatedChangelogText(): string {
-	const parts: string[] = [];
+const CHANGELOG = fs.readFileSync(
+	path.join(REPO_ROOT, "CHANGELOG.md"),
+	"utf-8",
+);
 
-	const changelog = fs.readFileSync(
-		path.join(REPO_ROOT, "CHANGELOG.md"),
-		"utf-8",
+/**
+ * The newest version that has actually SHIPPED, read off `CHANGELOG.md`'s
+ * `## [x.y.z] - date` headings. `package.json`'s version is the same number
+ * right after a release and therefore cannot tell "already out" from "about to
+ * go out" — which is exactly the distinction `deprecatedSince` needs (#2418
+ * review, S3).
+ */
+function lastReleasedVersion(): string {
+	const versions = [...CHANGELOG.matchAll(/^##\s+\[(\d+\.\d+\.\d+)\]/gm)].map(
+		(match) => match[1],
 	);
-	const lines = changelog.split(/\r?\n/);
-	let inside = false;
-	for (const line of lines) {
+	if (versions.length === 0) throw new Error("CHANGELOG.md names no release");
+	return versions.reduce((newest, candidate) =>
+		compareSemver(candidate, newest) > 0 ? candidate : newest,
+	);
+}
+
+const LAST_RELEASED_VERSION = lastReleasedVersion();
+
+/**
+ * Changelog `Deprecated` prose, split by whether it has SHIPPED.
+ *
+ * - `released` — `### Deprecated` bodies under a `## [x.y.z]` release heading.
+ * - `unreleased` — the same under `## [Unreleased]`, plus every `.changelog/`
+ *   fragment declaring `section: Deprecated`.
+ *
+ * The split is what makes the window check honest: a row announced only in an
+ * unreleased fragment cannot claim a `deprecatedSince` that already shipped,
+ * because no shipped release ever emitted its warning.
+ */
+function deprecatedChangelogText(): { released: string; unreleased: string } {
+	const released: string[] = [];
+	const unreleased: string[] = [];
+
+	let inDeprecated = false;
+	let inUnreleasedRelease = false;
+	for (const line of CHANGELOG.split(/\r?\n/)) {
+		if (/^##\s/.test(line)) {
+			inUnreleasedRelease = /^##\s+\[Unreleased\]/i.test(line);
+		}
 		if (/^#{2,4}\s/.test(line)) {
-			inside = /^###\s+Deprecated\s*$/.test(line);
+			inDeprecated = /^###\s+Deprecated\s*$/.test(line);
 			continue;
 		}
-		if (inside) parts.push(line);
+		if (inDeprecated) (inUnreleasedRelease ? unreleased : released).push(line);
 	}
 
 	const fragmentDir = path.join(REPO_ROOT, ".changelog");
@@ -68,11 +97,25 @@ function deprecatedChangelogText(): string {
 		if (!name.endsWith(".md") || name === "README.md") continue;
 		const fragment = fs.readFileSync(path.join(fragmentDir, name), "utf-8");
 		if (/^---[\s\S]*?section:\s*Deprecated[\s\S]*?---/m.test(fragment)) {
-			parts.push(fragment);
+			unreleased.push(fragment);
 		}
 	}
 
-	return parts.join("\n");
+	return { released: released.join("\n"), unreleased: unreleased.join("\n") };
+}
+
+/**
+ * Is `surface` announced in `text` as a DELIMITED token?
+ *
+ * Backticked, because that is how the changelog spells every config surface and
+ * because a bare substring test is wrong in a way that matters (#2418 review,
+ * F4): `"pi-lens.json"` is a substring of `".pi-lens.json"`, so an announcement
+ * of the canonical file counted as an announcement of the deprecated undotted
+ * one, and a row could ship with nobody ever told about it.
+ */
+function isAnnounced(text: string, surface: string): boolean {
+	const escaped = surface.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	return new RegExp("`\\s*" + escaped + "\\s*`").test(text);
 }
 
 const LSP_CONFIG_SOURCE = fs.readFileSync(
@@ -97,7 +140,7 @@ const KNOWN_CONFIG_FILES = new Set<string>([
 describe("deprecated config surface registry (#2418)", () => {
 	it("is non-empty", () => {
 		// Declared floor: an emptied registry must FAIL rather than read as
-		// "nothing is deprecated". Nine rows exist today; the floor sits below
+		// "nothing is deprecated". Eight rows exist today; the floor sits below
 		// that so a legitimate removal at a major does not break the sweep.
 		assertNonEmptyScan(
 			"deprecated config surface registry",
@@ -125,13 +168,40 @@ describe("deprecated config surface registry (#2418)", () => {
 		}
 	});
 
-	it("never claims a deprecation from the future", () => {
+	it("dates deprecatedSince by where the row is actually announced", () => {
+		// #2418 review, S3. `<= package.json` let a row back-date itself into a
+		// version that already shipped without the warning — the registry would
+		// claim 4.1.3 deprecated a key while 4.1.3 is on npm saying nothing. The
+		// announcement's location is the fact that settles it: announced in a
+		// shipped release => at or before the last release; announced only in an
+		// unreleased fragment => strictly after it.
+		const { released, unreleased } = deprecatedChangelogText();
 		for (const row of DEPRECATED_CONFIG_SURFACES) {
+			if (isAnnounced(released, row.surface)) {
+				expect(
+					compareSemver(row.deprecatedSince, LAST_RELEASED_VERSION),
+					`${row.surface} is announced in a shipped release, so deprecatedSince ${row.deprecatedSince} must be <= ${LAST_RELEASED_VERSION}`,
+				).toBeLessThanOrEqual(0);
+				continue;
+			}
 			expect(
-				compareSemver(row.deprecatedSince, PACKAGE_VERSION),
-				`${row.surface} deprecatedSince ${row.deprecatedSince} > ${PACKAGE_VERSION}`,
-			).toBeLessThanOrEqual(0);
+				isAnnounced(unreleased, row.surface),
+				`${row.surface} is announced nowhere`,
+			).toBe(true);
+			expect(
+				compareSemver(row.deprecatedSince, LAST_RELEASED_VERSION),
+				`${row.surface} is announced only in an UNRELEASED changelog entry, so deprecatedSince ${row.deprecatedSince} must be later than the last release ${LAST_RELEASED_VERSION}`,
+			).toBeGreaterThan(0);
 		}
+	});
+
+	it("reads the last released version off the changelog, not package.json", () => {
+		expect(LAST_RELEASED_VERSION).toMatch(/^\d+\.\d+\.\d+$/);
+		// The two agree today (4.1.3 shipped, no bump yet); the test must not
+		// silently start reading package.json if that ever stops being true.
+		expect(
+			compareSemver(LAST_RELEASED_VERSION, PACKAGE_VERSION),
+		).toBeLessThanOrEqual(0);
 	});
 
 	it("points every row at a registered diagnostic code", () => {
@@ -156,13 +226,56 @@ describe("deprecated config surface registry (#2418)", () => {
 		}
 	});
 
-	it("announces every row in a Changelog Deprecated section", () => {
-		const announced = deprecatedChangelogText();
+	it("announces every row in a Changelog Deprecated section, as a delimited token", () => {
+		const { released, unreleased } = deprecatedChangelogText();
+		const announced = `${released}\n${unreleased}`;
 		expect(announced.trim().length).toBeGreaterThan(0);
 		const missing = DEPRECATED_CONFIG_SURFACES.filter(
-			(row) => !announced.includes(row.surface),
+			(row) => !isAnnounced(announced, row.surface),
 		).map((row) => row.surface);
 		expect(missing).toEqual([]);
+	});
+
+	it("does not accept a longer filename as another row's announcement", () => {
+		// The F4 mutation, pinned: `.pi-lens.json` (canonical, mentioned in the
+		// same fragment) must never satisfy the undotted `pi-lens.json` row.
+		expect(isAnnounced("see `.pi-lens.json` for details", "pi-lens.json")).toBe(
+			false,
+		);
+		expect(isAnnounced("see `pi-lens.json` for details", "pi-lens.json")).toBe(
+			true,
+		);
+		// Nor may an undelimited mention in running prose count.
+		expect(isAnnounced("we no longer read pi-lens.json", "pi-lens.json")).toBe(
+			false,
+		);
+		// A regex metacharacter in the surface is matched literally.
+		expect(
+			isAnnounced("the `.pi-lens/lsp.json` file", ".pi-lens/lsp.json"),
+		).toBe(true);
+		expect(
+			isAnnounced("the `Xpi-lensYlsp.json` file", ".pi-lens/lsp.json"),
+		).toBe(false);
+	});
+
+	it("does not list a canonical config file as a deprecated FILE row", () => {
+		// #2418 review, F5. `.pi-lens.json` and `~/.pi-lens/config.json` are the
+		// two locations #2426 blesses; a row for either would promise users the
+		// file they were just told to migrate TO is going away. What IS
+		// deprecated is the legacy top-level LSP keys inside them — `kind: "key"`
+		// rows, which this asserts are actually present.
+		const files = DEPRECATED_CONFIG_SURFACES.filter(
+			(row) => row.kind === "file",
+		).map((row) => row.surface);
+		expect(files).not.toContain(".pi-lens.json");
+		expect(files).not.toContain("~/.pi-lens/config.json");
+		const keys = DEPRECATED_CONFIG_SURFACES.filter(
+			(row) => row.kind === "key",
+		).map((row) => row.surface);
+		expect(keys).toContain("servers");
+		expect(keys).toContain("serverOverrides");
+		expect(keys).toContain("disabledServers");
+		expect(keys).toContain("warmFiles");
 	});
 
 	it("only deprecates FILE locations the loaders actually read", () => {

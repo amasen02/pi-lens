@@ -22,12 +22,57 @@ function isObject(value: unknown): value is JsonSchemaNode {
 }
 
 /**
+ * Keywords whose value is an OBJECT of named subschemas that ARE published
+ * properties — each one must carry a tier. `patternProperties` counts: a field
+ * matched by a regex is still a field a user writes.
+ */
+const NAMED_PROPERTY_CONTAINERS = ["properties", "patternProperties"] as const;
+
+/**
+ * Keywords whose value is an OBJECT of named subschemas that are NOT
+ * themselves properties — a `$defs` entry is a reusable shape, not a field, so
+ * it needs no tier. Every property INSIDE one still does, which is exactly why
+ * the walk has to descend into them: `$defs` is the easiest place for an
+ * untiered field to hide.
+ */
+const NAMED_SUBSCHEMA_CONTAINERS = ["$defs", "definitions"] as const;
+
+/** Keywords whose value is an ARRAY of subschemas. */
+const SUBSCHEMA_LISTS = ["oneOf", "anyOf", "allOf", "prefixItems"] as const;
+
+/**
+ * Keywords whose value is a SINGLE subschema. `additionalProperties`,
+ * `items` and friends are also legal as booleans (`additionalProperties:
+ * false`) — the object guard below skips those, since a boolean has no
+ * properties to tier.
+ */
+const SUBSCHEMA_VALUES = [
+	"items",
+	"additionalItems",
+	"additionalProperties",
+	"unevaluatedItems",
+	"unevaluatedProperties",
+	"contains",
+	"propertyNames",
+	"not",
+	"if",
+	"then",
+	"else",
+] as const;
+
+/**
  * Every published property carries a valid `x-stability` tier.
  *
- * Walks `properties` and `items` recursively. The ROOT node is not itself a
- * property, so it is exempt; every named property below it is not. Throws with
- * the JSON-pointer-ish path of the first offender, so a CI failure names the
- * field rather than the schema.
+ * Walks every subschema-bearing keyword, not just `properties`/`items`: a
+ * schema can put a field under `oneOf`, `$defs`, `additionalProperties`,
+ * `prefixItems`, `not`, or `if`/`then`/`else` and it is no less published for
+ * it. A walker that only knew two keywords would pass a schema whose entire
+ * catalog lived in a `$defs` block — an enforcement test that cannot see the
+ * shape it governs is worse than none, because it reads as coverage.
+ *
+ * The ROOT node is not itself a property, so it is exempt; every named property
+ * below it is not. Throws with the JSON-pointer-ish path of every offender, so
+ * a CI failure names the field rather than the schema.
  */
 export function assertSchemaStabilityTiers(schema: unknown): void {
 	if (!isObject(schema)) {
@@ -35,11 +80,17 @@ export function assertSchemaStabilityTiers(schema: unknown): void {
 	}
 	const untiered: string[] = [];
 	const badTier: string[] = [];
+	// Shared subschema objects (and `$ref`-free self-references built by hand)
+	// would otherwise recurse forever; the walk is a graph walk, not a tree walk.
+	const seen = new Set<JsonSchemaNode>();
 
 	const walk = (node: unknown, pathParts: string[]): void => {
-		if (!isObject(node)) return;
-		const properties = node.properties;
-		if (isObject(properties)) {
+		if (!isObject(node) || seen.has(node)) return;
+		seen.add(node);
+
+		for (const container of NAMED_PROPERTY_CONTAINERS) {
+			const properties = node[container];
+			if (!isObject(properties)) continue;
 			for (const [name, child] of Object.entries(properties)) {
 				const childPath = [...pathParts, name];
 				const pointer = `/${childPath.join("/")}`;
@@ -54,11 +105,33 @@ export function assertSchemaStabilityTiers(schema: unknown): void {
 				walk(child, childPath);
 			}
 		}
-		const items = node.items;
-		if (Array.isArray(items)) {
-			items.forEach((entry, index) => walk(entry, [...pathParts, `${index}`]));
-		} else if (isObject(items)) {
-			walk(items, [...pathParts, "items"]);
+
+		for (const container of NAMED_SUBSCHEMA_CONTAINERS) {
+			const definitions = node[container];
+			if (!isObject(definitions)) continue;
+			for (const [name, child] of Object.entries(definitions)) {
+				walk(child, [...pathParts, container, name]);
+			}
+		}
+
+		for (const keyword of SUBSCHEMA_LISTS) {
+			const branches = node[keyword];
+			if (!Array.isArray(branches)) continue;
+			branches.forEach((branch, index) =>
+				walk(branch, [...pathParts, keyword, `${index}`]),
+			);
+		}
+
+		for (const keyword of SUBSCHEMA_VALUES) {
+			const value = node[keyword];
+			if (Array.isArray(value)) {
+				// Draft-07 tuple form of `items`.
+				value.forEach((entry, index) =>
+					walk(entry, [...pathParts, keyword, `${index}`]),
+				);
+			} else if (isObject(value)) {
+				walk(value, [...pathParts, keyword]);
+			}
 		}
 	};
 

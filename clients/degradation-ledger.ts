@@ -546,7 +546,23 @@ export type DegradationKind =
 	 * nothing for the file, silently prior to this kind. Once per file per
 	 * session; subject is the file path.
 	 */
-	| "ast-grep-napi-html-script-scan-failed";
+	| "ast-grep-napi-html-script-scan-failed"
+	/**
+	 * A config file the user wrote — or one key inside it — was rejected and
+	 * IGNORED, so pi-lens ran on defaults instead of on what the user asked for
+	 * (#2418). Written only through `warnIgnoredConfigOnce`
+	 * (`clients/config-warn.ts`), the single seam behind all three config
+	 * loaders. Before this kind the rejection existed only as a log line and a
+	 * one-shot notification: nothing counted it, so a session could silently run
+	 * the whole time on defaults with no durable trace. Subject is
+	 * `<file>\0<key>` (empty key = the whole file was unreadable), so a per-key
+	 * rejection and a whole-file rejection stay distinct rows for the same path;
+	 * `metadata.subsystem` says which loader. Once per subject per session — a
+	 * config is re-read on many paths and the count of re-reads is not the
+	 * observability question, the fact of the ignore is. This is the only kind
+	 * that carries a `code` (`PILENS_CFG_0001`) into the durable row.
+	 */
+	| "config-ignored";
 
 export interface DegradationRecord {
 	kind: unknown;

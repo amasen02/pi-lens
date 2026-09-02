@@ -1,6 +1,7 @@
-import type { ConfigDiagnosticCode } from "./config-diagnostic-codes.js";
-import { logExtension } from "./extension-log.js";
-import { notifyUserDegradation } from "./user-notify.js";
+import {
+	resetIgnoredConfigWarnCache,
+	warnIgnoredConfigOnce,
+} from "./config-warn.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -117,34 +118,24 @@ export function getPiLensGlobalConfigPath(homeDir = os.homedir()): string {
 	return path.join(homeDir, ".pi-lens", "config.json");
 }
 
-const warnedInvalidGlobalConfigs = new Set<string>();
-
 /**
  * Same warn-once-per-(path, reason) contract as project-lens-config.ts's
  * `warnInvalidConfigOnce` — a malformed global config value is logged once
- * and then treated as absent, rather than silently dropped (#792).
+ * and then treated as absent, rather than silently dropped (#792). Since #2418
+ * the latch, the log line, the durable ledger row, and the stable-coded
+ * notification all live in the one shared seam.
  */
 function warnInvalidGlobalConfigOnce(configPath: string, reason: string): void {
-	const key = `${configPath}:${reason}`;
-	if (warnedInvalidGlobalConfigs.has(key)) return;
-	warnedInvalidGlobalConfigs.add(key);
-	const message = `ignoring invalid global config ${configPath}: ${reason}`;
-	const code: ConfigDiagnosticCode = "PILENS_CFG_0001";
-	logExtension({
+	warnIgnoredConfigOnce({
 		subsystem: "lens-config",
-		level: "warn",
-		message,
-		metadata: { configPath, reason, code },
+		file: configPath,
+		reason,
 	});
-	// HUMAN-audience too: a config the user wrote is being ignored. Routed
-	// through the host's own render path (#1333), never a raw write. The
-	// stable code (#2418) makes it matchable without depending on the prose.
-	notifyUserDegradation(`pi-lens: ${message}`, "warning", { code });
 }
 
 /** For tests that need to force the warn-once cache to reset between cases. */
 export function resetGlobalConfigWarnCache(): void {
-	warnedInvalidGlobalConfigs.clear();
+	resetIgnoredConfigWarnCache("lens-config");
 }
 
 function asConfigObject(value: unknown): Record<string, unknown> | undefined {

@@ -70,11 +70,35 @@ export const CONFIG_SCHEMA_ANCHOR_KEY = "$schema";
  * pins the full list and goes red on any renumber or removal.
  */
 export const CONFIG_DIAGNOSTIC_CODES = {
-	/** A config file exists but could not be read or parsed, so it is ignored. */
+	/**
+	 * A config file exists but could not be read or parsed, so it is ignored.
+	 *
+	 * EMITTED, by `warnIgnoredConfigOnce` (`clients/config-warn.ts`) — the one
+	 * seam behind all three config loaders. It rides the user-facing message as
+	 * a ` [PILENS_CFG_0001]` suffix AND the durable `config-ignored`
+	 * degradation row, so the code a user greps for in the terminal is the same
+	 * one in `latency.log`.
+	 */
 	PILENS_CFG_0001: "config file unreadable or unparsable; ignored",
-	/** A deprecated config KEY was accepted inside its deprecation window. */
+	/**
+	 * A deprecated config KEY was accepted inside its deprecation window.
+	 *
+	 * RESERVED, NOT YET EMITTED. Nothing in pi-lens raises this today: the
+	 * migration warnings it describes arrive with #2416 slice 1, which is also
+	 * the first release in which any key is actually inside its window. The
+	 * number is registered now because the namespace is append-only — a number
+	 * cannot be chosen after the fact — and `DEPRECATED_CONFIG_SURFACES` already
+	 * points its `kind: "key"` rows at it, so the wiring is a call site, not a
+	 * new public surface. Deliberately reserved-but-inert per AGENTS.md's
+	 * "Issue and PR design contract".
+	 */
 	PILENS_CFG_0002: "deprecated config key accepted",
-	/** A deprecated config FILE LOCATION was read inside its window. */
+	/**
+	 * A deprecated config FILE LOCATION was read inside its window.
+	 *
+	 * RESERVED, NOT YET EMITTED — same slice, same reasoning as
+	 * `PILENS_CFG_0002`.
+	 */
 	PILENS_CFG_0003: "deprecated config file location accepted",
 } as const satisfies Record<`PILENS_CFG_${string}`, string>;
 
@@ -129,7 +153,14 @@ export interface DeprecatedConfigSurface {
 	readonly kind: DeprecatedConfigSurfaceKind;
 	/** The stable code the migration warning for this surface carries. */
 	readonly code: ConfigDiagnosticCode;
-	/** Version in which the surface was announced deprecated. */
+	/**
+	 * Version in which the surface is ANNOUNCED deprecated. For a row whose
+	 * announcement is still an unreleased `.changelog/` fragment this is the
+	 * NEXT release, never the version already on npm: back-dating a deprecation
+	 * into a shipped release claims a warning that release never emitted.
+	 * `tests/clients/config-deprecation-registry.test.ts` checks it against the
+	 * newest release in `CHANGELOG.md`, not against `package.json`.
+	 */
 	readonly deprecatedSince: string;
 	/** Earliest version in which removal is permitted (always a major). */
 	readonly removeNotBefore: string;
@@ -144,14 +175,20 @@ export interface DeprecatedConfigSurface {
  * checklist in `docs/public-api-stability.md`.
  *
  * The consolidation slice (#2426) blesses exactly two canonical locations:
- * `.pi-lens.json` (project) and `~/.pi-lens/config.json` (global).
+ * `.pi-lens.json` (project) and `~/.pi-lens/config.json` (global). Neither
+ * appears here, and that is the point: a CANONICAL FILE IS NOT DEPRECATED
+ * BECAUSE SOME OF ITS KEYS ARE. `.pi-lens.json` keeps being read forever; what
+ * is deprecated is the legacy top-level LSP keys inside it (`servers`,
+ * `serverOverrides`, `disabledServers`, `warmFiles`), which are the
+ * `kind: "key"` rows below. Listing the file itself would have promised users
+ * that the file they were just told to migrate TO is going away.
  */
 export const DEPRECATED_CONFIG_SURFACES = [
 	{
 		surface: "servers",
 		kind: "key",
 		code: "PILENS_CFG_0002",
-		deprecatedSince: "4.1.3",
+		deprecatedSince: "4.2.0",
 		removeNotBefore: "5.0.0",
 		reason:
 			"custom-server definitions move to the unified catalog schema; the bare string command + args form is replaced by the trust-gated ProcessSpec (#2416).",
@@ -160,7 +197,7 @@ export const DEPRECATED_CONFIG_SURFACES = [
 		surface: "serverOverrides",
 		kind: "key",
 		code: "PILENS_CFG_0002",
-		deprecatedSince: "4.1.3",
+		deprecatedSince: "4.2.0",
 		removeNotBefore: "5.0.0",
 		reason:
 			"per-server initializationOptions overrides fold into the catalog's field-wise merge, keyed by the same public server IDs (#2416).",
@@ -169,7 +206,7 @@ export const DEPRECATED_CONFIG_SURFACES = [
 		surface: "disabledServers",
 		kind: "key",
 		code: "PILENS_CFG_0002",
-		deprecatedSince: "4.1.3",
+		deprecatedSince: "4.2.0",
 		removeNotBefore: "5.0.0",
 		reason:
 			"replaced by the catalog's per-entry `enabled: false`, which carries monotonic deny precedence (#1416/#2415).",
@@ -178,7 +215,7 @@ export const DEPRECATED_CONFIG_SURFACES = [
 		surface: "warmFiles",
 		kind: "key",
 		code: "PILENS_CFG_0002",
-		deprecatedSince: "4.1.3",
+		deprecatedSince: "4.2.0",
 		removeNotBefore: "5.0.0",
 		reason:
 			"session warm-up seeds become a per-server catalog field rather than a config-root list (#2416).",
@@ -187,25 +224,16 @@ export const DEPRECATED_CONFIG_SURFACES = [
 		surface: ".pi-lens/lsp.json",
 		kind: "file",
 		code: "PILENS_CFG_0003",
-		deprecatedSince: "4.1.3",
+		deprecatedSince: "4.2.0",
 		removeNotBefore: "5.0.0",
 		reason:
 			"project LSP settings consolidate into `.pi-lens.json` under the unified envelope (#2426).",
 	},
 	{
-		surface: ".pi-lens.json",
-		kind: "file",
-		code: "PILENS_CFG_0003",
-		deprecatedSince: "4.1.3",
-		removeNotBefore: "5.0.0",
-		reason:
-			"the FILE stays canonical; its legacy top-level LSP keys (read as an `LSPConfig` root) move under the unified envelope (#2426).",
-	},
-	{
 		surface: "pi-lsp.json",
 		kind: "file",
 		code: "PILENS_CFG_0003",
-		deprecatedSince: "4.1.3",
+		deprecatedSince: "4.2.0",
 		removeNotBefore: "5.0.0",
 		reason:
 			"pre-rename project location; superseded by `.pi-lens.json` (#2426).",
@@ -214,7 +242,7 @@ export const DEPRECATED_CONFIG_SURFACES = [
 		surface: "pi-lens.json",
 		kind: "file",
 		code: "PILENS_CFG_0003",
-		deprecatedSince: "4.1.3",
+		deprecatedSince: "4.2.0",
 		removeNotBefore: "5.0.0",
 		reason:
 			"undotted project-config basename; superseded by `.pi-lens.json` (#2426).",
@@ -223,7 +251,7 @@ export const DEPRECATED_CONFIG_SURFACES = [
 		surface: "~/.pi-lens/lsp.json",
 		kind: "file",
 		code: "PILENS_CFG_0003",
-		deprecatedSince: "4.1.3",
+		deprecatedSince: "4.2.0",
 		removeNotBefore: "5.0.0",
 		reason:
 			"global LSP settings consolidate into `~/.pi-lens/config.json` (#2426).",

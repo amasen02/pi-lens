@@ -11,7 +11,8 @@ import {
 	isConfigDiagnosticCode,
 	withConfigDiagnosticCode,
 } from "../../clients/config-diagnostic-codes.js";
-import { assertNonEmptyScan } from "../support/sweep-kit.js";
+import { gitExecFileSync } from "../support/git-fixture-env.js";
+import { assertNonEmptyScan, stripSource } from "../support/sweep-kit.js";
 
 const REPO_ROOT = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -124,7 +125,12 @@ function configSurfaceSources(): Array<{ file: string; source: string }> {
 			if (!/config/i.test(entry.name)) continue;
 			found.push({
 				file: path.relative(REPO_ROOT, full).split(path.sep).join("/"),
-				source: fs.readFileSync(full, "utf-8"),
+				// Comments blanked, string bodies KEPT: the evidence this sweep
+				// reads IS a string literal (`"PILENS_CFG_0001"`), and a
+				// commented-out call must not read as a real one.
+				source: stripSource(fs.readFileSync(full, "utf-8"), {
+					strings: "keep",
+				}),
 			});
 		}
 	};
@@ -153,6 +159,201 @@ function notifyCalls(source: string): string[] {
 	return calls;
 }
 
+/**
+ * Split a balanced call's arguments at TOP-LEVEL commas.
+ *
+ * Nested calls, object/array literals and quoted text all suppress the split,
+ * so the third argument comes back whole. Known limit, stated rather than
+ * hidden: a top-level comma inside a template literal's `${...}` would split
+ * wrongly — no call site in this repo has one, and a wrong split fails CLOSED
+ * (the options argument stops parsing as an object, and the call is reported).
+ */
+export function callArguments(call: string): string[] {
+	const open = call.indexOf("(");
+	const inner = call.slice(open + 1, call.length - 1);
+	const args: string[] = [];
+	let depth = 0;
+	let quote: string | undefined;
+	let current = "";
+	for (let i = 0; i < inner.length; i += 1) {
+		const ch = inner[i];
+		if (quote) {
+			if (ch === "\\") {
+				current += ch + (inner[i + 1] ?? "");
+				i += 1;
+				continue;
+			}
+			if (ch === quote) quote = undefined;
+			current += ch;
+			continue;
+		}
+		if (ch === '"' || ch === "'" || ch === "`") {
+			quote = ch;
+			current += ch;
+			continue;
+		}
+		if (ch === "(" || ch === "[" || ch === "{") depth += 1;
+		else if (ch === ")" || ch === "]" || ch === "}") depth -= 1;
+		if (ch === "," && depth === 0) {
+			args.push(current.trim());
+			current = "";
+			continue;
+		}
+		current += ch;
+	}
+	if (current.trim().length > 0) args.push(current.trim());
+	return args;
+}
+
+/**
+ * The `code` property's VALUE EXPRESSION inside an options object literal, or
+ * `undefined` when the object declares no such property.
+ *
+ * Scoped to the object literal on purpose (#2418 review, F3). The first version
+ * of this sweep tested `/\bcode\b/` against the whole call text, which a
+ * comment saying "the stable code rides along" satisfied — the assertion was
+ * green on prose while the option itself could be missing.
+ */
+export function codeOptionExpression(
+	optionsArgument: string,
+): string | undefined {
+	if (!optionsArgument.startsWith("{") || !optionsArgument.endsWith("}")) {
+		return undefined;
+	}
+	const body = optionsArgument.slice(1, -1);
+	const explicit = /(?:^|[,{]|\s)code\s*:\s*([^,}]+)/.exec(body);
+	if (explicit) return explicit[1].trim();
+	// Shorthand `{ code }` / `{ code, level }`: the identifier IS the value.
+	if (/(?:^|,)\s*code\s*(?:,|$)/.test(body)) return "code";
+	return undefined;
+}
+
+/**
+ * Every `PILENS_CFG_*` literal a value expression can reach, resolving
+ * identifiers through the file's own `const`/parameter declarations (bounded
+ * depth, visited-set guarded). Returns `[]` when nothing resolves — a `code`
+ * option pointing at something this cannot prove is a registered code fails,
+ * rather than passing because the word `code` appeared.
+ */
+export function resolveCodeLiterals(
+	expression: string,
+	source: string,
+	seen: Set<string> = new Set(),
+	depth = 0,
+): string[] {
+	const literals = [
+		...expression.matchAll(/["'`](PILENS_CFG_\d{4})["'`]/g),
+	].map((match) => match[1]);
+	if (depth >= 4) return literals;
+	const identifiers = [
+		...expression.matchAll(/(?<![.\w$])([A-Za-z_$][\w$]*)/g),
+	].map((match) => match[1]);
+	for (const identifier of identifiers) {
+		if (seen.has(identifier)) continue;
+		seen.add(identifier);
+		const declaration =
+			new RegExp(
+				`(?:const|let|var)\\s+${identifier}\\b[^=;]*=\\s*([^;]+);`,
+			).exec(source) ??
+			new RegExp(`\\b${identifier}\\s*:[^=;,)]*=\\s*([^,;)]+)`).exec(source);
+		if (!declaration) continue;
+		literals.push(
+			...resolveCodeLiterals(declaration[1], source, seen, depth + 1),
+		);
+	}
+	return literals;
+}
+
+/**
+ * Audit ONE `notifyUserDegradation` call. Returns the failure reason, or
+ * `undefined` when the call passes a registered stable code. Exported as a pure
+ * (call, source) → verdict function so the parser itself is unit-tested against
+ * literal snippets below, rather than only inferred from a whole-tree scan that
+ * happens to be green.
+ */
+export function auditNotifyCall(
+	call: string,
+	source: string,
+): string | undefined {
+	const args = callArguments(call);
+	const optionsArgument = args[2];
+	if (optionsArgument === undefined) {
+		return "no options argument (message, level, options)";
+	}
+	const expression = codeOptionExpression(optionsArgument);
+	if (expression === undefined) {
+		return `options argument declares no \`code\` property: ${optionsArgument}`;
+	}
+	const resolved = resolveCodeLiterals(expression, source);
+	if (resolved.length === 0) {
+		return `\`code\` does not resolve to a PILENS_CFG_* literal: ${expression}`;
+	}
+	const unregistered = resolved.filter((code) => !isConfigDiagnosticCode(code));
+	if (unregistered.length > 0) {
+		return `\`code\` resolves to unregistered ${unregistered.join(", ")}`;
+	}
+	return undefined;
+}
+
+/**
+ * #2418 review, F1 — and the defect underneath it.
+ *
+ * The policy doc was written, referenced from AGENTS.md, from this module and
+ * from the changelog fragment, and then never reached the repo: `.gitignore`
+ * ignores `*.md` with a per-file negation list, so `git add docs/…md` for an
+ * un-negated name is a SILENT no-op. Three surfaces pointed users at a file
+ * that did not exist, and nothing in the build noticed.
+ *
+ * A test that only checked the file exists on disk would still have passed, so
+ * this one asks git: every `docs/*.md` a policy surface names must be TRACKED.
+ */
+function referencedDocPaths(
+	sources: ReadonlyArray<{ file: string; source: string }>,
+): string[] {
+	const texts = sources.map((entry) => entry.source);
+	texts.push(fs.readFileSync(path.join(REPO_ROOT, "AGENTS.md"), "utf-8"));
+	const fragmentDir = path.join(REPO_ROOT, ".changelog");
+	for (const name of fs.readdirSync(fragmentDir)) {
+		if (!name.endsWith(".md") || name === "README.md") continue;
+		texts.push(fs.readFileSync(path.join(fragmentDir, name), "utf-8"));
+	}
+	const referenced = new Set<string>();
+	for (const text of texts) {
+		for (const match of text.matchAll(/docs\/[A-Za-z0-9._-]+\.md/g)) {
+			referenced.add(match[0]);
+		}
+	}
+	return [...referenced].sort();
+}
+
+describe("referenced policy docs are actually in the repo (#2418)", () => {
+	const sources = configSurfaceSources();
+	const referenced = referencedDocPaths(sources);
+	const tracked = new Set(
+		gitExecFileSync("git", ["ls-files", "-z", "docs"], {
+			cwd: REPO_ROOT,
+			encoding: "utf8",
+		})
+			.split("\0")
+			.filter(Boolean),
+	);
+
+	it("finds doc references to check", () => {
+		// Declared floor: a scan that finds nothing must FAIL, not read as clean.
+		assertNonEmptyScan("referenced docs", referenced.length, 1);
+		assertNonEmptyScan("tracked docs", tracked.size, 1);
+	});
+
+	it("names the stability policy doc", () => {
+		expect(referenced).toContain("docs/public-api-stability.md");
+	});
+
+	it("tracks every referenced doc — a gitignored doc is a dangling promise", () => {
+		const untracked = referenced.filter((doc) => !tracked.has(doc));
+		expect(untracked).toEqual([]);
+	});
+});
+
 describe("config-surface warnings carry a stable code (#2418)", () => {
 	const sources = configSurfaceSources();
 
@@ -170,13 +371,14 @@ describe("config-surface warnings carry a stable code (#2418)", () => {
 		expect(files).toContain("clients/lsp/config.ts");
 	});
 
-	it("passes a code on every config-surface notifyUserDegradation call", () => {
+	it("passes a registered code option on every config-surface notifyUserDegradation call", () => {
 		const uncoded: string[] = [];
 		let audited = 0;
 		for (const { file, source } of sources) {
 			for (const call of notifyCalls(source)) {
 				audited += 1;
-				if (!/\bcode\b/.test(call)) uncoded.push(`${file}: ${call}`);
+				const failure = auditNotifyCall(call, source);
+				if (failure) uncoded.push(`${file}: ${failure}`);
 			}
 		}
 		expect(audited).toBeGreaterThan(0);
@@ -194,5 +396,85 @@ describe("config-surface warnings carry a stable code (#2418)", () => {
 		for (const code of referenced) {
 			expect(isConfigDiagnosticCode(code), code).toBe(true);
 		}
+	});
+});
+
+/**
+ * The auditor's own mutants (#2418 review, F3). A scanner is only as good as
+ * its failure modes, and the one this replaces passed on prose: the word
+ * "code" in a comment next to the call satisfied `/\bcode\b/`. These snippets
+ * pin what the auditor accepts and what it rejects, so a future loosening of
+ * the parser fails here rather than silently in the tree scan.
+ */
+describe("the notify-call code auditor itself (#2418)", () => {
+	const REAL_SOURCE = [
+		'const IGNORED_CONFIG_CODE: ConfigDiagnosticCode = "PILENS_CFG_0001";',
+		"const code: ConfigDiagnosticCode = options.code ?? IGNORED_CONFIG_CODE;",
+	].join("\n");
+
+	it("accepts a shorthand code resolved through the file's own const", () => {
+		const call =
+			'notifyUserDegradation(`pi-lens: ${message}`, "warning", { code })';
+		expect(auditNotifyCall(call, REAL_SOURCE)).toBeUndefined();
+	});
+
+	it("accepts an inline registered literal", () => {
+		const call =
+			'notifyUserDegradation("pi-lens: x", "warning", { code: "PILENS_CFG_0001" })';
+		expect(auditNotifyCall(call, "")).toBeUndefined();
+	});
+
+	it("REJECTS a call with the option dropped but the word in prose", () => {
+		// The exact mutation the old `/\bcode\b/` assertion passed: the option
+		// is gone, only the surrounding prose still says "code".
+		const call =
+			'notifyUserDegradation(`pi-lens: the stable code rides along ${message}`, "warning")';
+		expect(auditNotifyCall(call, REAL_SOURCE)).toMatch(/no options argument/);
+	});
+
+	it("REJECTS an options object with every field but code", () => {
+		const call =
+			'notifyUserDegradation("pi-lens: x", "warning", { detail: "code" })';
+		expect(auditNotifyCall(call, REAL_SOURCE)).toMatch(
+			/declares no `code` property/,
+		);
+	});
+
+	it("REJECTS a code that resolves to nothing", () => {
+		const call = 'notifyUserDegradation("pi-lens: x", "warning", { code })';
+		expect(auditNotifyCall(call, "const unrelated = 1;")).toMatch(
+			/does not resolve/,
+		);
+	});
+
+	it("REJECTS a code that resolves to an unregistered number", () => {
+		const call =
+			'notifyUserDegradation("pi-lens: x", "warning", { code: "PILENS_CFG_9999" })';
+		expect(auditNotifyCall(call, "")).toMatch(/unregistered PILENS_CFG_9999/);
+	});
+
+	it("splits arguments without being fooled by nested commas", () => {
+		const call =
+			'notifyUserDegradation(fmt("a", "b"), "warning", { code: "PILENS_CFG_0001" })';
+		expect(callArguments(call)).toEqual([
+			'fmt("a", "b")',
+			'"warning"',
+			'{ code: "PILENS_CFG_0001" }',
+		]);
+	});
+
+	it("reads the code expression out of the options object only", () => {
+		expect(codeOptionExpression('{ code: "PILENS_CFG_0002" }')).toBe(
+			'"PILENS_CFG_0002"',
+		);
+		expect(codeOptionExpression("{ code }")).toBe("code");
+		expect(codeOptionExpression("{ level: 1 }")).toBeUndefined();
+		expect(codeOptionExpression('"warning"')).toBeUndefined();
+	});
+
+	it("resolves an identifier chain to its literal", () => {
+		expect(resolveCodeLiterals("code", REAL_SOURCE)).toContain(
+			"PILENS_CFG_0001",
+		);
 	});
 });

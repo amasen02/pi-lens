@@ -47,9 +47,7 @@
  * clients/lsp/server.ts (e.g. "rust", "nix", "bash", "python", "go", "ts").
  */
 
-import type { ConfigDiagnosticCode } from "../config-diagnostic-codes.js";
-import { logExtension } from "../extension-log.js";
-import { notifyUserDegradation } from "../user-notify.js";
+import { warnIgnoredConfigOnce } from "../config-warn.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { BoundedLruCache } from "../bounded-cache.js";
@@ -128,19 +126,15 @@ export const GLOBAL_LSP_CONFIG_BASENAME = "lsp.json";
 const CONFIG_PATHS = LSP_CONFIG_PATHS;
 
 function warnInvalidLSPConfig(configPath: string, error: unknown): void {
-	const reason = error instanceof Error ? error.message : String(error);
-	const message = `ignoring invalid LSP config ${configPath}: ${reason}`;
-	const code: ConfigDiagnosticCode = "PILENS_CFG_0001";
-	logExtension({
+	// One shared seam for all three config loaders (#2418): it owns the
+	// warn-once latch, the extension.log line, the durable `config-ignored`
+	// ledger row, and the stable-coded user notification. The rendered prose is
+	// unchanged — `ignoring invalid LSP config <path>: <reason>`.
+	warnIgnoredConfigOnce({
 		subsystem: "lsp-config",
-		level: "warn",
-		message,
-		metadata: { configPath, reason, code },
+		file: configPath,
+		reason: error instanceof Error ? error.message : String(error),
 	});
-	// HUMAN-audience too: the user's own lsp.json is being ignored (#1333).
-	// The stable code (#2418) rides along so the warning is matchable by code
-	// rather than by prose; the prose itself is unchanged.
-	notifyUserDegradation(`pi-lens: ${message}`, "warning", { code });
 }
 
 async function readLSPConfig(
