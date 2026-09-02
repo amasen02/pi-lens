@@ -609,9 +609,8 @@ describe("#2423 review round 4 (F5) — the hashline anchor memo drops at the to
 			const before = "alpha\nbeta\ngamma\n";
 			const after = "zebra\nbeta\ngamma\n";
 			expect(Buffer.byteLength(after)).toBe(Buffer.byteLength(before));
-			const { computeHashlineAnchors } = await import(
-				"../../clients/hashline-anchor.js"
-			);
+			const { computeHashlineAnchors } =
+				await import("../../clients/hashline-anchor.js");
 			const anchorForAlpha = computeHashlineAnchors(before)![0]!;
 			// Pinned, not "now": two separate fs.writeFileSync calls landing on
 			// the same wall-clock tick is exactly the scenario under test, and
