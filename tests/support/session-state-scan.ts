@@ -394,23 +394,202 @@ export interface SessionStateCandidate {
 	hasProcessSingleton: boolean;
 }
 
+/** Container constructors every scan recognises regardless of origin. */
+const BUILTIN_CONTAINER_CTORS = ["Map", "Set", "WeakMap", "WeakSet"] as const;
+
 /**
- * Module-level (column-zero) `const`/`let` bound to a `Map`, `Set`,
- * `WeakMap`, `WeakSet` or one of the repo's own container classes
- * (`PathKeyedMap`, `BoundedFifoMap`, `BoundedLruCache`). Column zero is the
- * signal for "module scope" — a container declared inside a function is
- * per-call state and re-armed by construction.
- *
- * A repo container wrapping a `Map` holds session state exactly as a raw
- * `Map` does; the alternation must therefore name EVERY such class, or a
- * refactor from `new Map()` to the wrapper silently deletes the file from
- * this sweep. `PathKeyedMap` is the precedent (#1025); `BoundedFifoMap` /
- * `BoundedLruCache` were the gap #2442's migration opened and its review
- * round caught — `cache-observability.ts` went from four recognised
- * containers to zero without a single test noticing.
+ * Class names {@link classDeclarationNames} finds in `clients/` that are
+ * proven NOT to hold session-scoped state — an exclusion from the primary
+ * #2455 predicate ("declared in `clients/`"), not from a narrower method-name
+ * filter (round 1's `clear()`/`delete()` gate; see {@link containerClassNames}
+ * for why round 2 dropped it). Add an entry with a one-line reason, the same
+ * way {@link EXEMPT_SESSION_STATE_FILES} argues file-level exemptions, rather
+ * than silently special-casing a name at the call site. Both halves are
+ * self-checking (`tests/clients/session-state-conformance.test.ts`): a key
+ * naming a class the live scan no longer finds, or a reason-less entry, reds
+ * instead of quietly doing nothing.
  */
-const CONTAINER_DECLARATION =
-	/^(?:const|let)\s+([A-Za-z_$][\w$]*)[^=\n]*=\s*new\s+(?:Map|Set|WeakMap|WeakSet|PathKeyedMap|BoundedFifoMap|BoundedLruCache)\b/gm;
+const CONTAINER_CLASS_EXCLUSIONS: Readonly<Record<string, string>> = {};
+
+/**
+ * `class Name` declarations in (already {@link stripCommentsAndStrings}
+ * -processed) `source`, at column zero — module scope, mirroring the
+ * container-declaration regex's own column-zero requirement — in every
+ * export shape: `export class`, `export default class`, `export abstract
+ * class`, `export default abstract class`, and a bare (non-exported) `class`.
+ *
+ * Only the identifier immediately after the `class` keyword is captured. The
+ * round-1 regex instead matched the WHOLE header through to `{`
+ * (`^export class NAME(?:<[^>]*>)?(?:\s+extends\s+BASE(?:<[^>]*>)?)?...`), so
+ * it both required the literal `export class` prefix (missing `export
+ * default class`, `export abstract class`, and a non-exported `class` later
+ * re-exported via `export { A }` / `export { A as B }`) and broke on a nested
+ * generic in either the class's own type parameters or its `extends` target
+ * (`class A<T extends Map<K, V>>`, `extends Base<Map<K, V>>`) because
+ * `[^>]*` stops at the FIRST `>`, one short of the real end. Capturing only
+ * the name sidesteps both: nothing after `class NAME` is inspected — no
+ * header text is ever walked, balanced or otherwise — so there is nothing
+ * left for a nested generic to break. #2455 fix round 2 also drops the
+ * `extends`-chain body match this regex used to feed — round 2's predicate is
+ * "declared in `clients/`", not "owns `clear()`/`delete()`, directly or
+ * inherited", so there is nothing to resolve through an `extends` chain any
+ * more.
+ */
+function classDeclarationNames(source: string): Set<string> {
+	const names = new Set<string>();
+	const declaration =
+		/^(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)/gm;
+	for (const match of source.matchAll(declaration)) names.add(match[1]);
+
+	// A non-exported class re-exported (optionally renamed) through its own
+	// `export { A }` / `export { A as B }` statement: a caller elsewhere
+	// constructs `new B(...)`, so the alias must resolve to a recognised name
+	// too. Re-exports FROM another module (`export { A } from "./x.js"`) are
+	// skipped — that class is declared in `./x.js`, where this same scan
+	// already sees it directly when it walks that file.
+	const exportList = /^export\s*\{([\s\S]*?)\}\s*(from\s*["'][^"']*["'])?/gm;
+	for (const match of source.matchAll(exportList)) {
+		if (match[2]) continue;
+		for (const rawEntry of match[1].split(",")) {
+			const entry = rawEntry.trim().replace(/^type\s+/, "");
+			const aliased = /^[A-Za-z_$][\w$]*\s+as\s+([A-Za-z_$][\w$]*)$/.exec(
+				entry,
+			);
+			if (aliased) names.add(aliased[1]);
+		}
+	}
+	return names;
+}
+
+const declaredClassNamesCache = new Map<string, Set<string>>();
+
+/**
+ * Every class DECLARED anywhere in `dir` — the primary #2455 predicate,
+ * BEFORE {@link CONTAINER_CLASS_EXCLUSIONS} is applied. Split out from
+ * {@link containerClassNames} so {@link auditContainerClassExclusions} can
+ * check an exclusion's class name against what the scan actually finds,
+ * independent of whether that same name is about to be excluded.
+ *
+ * Round 1 gated recognition on the class owning a `clear()`/`delete()`
+ * method, directly or through an `extends` chain: a narrower proxy for "looks
+ * like a container", chosen so `BoundedFifoMap`/`BoundedLruCache` (which
+ * migrated ~20 module-level `new Map()` caches off a hard-coded name
+ * alternation, #2442) would be recognised by shape rather than by name. That
+ * proxy was itself a miss: `FactStore` (`clients/dispatch/fact-store.ts`)
+ * holds five session-scoped `Map`/`Set` fields behind `clearAll()` and
+ * `deleteFileFact()` — neither name is literally `clear` or `delete` — so two
+ * of its five production module-scope instances stayed invisible to the
+ * round-1 scan. #2455's issue text names the PRIMARY predicate directly:
+ * "module-level `const`/`let` bound to a `new` expression whose constructor
+ * is declared in `clients/`". Round 2 uses that wording instead of the
+ * method-name proxy, which also deletes the `extends`-chain walk and its
+ * cycle guard — with no method filter to resolve inheritance for, there is
+ * nothing left for either to do.
+ *
+ * Cached per `dir` — the real `clients/` tree is scanned once per process;
+ * a fixture tree passed by a test gets its own cache entry so tests never
+ * see a stale class list from an earlier fixture.
+ */
+function declaredClassNames(dir = CLIENTS_ROOT): Set<string> {
+	const cached = declaredClassNamesCache.get(dir);
+	if (cached) return cached;
+
+	const names = new Set<string>();
+	for (const absolute of clientSourceFiles(dir)) {
+		const source = stripCommentsAndStrings(fs.readFileSync(absolute, "utf8"));
+		for (const name of classDeclarationNames(source)) names.add(name);
+	}
+	declaredClassNamesCache.set(dir, names);
+	return names;
+}
+
+const containerClassNamesCache = new Map<string, Set<string>>();
+
+/** {@link declaredClassNames}, minus {@link CONTAINER_CLASS_EXCLUSIONS}. */
+function containerClassNames(dir = CLIENTS_ROOT): Set<string> {
+	const cached = containerClassNamesCache.get(dir);
+	if (cached) return cached;
+
+	const names = new Set(declaredClassNames(dir));
+	for (const excluded of Object.keys(CONTAINER_CLASS_EXCLUSIONS)) {
+		names.delete(excluded);
+	}
+	containerClassNamesCache.set(dir, names);
+	return names;
+}
+
+/**
+ * Problems with an exclusions table (defaults to the real
+ * {@link CONTAINER_CLASS_EXCLUSIONS}): a key naming a class
+ * {@link declaredClassNames} does not currently find (a stale entry — the
+ * class was renamed, deleted, or never existed), or an entry whose reason is
+ * empty. #2455 fix round 2 review F3: before this, a nonexistent class name
+ * paired with an empty-string reason changed nothing observable — the
+ * exclusion silently deleted nothing from a Set that never had that key, and
+ * the conformance sweep stayed green. Exported so
+ * `tests/clients/session-state-conformance.test.ts` can run this against
+ * BOTH the real (today empty) table and a synthetic fixture table that
+ * proves the guard actually fires.
+ */
+export function auditContainerClassExclusions(
+	exclusions: Readonly<Record<string, string>> = CONTAINER_CLASS_EXCLUSIONS,
+	dir = CLIENTS_ROOT,
+): string[] {
+	const declared = declaredClassNames(dir);
+	const problems: string[] = [];
+	for (const [name, reason] of Object.entries(exclusions)) {
+		if (!declared.has(name)) {
+			problems.push(
+				`CONTAINER_CLASS_EXCLUSIONS names "${name}", which the live class scan does not find — stale entry (renamed, deleted, or never existed)`,
+			);
+		}
+		if (reason.trim().length === 0) {
+			problems.push(
+				`CONTAINER_CLASS_EXCLUSIONS["${name}"] has an empty reason`,
+			);
+		}
+	}
+	return problems;
+}
+
+/** Escape a literal identifier for safe use inside a `RegExp` alternation. */
+function escapeRegExpLiteral(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const containerDeclarationCache = new Map<string, RegExp>();
+
+/**
+ * Module-level (column-zero) `const`/`let` bound to `new <Ctor>(...)`, where
+ * `<Ctor>` is a built-in container or a {@link containerClassNames} match for
+ * `dir`. Column zero is the signal for "module scope" — a container declared
+ * inside a function is per-call state and re-armed by construction.
+ *
+ * The `export` prefix is optional (#2455 fix round 4). It was not, and that
+ * was a miss of the same family as the two this issue already closed: whether
+ * a module-scope singleton is exported says nothing about whether it holds
+ * session state, and `export const goClient = new GoClient()` — the process's
+ * only Go availability latch — was invisible for no reason but the keyword in
+ * front of it. Seven pre-existing `export const … = new …` sites in `clients/`
+ * were equally unseen; the pins below record which of them the pairing rule
+ * turns into candidates.
+ *
+ * Built fresh (once, cached) from a live class scan rather than a hand list —
+ * see {@link containerClassNames}.
+ */
+function containerDeclarationRegex(dir: string): RegExp {
+	const cached = containerDeclarationCache.get(dir);
+	if (cached) return cached;
+	const names = [...BUILTIN_CONTAINER_CTORS, ...containerClassNames(dir)].map(
+		escapeRegExpLiteral,
+	);
+	const regex = new RegExp(
+		`^(?:export\\s+)?(?:const|let)\\s+([A-Za-z_$][\\w$]*)[^=\\n]*=\\s*new\\s+(?:${names.join("|")})\\b`,
+		"gm",
+	);
+	containerDeclarationCache.set(dir, regex);
+	return regex;
+}
 
 /** An exported reset-shaped function. */
 const EXPORTED_RESET = /^export function (_?(?:reset|clear)[A-Za-z0-9_]*)/gm;
@@ -437,9 +616,11 @@ const PROCESS_SINGLETON_CALL = /getProcessSingleton\s*\(/;
 /**
  * What this heuristic catches, and what it structurally cannot.
  *
- * CATCHES — a module-level `Map`/`Set`/`PathKeyedMap` in a file that also
- * exports a reset-shaped function; a `getProcessSingleton(...)` call in a file
- * that also exports one; and any file exporting a `_reset…ForTests`-style seam.
+ * CATCHES — a module-level `Map`/`Set`/`WeakMap`/`WeakSet`, or any class
+ * DECLARED in `clients/` regardless of export shape (see
+ * {@link containerClassNames} — #2455), in a file that also exports a
+ * reset-shaped function; a `getProcessSingleton(...)` call in a file that
+ * also exports one; and any file exporting a `_reset…ForTests`-style seam.
  * Those pairings are the observed shape of every process-lifetime-latch bug in
  * the #1266–#1625 arc (and #2319's process-singleton twin): state that outlives
  * a session plus a reset nobody calls at the session boundary.
@@ -487,6 +668,12 @@ export const SWEEP_HEURISTIC_LIMITS = [
 	"session-scoped vs import-time-constant semantics",
 	"substitution: add one container, remove another, and the #1817 symbol-count pin sees no change",
 	"getProcessSingleton cells are a SIGNAL, but the cell VALUE lives off module scope on globalThis — a session-scoped cell is still only caught when its file also exports a reset (the pair-with-reset rule), and the cell itself is registered/exempted by hand judgment",
+	// #2455 fix round 2, F4: the widened predicate is "declared in clients/",
+	// which is still only a NAME match against clients/'s own class index —
+	// two shapes remain structurally invisible even though they hold the exact
+	// same kind of state a repo-local container does.
+	"a `new` bound to a constructor IMPORTED FROM OUTSIDE clients/ (a node_modules class, e.g. a third-party cache/client) is invisible — the class index only walks clients/, by design (a walk of node_modules is a different, much larger problem)",
+	"a `new` bound to a constructor built through a FACTORY FUNCTION rather than a bare `new Ctor(...)` expression (createAvailabilityLatch(), createToolchainAvailability()) is invisible to the container-declaration regex, which matches only `new <Name>(...)` — this is the same shape as MISS 2 (closure-held state) one level up: the factory's return value can itself hold session state with no module-level container syntax marking it",
 ] as const;
 
 let cachedCandidates: SessionStateCandidate[] | undefined;
@@ -504,12 +691,13 @@ export function scanSessionStateCandidates(
 ): SessionStateCandidate[] {
 	const useCache = dir === CLIENTS_ROOT;
 	if (useCache && cachedCandidates) return cachedCandidates;
+	const containerDeclaration = containerDeclarationRegex(dir);
 	const found: SessionStateCandidate[] = [];
 	for (const absolute of clientSourceFiles(dir)) {
 		// Stripped for the same reason the reachability walk is (R1): a
 		// commented-out declaration or reset export is not one.
 		const source = stripCommentsAndStrings(fs.readFileSync(absolute, "utf8"));
-		const containers = [...source.matchAll(CONTAINER_DECLARATION)].map(
+		const containers = [...source.matchAll(containerDeclaration)].map(
 			(m) => m[1],
 		);
 		const resets = [...source.matchAll(EXPORTED_RESET)].map((m) => m[1]);

@@ -3291,6 +3291,58 @@ the registry checks this derived set rather than a copied list. Keep resets for
 process-singleton session state behind the concurrent-secondary decision. The
 primary activation owns the tally, and a secondary must never clear it.
 
+`tests/support/session-state-scan.ts`'s container detector recognises a
+module-level `const`/`let` bound to `new <Ctor>(...)` where `<Ctor>` is a
+built-in (`Map`/`Set`/`WeakMap`/`WeakSet`) or ANY class declared anywhere in
+`clients/`, regardless of export shape (`export class`, `export default
+class`, `export abstract class`, a bare non-exported `class` later re-exported
+via `export { A }` / `export { A as B }`), scanned live once per run instead
+of hand-listed. #2442's `BoundedFifoMap`/`BoundedLruCache` migration had to be
+added to a hard-coded alternation by hand before the scan could see it again;
+#2455 fix round 1 replaced the alternation with a live scan gated on the class
+owning a `clear()`/`delete()` method (directly or through an `extends`
+chain) — round 2 found that gate was ITSELF a miss: `FactStore`'s own clear
+methods are named `clearAll`/`deleteFileFact`, not `clear`/`delete`, so two of
+its five production module-scope instances (`dispatch/integration.ts`,
+`mcp/analyze.ts`) stayed invisible. Round 2 dropped the method-name gate for
+the issue's own primary wording — "declared in `clients/`" — which also
+deleted the `extends`-chain walk and its cycle guard (nothing left to resolve
+without a method filter). A class that structurally qualifies but is proven
+NOT to hold session state gets a documented `CONTAINER_CLASS_EXCLUSIONS`
+entry rather than a special case at the call site — empty today; both a stale
+entry (names a class the live scan no longer finds) and a reason-less entry
+red via `auditContainerClassExclusions()`. Known boundaries the predicate
+still cannot see (`SWEEP_HEURISTIC_LIMITS`): a `new` bound to a constructor
+IMPORTED from outside `clients/` (a node_modules class), or built via a
+factory function instead of a bare `new Ctor(...)` call. The declaration may
+carry an `export` prefix (round 4) — it could not before, which made
+`export const goClient = new GoClient()` invisible for no reason but the
+keyword in front of it.
+
+**The container predicate is not the gate that decides what the sweep looks
+at.** `scanSessionStateCandidates` skips a file outright when it exports no
+reset (`if (resets.length === 0) continue`), so widening the predicate can
+only ever surface state in files that ALREADY have a reset seam. A file
+holding session state with no reset at all stays invisible however wide the
+predicate gets — MISS 3, "state with no reset seam at all", and no #2455
+round touched it. `go-client.ts` and `rust-client.ts` are the worked example:
+their `GoClient`/`RustClient` latches were found by HAND while auditing what
+the widening should have covered, and the files only entered the sweep once
+#2455 added `resetGoAvailability`/`resetRustAvailability`. Read a widened
+predicate as "the registry now describes more of what it already watches",
+never as "the sweep now finds unreset state".
+
+**A reset is only as total as the instance count behind it.** #2455 round 2
+added those two resets against the runner-module singletons while
+`bootstrap.ts` separately constructed its own `GoClient`/`RustClient` for
+`BootstrapClients`, which is what `handleSessionStart` reads for its "Active
+tools" line — so the reset re-armed a latch nothing user-visible consulted and
+the bug survived its own fix (round 4, F2). A per-session reset over a
+process-lived latch is wrong unless there is exactly ONE instance of that
+latch; put the instance in the module that owns the class, beside the reset,
+and let every consumer import it. `tests/clients/toolchain-client-singleton.test.ts`
+is the ratchet for the toolchain clients.
+
 ## Issue triage & labels
 
 Every issue should carry **one TYPE label + at least one `area:` label**.
