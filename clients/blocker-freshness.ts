@@ -61,6 +61,20 @@
  * reads distinctly from #1944's "retired, unrecoverable" — a capped record
  * COULD still resolve a fresh dispatch; it just stopped being handed one for
  * free.
+ *
+ * Widget-footer sibling (#2275). The turn-end blocker channel above is not
+ * the only surface that demotes on dependency drift — `widget-state.ts`'s
+ * own `files` map carries the identical demotion shape
+ * (`markWidgetFileBlockersStale`) through a completely separate store, with
+ * its own `WidgetDiagnostic.staleDeliveryCount` and its own retire helpers
+ * (`incrementWidgetDependencyDriftDelivery`,
+ * `retireWidgetDependencyDriftBlockers`). It counts RENDERS rather than
+ * turn ends — the footer draws one record per pass, so `renderWidget` marks
+ * what it served and the turn-end step drains those marks — and it retires
+ * by HIDING the row from the footer rather than dropping the record, since
+ * the widget store also backs `lens_diagnostics mode=all`. What it shares
+ * with this module is the one number both caps retire against,
+ * `DEPENDENCY_DRIFT_MAX_DELIVERIES`, rather than inventing a second one.
  */
 import * as fs from "node:fs";
 import { normalizeEphemeralMapKey } from "./path-utils.js";

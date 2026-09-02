@@ -129,9 +129,12 @@ import { STALE_LINE_MARKER } from "./stale-marker.js";
 import { getActiveSessionId } from "./session-lifecycle.js";
 
 import {
+	drainRenderedDependencyDriftFilePaths,
 	getWidgetBlockingFilesForSweep,
+	incrementWidgetDependencyDriftDelivery,
 	markWidgetFileBlockersStale,
 	recordRunner,
+	retireWidgetDependencyDriftBlockers,
 } from "./widget-state.js";
 import type { TestRunnerFindingsCache } from "./project-diagnostics/runner-adapters/runner-findings.js";
 
@@ -475,6 +478,50 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	}
 
 	const files = Object.keys(turnState.files);
+
+	/**
+	 * #2275: widget-footer sibling of #1950's inline-blocker cap, for the
+	 * widget store's OWN dependency-drift demotion
+	 * (`markWidgetFileBlockersStale`, driven by the freshness sweep further
+	 * down this function) — a completely separate store from
+	 * `RuntimeCoordinator`'s inline-blocker map, so it needed its own
+	 * delivery count (`WidgetDiagnostic.staleDeliveryCount`) rather than
+	 * inheriting one.
+	 *
+	 * Review F1: the population is what the footer RENDERED since the last
+	 * turn end, drained here — not every file that merely holds a demoted
+	 * row. The footer draws one record per pass (`withBlocking[0]`, its top
+	 * five entries) and may not be drawn at all, so a per-turn walk of the
+	 * whole store charged deliveries the agent never received and retired a
+	 * delivery early. This is the widget-surface analogue of the inline
+	 * loop's own `pendingDependencyDriftDeliveries` deferral below: both
+	 * commit a delivery only once the surface has actually served it. Every
+	 * `deliveryCount` reported to the ledger is therefore a count of RENDERS.
+	 *
+	 * Fix-round 3 (#2275 review F1): this drain/charge MUST run before the
+	 * `files.length === 0` early return below — a read-only turn (no
+	 * modified files) still repaints the footer and can draw a demoted row,
+	 * so a cap that only charged deliveries below the early return silently
+	 * starved on quiet turns: the footer re-rendered the same demoted row
+	 * every turn while the delivery count never advanced. The drain is a
+	 * Set.take() plus one map lookup per drained file — cheap enough to run
+	 * unconditionally on every turn end.
+	 */
+	let widgetDemotedFindingsRetired = 0;
+	for (const wPath of drainRenderedDependencyDriftFilePaths()) {
+		const deliveryCount = incrementWidgetDependencyDriftDelivery(wPath);
+		if (deliveryCount >= DEPENDENCY_DRIFT_MAX_DELIVERIES) {
+			const capRetired = retireWidgetDependencyDriftBlockers(wPath);
+			if (capRetired) {
+				widgetDemotedFindingsRetired += 1;
+				incrementDegradationCount({
+					kind: "demoted-finding-retired",
+					subject: `widget-blocker:${toRunnerDisplayPath(cwd, wPath)}`,
+					reason: `capped after ${deliveryCount} deliveries with no re-run; hidden from the pi-lens footer, still listed by lens_diagnostics mode=all — re-run can still confirm`,
+				});
+			}
+		}
+	}
 
 	// R1 (#1443 follow-up): a read-only turn (no files touched) must not take
 	// the fast idle-reset path while a carried cascade run — or one still
@@ -3026,6 +3073,11 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			// answers that from latency.log even when the payload is empty, and
 			// the payload itself carries the retirement note when it is not.
 			demotedFindingsRetired,
+			// #2275: the widget-footer store's own dependency-drift retirements —
+			// a separate surface/counter from `demotedFindingsRetired` above,
+			// since a widget retirement never touches `advisoryParts` or the
+			// `turn-end-findings-last` suppression cache the block below clears.
+			widgetDemotedFindingsRetired,
 		},
 	});
 	resetFormatService();
