@@ -31,6 +31,7 @@ import {
 	loadPiLensConfigInDir,
 	loadPiLensProjectConfig,
 } from "./project-lens-config.js";
+import { recordProbeHomeRedirectEvent } from "./probe-home-state.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
 
 /**
@@ -158,30 +159,24 @@ function redirectGlobalDirToProbeHome(cwd: string): string {
 }
 
 /**
- * Dynamic import only (never a static one): `degradation-ledger.ts`
- * transitively imports THIS module through `extension-log.ts`/
- * `latency-logger.ts`, so a static import here would close a
- * `no-client-cycles` violation. A dynamic `import()` is exempt from that
- * rule (`.dependency-cruiser.cjs`'s `dependencyTypesNot: ["dynamic-import"]`)
- * and is safe at runtime too — this only ever runs well after both modules
- * have finished their own top-level evaluation. Fire-and-forget: telemetry
- * must never gate or fail the caller that just wants its directory back.
+ * Routed through the zero-import `probe-home-state.ts` leaf, never a direct
+ * import of `degradation-ledger.ts` (dynamic or static): `file-utils.ts` and
+ * `degradation-ledger.ts` are already mutually reachable through the
+ * existing `file-utils.js -> safe-spawn.js -> degradation-ledger.js ->
+ * extension-log.js -> file-utils.js` cycle
+ * (`.dependency-cruiser-known-violations.json`), so ANY direct edge between
+ * them — a dynamic `import()` included, since the `no-client-cycles` rule's
+ * dynamic-import exemption only excuses that ONE edge from being flagged,
+ * not from closing the cycle other static edges then also get flagged on —
+ * adds new, unpinned `no-client-cycles` violations. See `probe-home-state.ts`'s
+ * doc comment for the full account (caught live: a first attempt using a
+ * dynamic import here failed CI's "Dependency boundaries" gate).
  */
 function recordProbeHomeRedirectDegradation(
 	probeHome: string,
 	cwd: string,
 ): void {
-	import("./degradation-ledger.js")
-		.then(({ recordDegradationOnce }) => {
-			recordDegradationOnce({
-				kind: "global-dir-probe-redirect",
-				subject: probeHome,
-				reason: `PI_LENS_HOME unset outside test mode with cwd under a worktree/tmp probe context (${cwd}); redirected away from the real home directory`,
-			});
-		})
-		.catch(() => {
-			// Telemetry must never break the observed path.
-		});
+	recordProbeHomeRedirectEvent({ probeHome, cwd });
 }
 
 /**
