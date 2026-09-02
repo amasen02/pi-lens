@@ -7,6 +7,7 @@ import {
 	normalizeToLF,
 	stripBom,
 } from "./host-edit-normalize.js";
+import { classifyMutatingTool } from "./mutating-tool.js";
 import {
 	isExactAppliedRetry,
 	type EditSnapshotIdentity,
@@ -15,13 +16,11 @@ import {
 } from "./partial-edit-apply.js";
 import {
 	boundedEditIndexes,
-	boundedIndexesForCount,
 	createReadGuardEditBatchSummary,
 	logReadGuardEvent,
 	type EditBatchRejection,
 	type ReadGuardEditBatchSummary,
 } from "./read-guard-logger.js";
-import { isToolCallEventType } from "./tool-event.js";
 
 export interface GuardLineResult {
 	touchedLines: [number, number] | undefined;
@@ -199,25 +198,6 @@ function lineNumberAt(content: string, index: number): number {
 	return content.substring(0, index).split("\n").length;
 }
 
-function parseHashlineAnchor(anchor: unknown): number | undefined {
-	if (typeof anchor !== "string") return undefined;
-	const trimmed = anchor.trim();
-	const separator = trimmed.indexOf(":");
-	const lineText = separator === -1 ? trimmed : trimmed.slice(0, separator);
-	if (!/^\d+$/.test(lineText)) return undefined;
-	const line = Number(lineText);
-	return Number.isInteger(line) && line > 0 ? line : undefined;
-}
-
-function combineRanges(ranges: [number, number][]): GuardLineResult {
-	const starts = ranges.map(([start]) => start);
-	const ends = ranges.map(([, end]) => end);
-	return {
-		touchedLines: [Math.min(...starts), Math.max(...ends)],
-		editRanges: ranges.length > 1 ? ranges : undefined,
-	};
-}
-
 /**
  * Deduplicated overlapping pairs, in candidate order, for the overlap error
  * message. Each overlapping edit appears in exactly one pair where possible;
@@ -256,130 +236,6 @@ export function formatAlreadyAppliedNotes(
 	const suffix = editIndexes.length === 1 ? "was" : "were";
 	const pronoun = editIndexes.length === 1 ? "it" : "them";
 	return `\n\n✅ ${list} ${suffix} already applied by an identical earlier edit — the file already contains the result. Do NOT resubmit ${pronoun}.`;
-}
-
-function getHashlineOperations(input: Record<string, unknown>): unknown[] {
-	if (Array.isArray(input.operations)) return input.operations;
-	if (Array.isArray(input.ops)) return input.ops;
-	if (input.set_line || input.replace_lines || input.replace_symbol)
-		return [input];
-	return [];
-}
-
-function resolveHashlineEditInput(
-	input: Record<string, unknown>,
-	filePath: string | undefined,
-	sessionId: string | undefined,
-	correlationId?: string,
-): GuardLineResult | undefined {
-	const operations = getHashlineOperations(input);
-	if (operations.length === 0) return undefined;
-	const ranges: [number, number][] = [];
-	const errors: string[] = [];
-
-	for (let index = 0; index < operations.length; index += 1) {
-		const op = operations[index] as Record<string, unknown>;
-		if (op.set_line) {
-			const payload = op.set_line as Record<string, unknown>;
-			const line = parseHashlineAnchor(payload.anchor);
-			if (!line) {
-				errors.push(`operation[${index}].set_line.anchor is malformed`);
-				continue;
-			}
-			ranges.push([line, line]);
-			continue;
-		}
-		if (op.replace_lines) {
-			const payload = op.replace_lines as Record<string, unknown>;
-			const start = parseHashlineAnchor(payload.start_anchor);
-			const end = parseHashlineAnchor(payload.end_anchor);
-			if (!start || !end) {
-				errors.push(`operation[${index}].replace_lines anchors are malformed`);
-				continue;
-			}
-			if (start > end) {
-				errors.push(`operation[${index}].replace_lines range is inverted`);
-				continue;
-			}
-			ranges.push([start, end]);
-			continue;
-		}
-		if (op.replace_symbol) {
-			errors.push(
-				`operation[${index}].replace_symbol cannot be resolved safely yet; use line anchors or a native ranged edit`,
-			);
-			continue;
-		}
-		errors.push(`operation[${index}] is not a recognized hashline edit`);
-	}
-
-	if (errors.length > 0) {
-		const editBatchSummary = createReadGuardEditBatchSummary({
-			requestedIndexes: boundedIndexesForCount(operations.length),
-			requestedTotal: operations.length,
-			rejectedReasons: boundedIndexesForCount(operations.length).map(
-				(index) => ({
-					index,
-					code: "preflight_blocked" as const,
-				}),
-			),
-			rejectedTotal: operations.length,
-			durationMs: 0,
-			terminalStatus: "blocked",
-		});
-		if (filePath) {
-			logReadGuardEvent({
-				event: "edit_preflight_blocked",
-				correlationId,
-				sessionId,
-				filePath,
-				metadata: {
-					tool: "edit",
-					source: "hashline_edit",
-					reasonKind: "unsupported_hashline_edit_target",
-					operationCount: operations.length,
-					errorCount: errors.length,
-					errors: errors.slice(0, 10),
-				},
-			});
-			logReadGuardEvent({
-				event: "edit_batch_summary",
-				correlationId,
-				filePath,
-				metadata: { tool: "edit", editBatchSummary },
-			});
-		}
-		// Every blocking verdict ends with a single concrete next-action line so
-		// the agent recovers in one turn (#328 — uniform recovery-hint discipline).
-		const target = filePath ? `\`${filePath}\`` : "the file";
-		const retryHint = `Re-read ${target} to get current #line anchors, then retry using set_line / replace_lines with those anchors — or use a native ranged edit.`;
-		return {
-			touchedLines: undefined,
-			preflightError: `🔴 BLOCKED — Unsupported hashline edit target\n\n${errors.join("\n")}\n\n${retryHint}`,
-			editBatchSummary,
-		};
-	}
-	if (ranges.length === 0) return undefined;
-	const result = combineRanges(ranges);
-	if (filePath) {
-		logReadGuardEvent({
-			event: "touched_lines_detected",
-			correlationId,
-			sessionId,
-			filePath,
-			metadata: {
-				tool: "edit",
-				source:
-					ranges.length === 1 && ranges[0][0] === ranges[0][1]
-						? "hashline_set_line"
-						: "hashline_replace_lines",
-				touchedLines: result.touchedLines,
-				editRanges: result.editRanges,
-				operationCount: operations.length,
-			},
-		});
-	}
-	return result;
 }
 
 function findOccurrenceLines(content: string, needle: string): number[] {
@@ -1496,7 +1352,31 @@ export function getTouchedLinesForGuard(
 	correlationId?: string,
 	partialApplyRecords?: PartialApplyRecordStore,
 ): GuardLineResult {
-	if (isToolCallEventType("edit", event as any)) {
+	// #2423: the seam decides whether this event mutates a file, and which shape
+	// adapter (if any) already resolved its ranges. A tool named `replace` or
+	// `insert` reaches the native-shape ladder below exactly like `edit` does.
+	const mutation = classifyMutatingTool(event, {
+		filePath,
+		sessionId,
+		correlationId,
+	});
+	if (mutation === undefined) return { touchedLines: undefined };
+
+	if (mutation.kind === "edit") {
+		// An adapter that recognized the input owns the answer, including a
+		// blocking preflight error.
+		if (mutation.touchedLines !== undefined || mutation.preflightError) {
+			return {
+				touchedLines: mutation.touchedLines,
+				...(mutation.editRanges ? { editRanges: mutation.editRanges } : {}),
+				...(mutation.preflightError
+					? { preflightError: mutation.preflightError }
+					: {}),
+				...(mutation.editBatchSummary
+					? { editBatchSummary: mutation.editBatchSummary }
+					: {}),
+			};
+		}
 		// The host standard-edit fields (path, edits[].oldText/newText) are pinned
 		// to the SDK's EditToolInput, so a host edit-schema change is a compile
 		// error instead of silently falling through to `unknown_edit_schema`. The
@@ -1518,13 +1398,6 @@ export function getTouchedLinesForGuard(
 			replace_lines?: unknown;
 			replace_symbol?: unknown;
 		};
-		const hashlineResult = resolveHashlineEditInput(
-			editInput as Record<string, unknown>,
-			filePath,
-			sessionId,
-			correlationId,
-		);
-		if (hashlineResult) return hashlineResult;
 		if (editInput.oldRange) {
 			const touchedLines: [number, number] = [
 				editInput.oldRange.start.line,
@@ -1646,6 +1519,18 @@ export function getTouchedLinesForGuard(
 				metadata: {
 					tool: "edit",
 					source: "unknown_edit_schema",
+					// #2423: name the tool. An unknown schema under a third-party
+					// tool name is the actionable case — it says which producer
+					// needs a shape adapter.
+					mutatingToolName: mutation.toolName,
+					mutationProvenance: mutation.provenance,
+					// #2423 review round 1 (F1): an adapter that RECOGNIZED the
+					// shape but could not turn its anchors into lines says so here.
+					// `adapterSource: "hashline-edit-pro"` with
+					// `unresolvedReason: "remove_from:anchor_not_found"` is the
+					// production record of a stale anchor — a report, not a block.
+					adapterSource: mutation.source,
+					unresolvedReason: mutation.unresolvedReason,
 					topLevelKeys,
 					hasNativeOldRange: !!editInput.oldRange,
 					hasNativeEdits: Array.isArray(editInput.edits),
@@ -1661,25 +1546,22 @@ export function getTouchedLinesForGuard(
 		return { touchedLines: undefined };
 	}
 
-	if (isToolCallEventType("write", event as any)) {
-		const lineCount = filePath ? countFileLines(filePath) : 1;
-		const touchedLines: [number, number] = [1, lineCount];
-		if (filePath) {
-			logReadGuardEvent({
-				event: "touched_lines_detected",
-				correlationId,
-				sessionId,
-				filePath,
-				metadata: {
-					tool: "write",
-					source: "full_file_write",
-					touchedLines,
-					lineCount,
-				},
-			});
-		}
-		return { touchedLines };
+	// kind === "write": the whole file is the touched range.
+	const lineCount = filePath ? countFileLines(filePath) : 1;
+	const writeTouchedLines: [number, number] = [1, lineCount];
+	if (filePath) {
+		logReadGuardEvent({
+			event: "touched_lines_detected",
+			correlationId,
+			sessionId,
+			filePath,
+			metadata: {
+				tool: "write",
+				source: "full_file_write",
+				touchedLines: writeTouchedLines,
+				lineCount,
+			},
+		});
 	}
-
-	return { touchedLines: undefined };
+	return { touchedLines: writeTouchedLines };
 }

@@ -580,3 +580,100 @@ describe("#2402 partial-apply contract (mixed-validity preflight)", () => {
 		}
 	});
 });
+
+/**
+ * Review round 4, finding F5. `clients/hashline-anchor.ts`'s per-file anchor
+ * memo is keyed by `mtimeMs`+`size` alone. A rewrite that lands within one
+ * mtime tick and does not change the file's byte length changes NEITHER key,
+ * so a memo that survived across `tool_call`s could serve the PREVIOUS
+ * content's anchor index to a `tool_call` that reads the file after it
+ * changed. The fix drops the memo at the `tool_call` boundary
+ * (`handleToolCallImpl` entry in `clients/runtime-tool-call.ts`), so this
+ * drives `handleToolCall` itself — the reviewer's probe reproduces the
+ * mtime+size collision exactly, then asserts on what `readGuard.checkEdit`
+ * was actually told about the SECOND call, since that is what the guard and
+ * `addModifiedRange` act on downstream.
+ */
+describe("#2423 review round 4 (F5) — the hashline anchor memo drops at the tool_call boundary", () => {
+	it("does not resolve a rewritten file's line from a same-mtime, same-size stale memo", async () => {
+		const env = setupTestEnvironment("pi-lens-2423-f5-anchor-memo-");
+		try {
+			const filePath = createTempFile(
+				env.tmpDir,
+				"src/memo.ts",
+				"alpha\nbeta\ngamma\n",
+			);
+			// "alpha" -> "zebra": same byte length (5 ASCII chars), same total
+			// file size, so the ONLY thing that could distinguish the two reads
+			// is a genuine re-read, never mtime+size.
+			const before = "alpha\nbeta\ngamma\n";
+			const after = "zebra\nbeta\ngamma\n";
+			expect(Buffer.byteLength(after)).toBe(Buffer.byteLength(before));
+			const { computeHashlineAnchors } =
+				await import("../../clients/hashline-anchor.js");
+			const anchorForAlpha = computeHashlineAnchors(before)![0]!;
+			// Pinned, not "now": two separate fs.writeFileSync calls landing on
+			// the same wall-clock tick is exactly the scenario under test, and
+			// asserting it via real timing would be flaky by construction.
+			const pinnedMtime = new Date(2026, 0, 1, 12, 0, 0, 0);
+			fs.utimesSync(filePath, pinnedMtime, pinnedMtime);
+			const statBefore = fs.statSync(filePath);
+
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			const checkEdit = vi.spyOn(runtime.readGuard, "checkEdit");
+			const deps = baseDeps({
+				runtime,
+				ctx: { cwd: env.tmpDir },
+			});
+
+			// Call 1: warms `clients/hashline-anchor.ts`'s per-file memo against
+			// `before`'s content (this is what makes the second call a proof of
+			// the DROP, not just "the file happened to be read fresh once").
+			await handleToolCall({
+				...deps,
+				event: {
+					toolName: "replace",
+					input: {
+						path: filePath,
+						remove_from: anchorForAlpha,
+						remove_to: anchorForAlpha,
+						replacement_lines: ["placeholder"],
+					},
+				},
+			});
+			expect(checkEdit).toHaveBeenCalledTimes(1);
+			expect(checkEdit.mock.calls[0]![0]).toBe(filePath);
+			expect(checkEdit.mock.calls[0]![1]).toEqual([1, 1]);
+
+			// Rewrite with DIFFERENT content, IDENTICAL mtime and size.
+			fs.writeFileSync(filePath, after, "utf8");
+			fs.utimesSync(filePath, pinnedMtime, pinnedMtime);
+			const statAfter = fs.statSync(filePath);
+			expect(statAfter.mtimeMs).toBe(statBefore.mtimeMs);
+			expect(statAfter.size).toBe(statBefore.size);
+
+			// Call 2 quotes the SAME anchor token. "alpha" no longer exists in
+			// the file, so a genuine re-read must fail to resolve it — a memo
+			// that survived from call 1 would instead answer `line: 1`
+			// confidently, because that is exactly what it answered before.
+			await handleToolCall({
+				...deps,
+				event: {
+					toolName: "replace",
+					input: {
+						path: filePath,
+						remove_from: anchorForAlpha,
+						remove_to: anchorForAlpha,
+						replacement_lines: ["placeholder"],
+					},
+				},
+			});
+			expect(checkEdit).toHaveBeenCalledTimes(2);
+			expect(checkEdit.mock.calls[1]![0]).toBe(filePath);
+			expect(checkEdit.mock.calls[1]![1]).toBeUndefined();
+		} finally {
+			env.cleanup();
+		}
+	});
+});

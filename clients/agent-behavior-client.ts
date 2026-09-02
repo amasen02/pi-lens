@@ -9,6 +9,7 @@
  * No external dependencies — purely tracks tool call history.
  */
 
+import { isMutatingToolName } from "./mutating-tool.js";
 import { normalizeMapKey } from "./path-utils.js";
 
 // --- Types ---
@@ -33,7 +34,15 @@ interface ToolCallRecord {
 
 // --- Constants ---
 
-const WRITE_OPS = new Set(["edit", "write", "multiedit"]);
+// #2423: mutating-tool membership comes from the seam
+// (`clients/mutating-tool.ts`), the single source of truth for the built-in
+// table. The hand-maintained set this replaced also carried a dead
+// `"multiedit"` entry that no host emits.
+//
+// Known gap, stated rather than hidden: this client is handed a tool NAME and a
+// path, never the event, so it cannot see a third-party mutating tool the way
+// the shape adapters can. Blind-write and thrash detection covers pi's
+// built-ins only.
 const READ_OPS = new Set(["read", "bash", "grep", "glob", "find", "rg"]);
 
 const BLIND_WRITE_WINDOW = 5; // Check last N tool calls for a read
@@ -98,7 +107,7 @@ export class AgentBehaviorClient {
 		}
 
 		// Check for blind writes
-		if (WRITE_OPS.has(toolName)) {
+		if (isMutatingToolName(toolName)) {
 			const recentWindow = this.toolHistory.slice(-BLIND_WRITE_WINDOW);
 			// A read in the window proves file knowledge; so does a same-session
 			// write/edit of THIS path — the agent authored the content, so the
@@ -106,7 +115,7 @@ export class AgentBehaviorClient {
 			const hasRecentRead = recentWindow.some(
 				(r) =>
 					READ_OPS.has(r.toolName) ||
-					(WRITE_OPS.has(r.toolName) &&
+					(isMutatingToolName(r.toolName) &&
 						r.filePath !== undefined &&
 						normalizedPath !== null &&
 						normalizeMapKey(r.filePath) === normalizedPath),
@@ -115,7 +124,7 @@ export class AgentBehaviorClient {
 			if (!hasRecentRead && recentWindow.length > 0) {
 				// Count how many writes in the window without reads
 				const writesWithoutRead = recentWindow.filter((r) =>
-					WRITE_OPS.has(r.toolName),
+					isMutatingToolName(r.toolName),
 				).length;
 
 				if (writesWithoutRead >= 2) {
