@@ -1,19 +1,5 @@
-- Config migration notices now name only settings pi-lens recognizes: a key in
-  a legacy config file that is not a pi-lens setting no longer gets "move it
-  to ..." advice it cannot act on, and the unrecognized keys are summarised in
-  one whole-file notice instead. The number of notices any one config file can
-  produce is bounded, with the suppressed count reported as `PILENS_CFG_0007`
-  rather than dropped silently (refs #2426).
-- A legacy root LSP key (`servers`, `serverOverrides`, `disabledServers`,
-  `warmFiles`) in `~/.pi-lens/config.json` is no longer both applied and called
-  a typo in the same session — it gets the migration notice only (refs #2426).
-- A malformed `~/.pi-lens/config.json` is now reported by the global config
-  loader itself, as a global-config problem, instead of being silently dropped
-  and mislabelled "invalid LSP config" by the LSP loader (closes #2445).
-- The half-migrated warnings for a legacy `pi-lens.json` sitting beside or above
-  a canonical `.pi-lens.json` are now produced by the pi-lens config loader, so
-  they still appear under `--no-lsp`, `lsp.enabled: false`, and in subagent
-  sessions (refs #2426).
-- A repeat load of an unchanged config file replays its ignored-setting warnings
-  as well as its deprecation warnings, so the durable `config-ignored` record no
-  longer disappears after the session that first parsed the file (refs #2426).
+---
+section: Fixed
+---
+
+- **Config notices now name only settings pi-lens recognizes, and one file can no longer flood you with them (refs #2426)** — a legacy config file used to produce one "move it to `.pi-lens.json`" notice for EVERY top-level key it held, whether or not the key was a pi-lens setting, so a 100-key file emitted 198 notifications and told you to migrate 98 keys that have nowhere to go. Migration advice is now emitted only for keys the canonical schema recognizes; the rest are summarised in one whole-file notice naming how many were not recognized, and they keep the ordinary unrecognized-key notice they always deserved. Both classes of notice are bounded at 20 per file, with the suppressed count reported under a new stable code `[PILENS_CFG_0007]` rather than dropped silently. Three related notice defects go with it: a `servers` / `serverOverrides` / `disabledServers` / `warmFiles` key at the root of `~/.pi-lens/config.json` was both honored by the LSP loader and called a typo by the global loader in the same session, and now gets only the migration notice; the warnings about settings a project `.pi-lens.json` dropped (an unknown key, a bad `maxProjectFiles`, a malformed `rules.*`) were re-reported only in the session that first read the file, and are now recorded every session the file is still in effect; and the warnings about a legacy `pi-lens.json` sitting beside or above a canonical `.pi-lens.json` were produced only when the LSP loader ran, so they were silent under `--no-lsp`, under `lsp.enabled: false`, and in subagent sessions — the pi-lens config loader now produces them itself. An internal resolution failure also names the file it happened on and is reported once instead of three times under three different subsystem labels.
