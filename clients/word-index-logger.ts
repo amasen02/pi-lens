@@ -21,12 +21,15 @@
  */
 import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
-import { getGlobalPiLensDir } from "./file-utils.js";
+import { getGlobalPiLensLogDir } from "./file-utils.js";
 import { getMaxLogSizeMB } from "./log-cleanup.js";
 import { createNdjsonLogger } from "./ndjson-logger.js";
 import { normalizeFilePath } from "./path-utils.js";
 
-const WORD_INDEX_LOG_FILE = path.join(getGlobalPiLensDir(), "word-index.log");
+const WORD_INDEX_LOG_FILE = path.join(
+	getGlobalPiLensLogDir(),
+	"word-index.log",
+);
 
 const writer = createNdjsonLogger({
 	filePath: WORD_INDEX_LOG_FILE,

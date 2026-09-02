@@ -23,11 +23,11 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { getGlobalPiLensDir } from "./file-utils.js";
+import { getGlobalPiLensLogDir } from "./file-utils.js";
 import { getRegisteredLogFiles } from "./ndjson-logger.js";
 import { pathsEqual } from "./path-utils.js";
 
-const LOG_DIR = getGlobalPiLensDir();
+const LOG_DIR = getGlobalPiLensLogDir();
 const LOGS_SUBDIR = path.join(LOG_DIR, "logs");
 
 /**
