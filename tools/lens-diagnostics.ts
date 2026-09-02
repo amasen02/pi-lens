@@ -12,6 +12,7 @@
 import { promises as fs } from "node:fs";
 import * as fsSync from "node:fs";
 import * as path from "node:path";
+import { BoundedLruCache } from "../clients/bounded-cache.js";
 import { Type } from "../clients/deps/typebox.js";
 import {
 	anchorsForDiagnostic,
@@ -621,11 +622,11 @@ function appendProjectDiagnosticsDeltaLines(
  * TTL. Insertion-ordered LRU cap bounds resident source bytes; repeated
  * queries and multi-file reports that cite the same file reuse one read.
  */
-const CACHED_CONTENT_MEMO_CAP = 64;
-const cachedContentMemo = new Map<
+export const CACHED_CONTENT_MEMO_CAP = 64;
+const cachedContentMemo = new BoundedLruCache<
 	string,
 	{ mtimeMs: number; size: number; content: string }
->();
+>(CACHED_CONTENT_MEMO_CAP);
 
 function readContentForAnchors(
 	filePath: string,
@@ -634,9 +635,6 @@ function readContentForAnchors(
 	const key = normalizeEphemeralMapKey(filePath);
 	const hit = cachedContentMemo.get(key);
 	if (hit && hit.mtimeMs === stat.mtimeMs && hit.size === stat.size) {
-		// Refresh LRU position.
-		cachedContentMemo.delete(key);
-		cachedContentMemo.set(key, hit);
 		return hit.content;
 	}
 	let content: string;
@@ -645,16 +643,21 @@ function readContentForAnchors(
 	} catch {
 		return undefined;
 	}
-	if (cachedContentMemo.size >= CACHED_CONTENT_MEMO_CAP) {
-		const oldest = cachedContentMemo.keys().next().value;
-		if (oldest !== undefined) cachedContentMemo.delete(oldest);
-	}
 	cachedContentMemo.set(key, {
 		mtimeMs: stat.mtimeMs,
 		size: stat.size,
 		content,
 	});
 	return content;
+}
+
+/** #2442 test-only: exercise the bounded content memo (LRU) directly,
+ *  without a full lens_diagnostics dispatch. */
+export function _readContentForAnchorsForTests(
+	filePath: string,
+	stat: { mtimeMs: number; size: number },
+): string | undefined {
+	return readContentForAnchors(filePath, stat as fsSync.Stats);
 }
 
 /**

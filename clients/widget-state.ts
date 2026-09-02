@@ -1,6 +1,7 @@
 import { stat } from "node:fs/promises";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
+import { BoundedFifoMap } from "./bounded-cache.js";
 import {
 	demotePastEofDiagnostics,
 	type LineCountCache,
@@ -193,7 +194,6 @@ interface LspRecord {
 // ── Module state ─────────────────────────────────────────────────────────────
 
 const files = new Map<string, FileRecord>();
-const lspServers = new Map<string, LspRecord>();
 let sessionLanguages: string[] = [];
 let requestRenderFn: (() => void) | null = null;
 
@@ -218,7 +218,10 @@ const runnerWriteGuard = new WriteOrderingGuard<string, number>();
 const MAX_STORED_DIAGNOSTICS_PER_FILE = 12;
 const MAX_INACTIVE_FILE_RECORDS = 1024;
 const ACTIVE_FILE_IDLE_MS = 30 * 60_000;
-const MAX_LSP_SERVER_RECORDS = 128;
+export const MAX_LSP_SERVER_RECORDS = 128;
+const lspServers = new BoundedFifoMap<string, LspRecord>(
+	MAX_LSP_SERVER_RECORDS,
+);
 // Pruning is a cold-size-boundary operation. Do not walk the whole file map
 // for every record in a large diagnostics reconciliation; the full-scan path
 // can legitimately create thousands of records in one synchronous batch.
@@ -1470,11 +1473,6 @@ export function recordLsp(
 				? "ready"
 				: "failed";
 	lspServers.set(key, { serverId, root, status: mapped, durationMs });
-	while (lspServers.size > MAX_LSP_SERVER_RECORDS) {
-		const oldest = lspServers.keys().next().value;
-		if (oldest === undefined) break;
-		lspServers.delete(oldest);
-	}
 	requestRender();
 }
 

@@ -26,6 +26,7 @@ import {
 	recordDegradation,
 	recordDegradationOnce,
 } from "./degradation-ledger.js";
+import { BoundedFifoMap } from "./bounded-cache.js";
 import { loadWebTreeSitter } from "./deps/web-tree-sitter.js";
 import { transientRetryDelayMs } from "./dispatch/runners/utils/availability-policy.js";
 import { getProjectIgnoreMatcher, isExcludedDirName } from "./file-utils.js";
@@ -398,13 +399,23 @@ export class TreeSitterClient {
 	private ParserClass: any = null;
 	// biome-ignore lint/suspicious/noExplicitAny: Language loader from module
 	private LanguageLoader: any = null;
-	// biome-ignore lint/suspicious/noExplicitAny: Compiled query cache by language+pattern hash
-	private queryCache = new Map<string, any>();
-	/** Combined multi-rule queries by language + rule-set identity (null = don't retry). */
-	private queryBatchCache = new Map<string, QueryBatch | null>();
+	// Declared BEFORE the two caches below: a static read by an instance field
+	// initializer must already be initialized (TS2729).
 	private static readonly QUERY_CACHE_MAX_ENTRIES = 256;
 	private static readonly QUERY_BATCH_CACHE_MAX_ENTRIES = 256;
-
+	// biome-ignore lint/suspicious/noExplicitAny: Compiled query cache by language+pattern hash
+	// BoundedFifoMap, not BoundedLruCache: recency here is refreshed by this
+	// class's own explicit delete+set on both the read and the write path (see
+	// cacheQuery and the two lookup sites) — exactly the raw-`Map` discipline
+	// the FIFO map documents. A get() that promoted on its own would change
+	// which entry eviction targets (#2442 review F5/F7).
+	private queryCache = new BoundedFifoMap<string, any>(
+		TreeSitterClient.QUERY_CACHE_MAX_ENTRIES,
+	);
+	/** Combined multi-rule queries by language + rule-set identity (null = don't retry). */
+	private queryBatchCache = new BoundedFifoMap<string, QueryBatch | null>(
+		TreeSitterClient.QUERY_BATCH_CACHE_MAX_ENTRIES,
+	);
 	private queryCacheCap(): number {
 		const value = Number.parseInt(
 			process.env.PI_LENS_TREE_SITTER_QUERY_CACHE_CAP ?? "",
@@ -425,30 +436,26 @@ export class TreeSitterClient {
 			: TreeSitterClient.QUERY_BATCH_CACHE_MAX_ENTRIES;
 	}
 
+	// biome-ignore lint/suspicious/noExplicitAny: compiled query objects
 	private cacheQuery(key: string, value: any): void {
-		this.queryCache.delete(key);
-		this.queryCache.set(key, value);
-		while (this.queryCache.size > this.queryCacheCap()) {
-			const oldest = this.queryCache.entries().next().value as
-				| [string, any]
-				| undefined;
-			if (!oldest) break;
-			this.queryCache.delete(oldest[0]);
-			oldest[1]?.query?.delete?.();
-		}
+		this.queryCache.delete(key); // write-refresh: this write is the newest
+		// The cap is env-readable, so re-apply it before every write — a raised
+		// or lowered ceiling has to take effect on the next insert, not on the
+		// next restart. Both calls hand back the dropped [key, value] pairs so
+		// the evicted compiled query's native handle is still freed (#2442
+		// review F5/F7 — this is why set() returns the VALUE, not just the key).
+		const evicted = this.queryCache.setMaxEntries(this.queryCacheCap());
+		evicted.push(...this.queryCache.set(key, value));
+		for (const [, dropped] of evicted) dropped?.query?.delete?.();
 	}
 
 	private cacheQueryBatch(key: string, value: QueryBatch | null): void {
 		this.queryBatchCache.delete(key);
-		this.queryBatchCache.set(key, value);
-		while (this.queryBatchCache.size > this.queryBatchCacheCap()) {
-			const oldest = this.queryBatchCache.entries().next().value as
-				| [string, QueryBatch | null]
-				| undefined;
-			if (!oldest) break;
-			this.queryBatchCache.delete(oldest[0]);
-			oldest[1]?.query?.delete?.();
-		}
+		const evicted = this.queryBatchCache.setMaxEntries(
+			this.queryBatchCacheCap(),
+		);
+		evicted.push(...this.queryBatchCache.set(key, value));
+		for (const [, dropped] of evicted) dropped?.query?.delete?.();
 	}
 	/** Consecutive grammar-load failures per batch key — bounds load retries (#889). */
 	private queryBatchLoadFailures = new Map<string, number>();

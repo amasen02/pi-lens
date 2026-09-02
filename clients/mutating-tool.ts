@@ -65,6 +65,7 @@
  * itself, and the `agent_settled` sweep for tools that name no path, stay in
  * those modules: this one is the classifier, not the observer.
  */
+import { BoundedFifoMap } from "./bounded-cache.js";
 import {
 	type HashlineAnchorFailure,
 	resolveHashlineAnchor,
@@ -677,11 +678,11 @@ const hashlineEditProAdapter: ShapeAdapter = (input, ctx) => {
  * and a consuming read would hand the ranges to whichever asked first. The map
  * drains by capacity instead.
  */
-const RESOLVED_RANGE_CARRY = new Map<
+const RESOLVED_RANGE_CARRY_LIMIT = 64;
+const RESOLVED_RANGE_CARRY = new BoundedFifoMap<
 	string,
 	{ touchedLines: [number, number]; editRanges?: [number, number][] }
->();
-const RESOLVED_RANGE_CARRY_LIMIT = 64;
+>(RESOLVED_RANGE_CARRY_LIMIT);
 
 function readToolCallId(event: unknown): string | undefined {
 	const id = (event as { toolCallId?: unknown } | undefined)?.toolCallId;
@@ -691,10 +692,6 @@ function readToolCallId(event: unknown): string | undefined {
 function carryResolvedRanges(event: unknown, result: MutationLineResult): void {
 	const toolCallId = readToolCallId(event);
 	if (!toolCallId || result.touchedLines === undefined) return;
-	if (RESOLVED_RANGE_CARRY.size >= RESOLVED_RANGE_CARRY_LIMIT) {
-		const oldest = RESOLVED_RANGE_CARRY.keys().next().value;
-		if (oldest !== undefined) RESOLVED_RANGE_CARRY.delete(oldest);
-	}
 	RESOLVED_RANGE_CARRY.set(toolCallId, {
 		touchedLines: result.touchedLines,
 		editRanges: result.editRanges,
@@ -714,6 +711,19 @@ function readCarriedRanges(
 export function _resetMutationRangeCarryForTests(): void {
 	RESOLVED_RANGE_CARRY.clear();
 }
+
+/** #2442 test seam: exercise RESOLVED_RANGE_CARRY's capacity eviction through
+ *  the exact production write/read paths. */
+export function _carryResolvedRangesForTests(
+	toolCallId: string,
+	touchedLines: [number, number],
+): void {
+	carryResolvedRanges({ toolCallId }, { touchedLines, editRanges: undefined });
+}
+export function _hasCarriedRangeForTests(toolCallId: string): boolean {
+	return readCarriedRanges({ toolCallId }) !== undefined;
+}
+export const RESOLVED_RANGE_CARRY_LIMIT_FOR_TESTS = RESOLVED_RANGE_CARRY_LIMIT;
 
 /**
  * The registry. ORDER IS THE CONTRACT: adapters run top to bottom and the first

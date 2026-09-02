@@ -109,3 +109,64 @@ describe("PathKeyedMap", () => {
 		expect(map.size).toBe(2);
 	});
 });
+
+// #2442: the optional bound, backed by BoundedFifoMap. `PartialApplyRecordStore`
+// hand-rolled `keys().next().value` on its PathKeyedMap before this existed.
+describe("PathKeyedMap — optional bound (#2442)", () => {
+	it("is unbounded when maxEntries is omitted", () => {
+		const map = new PathKeyedMap<number>(fold);
+		for (let i = 0; i < 50; i++) map.set(`f-${i}.ts`, i);
+		expect(map.size).toBe(50);
+		expect(map.get("f-0.ts")).toBe(0);
+	});
+
+	it("evicts the oldest path once maxEntries is exceeded (FIFO)", () => {
+		const map = new PathKeyedMap<number>(fold, 3);
+		map.set("a.ts", 1);
+		map.set("b.ts", 2);
+		map.set("c.ts", 3);
+		map.set("d.ts", 4);
+		expect(map.size).toBe(3);
+		expect(map.has("a.ts")).toBe(false);
+		expect([...map.keys()]).toEqual(["b.ts", "c.ts", "d.ts"]);
+	});
+
+	it("a get never reorders eviction order (FIFO, not LRU)", () => {
+		const map = new PathKeyedMap<number>(fold, 3);
+		map.set("a.ts", 1);
+		map.set("b.ts", 2);
+		map.set("c.ts", 3);
+		// Read the oldest repeatedly BEFORE the overflow write. An LRU-backed
+		// store would promote it and evict "b.ts" instead.
+		// Spelled differently on purpose: the read goes through the normalizer.
+		for (let i = 0; i < 5; i++) expect(map.get("A.TS")).toBe(1);
+		map.set("d.ts", 4);
+		expect(map.has("a.ts")).toBe(false);
+		expect(map.has("b.ts")).toBe(true);
+	});
+
+	it("an UPDATE of a resident path at capacity evicts nothing", () => {
+		// The hand-rolled block this replaced evicted BEFORE inserting whenever
+		// `size >= cap`, so re-recording an already-present file silently
+		// dropped an unrelated one and the map shrank by one.
+		const map = new PathKeyedMap<number>(fold, 3);
+		map.set("a.ts", 1);
+		map.set("b.ts", 2);
+		map.set("c.ts", 3);
+		map.set("a.ts", 99);
+		expect(map.size).toBe(3);
+		expect([...map.keys()]).toEqual(["a.ts", "b.ts", "c.ts"]);
+		expect(map.get("a.ts")).toBe(99);
+	});
+
+	it("normalizes the bounded store's keys too (no duplicate residency)", () => {
+		const map = new PathKeyedMap<number>(fold, 3);
+		map.set("SUB/a.ts", 1);
+		map.set("sub\\a.ts", 2);
+		map.set("b.ts", 3);
+		map.set("c.ts", 4);
+		// The two spellings collapsed to one entry, so nothing was evicted.
+		expect(map.size).toBe(3);
+		expect(map.get("SUB/a.ts")).toBe(2);
+	});
+});
