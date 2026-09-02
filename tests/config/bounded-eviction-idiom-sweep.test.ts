@@ -20,12 +20,31 @@
  *    across `keys`/`values`/`entries` — the Set-shaped sites use `.values()`.
  * 2. **Per-OCCURRENCE, not per-FILE.** Exemptions used to name a file, so a
  *    NEW hand-rolled eviction appended to an already-exempted file passed
- *    silently — the exemption laundered it. Every flagged item is now
- *    `path:line`, so an exemption excuses exactly one occurrence and nothing
- *    else. The cost is that an exemption's line number drifts when its file is
- *    edited above it; `auditRegistry`'s stale-exemption check turns that into
- *    a loud failure with the new line right there in the flagged list, which
- *    is the direction a guard should fail.
+ *    silently — the exemption laundered it. Every flagged item is now keyed
+ *    by `stableOccurrenceKey` (`tests/support/sweep-kit.ts`), so an exemption
+ *    is supposed to excuse exactly one occurrence and nothing else — but the
+ *    key alone cannot fully guarantee that: in a class-shaped file, every
+ *    method's flagged line resolves to the SAME enclosing symbol (the class
+ *    name), so two sibling methods that each flag a byte-identical line
+ *    collide on one key, and one exemption would silently excuse both (#2487
+ *    review F1 — the exact laundering this property exists to prevent, one
+ *    layer down). `auditRegistry`'s `requireUniqueFlagged` (on by default)
+ *    is what actually closes that: a duplicate flagged key fails LOUD before
+ *    exemption-matching ever runs, so a real collision cannot ride through
+ *    silently regardless of how the key was derived.
+ * 3. **Content-keyed, not line-keyed (#2475).** The first version of property
+ *    2 keyed on `path:line`, which re-keys on every unrelated line inserted
+ *    ABOVE a flagged site — #2459, #2449, and #2474 each had to re-pin a line
+ *    number that had nothing to do with their own change, and a textual merge
+ *    of two such re-keys can silently land a WRONG number with no conflict
+ *    marker. `stableOccurrenceKey` keys on the occurrence's own TEXT instead
+ *    (its enclosing top-level declaration name, via `findEnclosingSymbol`,
+ *    plus a short content hash of the flagged line via `lineContentHash`), so
+ *    moving the site by inserting lines elsewhere in the file is a no-op for
+ *    the key. Deleting or editing the flagged line still changes its key —
+ *    correctly, since `auditRegistry`'s stale-exemption check must still
+ *    catch an exemption whose target moved or vanished; it now reports the
+ *    drift by name/hash instead of by line number.
  *
  * Built on tests/support/sweep-kit.ts, same as this repo's other
  * registered-or-fail sweeps. `EXEMPT_SITES` below is the FULL, reasoned list
@@ -41,6 +60,7 @@ import {
 	auditRegistry,
 	listSourceFiles,
 	relativePosix,
+	stableOccurrenceKey,
 	stripSource,
 } from "../support/sweep-kit.js";
 
@@ -72,7 +92,9 @@ const FOR_OF_WINDOW = 12;
 const DEFINITION_FILE = "clients/bounded-cache.ts";
 
 /**
- * `path:line` → why this exact occurrence stays hand-rolled.
+ * `stableOccurrenceKey` output (`path#enclosingSymbol:contentHash`, or
+ * `path#contentHash` with no enclosing symbol) → why this exact occurrence
+ * stays hand-rolled.
  *
  * Every entry is a container shape neither bounded class covers. There are no
  * "deferred" entries left: #2442's review round migrated the three
@@ -80,24 +102,27 @@ const DEFINITION_FILE = "clients/bounded-cache.ts";
  * merged as #2446) and the four eviction-side-effect sites in
  * `tree-sitter-cache.ts` / `tree-sitter-client.ts`, which is what
  * `set()`'s `[key, value]` return exists for.
+ *
+ * Keys were migrated from `path:line` to `stableOccurrenceKey` by #2475. When
+ * a genuine edit to the flagged line itself invalidates a key (not a line
+ * inserted elsewhere — that's the churn this migration removes), the failing
+ * test's `audit.problems` output prints the new key the scan now computes;
+ * paste it in.
  */
 const EXEMPT_SITES: Readonly<Record<string, string>> = {
-	"clients/lsp/session-roots.ts:51":
+	"clients/lsp/session-roots.ts#registerSessionRoot:0a69a3da":
 		"Set, not Map: `sessionRoots` stores membership only, and there is no " +
 		"BoundedSet in clients/bounded-cache.ts. Building one is a second " +
 		"primitive with its own tests, deliberately out of #2442's scope " +
 		"(the issue asks for a FIFO sibling of BoundedLruCache, a K,V map). " +
 		"Named here rather than left invisible; a BoundedSet is the natural " +
 		"follow-up that would clear all four Set-shaped entries at once.",
-	// Line-keyed, so it is recomputed from the MERGED file, never taken from
-	// either side: master moved it to 546 and this branch to 576, and the merge
-	// puts it at neither.
-	"index.ts:573":
+	"index.ts#ensureLSPConfigInitialized:4115f214":
 		"Set, not Map: `_lspConfigInitializedCwds` is membership-only — same " +
 		"reason as clients/lsp/session-roots.ts, whose SESSION_ROOT_CAP this " +
 		"cap is deliberately paired with. No BoundedSet exists; see that " +
 		"entry for why building one is out of #2442's scope.",
-	"clients/observed-mutation.ts:397":
+	"clients/observed-mutation.ts#noteMutationHandled:8c9e32ed":
 		"Set, not Map: `handled` records only THAT a path was already recorded " +
 		"through the pipeline this run — membership, no value. Migrating it to " +
 		"BoundedFifoMap purely to reuse the eviction block would mean storing a " +
@@ -107,13 +132,13 @@ const EXEMPT_SITES: Readonly<Record<string, string>> = {
 		"silent: it emits `observed_handled_evicted` naming the dropped path " +
 		"(#2449 review round 4, S2), because dropping a mark makes pi-lens read " +
 		"its own formatter output as third-party drift.",
-	"clients/lsp-mutation.ts:430":
+	"clients/lsp-mutation.ts#bookkeepLspMutation:a1744d34":
 		"Set, not Map: `autofixRecordedPaths` is membership-only, and it is " +
 		"per-CONTEXT state (created on the mutation context, not module " +
 		"scope), so it is not even process-lifetime. No BoundedSet exists; " +
 		"see clients/lsp/session-roots.ts for why building one is out of " +
 		"#2442's scope.",
-	"clients/debug-handles.ts:118":
+	"clients/debug-handles.ts#recordTrackedInit:3737b5dc":
 		"Not evict-OLDEST: this walk deliberately SKIPS the first " +
 		"TRACKER_PROTECTED_COUNT insertion-order entries and evicts the " +
 		"oldest one after them, so the earliest-created handles (the ones " +
@@ -149,24 +174,39 @@ export function findEvictionLines(stripped: string): number[] {
 	return [...hits].sort((a, b) => a - b);
 }
 
-function findFlaggedOccurrences(): { flagged: string[]; scanned: number } {
+/** One flagged occurrence: its stable key plus a `file:line` diagnostic detail. */
+interface FlaggedOccurrence {
+	key: string;
+	detail: string;
+}
+
+function findFlaggedOccurrences(): {
+	occurrences: FlaggedOccurrence[];
+	scanned: number;
+} {
 	const files = shippedSourceFiles();
-	const flagged: string[] = [];
+	const occurrences: FlaggedOccurrence[] = [];
 	for (const abs of files) {
 		const rel = relativePosix(REPO_ROOT, abs);
 		if (rel === DEFINITION_FILE) continue;
 		// Strip first: an idiom named only in a comment or a string is not one.
-		// Layout is preserved, so these line numbers match the raw source.
+		// Layout is preserved, so these line numbers (and the hash inputs derived
+		// from them) match the raw source.
 		const stripped = stripSource(fs.readFileSync(abs, "utf8"));
+		const lines = stripped.split("\n");
 		for (const line of findEvictionLines(stripped)) {
-			flagged.push(`${rel}:${line}`);
+			occurrences.push({
+				key: stableOccurrenceKey(rel, lines, line - 1),
+				detail: `${rel}:${line}`,
+			});
 		}
 	}
-	return { flagged, scanned: files.length };
+	return { occurrences, scanned: files.length };
 }
 
 describe("#2442 no new hand-rolled evict-oldest idiom outside bounded-cache.ts", () => {
-	const { flagged, scanned } = findFlaggedOccurrences();
+	const { occurrences, scanned } = findFlaggedOccurrences();
+	const flagged = occurrences.map((o) => o.key);
 
 	it("actually finds the family (a dead scan must not read as clean)", () => {
 		// Vacuity guard on the DETECTOR: as of #2449's review round 4, five
@@ -205,18 +245,20 @@ describe("#2442 no new hand-rolled evict-oldest idiom outside bounded-cache.ts",
 
 	it("flags per OCCURRENCE, so an exemption cannot launder a new sibling", () => {
 		// #2442 review F6: exemptions used to be file-level, so appending a NEW
-		// eviction to an exempted file passed. Every flagged id carries its line.
+		// eviction to an exempted file passed. Every flagged id carries a
+		// content-derived key (#2475: `path#symbol:hash` or `path#hash`, never a
+		// bare line number — see `stableOccurrenceKey`).
 		for (const item of flagged) {
-			expect(item).toMatch(/^[\w./-]+\.ts:\d+$/);
+			expect(item).toMatch(/^[\w./-]+\.ts#(?:[A-Za-z_$][\w$]*:)?[0-9a-f]{8}$/);
 		}
 		const exemptedFiles = new Set(
-			Object.keys(EXEMPT_SITES).map((k) => k.split(":")[0]),
+			Object.keys(EXEMPT_SITES).map((k) => k.split("#")[0]),
 		);
 		// Every exempted FILE still has exactly the occurrences named, no more:
 		// a second, unexcused occurrence in the same file must show up as
 		// unaccounted below rather than riding the file's exemption.
 		for (const file of exemptedFiles) {
-			const inFile = flagged.filter((f) => f.startsWith(`${file}:`));
+			const inFile = flagged.filter((f) => f.startsWith(`${file}#`));
 			for (const occurrence of inFile) {
 				expect(
 					Object.hasOwn(EXEMPT_SITES, occurrence),
@@ -226,10 +268,101 @@ describe("#2442 no new hand-rolled evict-oldest idiom outside bounded-cache.ts",
 		}
 	});
 
+	// #2487 review F1: the test above ("flags per OCCURRENCE") is vacuous
+	// against a real collision, because `expect(item).toBe(...)` compares the
+	// SAME string to itself when two occurrences hash to one key — it cannot
+	// distinguish "this occurrence is exempted" from "some occurrence sharing
+	// this key is exempted". This test runs a REAL twin-collision fixture
+	// through the actual detection pipeline (`findEvictionLines` +
+	// `stableOccurrenceKey`, not a hand-typed key) and proves `auditRegistry`
+	// itself refuses to let one exemption cover both — the property the
+	// vacuous test above could never have caught.
+	it("ATTACK_TWIN_OCCURRENCE_COLLISION (#2487 review F1): two sibling methods with an identical flagged line cannot share one exemption", () => {
+		const rel = "clients/__probe_twin_cache.ts";
+		const source = [
+			"class ProbeTwinCache {",
+			"\tevictFirst() {",
+			"\t\tfor (const k of this.map.keys()) {",
+			"\t\t\tthis.map.delete(k);",
+			"\t\t\tbreak;",
+			"\t\t}",
+			"\t}",
+			"\tevictSecond() {",
+			"\t\tfor (const k of this.map.keys()) {",
+			"\t\t\tthis.map.delete(k);",
+			"\t\t\tbreak;",
+			"\t\t}",
+			"\t}",
+			"}",
+		].join("\n");
+		const evictionLines = findEvictionLines(source);
+		expect(evictionLines).toEqual([3, 9]); // both flagged by the REAL detector
+		const lines = source.split("\n");
+		const twinOccurrences = evictionLines.map((line) => ({
+			key: stableOccurrenceKey(rel, lines, line - 1),
+			detail: `${rel}:${line}`,
+		}));
+		// Precondition: both really do collide on one key — same enclosing
+		// symbol (the class), same flagged-line text.
+		expect(twinOccurrences[0]?.key).toBe(twinOccurrences[1]?.key);
+
+		// One exemption, keyed to the shared string: pre-guard this read clean
+		// (laundered); the collision guard must refuse it.
+		const laundered = auditRegistry({
+			sweepName: "probe twin sweep",
+			flagged: twinOccurrences,
+			registered: [],
+			exemptions: {
+				[twinOccurrences[0]!.key]: "reviewed exemption for one occurrence",
+			},
+		});
+		expect(laundered.problems.join("\n")).toContain("collide");
+
+		// The remedy this sweep ships (#2487 review round 3 F1): NOT an
+		// auto-numbered ordinal — `disambiguateFlaggedKeys` shipped that and was
+		// deleted, because numbering by SCAN POSITION let a genuinely new,
+		// unreviewed occurrence ride an existing exemption's ordinal the moment
+		// it landed between two already-exempted ones (proved against
+		// `sync-child-process-timeout.test.ts`'s real collision in that same
+		// review round). The actual remedy is the message's own instruction:
+		// "give each occurrence a distinguishing key ... before exempting
+		// either" — a human edits the flagged line's own text so its content
+		// hash genuinely differs, which is what distinguishes two occurrences
+		// that a mechanical scan cannot tell apart on its own.
+		const distinguishedSource = source.replace(
+			"\tevictSecond() {\n\t\tfor (const k of this.map.keys()) {",
+			"\tevictSecond() {\n\t\tfor (const key of this.map.keys()) {",
+		);
+		const distinguishedLines = distinguishedSource.split("\n");
+		const distinguishedEvictionLines = findEvictionLines(distinguishedSource);
+		expect(distinguishedEvictionLines).toEqual([3, 9]); // same lines...
+		const distinguishedOccurrences = distinguishedEvictionLines.map((line) => ({
+			key: stableOccurrenceKey(rel, distinguishedLines, line - 1),
+			detail: `${rel}:${line}`,
+		}));
+		// ...but no longer the same KEY: `key` vs `k` changed the flagged
+		// line's own text, so its content hash — not its position — differs.
+		expect(distinguishedOccurrences[0]!.key).not.toBe(
+			distinguishedOccurrences[1]!.key,
+		);
+		const properlyExempted = auditRegistry({
+			sweepName: "probe twin sweep",
+			flagged: distinguishedOccurrences,
+			registered: [],
+			exemptions: {
+				[distinguishedOccurrences[0]!.key]:
+					"reviewed exemption for evictFirst's occurrence",
+				[distinguishedOccurrences[1]!.key]:
+					"reviewed exemption for evictSecond's occurrence",
+			},
+		});
+		expect(properlyExempted.problems).toEqual([]);
+	});
+
 	it("every occurrence is the definition file, migrated, or exempted with a reason", () => {
 		const audit = auditRegistry({
 			sweepName: "bounded-eviction-idiom sweep",
-			flagged,
+			flagged: occurrences,
 			registered: [],
 			exemptions: EXEMPT_SITES,
 			scannedCount: scanned,
@@ -242,9 +375,11 @@ describe("#2442 no new hand-rolled evict-oldest idiom outside bounded-cache.ts",
 				"BoundedFifoMap (get() never re-inserts — FIFO) from " +
 				"clients/bounded-cache.ts — both return the evicted [key, value] " +
 				"pairs from set(), so eviction-side bookkeeping needs no hand-rolled " +
-				"block either — or add an EXEMPT_SITES entry here (keyed " +
-				"`path:line`) with a real reason (see #2442's PR body verdict table " +
-				"for the shape of a legitimate exemption).",
+				"block either — or add an EXEMPT_SITES entry here (keyed by " +
+				"`stableOccurrenceKey` from tests/support/sweep-kit.ts — " +
+				"`path#symbol:hash` or `path#hash`, printed above) with a real " +
+				"reason (see #2442's PR body verdict table for the shape of a " +
+				"legitimate exemption).",
 		});
 		expect(audit.problems, audit.problems.join("\n")).toEqual([]);
 	});

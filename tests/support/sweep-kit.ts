@@ -72,6 +72,20 @@
  *    silently tags the NEXT seam instead. Defense: a bounded blank-line gap
  *    (`maxBlankGap`, default 1) and outright rejection of inline tags — see
  *    {@link bindTagsToSeams}.
+ * - **Positional-ordinal disambiguation** (#2487 review round 3). A prior
+ *    version of this kit shipped `disambiguateFlaggedKeys`, which numbered
+ *    colliding occurrences `key`, `key#2`, `key#3`, ... by SCAN POSITION, not
+ *    by occurrence identity. A new colliding call inserted BETWEEN two already
+ *    exempted ones shifts every ordinal after it, so an exemption reasoned
+ *    about one call site silently rides a different one — one round it failed
+ *    loud with no file:line to act on, another round it stayed fully green
+ *    while an unreviewed unbounded call shipped. Removed outright: fix the
+ *    KEY GENERATOR so genuinely distinct call sites derive genuinely distinct
+ *    keys (`tests/config/sync-child-process-timeout.test.ts`'s `exemptionKey`
+ *    now matches each call's own ARGUMENTS against a discriminating snippet,
+ *    not a position-dependent ordinal), and let `requireUniqueFlagged` fail
+ *    loud — by file:line, via `FlaggedEntry.detail` — on any collision the
+ *    generator still produces.
  *
  * ## Known limits, named rather than papered over
  *
@@ -94,6 +108,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { lineContentHash } from "../../clients/read-guard.js";
 import { toPosix } from "../../clients/path-utils.js";
 
 // ── 1. Source scanning ──────────────────────────────────────────────────────
@@ -299,13 +314,107 @@ export function relativePosix(root: string, absolute: string): string {
 	return toPosix(path.relative(root, absolute));
 }
 
+/**
+ * Nearest named function/class/const-or-let declaration STRICTLY ABOVE
+ * `lineIndex` (0-based) in `lines` — a cheap line-scan heuristic, not a
+ * parser. Built for {@link stableOccurrenceKey}: keying a per-occurrence
+ * exemption on this name survives a line inserted anywhere else in the file,
+ * because the declaration's TEXT, not its line number, is what the walk
+ * matches (#2475 — the bounded-eviction-idiom sweep's `path:line` exemptions
+ * used to re-key on every unrelated insertion above a flagged site).
+ *
+ * Declarations are matched by shape at the start of the line: `function`/
+ * `class` (with `export`/`default`/`abstract`/`async` modifiers), or a
+ * `const`/`let` bound to a name. The walk goes upward and returns the FIRST
+ * match — the nearest enclosing declaration, on the assumption true of every
+ * #2442 site: a flagged statement sits directly inside the body of the
+ * declaration immediately above it. `maxLookback` bounds the walk so one
+ * pathological file can't turn this into an O(fileSize) scan per occurrence.
+ *
+ * Matched at column 0 ONLY — no leading whitespace. This repo's shipped
+ * source declares every top-level function/class/const at column 0, so
+ * anchoring there is what keeps a nested LOCAL (`let evictKey` two lines
+ * above a flagged `for` loop, indented inside an `if` inside the function)
+ * from winning over the function that actually encloses the flagged site —
+ * the first draft matched any indentation and resolved
+ * `clients/debug-handles.ts`'s flagged line to `evictKey`, a loop-local
+ * variable, instead of `recordTrackedInit`. The trade is real: a declaration
+ * nested inside a class or namespace is invisible to this pattern and falls
+ * back to the content hash in {@link stableOccurrenceKey}, same as a
+ * module-scope site with no enclosing declaration at all.
+ */
+const DECLARATION_PATTERN =
+	/^(?:export\s+)?(?:default\s+)?(?:abstract\s+)?(?:async\s+)?(?:function\s*\*?\s+|class\s+)([A-Za-z_$][\w$]*)|^(?:export\s+)?(?:const|let)\s+([A-Za-z_$][\w$]*)\s*[:=]/;
+
+export function findEnclosingSymbol(
+	lines: readonly string[],
+	lineIndex: number,
+	maxLookback = 400,
+): string | undefined {
+	// Starts ABOVE lineIndex, never on it: a flagged occurrence that itself
+	// happens to read as `const x = ...` (the eviction idiom's own shape) must
+	// never resolve to ITSELF as its own "enclosing" declaration.
+	const floor = Math.max(0, lineIndex - maxLookback);
+	for (let i = lineIndex - 1; i >= floor; i--) {
+		const match = DECLARATION_PATTERN.exec(lines[i] ?? "");
+		if (match) return match[1] ?? match[2];
+	}
+	return undefined;
+}
+
+/**
+ * A per-occurrence exemption key immune to line-number churn (#2475): the
+ * enclosing declaration's NAME when {@link findEnclosingSymbol} finds one —
+ * readable, and stable under any edit that doesn't touch the declaration or
+ * the flagged line itself — with a short content hash of the flagged line's
+ * OWN text always appended (`lineContentHash`, already used by read-guard's
+ * line-move relocation for exactly this "survive line movement, catch
+ * content movement" property). The hash does two jobs: it disambiguates two
+ * flagged occurrences that share one enclosing declaration WHEN their flagged
+ * lines' text differs, and it is the WHOLE key when no declaration is found
+ * at all (a top-level flagged site). Either way, editing the flagged line's
+ * own text — as opposed to inserting a line elsewhere in the file — correctly
+ * changes the key, which is the direction that must re-trigger review.
+ *
+ * This does NOT guarantee two distinct occurrences always get distinct keys.
+ * In a class-shaped file every method's flagged line resolves to the SAME
+ * enclosing symbol (the class name — `findEnclosingSymbol` matches column-0
+ * declarations only, and a method sits indented), so two sibling methods that
+ * each flag a byte-identical line (a stereotyped idiom like
+ * `for (const key of map.keys()) {`) collide on one key (#2487 review F1).
+ * An exemption keyed to that string then excuses BOTH occurrences, not the
+ * one it was reasoned about — the same laundering `stableOccurrenceKey` was
+ * built to close, one layer down. `auditRegistry`'s `requireUniqueFlagged`
+ * (default on) is the backstop: it fails loud on any duplicate flagged key
+ * rather than let a caller of this function rely on the hash alone.
+ */
+export function stableOccurrenceKey(
+	relPath: string,
+	lines: readonly string[],
+	lineIndex: number,
+): string {
+	const symbol = findEnclosingSymbol(lines, lineIndex);
+	const hash = lineContentHash(lines[lineIndex] ?? "");
+	return symbol ? `${relPath}#${symbol}:${hash}` : `${relPath}#${hash}`;
+}
+
 // ── 2. Registry semantics ───────────────────────────────────────────────────
+
+/**
+ * One item the scan flags. A bare string is both the registry/exemption key
+ * AND the diagnostic detail shown in messages. A caller that can distinguish
+ * an occurrence's stable KEY from a human-readable DETAIL (a file:line, a
+ * snippet) should pass the object form so a duplicate-key collision message
+ * ({@link RegistryAuditInput.requireUniqueFlagged}) can name each colliding
+ * occurrence by its own detail rather than repeating the shared key.
+ */
+export type FlaggedEntry = string | { key: string; detail: string };
 
 export interface RegistryAuditInput {
 	/** Sweep name, used in every composed message. */
 	sweepName: string;
 	/** The items the scan currently flags — the sweep's REDS. */
-	flagged: Iterable<string>;
+	flagged: Iterable<FlaggedEntry>;
 	/** Items the registry covers. */
 	registered: Iterable<string>;
 	/** Exempted item → the reason it is exempt. A reason is REQUIRED. */
@@ -328,6 +437,18 @@ export interface RegistryAuditInput {
 	minScanned?: number;
 	/** Appended to the unaccounted-items message: what the author should do. */
 	remediation?: string;
+	/**
+	 * Fail loud when the same key appears more than once in `flagged` — two
+	 * distinct occurrences whose derived id collided (#2487 review F1: a
+	 * class's sibling methods can hash-collide under `stableOccurrenceKey`).
+	 * A duplicate key means one exemption or registry entry silently excuses
+	 * MORE than the single site it names, which is exactly the laundering this
+	 * kit's per-occurrence keying exists to prevent. Default `true` — no sweep
+	 * built on this kit legitimately relies on two distinct occurrences
+	 * sharing one flagged key. Set `false` only for a caller that deliberately
+	 * flags the same key more than once (none does today).
+	 */
+	requireUniqueFlagged?: boolean;
 }
 
 export interface RegistryAudit {
@@ -355,12 +476,16 @@ export interface RegistryAudit {
  * library behavior.
  */
 export function auditRegistry(input: RegistryAuditInput): RegistryAudit {
-	const flagged = [...input.flagged];
+	const flaggedEntries = [...input.flagged].map((entry) =>
+		typeof entry === "string" ? { key: entry, detail: entry } : entry,
+	);
+	const flagged = flaggedEntries.map((entry) => entry.key);
 	const flaggedSet = new Set(flagged);
 	const registered = new Set(input.registered);
 	const exemptions = input.exemptions ?? {};
 	const minReasonLength = input.minReasonLength ?? 15;
 	const minFlagged = input.minFlagged ?? 1;
+	const requireUniqueFlagged = input.requireUniqueFlagged ?? true;
 	const problems: string[] = [];
 
 	// Two distinct emptiness failures, reported separately (#1755 review F4).
@@ -387,6 +512,42 @@ export function auditRegistry(input: RegistryAuditInput): RegistryAudit {
 		);
 	}
 
+	// Duplicate-key collision (#2487 review F1). Two distinct occurrences that
+	// derived the SAME key are exactly the shape a per-occurrence exemption
+	// exists to forbid: one exemption entry then excuses both, silently.
+	// Checked on the raw entries (not `flaggedSet`) so the message can name
+	// every colliding occurrence's own detail — real diagnostic content in a
+	// MESSAGE, never folded into a key. Runs BEFORE the exemption-matching
+	// checks below: a caller should fix a collision, not exempt around it.
+	if (requireUniqueFlagged) {
+		const byKey = new Map<string, string[]>();
+		for (const entry of flaggedEntries) {
+			const details = byKey.get(entry.key) ?? [];
+			details.push(entry.detail);
+			byKey.set(entry.key, details);
+		}
+		const collisions = [...byKey.entries()].filter(
+			([, details]) => details.length > 1,
+		);
+		if (collisions.length > 0) {
+			problems.push(
+				`${input.sweepName}: ${collisions.length} flagged key(s) collide — ` +
+					"two or more distinct occurrences derived the SAME key, so one " +
+					"exemption or registry entry would silently excuse more than the " +
+					"single site it names:\n" +
+					collisions
+						.map(
+							([key, details]) =>
+								`  ${key} (${details.length}×): ${details.join(", ")}`,
+						)
+						.join("\n") +
+					"\n\nGive each occurrence a distinguishing key (or fix the " +
+					"generator that produced two identical ones) before exempting " +
+					"either.",
+			);
+		}
+	}
+
 	// `Object.hasOwn`, never `item in exemptions` (#1755 review F1). The `in`
 	// operator walks the PROTOTYPE CHAIN, so a flagged item named `toString`,
 	// `constructor`, `valueOf` or `__proto__` would exempt itself against an
@@ -394,6 +555,36 @@ export function auditRegistry(input: RegistryAuditInput): RegistryAudit {
 	// `Object.keys` (own properties only), so it could never report the phantom
 	// exemption as stale either. No sweep's id namespace collides today, but the
 	// kit is built for six more with arbitrary id namespaces.
+	// Detail lookup for readable messages (#2487 review round 3 F1). A caller
+	// that passes the object `FlaggedEntry` form gives each key a
+	// human-readable detail — a file:line, typically — and a problem message
+	// should NAME the site rather than print a bare key nobody can act on.
+	// Round 3's probe 1 was exactly this: an unaccounted ordinal key
+	// (`...#3`) printed with no file:line, so the natural remediation excused
+	// the wrong call site. Built once, over every entry, first occurrence
+	// wins (a duplicate key's collision is already reported separately, above).
+	//
+	// Used by `unaccounted` ONLY (#2487 review round 4 F2). A stale
+	// exemption's key is, by construction, one `flaggedEntries` never
+	// contains (that is what "stale" means: the scan no longer flags it), so
+	// it can never have an entry in `detailByKey` — calling this lookup for
+	// `staleExemptions` was dead code that always fell through to the bare
+	// key. `staleExemptions` prints the bare key directly below instead.
+	const detailByKey = new Map<string, string>();
+	for (const entry of flaggedEntries) {
+		if (
+			entry.detail &&
+			entry.detail !== entry.key &&
+			!detailByKey.has(entry.key)
+		) {
+			detailByKey.set(entry.key, entry.detail);
+		}
+	}
+	const describe = (item: string): string => {
+		const detail = detailByKey.get(item);
+		return detail ? `${item} (${detail})` : item;
+	};
+
 	const unaccounted = flagged.filter(
 		(item) => !registered.has(item) && !Object.hasOwn(exemptions, item),
 	);
@@ -401,7 +592,7 @@ export function auditRegistry(input: RegistryAuditInput): RegistryAudit {
 		problems.push(
 			`${input.sweepName}: ${unaccounted.length} flagged item(s) are neither ` +
 				"registered nor exempted:\n" +
-				unaccounted.map((item) => `  ${item}`).join("\n") +
+				unaccounted.map((item) => `  ${describe(item)}`).join("\n") +
 				(input.remediation ? `\n\n${input.remediation}` : ""),
 		);
 	}
