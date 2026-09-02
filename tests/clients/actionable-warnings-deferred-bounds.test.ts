@@ -146,7 +146,7 @@ describe("#2504 r2 F3 — per-round-trip bound on the deferred loop", () => {
 
 		// Pre-fix the ONLY bound is a 60 s deadline checked BETWEEN files, so a
 		// pull that never answers pins the loop forever.
-		expect(await settlesWithin(_awaitDeferredLspPullForTest(), 4_000)).toBe(
+		expect(await settlesWithin(_awaitDeferredLspPullForTest(), 2_500)).toBe(
 			"settled",
 		);
 		// And it moved PAST the wedged file rather than abandoning the batch.
@@ -187,7 +187,7 @@ describe("#2504 r2 F3 — session_shutdown aborts the deferred loop", () => {
 			reason: "session_shutdown",
 		});
 
-		expect(await settlesWithin(_awaitDeferredLspPullForTest(), 4_000)).toBe(
+		expect(await settlesWithin(_awaitDeferredLspPullForTest(), 2_500)).toBe(
 			"settled",
 		);
 		// No further document was handed to a service being torn down.
@@ -217,7 +217,7 @@ describe("#2504 r2 F3 — session_shutdown aborts the deferred loop", () => {
 		await delay(50);
 		resetLSPService({ fast: true, reason: "session_start" });
 
-		expect(await settlesWithin(_awaitDeferredLspPullForTest(), 4_000)).toBe(
+		expect(await settlesWithin(_awaitDeferredLspPullForTest(), 2_500)).toBe(
 			"settled",
 		);
 		expect(delivered).toEqual([]);
@@ -260,7 +260,7 @@ describe("#2504 r2 F3 — a second deferral retires the first", () => {
 			onDeferredReport: () => {},
 		});
 
-		expect(await settlesWithin(first, 4_000)).toBe("settled");
+		expect(await settlesWithin(first, 2_500)).toBe("settled");
 	});
 });
 

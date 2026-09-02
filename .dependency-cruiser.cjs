@@ -28,7 +28,12 @@ module.exports = {
 			severity: "error",
 			comment: "Declared leaf modules must not import another clients/ module.",
 			from: {
-				path: "^(?:\\./)?clients/(ledger-bounds|spawn-output-cap|lsp/workspace-diagnostics-session)\\.js$",
+				// #2504 adds the two leaves it introduced. Both exist precisely so
+				// a heavyweight importer (runtime-turn, lsp/index) can reach a
+				// small shared primitive without dragging that primitive's owner's
+				// import graph along — a claim each module's own doc comment makes
+				// and which only this rule can actually hold.
+				path: "^(?:\\./)?clients/(ledger-bounds|spawn-output-cap|map-with-concurrency|deferred-lsp-work|lsp/workspace-diagnostics-session)\\.js$",
 			},
 			to: { path: "^(?:\\./)?clients/" },
 		},
