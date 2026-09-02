@@ -2600,14 +2600,17 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 						// overwrote a newer report, which `agent_end` then rejected
 						// as `project_seq_mismatch` (silently skipping the autofix
 						// pass) and `lens_diagnostics` re-served as a stale delta.
-						// `runtime.projectSeq` is read HERE, at write time, not at
-						// arm time — the whole point is how far the project moved
-						// while the loop ran.
+						// #2504 review round 3 (F-A(a)): the guard asks only
+						// whether something NEWER is already PERSISTED. How far
+						// the live projectSeq moved is a freshness question, and
+						// both consumers (`formatDeltaMode`,
+						// `checkActionableWarningsReportFresh`) already answer it
+						// for themselves — refusing to publish on it only lost
+						// the turn's warnings outright.
 						writeDeferredActionableWarningsReport({
 							cacheManager,
 							cwd,
 							report: deferred,
-							currentProjectSeq: runtime.projectSeq,
 							dbg,
 						});
 					} catch (deferErr) {

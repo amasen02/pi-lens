@@ -12,8 +12,9 @@
  * landing mid-loop hit the #234 spawn-at-teardown shape, and the handle was a
  * module-level `let` with no reset that a second deferral simply overwrote.
  *
- * This module supplies the missing halves: ONE registered handle (arming
- * aborts whatever previously held the slot) and ONE abort signal that
+ * This module supplies the missing halves: ONE registered handle (held by
+ * whichever deferral got there first, released when its work settles — see
+ * `armDeferredLspWork`) and ONE abort signal that
  * `resetLSPService` fires — the single choke point through which
  * `session_shutdown`, `session_start` and the idle reset all retire the
  * service, so no caller has to remember to wire each lifecycle event
@@ -44,16 +45,35 @@ export function abortDeferredLspWork(reason: string): void {
 }
 
 /**
- * Claim the deferred-work slot and return the signal the new work must honor.
+ * Claim the deferred-work slot, or `undefined` when an incumbent still holds
+ * it. THE INCUMBENT WINS (#2504 review round 3, F-A(d)).
  *
- * Arming ABORTS whatever previously held the slot: two deferrals may not run
- * concurrently against the same LSP service, and the pre-fix code overwrote
- * the handle so the first loop kept running untracked and unstoppable.
+ * Round 2 had arming ABORT the previous deferral, reasoning that two loops
+ * must not run concurrently against one LSP service. The first half of that is
+ * right and still holds — there is exactly one slot. The second half was
+ * backwards about which loop to keep. A deferral is armed by a turn that
+ * primed NO LSP cache, which in a live editing session is every turn; so every
+ * turn cancelled its predecessor, and an aborted loop publishes nothing by
+ * design (its service is presumed gone). Back-to-back editing turns therefore
+ * delivered NOTHING AT ALL — the exact delivery AC #2504 exists to preserve.
+ *
+ * Keeping the incumbent inverts that: the loop that is already talking to the
+ * service runs to completion and publishes, and the newcomer is declined and
+ * says so out loud. The cost is stated rather than silent — the declining
+ * turn's cold files go unchecked on this channel until a later turn defers.
+ *
+ * Declining cannot latch. `registerDeferredLspWork` releases the slot the
+ * moment the work settles, and the loop itself is bounded twice over
+ * (`ACTIONABLE_WARNINGS_DEFERRED_BUDGET_MS` between files, a per-round-trip
+ * timeout inside them), so an incumbent always yields the slot in bounded
+ * time. Teardown is unaffected: `abortDeferredLspWork` still evicts the
+ * incumbent unconditionally, which is how `resetLSPService` retires it.
  */
-export function armDeferredLspWork(): AbortSignal {
-	abortDeferredLspWork("superseded by a newer deferred LSP pull");
+export function armDeferredLspWork(): AbortSignal | undefined {
+	if (isDeferredLspWorkArmed()) return undefined;
 	const controller = new AbortController();
 	deferredController = controller;
+	deferredWork = undefined;
 	return controller.signal;
 }
 
@@ -61,6 +81,12 @@ export function armDeferredLspWork(): AbortSignal {
  * Register the armed work's promise so callers (and tests) have something to
  * await. Ignored when the slot has already been re-armed or aborted since — a
  * late registration must not resurrect a retired handle.
+ *
+ * Registration also arranges the RELEASE (#2504 review round 3, F-A(d)):
+ * because the slot now turns a newcomer away rather than evicting the
+ * incumbent, something has to hand it back, and the only correct moment is
+ * when the work settles. Guarded on identity, so a slot re-armed or aborted in
+ * the meantime is never cleared by a stale finalizer.
  */
 export function registerDeferredLspWork(
 	signal: AbortSignal,
@@ -68,6 +94,11 @@ export function registerDeferredLspWork(
 ): void {
 	if (deferredController?.signal !== signal) return;
 	deferredWork = work;
+	void work.finally(() => {
+		if (deferredController?.signal !== signal) return;
+		deferredController = undefined;
+		deferredWork = undefined;
+	});
 }
 
 /** The in-flight deferred work, or an already-resolved promise when idle. */
@@ -78,10 +109,4 @@ export function awaitDeferredLspWork(): Promise<void> {
 /** True while a deferral holds the slot and has not been aborted. */
 export function isDeferredLspWorkArmed(): boolean {
 	return deferredController?.signal.aborted === false;
-}
-
-/** Test-only: drop the slot without aborting, for suite isolation. */
-export function _resetDeferredLspWorkForTests(): void {
-	deferredController = undefined;
-	deferredWork = undefined;
 }

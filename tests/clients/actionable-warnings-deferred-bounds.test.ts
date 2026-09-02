@@ -27,25 +27,40 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CacheManager } from "../../clients/cache-manager.js";
 import type { ActionableWarningsReport } from "../../clients/actionable-warnings.js";
-import type { LSPCodeAction } from "../../clients/lsp/client.js";
+import type { LSPCodeAction, LSPDiagnostic } from "../../clients/lsp/client.js";
 import { resetDegradationLedger } from "../../clients/degradation-ledger.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
 /** Basenames whose `getDiagnostics` never settles — a wedged server. */
 let wedgedFiles = new Set<string>();
+/**
+ * Basenames whose `openFile` never settles (#2504 review round 3, F-B). A
+ * server that never acknowledges `didOpen` is the #240 shape: the document
+ * the next pull asks about was never received, so an empty pull answers
+ * "unknown", not "clean".
+ */
+let wedgedOpens = new Set<string>();
+/** What a FRESH pull returns, by basename. Default: nothing. */
+let diagnosticsByFile = new Map<string, LSPDiagnostic[]>();
+/** What `codeAction` returns. A record only survives if it has one. */
+let codeActions: LSPCodeAction[] = [];
 
-const openFile = vi.fn(
-	async (_filePath: string, _content?: string) => undefined,
-);
+const openFile = vi.fn(async (filePath: string, _content?: string) => {
+	if (wedgedOpens.has(path.basename(filePath))) {
+		// Never settles: the server never acknowledges the document.
+		await new Promise(() => {});
+	}
+	return undefined;
+});
 const getDiagnostics = vi.fn(async (filePath: string) => {
 	if (wedgedFiles.has(path.basename(filePath))) {
 		// Never settles. Only a per-round-trip bound can get past this.
 		await new Promise(() => {});
 	}
-	return [];
+	return diagnosticsByFile.get(path.basename(filePath)) ?? [];
 });
-const codeAction = vi.fn(async (): Promise<LSPCodeAction[]> => []);
+const codeAction = vi.fn(async (): Promise<LSPCodeAction[]> => codeActions);
 /** Nothing is ever primed: every file is a cold fresh pull, so it defers. */
 const getLastKnownDiagnostics = vi.fn(() => undefined);
 
@@ -78,6 +93,9 @@ let env: { tmpDir: string; cleanup: () => void };
 beforeEach(() => {
 	env = setupTestEnvironment("pi-lens-2504-deferred-");
 	wedgedFiles = new Set();
+	wedgedOpens = new Set();
+	diagnosticsByFile = new Map();
+	codeActions = [];
 	openFile.mockClear();
 	getDiagnostics.mockClear();
 	codeAction.mockClear();
@@ -224,10 +242,84 @@ describe("#2504 r2 F3 — session_shutdown aborts the deferred loop", () => {
 	});
 });
 
-describe("#2504 r2 F3 — a second deferral retires the first", () => {
-	it("aborts the loop that already held the slot", async () => {
+describe("#2504 r3 F-A(d) — a second cold-cache turn lets the first finish", () => {
+	it("declines the second arm instead of cancelling the in-flight loop", async () => {
 		const { buildActionableWarningsReport, _awaitDeferredLspPullForTest } =
 			await loadWarnings();
+		const files = makeSources(2);
+		// Keeps loop 1 in flight while turn 2 arrives; it clears on the
+		// per-round-trip bound, so the loop still finishes and publishes.
+		wedgedFiles.add(path.basename(files[0]));
+		const delivered: ActionableWarningsReport[] = [];
+
+		await buildActionableWarningsReport({
+			cwd: env.tmpDir,
+			sessionId: "lens-test",
+			turnIndex: 1,
+			files,
+			modifiedRangesByFile: new Map(),
+			dispatchWarnings: [],
+			includeLspCodeActions: true,
+			lspPullTimeoutMs: 400,
+			onDeferredReport: (r: ActionableWarningsReport) => delivered.push(r),
+		});
+		// The handle for the FIRST loop, captured before anything else arms.
+		const first = _awaitDeferredLspPullForTest();
+		await delay(50);
+
+		// Turn 2 is ALSO cold-cache — in a real editing session every turn is,
+		// which is why round 2's abort-on-arm meant back-to-back editing turns
+		// delivered NOTHING: each arm cancelled its predecessor, and an aborted
+		// loop publishes nothing by design. One slot, but the incumbent keeps
+		// it; the newcomer is declined and says so.
+		await buildActionableWarningsReport({
+			cwd: env.tmpDir,
+			sessionId: "lens-test",
+			turnIndex: 2,
+			files,
+			modifiedRangesByFile: new Map(),
+			dispatchWarnings: [],
+			includeLspCodeActions: true,
+			lspPullTimeoutMs: 60_000,
+			onDeferredReport: (r: ActionableWarningsReport) => delivered.push(r),
+		});
+
+		expect(await settlesWithin(first, 6_000)).toBe("settled");
+		expect(delivered.map((r) => r.turnIndex)).toEqual([1]);
+	});
+
+	it("arms again once the previous deferral has finished", async () => {
+		const { buildActionableWarningsReport, _awaitDeferredLspPullForTest } =
+			await loadWarnings();
+		const files = makeSources(1);
+		const delivered: ActionableWarningsReport[] = [];
+
+		for (const turnIndex of [1, 2]) {
+			await buildActionableWarningsReport({
+				cwd: env.tmpDir,
+				sessionId: "lens-test",
+				turnIndex,
+				files,
+				modifiedRangesByFile: new Map(),
+				dispatchWarnings: [],
+				includeLspCodeActions: true,
+				lspPullTimeoutMs: 400,
+				onDeferredReport: (r: ActionableWarningsReport) => delivered.push(r),
+			});
+			expect(await settlesWithin(_awaitDeferredLspPullForTest(), 4_000)).toBe(
+				"settled",
+			);
+		}
+
+		// Declining is not a latch: the slot is released the moment the work
+		// settles, so the very next cold-cache turn defers normally.
+		expect(delivered.map((r) => r.turnIndex)).toEqual([1, 2]);
+	});
+
+	it("still lets resetLSPService retire the incumbent", async () => {
+		const { buildActionableWarningsReport, _awaitDeferredLspPullForTest } =
+			await loadWarnings();
+		const { resetLSPService } = await import("../../clients/lsp/index.js");
 		const files = makeSources(5);
 		for (const f of files) wedgedFiles.add(path.basename(f));
 
@@ -242,24 +334,12 @@ describe("#2504 r2 F3 — a second deferral retires the first", () => {
 			lspPullTimeoutMs: 60_000,
 			onDeferredReport: () => {},
 		});
-		// The handle for the FIRST loop, captured before anything re-arms.
 		const first = _awaitDeferredLspPullForTest();
 		await delay(50);
 
-		// A second turn defers too. Pre-fix this only overwrote a module-level
-		// `let`: the first loop kept running, untracked and unstoppable.
-		await buildActionableWarningsReport({
-			cwd: env.tmpDir,
-			sessionId: "lens-test",
-			turnIndex: 2,
-			files,
-			modifiedRangesByFile: new Map(),
-			dispatchWarnings: [],
-			includeLspCodeActions: true,
-			lspPullTimeoutMs: 60_000,
-			onDeferredReport: () => {},
-		});
-
+		// Holding the slot against a NEWER TURN must not also hold it against
+		// TEARDOWN: the service lifecycle seam still wins, unconditionally.
+		resetLSPService({ fast: true, reason: "session_start" });
 		expect(await settlesWithin(first, 2_500)).toBe("settled");
 	});
 });
@@ -333,5 +413,310 @@ describe("#2504 r2 F2 — a deferred report never clobbers a newer one", () => {
 		)?.data;
 		expect(persisted?.turnIndex).toBe(newer.turnIndex);
 		expect(persisted?.projectSeqEnd).toBe(41);
+	});
+});
+
+/**
+ * #2504 review round 3 — the deferral's DELIVERY half.
+ *
+ * Round 2 bounded the loop and guarded its write. Neither half had a positive
+ * test: neutering `writeDeferredActionableWarningsReport` to never write left
+ * all eight suites green (98/98), because every deferral assertion was about a
+ * loop STOPPING. AC3 is not "the sweep stops holding the terminal", it is "the
+ * findings still reach the agent, by the cached channel, one turn later at
+ * worst". These tests pin that second clause.
+ */
+
+/** One unused-variable warning on the modified line, plus its quickfix. */
+function armOneActionableWarning(basename: string): void {
+	diagnosticsByFile.set(basename, [
+		{
+			severity: 2,
+			message: "v0 is declared but its value is never read.",
+			range: {
+				start: { line: 0, character: 13 },
+				end: { line: 0, character: 15 },
+			},
+			source: "ts",
+			code: 6133,
+		},
+	]);
+	codeActions = [
+		{
+			title: "Remove unused declaration for v0",
+			kind: "quickfix",
+			edit: { changes: {} },
+		},
+	];
+}
+
+/** The minimal `turn_end` deps the actionable-warnings path needs. */
+function turnEndDeps(
+	runtime: RuntimeCoordinator,
+	cacheManager: CacheManager,
+): unknown {
+	return {
+		ctxCwd: env.tmpDir,
+		getFlag: (name: string) =>
+			name === "lens-actionable-warnings" ||
+			name === "lens-actionable-warning-actions",
+		dbg: () => {},
+		runtime,
+		cacheManager,
+		knipClient: {
+			ensureAvailable: async () => false,
+			analyze: async () => EMPTY_KNIP_RESULT,
+		},
+		deadCodeClients: [],
+		depChecker: { ensureAvailable: async () => false },
+		testRunnerClient: { getTestRunTarget: () => null },
+		resetLSPService: () => {},
+		resetFormatService: () => {},
+	};
+}
+
+describe("#2504 r3 F-A — the deferred report is actually DELIVERED", () => {
+	it("lands the off-hook findings in the cache when nothing newer is persisted", async () => {
+		const { _awaitDeferredLspPullForTest } = await loadWarnings();
+		const { handleTurnEnd } = await import("../../clients/runtime-turn.js");
+		const runtime = new RuntimeCoordinator();
+		const cacheManager = new CacheManager(false);
+
+		const source = makeSources(1)[0];
+		cacheManager.addModifiedRange(
+			source,
+			{ start: 1, end: 1 },
+			false,
+			env.tmpDir,
+			runtime.telemetrySessionId,
+		);
+		armOneActionableWarning(path.basename(source));
+
+		// biome-ignore lint/suspicious/noExplicitAny: minimal turn_end deps
+		await handleTurnEnd(turnEndDeps(runtime, cacheManager) as any);
+
+		// The AWAITED report carries nothing: the turn primed no LSP cache, so
+		// every pull was deferred. That is the whole point of #2504 — turn_end
+		// returns without the 187 s sweep.
+		const inBand = cacheManager.readCache<ActionableWarningsReport>(
+			"actionable-warnings",
+			env.tmpDir,
+		)?.data;
+		expect(inBand?.summary.files).toBe(0);
+
+		expect(await settlesWithin(_awaitDeferredLspPullForTest(), 8_000)).toBe(
+			"settled",
+		);
+		// The pull genuinely happened, off the hook, exactly once.
+		expect(getDiagnostics.mock.calls.length).toBe(1);
+
+		// …and the finding it produced REPLACED the empty in-band report, which
+		// is the only way the agent ever sees it.
+		const persisted = cacheManager.readCache<ActionableWarningsReport>(
+			"actionable-warnings",
+			env.tmpDir,
+		)?.data;
+		expect(persisted?.summary.files).toBe(1);
+		expect(persisted?.files[0]?.warnings[0]?.actions.length).toBeGreaterThan(0);
+	});
+
+	it("publishes even though the NEXT turn already edited a file", async () => {
+		const { _awaitDeferredLspPullForTest } = await loadWarnings();
+		const { handleTurnEnd } = await import("../../clients/runtime-turn.js");
+		const runtime = new RuntimeCoordinator();
+		const cacheManager = new CacheManager(false);
+
+		const source = makeSources(1)[0];
+		cacheManager.addModifiedRange(
+			source,
+			{ start: 1, end: 1 },
+			false,
+			env.tmpDir,
+			runtime.telemetrySessionId,
+		);
+		armOneActionableWarning(path.basename(source));
+
+		// biome-ignore lint/suspicious/noExplicitAny: minimal turn_end deps
+		await handleTurnEnd(turnEndDeps(runtime, cacheManager) as any);
+
+		// The next turn edits ONE file before the deferral finishes. That is the
+		// ordinary case, not an edge: the deferral exists precisely because the
+		// session is editing. Nothing NEWER has been persisted — no report has
+		// been written since this turn's own empty in-band one — so there is
+		// nothing to clobber and every reason to publish.
+		//
+		// Pre-fix, the `currentProjectSeq > report.projectSeqEnd` branch
+		// discarded it here (currentProjectSeq=1, projectSeqEnd=0), and the
+		// ledger then claimed the warnings were "re-derived by the next turn's
+		// report" — which a delta over a DISJOINT file set does not do.
+		runtime.recordProjectMutation({ filePath: source, source: "agent-edit" });
+		expect(runtime.projectSeq).toBeGreaterThan(0);
+
+		expect(await settlesWithin(_awaitDeferredLspPullForTest(), 8_000)).toBe(
+			"settled",
+		);
+
+		const persisted = cacheManager.readCache<ActionableWarningsReport>(
+			"actionable-warnings",
+			env.tmpDir,
+		)?.data;
+		expect(persisted?.summary.files).toBe(1);
+	});
+});
+
+describe("#2504 r3 F-A — the write guard still refuses a NEWER PERSISTED report", () => {
+	/**
+	 * Each surviving branch is pinned INDEPENDENTLY: every case below is built
+	 * so that exactly ONE branch can produce the refusal, so deleting either
+	 * branch alone turns exactly one of these red.
+	 */
+	function baseReport(
+		over: Partial<ActionableWarningsReport>,
+	): ActionableWarningsReport {
+		return {
+			generatedAt: new Date(2_000_000).toISOString(),
+			scope: "turn_delta",
+			sessionId: "lens-test",
+			turnIndex: 7,
+			projectSeqStart: 39,
+			projectSeqEnd: 40,
+			deltaOnly: true,
+			includeLspCodeActions: true,
+			files: [],
+			summary: {
+				warnings: 0,
+				unsuppressed: 0,
+				byTier: { warning: 0, info: 0, hint: 0 },
+				suppressed: 0,
+				files: 0,
+				actions: 0,
+				autoFixEligible: 0,
+			},
+			...over,
+		} as ActionableWarningsReport;
+	}
+
+	it("refuses on a newer persisted projectSeqEnd alone", async () => {
+		const { writeDeferredActionableWarningsReport } = await loadWarnings();
+		const cacheManager = new CacheManager(false);
+		// Equal turnIndex and an EARLIER generatedAt, so neither of the other
+		// two branches can fire. Only projectSeqEnd can.
+		cacheManager.writeCache(
+			"actionable-warnings",
+			baseReport({
+				projectSeqEnd: 41,
+				generatedAt: new Date(1_000_000).toISOString(),
+			}),
+			env.tmpDir,
+		);
+		const result = writeDeferredActionableWarningsReport({
+			cacheManager,
+			cwd: env.tmpDir,
+			report: baseReport({}),
+		});
+		expect(result.written).toBe(false);
+		expect(result.reason).toContain("projectSeqEnd");
+	});
+
+	it("refuses on a newer persisted turnIndex alone", async () => {
+		const { writeDeferredActionableWarningsReport } = await loadWarnings();
+		const cacheManager = new CacheManager(false);
+		// Equal projectSeqEnd and an EARLIER generatedAt, so only turnIndex can
+		// fire.
+		cacheManager.writeCache(
+			"actionable-warnings",
+			baseReport({
+				turnIndex: 8,
+				generatedAt: new Date(1_000_000).toISOString(),
+			}),
+			env.tmpDir,
+		);
+		const result = writeDeferredActionableWarningsReport({
+			cacheManager,
+			cwd: env.tmpDir,
+			report: baseReport({}),
+		});
+		expect(result.written).toBe(false);
+		expect(result.reason).toContain("turn 8");
+	});
+
+	it("publishes over an OLDER persisted report", async () => {
+		const { writeDeferredActionableWarningsReport } = await loadWarnings();
+		const cacheManager = new CacheManager(false);
+		cacheManager.writeCache(
+			"actionable-warnings",
+			baseReport({
+				turnIndex: 6,
+				projectSeqEnd: 39,
+				generatedAt: new Date(1_000_000).toISOString(),
+			}),
+			env.tmpDir,
+		);
+		const result = writeDeferredActionableWarningsReport({
+			cacheManager,
+			cwd: env.tmpDir,
+			report: baseReport({}),
+		});
+		expect(result.written).toBe(true);
+		const persisted = cacheManager.readCache<ActionableWarningsReport>(
+			"actionable-warnings",
+			env.tmpDir,
+		)?.data;
+		expect(persisted?.turnIndex).toBe(7);
+	});
+});
+
+describe("#2504 r3 F-B — an unacknowledged open is never read as clean", () => {
+	it("skips the file rather than pulling for a document the server never received", async () => {
+		const { buildActionableWarningsReport, _awaitDeferredLspPullForTest } =
+			await loadWarnings();
+		const files = makeSources(1);
+		wedgedOpens.add(path.basename(files[0]));
+
+		await buildActionableWarningsReport({
+			cwd: env.tmpDir,
+			sessionId: "lens-test",
+			turnIndex: 1,
+			files,
+			modifiedRangesByFile: new Map(),
+			dispatchWarnings: [],
+			includeLspCodeActions: true,
+			lspPullTimeoutMs: 200,
+			onDeferredReport: () => {},
+		});
+
+		expect(await settlesWithin(_awaitDeferredLspPullForTest(), 4_000)).toBe(
+			"settled",
+		);
+		// #240. The bounded `openFile` lost to its timeout, so the server never
+		// received the document. Pulling anyway asks it about a file it has
+		// never seen; the empty answer means UNKNOWN, and the pre-fix code
+		// logged the file `lsp_file_checked lspSource:"fresh"` — a failed pull
+		// read as clean, which is exactly what the comment beside the pull
+		// promises never happens.
+		expect(getDiagnostics.mock.calls.length).toBe(0);
+	});
+
+	it("still pulls when the open was acknowledged", async () => {
+		const { buildActionableWarningsReport, _awaitDeferredLspPullForTest } =
+			await loadWarnings();
+		const files = makeSources(1);
+
+		await buildActionableWarningsReport({
+			cwd: env.tmpDir,
+			sessionId: "lens-test",
+			turnIndex: 1,
+			files,
+			modifiedRangesByFile: new Map(),
+			dispatchWarnings: [],
+			includeLspCodeActions: true,
+			lspPullTimeoutMs: 200,
+			onDeferredReport: () => {},
+		});
+
+		expect(await settlesWithin(_awaitDeferredLspPullForTest(), 4_000)).toBe(
+			"settled",
+		);
+		expect(getDiagnostics.mock.calls.length).toBe(1);
 	});
 });
