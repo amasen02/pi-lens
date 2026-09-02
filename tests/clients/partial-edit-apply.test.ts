@@ -6,6 +6,7 @@ import {
 	applyPartiallyApplicableEdits,
 	type EditSnapshotIdentity,
 	isExactAppliedRetry,
+	MAX_APPLIED_RECORD_FILES,
 	PartialApplyRecordStore,
 	type PartiallyApplicableEdit,
 } from "../../clients/partial-edit-apply.js";
@@ -664,12 +665,51 @@ describe("PartialApplyRecordStore", () => {
 		for (let i = 0; i < 70; i += 1) {
 			store.record(`/f${i}.ts`, "old", "new");
 		}
-		expect(store.fileCount).toBe(64);
+		expect(store.fileCount).toBe(MAX_APPLIED_RECORD_FILES);
 		expect(store.find("/f0.ts", "old", "new")).toBeUndefined();
 		expect(store.find("/f69.ts", "old", "new")).toBeDefined();
 
 		store.clear();
 		expect(store.fileCount).toBe(0);
+	});
+
+	it("a re-record of a resident file at capacity evicts nothing (#2442)", () => {
+		// The hand-rolled `keys().next().value` block this replaced evicted
+		// BEFORE inserting whenever `size >= cap`, so re-recording an edit for a
+		// file ALREADY in the store dropped an unrelated file and the store
+		// silently shrank by one. The bound now lives on the PathKeyedMap
+		// itself, which inserts first and evicts only while genuinely over
+		// capacity.
+		const store = new PartialApplyRecordStore();
+		for (let i = 0; i < MAX_APPLIED_RECORD_FILES; i += 1) {
+			store.record(`/cap${i}.ts`, "old", "new");
+		}
+		expect(store.fileCount).toBe(MAX_APPLIED_RECORD_FILES);
+
+		// A second edit to a file already in the store — an UPDATE, not a new key.
+		store.record("/cap0.ts", "old-2", "new-2");
+
+		expect(store.fileCount).toBe(MAX_APPLIED_RECORD_FILES);
+		// Nothing was displaced: every original file is still findable.
+		expect(store.find("/cap1.ts", "old", "new")).toBeDefined();
+		expect(store.find("/cap0.ts", "old-2", "new-2")).toBeDefined();
+	});
+
+	it("a re-record does not refresh a file's eviction position (FIFO, #2442)", () => {
+		const store = new PartialApplyRecordStore();
+		for (let i = 0; i < MAX_APPLIED_RECORD_FILES; i += 1) {
+			store.record(`/fifo${i}.ts`, "old", "new");
+		}
+		// Read AND re-write the oldest file, then overflow. `find` is the
+		// store's production read (`files.get`); under an LRU-backed store
+		// either access would promote fifo0 and fifo1 would be evicted instead.
+		expect(store.find("/fifo0.ts", "old", "new")).toBeDefined();
+		store.record("/fifo0.ts", "old-again", "new-again");
+
+		store.record("/overflow.ts", "old", "new");
+
+		expect(store.find("/fifo0.ts", "old-again", "new-again")).toBeUndefined();
+		expect(store.find("/fifo1.ts", "old", "new")).toBeDefined();
 	});
 });
 

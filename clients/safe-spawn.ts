@@ -22,6 +22,7 @@ import {
 } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { BoundedFifoMap } from "./bounded-cache.js";
 import { logLatency } from "./latency-logger.js";
 import { recordDegradation } from "./degradation-ledger.js";
 import { logExtension } from "./extension-log.js";
@@ -802,13 +803,16 @@ function resolveWindowsPathEntry(
  * cache is also count-bounded with oldest-entry eviction because a long-lived
  * process can encounter unbounded cwd/environment combinations.
  */
-const WINDOWS_COMMAND_CACHE_MAX_ENTRIES = 256;
+export const WINDOWS_COMMAND_CACHE_MAX_ENTRIES = 256;
 const WINDOWS_COMMAND_NEGATIVE_CACHE_TTL_MS = 1000;
 interface WindowsCommandCacheEntry {
 	resolved: ResolvedWindowsCommand | null;
 	checkedAt: number;
 }
-const windowsCommandCache = new Map<string, WindowsCommandCacheEntry>();
+const windowsCommandCache = new BoundedFifoMap<
+	string,
+	WindowsCommandCacheEntry
+>(WINDOWS_COMMAND_CACHE_MAX_ENTRIES);
 
 /** Reset after session replacement or a successful managed install. */
 export function resetSafeSpawnWindowsCommandCache(): void {
@@ -820,13 +824,12 @@ function cacheWindowsCommandResult(
 	key: string,
 	resolved: ResolvedWindowsCommand | null,
 ): void {
-	if (windowsCommandCache.size >= WINDOWS_COMMAND_CACHE_MAX_ENTRIES) {
-		// Resolution entries are session-scoped and cheap to recompute. Evict the
-		// oldest insertion first so a long-lived process cannot retain every cwd /
-		// environment it has ever touched.
-		const oldest = windowsCommandCache.keys().next().value;
-		if (oldest !== undefined) windowsCommandCache.delete(oldest);
-	}
+	// Resolution entries are session-scoped and cheap to recompute. The
+	// caller always deletes any stale entry for `key` before reaching here
+	// (see resolveWindowsCommandForEnvironment), so this can only grow the
+	// map; BoundedFifoMap evicts the oldest insertion first once the map
+	// exceeds capacity, so a long-lived process cannot retain every cwd /
+	// environment it has ever touched.
 	windowsCommandCache.set(key, { resolved, checkedAt: Date.now() });
 }
 

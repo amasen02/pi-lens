@@ -98,7 +98,8 @@ export interface AppliedPartialEditRecord {
 }
 
 const MAX_APPLIED_RECORDS_PER_FILE = 8;
-const MAX_APPLIED_RECORD_FILES = 64;
+/** Exported for #2442's bounded-eviction test; not a public API. */
+export const MAX_APPLIED_RECORD_FILES = 64;
 
 /**
  * Canonical key for an applied edit: LF-normalized, per-line trailing
@@ -220,8 +221,12 @@ export function isExactAppliedRetry(args: {
  * both axes (per-file entries, and files) with oldest-entry eviction.
  */
 export class PartialApplyRecordStore {
+	// Bounded on the PathKeyedMap itself (#2442): the file axis used to
+	// hand-roll `keys().next().value` here, which also evicted an unrelated
+	// file when a path ALREADY in the map was re-recorded at capacity.
 	private readonly files = new PathKeyedMap<AppliedPartialEditRecord[]>(
 		normalizeMapKey,
+		MAX_APPLIED_RECORD_FILES,
 	);
 
 	find(
@@ -253,11 +258,7 @@ export class PartialApplyRecordStore {
 		};
 		if (records.length >= MAX_APPLIED_RECORDS_PER_FILE) records.shift();
 		records.push(entry);
-		if (this.files.size >= MAX_APPLIED_RECORD_FILES) {
-			const oldest = this.files.keys().next().value;
-			if (oldest !== undefined) this.files.delete(oldest);
-		}
-		this.files.set(filePath, records);
+		this.files.set(filePath, records); // the map bounds its own file axis
 	}
 
 	/**

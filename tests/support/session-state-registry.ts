@@ -1193,20 +1193,28 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"dispatch/runners/ast-grep-napi.ts": 7,
 	"dispatch/runners/biome-check.ts": 1,
 	"dispatch/runners/psscriptanalyzer.ts": 2,
-	"dispatch/runners/spotbugs.ts": 0,
+	// #2442 review F2: the container regex now recognises BoundedFifoMap /
+	// BoundedLruCache, so this file's module-level bounded cache is counted.
+	"dispatch/runners/spotbugs.ts": 1,
 	"dispatch/runners/utils/lazy-installer.ts": 2,
 	"dispatch/runners/utils/runner-helpers.ts": 7,
 	"disposition-publish.ts": 0,
 	"extension-log.ts": 2,
 	"format-events-publish.ts": 0,
-	"formatters.ts": 7,
-	"generated-artifacts.ts": 2,
+	// #2442 review F2: the container regex now recognises BoundedFifoMap /
+	// BoundedLruCache, so this file's module-level bounded cache is counted.
+	"formatters.ts": 8,
+	// #2442 review F2: the container regex now recognises BoundedFifoMap /
+	// BoundedLruCache, so this file's module-level bounded cache is counted.
+	"generated-artifacts.ts": 3,
 	// #2007 hoisted git's global-option table to a module-level `new Set`
 	// (1 → 2). It is an import-time frozen lookup with no session lifetime —
 	// SWEEP_HEURISTIC_LIMITS item 5, not state that must re-arm.
 	"git-guard.ts": 2,
 	"git-tracked-ignore.ts": 3,
-	"installer/index.ts": 12,
+	// #2442 review F2: the container regex now recognises BoundedFifoMap /
+	// BoundedLruCache, so this file's module-level bounded cache is counted.
+	"installer/index.ts": 13,
 	"instance-registry.ts": 0,
 	"latency-logger.ts": 2,
 	// #2418 removed lens-config.ts's row: its only module-scope state was the
@@ -1223,7 +1231,9 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	// per module evaluation to one per process — and it stays exempt from a
 	// session_start reset for exactly the reason recorded above.
 	"lsp/client.ts": 2,
-	"lsp/config.ts": 1,
+	// #2442 review F2: the container regex now recognises BoundedFifoMap /
+	// BoundedLruCache, so this file's module-level bounded cache is counted.
+	"lsp/config.ts": 2,
 	"lsp/index.ts": 2,
 	// #2000 phase 2: the pending-baseline store (one slot per cwd:generation)
 	// plus the process-global Symbol.for slot; cleared via resetOpaqueMutationState.
@@ -1274,7 +1284,12 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"quiet-window.ts": 0,
 	"recent-touches.ts": 1,
 	"review-graph/builder.ts": 19,
-	"review-graph/git-identity.ts": 0,
+	// #2442 review F2: the container regex now recognises BoundedFifoMap /
+	// BoundedLruCache, so this file's module-level bounded cache is counted.
+	"review-graph/git-identity.ts": 1,
+	// #2442 review F2: the container regex now recognises BoundedFifoMap /
+	// BoundedLruCache, so this file's module-level bounded cache is counted.
+	"review-graph/tsconfig-paths.ts": 2,
 	"review-graph/shared-extraction-ir.ts": 1,
 	"review-graph/workspace-modules.ts": 2,
 	"runtime-config.ts": 0,
@@ -1290,7 +1305,9 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	// is what flags this file now.
 	"session-start-observability.ts": 0,
 	"sgconfig.ts": 2,
-	"slow-fs.ts": 0,
+	// #2442 review F2: the container regex now recognises BoundedFifoMap /
+	// BoundedLruCache, so this file's module-level bounded cache is counted.
+	"slow-fs.ts": 1,
 	"smells-rollup.ts": 1,
 	"startup-timing.ts": 0,
 	"subagent-mode.ts": 0,

@@ -958,37 +958,49 @@ describe("triggerBackgroundWordIndexBuild (#348 cold-query stampede guard)", () 
 	// dropped the overflow so the tail postings read `undefined`. The fix skips
 	// any list that changed since the snapshot, so no posting is ever corrupted.
 	it("never corrupts postings when an edit grows a list mid-recompaction (#2117)", async () => {
-		// Enough lane data that the copy crosses the 8 ms budget and yields at
-		// least once — the window the concurrent edit needs.
+		// A sizeable corpus so the arena spans many lists, but the yield itself is
+		// no longer sized to cross a wall-clock budget — see the forced deadline
+		// below (#2293).
 		const postings = new Map<string, WordPostingList>();
-		const LISTS = 40_000;
-		const ENTRIES = 60;
+		const LISTS = 2_000;
+		const ENTRIES = 20;
 		for (let t = 0; t < LISTS; t += 1) {
 			const list = new WordPostingList(`token${t}`, ENTRIES);
 			for (let e = 0; e < ENTRIES; e += 1) list.push(t % 7, e);
 			postings.set(`token${t}`, list);
 		}
 		// The victim is inserted last, so the copy adopts it only at the very end;
-		// every yield gap lands before its adoption.
+		// the forced yield below lands well before its adoption.
 		const victim = new WordPostingList("victimToken", 1);
 		victim.push(3, 0);
 		postings.set("victimToken", victim);
 
-		const recompact = compactPostingsIntoArenaCooperatively(postings);
-		let settled = false;
-		void recompact.then(() => {
-			settled = true;
-		});
-		// Grow the victim in each yield gap until the copy finishes. On the
-		// pre-fix code the grown victim overruns its 1-entry arena slot.
+		// #2293: `grewDuringYield` used to be a PRECONDITION riding on the real
+		// 8 ms deadline actually crossing during the copy — true only when the
+		// scheduler let the copy run long enough to yield at least once before
+		// finishing, which a busy CI box or a smaller corpus could miss, failing
+		// the assertion below for a reason unrelated to the #2117 invariant. This
+		// deadline expires on its very first check (deterministically, before the
+		// victim's plan is reached, since the victim is last) and never expires
+		// again once reset — the real `CooperativeDeadline` contract, just driven
+		// by an explicit trigger instead of wall-clock time. `beforeYield` runs
+		// in-line with the production yield, so the growth is guaranteed to land
+		// mid-copy without racing a second concurrently-scheduled loop.
+		let usedOnce = false;
 		let grewDuringYield = false;
-		while (!settled) {
-			await new Promise<void>((resolve) => setImmediate(resolve));
-			if (!settled) {
+		const recompact = compactPostingsIntoArenaCooperatively(postings, {
+			deadline: {
+				expired: () => !usedOnce,
+				reset: () => {
+					usedOnce = true;
+				},
+			},
+			beforeYield: () => {
+				// On the pre-fix code the grown victim overruns its 1-entry arena slot.
 				victim.push(3, victim.length);
 				grewDuringYield = true;
-			}
-		}
+			},
+		});
 		await recompact;
 
 		expect(grewDuringYield).toBe(true);

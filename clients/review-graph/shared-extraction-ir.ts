@@ -4,6 +4,7 @@ import type {
 	ImportEntry,
 	ReExportEntry,
 } from "../dispatch/facts/import-facts.js";
+import { BoundedFifoMap } from "../bounded-cache.js";
 import { normalizeMapKey } from "../path-utils.js";
 import type { ExtractedSymbols } from "../tree-sitter-symbol-extractor.js";
 
@@ -64,7 +65,13 @@ export function reviewGraphIrContentHash(content: string): string {
 // registry's lifetime is the scan-to-build window, not the process lifetime.
 const MAX_ROOTS = 8;
 const MAX_FILES_PER_ROOT = 20_000;
-const roots = new Map<string, Map<string, ReviewGraphFileIr>>();
+// Both levels are FIFO, matching the hand-rolled blocks these replaced: no
+// read on either map refreshed recency before #2442, and the consume-once
+// contract above means a read is normally a DELETE anyway.
+const roots = new BoundedFifoMap<
+	string,
+	BoundedFifoMap<string, ReviewGraphFileIr>
+>(MAX_ROOTS);
 let accepted = 0;
 let rejected = 0;
 
@@ -84,21 +91,11 @@ export function publishReviewGraphFileIr(
 	const key = rootKey(cwd);
 	let files = roots.get(key);
 	if (!files) {
-		files = new Map();
+		files = new BoundedFifoMap<string, ReviewGraphFileIr>(MAX_FILES_PER_ROOT);
 		roots.set(key, files);
-		while (roots.size > MAX_ROOTS) {
-			const oldest = roots.keys().next().value as string | undefined;
-			if (oldest === undefined) break;
-			roots.delete(oldest);
-		}
 	}
 	const fileKey = normalizeMapKey(entry.filePath);
-	files.delete(fileKey);
-	while (files.size >= MAX_FILES_PER_ROOT) {
-		const oldest = files.keys().next().value as string | undefined;
-		if (oldest === undefined) break;
-		files.delete(oldest);
-	}
+	files.delete(fileKey); // republish is a refresh: it becomes the newest
 	files.set(fileKey, { ...entry, filePath: fileKey });
 }
 

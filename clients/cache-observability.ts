@@ -48,6 +48,7 @@
  * event handlers.
  */
 import { createHash } from "node:crypto";
+import { BoundedFifoMap, BoundedLruCache } from "./bounded-cache.js";
 import { lazyEnvNumber } from "./env-utils.js";
 import { logLatency } from "./latency-logger.js";
 import { compareOrdinal } from "./string-utils.js";
@@ -293,7 +294,14 @@ function newCacheUsageSummary(): CacheUsageSessionSummary {
 	};
 }
 
-const attributionBySession = new Map<string, SessionAttributionState>();
+// Shared cap for every per-session bounded map in this module (also used by
+// `prefixHashBySession` below) — a long-lived process cycling through many
+// sessions cannot grow any of them without limit.
+export const MAX_TRACKED_SESSIONS = 32;
+const attributionBySession = new BoundedLruCache<
+	string,
+	SessionAttributionState
+>(MAX_TRACKED_SESSIONS);
 
 function newAttributionState(): SessionAttributionState {
 	return {
@@ -317,13 +325,9 @@ function newAttributionState(): SessionAttributionState {
 function attributionFor(key: string): SessionAttributionState {
 	const existing = attributionBySession.get(key);
 	const state = existing ?? newAttributionState();
-	attributionBySession.delete(key);
+	// `get` above already moved an existing entry to MRU; `set` below also
+	// refreshes recency on a create, so every fetch counts as a touch.
 	attributionBySession.set(key, state);
-	while (attributionBySession.size > MAX_TRACKED_SESSIONS) {
-		const oldest = attributionBySession.keys().next().value;
-		if (oldest === undefined) break;
-		attributionBySession.delete(oldest);
-	}
 	return state;
 }
 
@@ -1349,11 +1353,15 @@ function hashFirstMessage(first: {
  *     session state (read guard #1041, widget #190) which IS rehydrated from the
  *     sidecar.
  *
- * Bounded as an insertion-ordered LRU (evict oldest-inserted past the cap) so a
- * long-lived process cycling through many sessions can't grow this unbounded.
+ * Bounded as insertion-ordered FIFO (evict oldest-inserted past the cap,
+ * refreshed on every WRITE by {@link recordSessionHash}'s delete+set — a
+ * plain read never reorders) so a long-lived process cycling through many
+ * sessions can't grow this unbounded. Shares {@link MAX_TRACKED_SESSIONS}
+ * with `attributionBySession` above.
  */
-const MAX_TRACKED_SESSIONS = 32;
-const prefixHashBySession = new Map<string, string>();
+const prefixHashBySession = new BoundedFifoMap<string, string>(
+	MAX_TRACKED_SESSIONS,
+);
 
 /**
  * Reported key used when no session id is available (undefined/empty). Internal
@@ -1371,11 +1379,6 @@ const NO_SESSION_KEY = "<no-session>";
 function recordSessionHash(key: string, hash: string): void {
 	prefixHashBySession.delete(key);
 	prefixHashBySession.set(key, hash);
-	while (prefixHashBySession.size > MAX_TRACKED_SESSIONS) {
-		const oldest = prefixHashBySession.keys().next().value;
-		if (oldest === undefined) break;
-		prefixHashBySession.delete(oldest);
-	}
 }
 
 /**
@@ -1531,4 +1534,40 @@ export function emitCacheUsageSummaryAtSessionEnd(
 export function resetCachePrefixObservation(): void {
 	prefixHashBySession.clear();
 	attributionBySession.clear();
+}
+
+/** #2442 test-only membership reads, bypassing emitCacheUsageSummaryAtSessionEnd's
+ *  usageRecords>0 gate and log side effects. */
+export function _attributionKeyForTests(
+	sessionId?: string,
+	sessionRole?: "primary" | "concurrent-secondary",
+): string {
+	return attributionKey(sessionId, sessionRole);
+}
+export function _attributionBySessionHasForTests(key: string): boolean {
+	return attributionBySession.has(key);
+}
+export function _prefixHashBySessionHasForTests(key: string): boolean {
+	return prefixHashBySession.has(key);
+}
+/** #2442 test-only: drive attributionFor's fetch-or-create touch directly
+ *  (every call refreshes LRU recency, matching production — see
+ *  attributionFor's own doc comment). */
+export function _touchAttributionForTests(key: string): void {
+	attributionFor(key);
+}
+/** #2442 test-only: drive recordSessionHash's write-refresh directly. */
+export function _recordSessionHashForTests(key: string, hash: string): void {
+	recordSessionHash(key, hash);
+}
+/**
+ * #2442 test-only: the exact `prefixHashBySession.get(key)` that
+ * `observeCachePrefix` performs to fetch a session's previous hash. A
+ * `.has()` reorders nothing on either bounded class, so only a real `get`
+ * can pin FIFO-vs-LRU behavior (#2442 review F4).
+ */
+export function _prefixHashBySessionGetForTests(
+	key: string,
+): string | undefined {
+	return prefixHashBySession.get(key);
 }
