@@ -280,10 +280,14 @@ describe("#2467 — both bounds on the wait, neither on the load", () => {
 		controller.abort();
 		expect(await pending).toBeNull();
 
+		// The CALLER'S OWN signal fired — a deliberate cancel, not the seam
+		// degrading (#2467 review, F5). Writing it to the ledger inverted the
+		// two: a user pressing Escape would surface as an unhealthy analyzer
+		// graph in `pilens_health`. Nothing is recorded for it.
 		const group = ledger
 			.getDegradationSummary()
 			.find((entry) => entry.kind === "analyzer-bootstrap-unavailable");
-		expect(group?.latestReasons[0]?.reason).toContain("aborted");
+		expect(group).toBeUndefined();
 
 		gate.release();
 		await bootstrap.loadBootstrapClients();
@@ -334,6 +338,47 @@ describe("#2467 — the primary-shutdown gate", () => {
 				return bootstrap.loadBootstrapClients();
 			})(),
 		).rejects.toThrow(/shutting down/);
+	}, 30_000);
+
+	it("unparks a bounded waiter at shutdown instead of burning the full ceiling", async () => {
+		const { bootstrap, ledger } = await freshSeam();
+		const gate = gateOneClientImport();
+
+		const pending = bootstrap.requestBootstrapClients({
+			reason: "session-start-scans",
+			timeoutMs: 60_000,
+		});
+		await new Promise((resolve) => setImmediate(resolve));
+		expect(bootstrap._analyzerBootstrapLoadAttempts()).toBe(1);
+
+		bootstrap.markAnalyzerBootstrapShutdown();
+		expect(await pending).toBeNull();
+		const group = ledger
+			.getDegradationSummary()
+			.find((entry) => entry.kind === "analyzer-bootstrap-unavailable");
+		expect(group?.latestReasons[0]?.reason).toContain("shutdown");
+
+		gate.release();
+		const clients = await bootstrap.loadBootstrapClients();
+		expect(clients.biomeClient).toBeDefined();
+		expect(bootstrap._analyzerBootstrapLoadAttempts()).toBe(1);
+	}, 30_000);
+
+	it("a bounded demand joins a live flight and gets clients when no shutdown fired", async () => {
+		const { bootstrap } = await freshSeam();
+		const gate = gateOneClientImport();
+
+		const opener = bootstrap.loadBootstrapClients();
+		const joiner = bootstrap.requestBootstrapClients({
+			reason: "tool-call-complexity-baseline",
+			timeoutMs: 60_000,
+		});
+
+		gate.release();
+		const [a, b] = await Promise.all([opener, joiner]);
+		expect(b).toBe(a);
+		expect(b?.biomeClient).toBeDefined();
+		expect(bootstrap._analyzerBootstrapLoadAttempts()).toBe(1);
 	}, 30_000);
 
 	it("admits a NEW demand that arrives while a flight is still live", async () => {

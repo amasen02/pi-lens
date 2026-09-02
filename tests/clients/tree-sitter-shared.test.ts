@@ -1,8 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ComplexityClient } from "../../clients/complexity-client.js";
+import { LANGUAGES } from "../../clients/language-registry.js";
 import {
 	_resetSharedTreeSitterClientForTests,
+	COMPLEXITY_LANGUAGE_IDS,
+	EXT_TO_LANG,
 	getSharedTreeSitterClient,
 	getTreeSitterRuntimeStatus,
+	isComplexitySupportedFile,
 	isTreeSitterWasmAborted,
 	markTreeSitterWasmAborted,
 	resolveTreeSitterLanguage,
@@ -45,6 +50,36 @@ describe("resolveTreeSitterLanguage", () => {
 	it("returns undefined for unsupported extensions", () => {
 		expect(resolveTreeSitterLanguage("file.md")).toBeUndefined();
 		expect(resolveTreeSitterLanguage("file")).toBeUndefined();
+	});
+});
+
+/**
+ * #2467 review, F6: nothing shipped pinned the ONE thing
+ * `isComplexitySupportedFile` exists to be — the client-free mirror of
+ * `ComplexityClient.isSupportedFile` — or that `COMPLEXITY_LANGUAGE_IDS`
+ * still names grammars the canonical registry actually resolves to. Either
+ * one could drift silently: the client delegates back to this predicate
+ * today, so a future edit that breaks that delegation compiles clean, and a
+ * grammar rename in `language-registry.ts` would leave a `COMPLEXITY_LANGUAGE_IDS`
+ * entry that `resolveTreeSitterLanguage` can never produce, silently starving
+ * that language of complexity baselines.
+ */
+describe("isComplexitySupportedFile mirrors ComplexityClient.isSupportedFile (#2467 review, F6)", () => {
+	it("agrees with the client on every extension the registry owns", () => {
+		const client = new ComplexityClient();
+		for (const ext of Object.keys(EXT_TO_LANG)) {
+			const filePath = `src/file${ext}`;
+			expect(isComplexitySupportedFile(filePath)).toBe(
+				client.isSupportedFile(filePath),
+			);
+		}
+	});
+
+	it("every COMPLEXITY_LANGUAGE_IDS entry is a live registry grammar id", () => {
+		const liveGrammarIds = new Set(LANGUAGES.map((entry) => entry.grammar));
+		for (const languageId of COMPLEXITY_LANGUAGE_IDS) {
+			expect(liveGrammarIds.has(languageId)).toBe(true);
+		}
 	});
 });
 

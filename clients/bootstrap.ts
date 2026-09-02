@@ -508,13 +508,15 @@ export function loadBootstrapClients(): Promise<BootstrapClients> {
 			),
 		);
 	}
-	// Same `!has()` shape as the shutdown gate above, for the same reason: a
-	// flight that is already running is JOINED, never refused. Only a build
-	// this call would have to START is what the strike latch declines.
-	if (
-		bootstrapFailureStrikes >= BOOTSTRAP_FAILURE_STRIKE_LIMIT &&
-		!bootstrapFlight.has(BOOTSTRAP_FLIGHT_KEY)
-	) {
+	// Unlike the shutdown gate above, this one has no `!has()` half: strikes
+	// only ever reach the limit inside `noteBootstrapBuildFailure`, which runs
+	// synchronously INSIDE this flight's own callback, immediately before it
+	// rethrows and the flight's `release` runs — there is no synchronous window
+	// in which a fresh call can observe strikes at the limit while that same
+	// flight is still registered. A `!has()` half here would only ever be
+	// false, so it stayed an untested branch (#2467 review, F2) rather than a
+	// second guard.
+	if (bootstrapFailureStrikes >= BOOTSTRAP_FAILURE_STRIKE_LIMIT) {
 		return Promise.reject(
 			new BootstrapUnavailableError(
 				"latched",
@@ -580,9 +582,13 @@ function noteBootstrapBuildFailure(err: unknown): void {
  * Bounds the caller's WAIT on both axes AGENTS.md's both-bounds rule names —
  * a wall-clock ceiling AND the caller's abort signal — and answers `null`
  * instead of throwing, so the caller proceeds without the clients. Every
- * `null` is counted in the degradation ledger under
+ * `null` caused by the SEAM (shutdown, timeout, a rejected load, or the
+ * strike latch) is counted in the degradation ledger under
  * `analyzer-bootstrap-unavailable`, rising-edge per subject, so a repeated
  * failure stays one record with an exact count rather than per-demand spam.
+ * A `null` caused by the CALLER'S OWN signal firing is not: that is the
+ * caller choosing to stop waiting (Escape, a turn ending), not the analyzer
+ * graph degrading, and counting it inverted the two in `pilens_health`.
  */
 export async function requestBootstrapClients(options: {
 	/** Who is asking. Becomes the ledger subject, so keep it stable and coarse. */
@@ -610,23 +616,32 @@ export async function requestBootstrapClients(options: {
 			err instanceof BootstrapUnavailableError
 				? err.unavailableReason
 				: "failed";
-		emitBounded(
-			"bootstrap_clients_unavailable",
-			options.reason,
-			{
-				durationMs: 0,
-				metadata: {
-					unavailableReason,
-					attempt: bootstrapLoadAttempts,
-					detail: (err as Error)?.message ?? String(err),
+		// "aborted" means the CALLER'S OWN signal fired — a user pressing Escape
+		// mid-tool-call, a turn ending. That is the caller choosing to stop
+		// waiting, not the analyzer graph degrading, and writing it to the ledger
+		// inverted the two: a deliberate cancel surfaced identically to an
+		// unhealthy environment in `pilens_health`. `shutdown`/`timeout`/`failed`/
+		// `latched` all describe the SEAM failing to serve the demand, so those
+		// still count.
+		if (unavailableReason !== "aborted") {
+			emitBounded(
+				"bootstrap_clients_unavailable",
+				options.reason,
+				{
+					durationMs: 0,
+					metadata: {
+						unavailableReason,
+						attempt: bootstrapLoadAttempts,
+						detail: (err as Error)?.message ?? String(err),
+					},
 				},
-			},
-			{
-				ledgerKind: "analyzer-bootstrap-unavailable",
-				risingEdgePer: "identity",
-				reason: unavailableReason,
-			},
-		);
+				{
+					ledgerKind: "analyzer-bootstrap-unavailable",
+					risingEdgePer: "identity",
+					reason: unavailableReason,
+				},
+			);
+		}
 		return null;
 	}
 }

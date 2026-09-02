@@ -989,14 +989,24 @@ the strict form for callers that cannot proceed without the clients. Concurrent
 demands share one `createSingleFlight` flight, a rejected load is retried by
 the next demand, and `markAnalyzerBootstrapShutdown()` (primary
 `session_shutdown`) refuses NEW loads without invalidating a waiter already in
-flight — nor a NEW demand that joins a flight already running;
+flight — nor a NEW demand through the STRICT accessor that joins a flight
+already running. `markAnalyzerBootstrapShutdown()` also aborts the seam's own
+teardown signal, which every BOUNDED demand races (#2467 review, F1); a
+`requestBootstrapClients()` call made AFTER shutdown therefore fails open
+immediately via that signal, whether or not a flight happens to still be
+running — the "still joins" guarantee is the strict accessor's alone.
 `resetAnalyzerBootstrapSessionState()` re-arms that gate at
 `session_start`. Retry is bounded: after `BOOTSTRAP_FAILURE_STRIKE_LIMIT` (3)
 consecutive failed builds the seam stops rebuilding and fails open
 immediately, recorded once under `analyzer-bootstrap-latched` and re-armed at
 `session_start` — a module that cannot resolve under the host's package
 layout fails identically every time, so re-running seventeen dynamic imports
-plus `collectInstallDiagnostics` per demand bought nothing.
+plus `collectInstallDiagnostics` per demand bought nothing. A `null` from
+`requestBootstrapClients()` is counted under `analyzer-bootstrap-unavailable`
+for every seam-caused reason (shutdown, timeout, a rejected load, the strike
+latch) but NOT for `aborted` — the caller's own signal firing is a deliberate
+cancel, not the seam degrading, and counting it would read as an unhealthy
+analyzer graph in `pilens_health` (#2467 review, F5).
 `bootstrap_clients_load` is emitted by `clients/bootstrap.ts`
 where the load actually runs, stamped with the attempt number, NOT by
 `handleSessionStart`.
