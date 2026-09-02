@@ -3134,6 +3134,19 @@ the registry checks this derived set rather than a copied list. Keep resets for
 process-singleton session state behind the concurrent-secondary decision. The
 primary activation owns the tally, and a secondary must never clear it.
 
+`tests/support/session-state-scan.ts`'s container detector recognises a
+module-level `const`/`let` bound to `new <Ctor>(...)` where `<Ctor>` is a
+built-in (`Map`/`Set`/`WeakMap`/`WeakSet`) or `containerClassNames()` — every
+class exported from `clients/` that owns a `clear()`/`delete()` method,
+resolved directly or through an `extends` chain, scanned live once per run
+instead of hand-listed. #2442's `BoundedFifoMap`/`BoundedLruCache` migration
+had to be added to a hard-coded alternation by hand before the scan could see
+it again; #2455 replaced the alternation with this scan so a NEW repo-local
+collection wrapper is recognised the moment it is written. A class that
+structurally qualifies but provably holds no session state gets a documented
+`CONTAINER_CLASS_EXCLUSIONS` entry rather than a special case at the call
+site — empty today.
+
 ## Issue triage & labels
 
 Every issue should carry **one TYPE label + at least one `area:` label**.

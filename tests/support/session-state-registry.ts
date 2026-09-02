@@ -1184,7 +1184,13 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"dispatch/collect-later-tier.ts": 1,
 	// #1899 removed the dead `neighborTouchCache` (10 → 9); #2282 removed the
 	// redundant `cascadeDiagnosticBaselines` shadow map (9 → 8).
-	"dispatch/integration.ts": 8,
+	// #2455: the container scan now recognises any repo-local class owning a
+	// `clear()`/`delete()` method instead of a hard-coded name list, so
+	// `sessionRunnerRegistry` (`new RunnerRegistry()`) is now counted (8 → 9).
+	// It is an import-time-built lookup with no session lifetime
+	// (SWEEP_HEURISTIC_LIMITS item 5, same as this file's other frozen
+	// vocabulary constants) — no new registry entry needed.
+	"dispatch/integration.ts": 9,
 	"dispatch/lazy.ts": 0,
 	// #2215 added the language matrix's two derived lookups
 	// (`BINDING_BY_EXTENSION`, `LSP_ONLY_RULE_LANGUAGES`) (5 → 7). Both are
@@ -1318,7 +1324,12 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"warm-attach.ts": 0,
 	// #2275 added `renderedDependencyDriftFiles` (the drained per-turn footer
 	// delivery set) alongside the existing two.
-	"widget-state.ts": 3,
+	// #2455: the container scan now recognises any repo-local class owning a
+	// `clear()`/`delete()` method, so `diagnosticsWriteGuard` and
+	// `runnerWriteGuard` (`new WriteOrderingGuard(...)`) are now counted
+	// (3 → 5). Both were already cleared by `clearWidgetState` — the file's
+	// exemption above already covers them; only the pin was stale.
+	"widget-state.ts": 5,
 	// #2068 added the per-index dirty-file set; it is process-local wire-cache
 	// state and is cleared by serialization, so it needs no session reset.
 	"word-index.ts": 4,

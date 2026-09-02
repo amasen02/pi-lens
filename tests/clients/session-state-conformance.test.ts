@@ -620,7 +620,7 @@ describe("session-state sweep — symbol-count pin regression (#1817)", () => {
 	});
 });
 
-describe("session-state scan — repo container classes are containers (#2442 F2)", () => {
+describe("session-state scan — repo container classes are containers (#2442 F2, #2455)", () => {
 	function withFixtureTree(
 		files: Record<string, string>,
 		run: (dir: string) => void,
@@ -638,18 +638,54 @@ describe("session-state scan — repo container classes are containers (#2442 F2
 		}
 	}
 
+	// The class definitions the fixture modules below import. #2455 replaced
+	// the hard-coded `Map|Set|WeakMap|WeakSet|PathKeyedMap|BoundedFifoMap|
+	// BoundedLruCache` alternation with a live scan of exported classes that
+	// own a `clear()`/`delete()` method, so the fixture tree must carry the
+	// class DEFINITIONS the detector is meant to discover — a name alone (as
+	// the pre-#2455 fixture used, importing from a `bounded-cache.js` that
+	// never existed in the fixture tree) no longer proves anything about the
+	// new mechanism.
+	const CONTAINER_CLASSES_MODULE = [
+		"export class BoundedFifoMap<K, V> {",
+		"\tprivate readonly entries = new Map<K, V>();",
+		"\tconstructor(maxEntries: number) {}",
+		"\tclear(): void {",
+		"\t\tthis.entries.clear();",
+		"\t}",
+		"\tdelete(key: K): boolean {",
+		"\t\treturn this.entries.delete(key);",
+		"\t}",
+		"}",
+		"",
+		// Owns neither method directly — recognised only through the `extends`
+		// chain, exactly like the real `BoundedLruCache` (bounded-cache.ts).
+		"export class BoundedLruCache<K, V> extends BoundedFifoMap<K, V> {",
+		"\toverride get(key: K): V | undefined {",
+		"\t\treturn undefined;",
+		"\t}",
+		"}",
+		"",
+	].join("\n");
+
 	// #2442 migrated ~20 module-level `new Map()` caches to BoundedFifoMap /
-	// BoundedLruCache. The container regex named only Map/Set/WeakMap/WeakSet/
-	// PathKeyedMap, so every migrated module silently DROPPED OUT of this
-	// sweep — cache-observability.ts went from two recognised containers to
-	// zero and no test noticed. A refactor from a raw Map to one of this
-	// repo's own container wrappers must never make session state invisible.
+	// BoundedLruCache. The (then hard-coded) container regex named only
+	// Map/Set/WeakMap/WeakSet/PathKeyedMap, so every migrated module silently
+	// DROPPED OUT of this sweep — cache-observability.ts went from two
+	// recognised containers to zero and no test noticed. A refactor from a raw
+	// Map to one of this repo's own container wrappers must never make session
+	// state invisible.
 	//
-	// MUTATION: delete `BoundedFifoMap` (or `BoundedLruCache`) from
-	// CONTAINER_DECLARATION's alternation in tests/support/session-state-scan.ts
-	// and this test reds — the containers array comes back short.
+	// MUTATION: replace `containerClassNames`'s live scan with the old
+	// hard-coded alternation (`Map|Set|WeakMap|WeakSet|PathKeyedMap|
+	// BoundedFifoMap|BoundedLruCache`) in tests/support/session-state-scan.ts
+	// and this test still passes for THESE two names (they were in the old
+	// list) — the point of this fixture is `BoundedLruCache`'s `extends`
+	// chain, which the old flat regex never had to resolve. The `#2455`
+	// describe block below is what actually reds under that mutation, because
+	// it uses a name the hard-coded list never knew.
 	const BOUNDED_MODULE = [
-		'import { BoundedFifoMap, BoundedLruCache } from "./bounded-cache.js";',
+		'import { BoundedFifoMap, BoundedLruCache } from "./container-classes.js";',
 		"",
 		"const fifoLatch = new BoundedFifoMap<string, number>(8);",
 		"const lruLatch = new BoundedLruCache<string, number>(8);",
@@ -662,26 +698,38 @@ describe("session-state scan — repo container classes are containers (#2442 F2
 	].join("\n");
 
 	it("flags a module-level `new BoundedFifoMap()` / `new BoundedLruCache()`", () => {
-		withFixtureTree({ "bounded-holder.ts": BOUNDED_MODULE }, (dir) => {
-			const candidates = scanSessionStateCandidates(dir);
-			expect(candidates.map((c) => c.file)).toEqual(["bounded-holder.ts"]);
-			expect(candidates[0].containers).toEqual(["fifoLatch", "lruLatch"]);
-		});
+		withFixtureTree(
+			{
+				"bounded-holder.ts": BOUNDED_MODULE,
+				"container-classes.ts": CONTAINER_CLASSES_MODULE,
+			},
+			(dir) => {
+				const candidates = scanSessionStateCandidates(dir);
+				const holder = candidates.find((c) => c.file === "bounded-holder.ts");
+				expect(holder?.containers).toEqual(["fifoLatch", "lruLatch"]);
+			},
+		);
 	});
 
 	it("counts them for the symbol-count pin, so a new bounded latch reds", () => {
-		withFixtureTree({ "bounded-holder.ts": BOUNDED_MODULE }, (dir) => {
-			const candidates = scanSessionStateCandidates(dir);
-			const counts: Record<string, number> = {};
-			for (const c of candidates) counts[c.file] = c.containers.length;
-			// A pin captured when the file held only the FIFO latch.
-			const pinAudit = auditSymbolCounts({
-				sweepName: "fixture symbol-count audit",
-				counts,
-				pinned: { "bounded-holder.ts": 1 },
-			});
-			expect(pinAudit.unaccounted).toEqual(["bounded-holder.ts@2"]);
-		});
+		withFixtureTree(
+			{
+				"bounded-holder.ts": BOUNDED_MODULE,
+				"container-classes.ts": CONTAINER_CLASSES_MODULE,
+			},
+			(dir) => {
+				const candidates = scanSessionStateCandidates(dir);
+				const counts: Record<string, number> = {};
+				for (const c of candidates) counts[c.file] = c.containers.length;
+				// A pin captured when the file held only the FIFO latch.
+				const pinAudit = auditSymbolCounts({
+					sweepName: "fixture symbol-count audit",
+					counts,
+					pinned: { "bounded-holder.ts": 1, "container-classes.ts": 0 },
+				});
+				expect(pinAudit.unaccounted).toEqual(["bounded-holder.ts@2"]);
+			},
+		);
 	});
 
 	it("still ignores a bounded container declared inside a function", () => {
@@ -689,7 +737,10 @@ describe("session-state scan — repo container classes are containers (#2442 F2
 		// re-armed by construction and must not be flagged.
 		withFixtureTree(
 			{
+				"container-classes.ts": CONTAINER_CLASSES_MODULE,
 				"per-call.ts": [
+					'import { BoundedFifoMap } from "./container-classes.js";',
+					"",
 					"export function makeCache(): unknown {",
 					"\tconst perCall = new BoundedFifoMap<string, number>(8);",
 					"\treturn perCall;",
@@ -701,7 +752,135 @@ describe("session-state scan — repo container classes are containers (#2442 F2
 			},
 			(dir) => {
 				const candidates = scanSessionStateCandidates(dir);
-				expect(candidates.flatMap((c) => c.containers)).toEqual([]);
+				const perCall = candidates.find((c) => c.file === "per-call.ts");
+				expect(perCall?.containers ?? []).toEqual([]);
+			},
+		);
+	});
+});
+
+// #2455: the detector must recognise a BRAND NEW repo-local collection class
+// by what it DOES (owns `clear()`/`delete()`), not by whether its name made
+// it into a hand-maintained list. `SomeRepoLocalCollection` below names
+// nothing the pre-#2455 hard-coded alternation
+// (`Map|Set|WeakMap|WeakSet|PathKeyedMap|BoundedFifoMap|BoundedLruCache`)
+// could ever have matched — proof that the detector generalises rather than
+// having simply grown a fourth hard-coded name.
+//
+// MUTATION: revert `tests/support/session-state-scan.ts` to the pre-#2455
+// hard-coded `CONTAINER_DECLARATION` alternation and every test in this
+// block reds — `SomeRepoLocalCollection` is invisible to a fixed name list
+// by construction.
+describe("session-state scan — new repo-local collection classes need no detector edit (#2455)", () => {
+	function withFixtureTree(
+		files: Record<string, string>,
+		run: (dir: string) => void,
+	): void {
+		const dir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-session-state-new-class-"),
+		);
+		try {
+			for (const [name, contents] of Object.entries(files)) {
+				fs.writeFileSync(path.join(dir, name), contents);
+			}
+			run(dir);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	}
+
+	const NEW_CLASS_MODULE = [
+		"export class SomeRepoLocalCollection<K, V> {",
+		"\tprivate readonly entries = new Map<K, V>();",
+		"\tset(key: K, value: V): void {",
+		"\t\tthis.entries.set(key, value);",
+		"\t}",
+		"\tdelete(key: K): boolean {",
+		"\t\treturn this.entries.delete(key);",
+		"\t}",
+		"}",
+		"",
+	].join("\n");
+
+	const HOLDER_MODULE = [
+		'import { SomeRepoLocalCollection } from "./new-collection-class.js";',
+		"",
+		"const sessionLatch = new SomeRepoLocalCollection<string, number>();",
+		"",
+		"export function resetSessionLatch(): void {",
+		'\tsessionLatch.delete("k");',
+		"}",
+		"",
+	].join("\n");
+
+	it("flags a module-level `new SomeRepoLocalCollection()` without editing the detector", () => {
+		withFixtureTree(
+			{
+				"new-collection-class.ts": NEW_CLASS_MODULE,
+				"holder.ts": HOLDER_MODULE,
+			},
+			(dir) => {
+				const candidates = scanSessionStateCandidates(dir);
+				const holder = candidates.find((c) => c.file === "holder.ts");
+				expect(holder?.containers).toEqual(["sessionLatch"]);
+			},
+		);
+	});
+
+	it("resolves the container class through an `extends` chain too", () => {
+		const subclassModule = [
+			NEW_CLASS_MODULE,
+			// Owns neither `clear()` nor `delete()` in its own body — only
+			// through the `extends` chain, same shape as `BoundedLruCache`.
+			"export class SomeRepoLocalSubclass<K, V> extends SomeRepoLocalCollection<K, V> {",
+			"\toverride set(key: K, value: V): void {",
+			"\t\tsuper.set(key, value);",
+			"\t}",
+			"}",
+			"",
+		].join("\n");
+		withFixtureTree(
+			{
+				"new-collection-class.ts": subclassModule,
+				"holder.ts": [
+					'import { SomeRepoLocalSubclass } from "./new-collection-class.js";',
+					"",
+					"const sessionLatch = new SomeRepoLocalSubclass<string, number>();",
+					"",
+					"export function resetSessionLatch(): void {",
+					'\tsessionLatch.delete("k");',
+					"}",
+					"",
+				].join("\n"),
+			},
+			(dir) => {
+				const candidates = scanSessionStateCandidates(dir);
+				const holder = candidates.find((c) => c.file === "holder.ts");
+				expect(holder?.containers).toEqual(["sessionLatch"]);
+			},
+		);
+	});
+
+	it("still ignores the new class declared inside a function (module scope still required)", () => {
+		withFixtureTree(
+			{
+				"new-collection-class.ts": NEW_CLASS_MODULE,
+				"per-call.ts": [
+					'import { SomeRepoLocalCollection } from "./new-collection-class.js";',
+					"",
+					"export function makeLatch(): unknown {",
+					"\tconst perCall = new SomeRepoLocalCollection<string, number>();",
+					"\treturn perCall;",
+					"}",
+					"",
+					"export function resetNothing(): void {}",
+					"",
+				].join("\n"),
+			},
+			(dir) => {
+				const candidates = scanSessionStateCandidates(dir);
+				const perCall = candidates.find((c) => c.file === "per-call.ts");
+				expect(perCall?.containers ?? []).toEqual([]);
 			},
 		);
 	});

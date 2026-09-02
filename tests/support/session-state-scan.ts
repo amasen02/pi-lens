@@ -394,23 +394,158 @@ export interface SessionStateCandidate {
 	hasProcessSingleton: boolean;
 }
 
+/** Container constructors every scan recognises regardless of origin. */
+const BUILTIN_CONTAINER_CTORS = ["Map", "Set", "WeakMap", "WeakSet"] as const;
+
 /**
- * Module-level (column-zero) `const`/`let` bound to a `Map`, `Set`,
- * `WeakMap`, `WeakSet` or one of the repo's own container classes
- * (`PathKeyedMap`, `BoundedFifoMap`, `BoundedLruCache`). Column zero is the
- * signal for "module scope" — a container declared inside a function is
- * per-call state and re-armed by construction.
- *
- * A repo container wrapping a `Map` holds session state exactly as a raw
- * `Map` does; the alternation must therefore name EVERY such class, or a
- * refactor from `new Map()` to the wrapper silently deletes the file from
- * this sweep. `PathKeyedMap` is the precedent (#1025); `BoundedFifoMap` /
- * `BoundedLruCache` were the gap #2442's migration opened and its review
- * round caught — `cache-observability.ts` went from four recognised
- * containers to zero without a single test noticing.
+ * Constructors that structurally look like a repo-local container class
+ * (exported from `clients/`, owning a `clear()` or `delete()` method — see
+ * {@link containerClassNames}) but are proven NOT to hold session-scoped
+ * state. Empty today. Add an entry with a one-line reason, the same way
+ * {@link EXEMPT_SESSION_STATE_FILES} argues file-level exemptions, rather
+ * than silently special-casing a name at the call site.
  */
-const CONTAINER_DECLARATION =
-	/^(?:const|let)\s+([A-Za-z_$][\w$]*)[^=\n]*=\s*new\s+(?:Map|Set|WeakMap|WeakSet|PathKeyedMap|BoundedFifoMap|BoundedLruCache)\b/gm;
+const CONTAINER_CLASS_EXCLUSIONS: Readonly<Record<string, string>> = {};
+
+/** A brace-matched `export class` declaration found in a stripped source file. */
+interface ExportedClassDeclaration {
+	name: string;
+	/** The `extends` target's bare name, if any (generics stripped). */
+	extendsName: string | undefined;
+	/** The class body, including its braces, still comment/string-stripped. */
+	body: string;
+}
+
+/**
+ * `export class Name<T> [extends Base<T>] [implements ...] { ... }` blocks in
+ * (already {@link stripCommentsAndStrings}-processed) `source`, brace-matched
+ * from the class's own `{` so a nested class or object literal cannot end the
+ * body early.
+ */
+function findExportedClasses(source: string): ExportedClassDeclaration[] {
+	const declarations: ExportedClassDeclaration[] = [];
+	const declaration =
+		/^export class ([A-Za-z_$][\w$]*)(?:<[^>]*>)?(?:\s+extends\s+([A-Za-z_$][\w$]*)(?:<[^>]*>)?)?(?:\s+implements\s+[^{]*)?\s*\{/gm;
+	let match: RegExpExecArray | null;
+	while ((match = declaration.exec(source))) {
+		const openBrace = match.index + match[0].length - 1;
+		let depth = 0;
+		let end = -1;
+		for (let i = openBrace; i < source.length; i++) {
+			if (source[i] === "{") depth++;
+			else if (source[i] === "}") {
+				depth--;
+				if (depth === 0) {
+					end = i;
+					break;
+				}
+			}
+		}
+		if (end < 0) continue;
+		declarations.push({
+			name: match[1],
+			extendsName: match[2],
+			body: source.slice(openBrace, end + 1),
+		});
+	}
+	return declarations;
+}
+
+/**
+ * Whether `body` DECLARES its own `clear()` or `delete()` method — a method
+ * definition (`name(...) { ... }`), never a call to one (`x.clear();`, which
+ * has no `{` directly after the parameter list and so cannot match).
+ */
+function declaresOwnMethod(body: string, name: "clear" | "delete"): boolean {
+	const method = new RegExp(
+		`(?:^|\\n)[ \\t]*(?:public\\s+|protected\\s+|private\\s+|static\\s+|override\\s+|readonly\\s+|async\\s+|\\*\\s*)*${name}\\s*\\([^)]*\\)\\s*(?::[^{;=]+)?\\s*\\{`,
+	);
+	return method.test(body);
+}
+
+const containerClassNamesCache = new Map<string, Set<string>>();
+
+/**
+ * Every class exported from `dir` that owns a `clear()` or `delete()`
+ * method — directly, or inherited through an `extends` chain resolved within
+ * the same scan — minus {@link CONTAINER_CLASS_EXCLUSIONS}.
+ *
+ * `BoundedFifoMap` / `BoundedLruCache` / `PathKeyedMap` used to be a
+ * hard-coded alternation on the container regex (`Map|Set|WeakMap|WeakSet|
+ * PathKeyedMap|BoundedFifoMap|BoundedLruCache`): naming three of the repo's
+ * own wrapper classes by hand rather than recognising the SHAPE ("a class
+ * that behaves like a `Map`"). #2455: migrating `cache-observability.ts`'s
+ * maps to `BoundedFifoMap` had already proven the failure mode once
+ * (#2442) — every new repo-local collection wrapper silently drops its file
+ * out of the sweep until someone remembers to extend the list by hand. This
+ * scans `dir` once instead, so a class earns recognition by what it DOES
+ * (`clear()`/`delete()`, the `Map`/`Set` contract's clearing surface), not by
+ * whether its name happened to make it into a comment.
+ *
+ * Cached per `dir` — the real `clients/` tree is scanned once per process;
+ * a fixture tree passed by a test gets its own cache entry so tests never
+ * see a stale class list from an earlier fixture.
+ */
+export function containerClassNames(dir = CLIENTS_ROOT): Set<string> {
+	const cached = containerClassNamesCache.get(dir);
+	if (cached) return cached;
+
+	const classesByName = new Map<string, ExportedClassDeclaration>();
+	for (const absolute of clientSourceFiles(dir)) {
+		const source = stripCommentsAndStrings(fs.readFileSync(absolute, "utf8"));
+		for (const found of findExportedClasses(source)) {
+			classesByName.set(found.name, found);
+		}
+	}
+
+	const ownsClearOrDelete = (name: string, seen: Set<string>): boolean => {
+		if (seen.has(name)) return false; // `extends` cycle guard.
+		seen.add(name);
+		const found = classesByName.get(name);
+		if (!found) return false;
+		if (declaresOwnMethod(found.body, "clear") || declaresOwnMethod(found.body, "delete"))
+			return true;
+		return found.extendsName ? ownsClearOrDelete(found.extendsName, seen) : false;
+	};
+
+	const names = new Set<string>();
+	for (const name of classesByName.keys()) {
+		if (Object.hasOwn(CONTAINER_CLASS_EXCLUSIONS, name)) continue;
+		if (ownsClearOrDelete(name, new Set())) names.add(name);
+	}
+	containerClassNamesCache.set(dir, names);
+	return names;
+}
+
+/** Escape a literal identifier for safe use inside a `RegExp` alternation. */
+function escapeRegExpLiteral(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const containerDeclarationCache = new Map<string, RegExp>();
+
+/**
+ * Module-level (column-zero) `const`/`let` bound to `new <Ctor>(...)`, where
+ * `<Ctor>` is a built-in container or a {@link containerClassNames} match for
+ * `dir`. Column zero is the signal for "module scope" — a container declared
+ * inside a function is per-call state and re-armed by construction.
+ *
+ * Built fresh (once, cached) from a live class scan rather than a hand list —
+ * see {@link containerClassNames}.
+ */
+function containerDeclarationRegex(dir: string): RegExp {
+	const cached = containerDeclarationCache.get(dir);
+	if (cached) return cached;
+	const names = [...BUILTIN_CONTAINER_CTORS, ...containerClassNames(dir)].map(
+		escapeRegExpLiteral,
+	);
+	const regex = new RegExp(
+		`^(?:const|let)\\s+([A-Za-z_$][\\w$]*)[^=\\n]*=\\s*new\\s+(?:${names.join("|")})\\b`,
+		"gm",
+	);
+	containerDeclarationCache.set(dir, regex);
+	return regex;
+}
 
 /** An exported reset-shaped function. */
 const EXPORTED_RESET = /^export function (_?(?:reset|clear)[A-Za-z0-9_]*)/gm;
@@ -437,9 +572,11 @@ const PROCESS_SINGLETON_CALL = /getProcessSingleton\s*\(/;
 /**
  * What this heuristic catches, and what it structurally cannot.
  *
- * CATCHES — a module-level `Map`/`Set`/`PathKeyedMap` in a file that also
- * exports a reset-shaped function; a `getProcessSingleton(...)` call in a file
- * that also exports one; and any file exporting a `_reset…ForTests`-style seam.
+ * CATCHES — a module-level `Map`/`Set`/`WeakMap`/`WeakSet`, or a repo-local
+ * class that owns a `clear()`/`delete()` method (see
+ * {@link containerClassNames} — #2455), in a file that also exports a
+ * reset-shaped function; a `getProcessSingleton(...)` call in a file that
+ * also exports one; and any file exporting a `_reset…ForTests`-style seam.
  * Those pairings are the observed shape of every process-lifetime-latch bug in
  * the #1266–#1625 arc (and #2319's process-singleton twin): state that outlives
  * a session plus a reset nobody calls at the session boundary.
@@ -504,12 +641,13 @@ export function scanSessionStateCandidates(
 ): SessionStateCandidate[] {
 	const useCache = dir === CLIENTS_ROOT;
 	if (useCache && cachedCandidates) return cachedCandidates;
+	const containerDeclaration = containerDeclarationRegex(dir);
 	const found: SessionStateCandidate[] = [];
 	for (const absolute of clientSourceFiles(dir)) {
 		// Stripped for the same reason the reachability walk is (R1): a
 		// commented-out declaration or reset export is not one.
 		const source = stripCommentsAndStrings(fs.readFileSync(absolute, "utf8"));
-		const containers = [...source.matchAll(CONTAINER_DECLARATION)].map(
+		const containers = [...source.matchAll(containerDeclaration)].map(
 			(m) => m[1],
 		);
 		const resets = [...source.matchAll(EXPORTED_RESET)].map((m) => m[1]);
