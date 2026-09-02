@@ -53,7 +53,10 @@ import * as path from "node:path";
 import * as v8 from "node:v8";
 import { getGlobalPiLensDir } from "./file-utils.js";
 import { getMaxLogSizeMB } from "./log-cleanup.js";
-import { createNdjsonLogger, type NdjsonLogger } from "./ndjson-logger.js";
+import {
+	createLazyNdjsonLogger,
+	type LazyNdjsonLogger,
+} from "./ndjson-logger.js";
 
 /** Read once at module load — see module docstring. Not re-read per call. */
 const DEBUG_HEAP_ENABLED = process.env.PI_LENS_DEBUG_HEAP === "1";
@@ -66,18 +69,21 @@ export const SNAPSHOT_RETENTION = 3;
 const SNAPSHOT_PREFIX = "heap-";
 const SNAPSHOT_SUFFIX = ".heapsnapshot";
 
-const HEAP_SNAPSHOT_LOG_FILE = path.join(
-	getGlobalPiLensDir(),
-	"heap-snapshots.log",
-);
+// #2506: lazy, not a module-top-level `const` — see `createLazyNdjsonLogger`'s
+// doc comment in ndjson-logger.ts. Unlike `DEBUG_HEAP_ENABLED` above (which the
+// module docstring documents as deliberately frozen at load time), there is no
+// such rationale for the LOG PATH itself.
+function heapSnapshotLogFile(): string {
+	return path.join(getGlobalPiLensDir(), "heap-snapshots.log");
+}
 
 // Only ever constructed when the flag is on — the entire cost of this module
 // when unset is the one boolean check at the top of each export below.
-const writer: NdjsonLogger | null = DEBUG_HEAP_ENABLED
-	? createNdjsonLogger({
-			filePath: HEAP_SNAPSHOT_LOG_FILE,
+const writer: LazyNdjsonLogger | null = DEBUG_HEAP_ENABLED
+	? createLazyNdjsonLogger(() => ({
+			filePath: heapSnapshotLogFile(),
 			maxBytes: getMaxLogSizeMB() * 1024 * 1024,
-		})
+		}))
 	: null;
 
 /** True iff `PI_LENS_DEBUG_HEAP=1` was set when this module first loaded. */
@@ -86,7 +92,7 @@ export function isDebugHeapEnabled(): boolean {
 }
 
 export function getHeapSnapshotLogPath(): string {
-	return HEAP_SNAPSHOT_LOG_FILE;
+	return writer ? writer.getFilePath() : heapSnapshotLogFile();
 }
 
 /** Resolve once all enqueued breadcrumb writes are on disk (tests). */

@@ -90,6 +90,21 @@ describe("logReadGuardEvent filePath normalization (#2219)", () => {
 				flush: vi.fn().mockResolvedValue(undefined),
 				flushSync: vi.fn(),
 			}),
+			// #2506: latency-logger.ts (pulled in transitively via
+			// file-utils.ts -> spawn-timeout-cooldown.ts, which this fresh
+			// module graph re-imports) now builds its writer via
+			// createLazyNdjsonLogger, not createNdjsonLogger alone — this mock
+			// must cover both factories or the fresh import throws "No
+			// createLazyNdjsonLogger export" before this test body runs.
+			createLazyNdjsonLogger: (resolveOptions: () => { filePath: string }) => ({
+				log: writerLog,
+				append: vi.fn(),
+				truncate: vi.fn(),
+				flush: vi.fn().mockResolvedValue(undefined),
+				flushSync: vi.fn(),
+				getFilePath: () => resolveOptions().filePath,
+				_resetForTests: vi.fn(),
+			}),
 		}));
 
 		const mod = await import("../../clients/read-guard-logger.js");

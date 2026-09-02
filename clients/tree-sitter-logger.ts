@@ -1,18 +1,21 @@
 import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
 import { getGlobalPiLensDir } from "./file-utils.js";
-import { createNdjsonLogger } from "./ndjson-logger.js";
+import { createLazyNdjsonLogger } from "./ndjson-logger.js";
 import type { TreeSitterParseCacheStats } from "./tree-sitter-client.js";
 import { getMaxLogSizeMB } from "./log-cleanup.js";
 import { normalizeLoggedPath } from "./path-utils.js";
 
-const TREE_SITTER_LOG_DIR = getGlobalPiLensDir();
-const TREE_SITTER_LOG_FILE = path.join(TREE_SITTER_LOG_DIR, "tree-sitter.log");
-
-const writer = createNdjsonLogger({
-	filePath: TREE_SITTER_LOG_FILE,
+// #2506: resolved lazily (first real write), not at module-import time — see
+// `createLazyNdjsonLogger`'s doc comment for why a top-level `getGlobalPiLensDir()`
+// call here froze every write to whichever `PI_LENS_HOME` was live at the
+// FIRST process that imported this module (vitest's `globalSetup` among them —
+// `tree-sitter-client.ts`, which imports this module, is on the import graph
+// of several always-loaded clients).
+const writer = createLazyNdjsonLogger(() => ({
+	filePath: path.join(getGlobalPiLensDir(), "tree-sitter.log"),
 	maxBytes: getMaxLogSizeMB() * 1024 * 1024,
-});
+}));
 
 export interface TreeSitterLogEntry {
 	ts?: string;
@@ -159,10 +162,18 @@ export function logTreeSitterDiagnostic(entry: {
 }
 
 export function getTreeSitterLogPath(): string {
-	return TREE_SITTER_LOG_FILE;
+	return writer.getFilePath();
 }
 
 /** Resolve once all enqueued tree-sitter writes are on disk (tests/shutdown). */
 export function flushTreeSitterLog(): Promise<void> {
 	return writer.flush();
+}
+
+/**
+ * Test-only: drop the memoized writer so the next call re-resolves
+ * `getGlobalPiLensDir()` against the CURRENT env (#2506).
+ */
+export function _resetTreeSitterLoggerForTests(): void {
+	writer._resetForTests();
 }

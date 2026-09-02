@@ -1,20 +1,25 @@
 import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
 import { getGlobalPiLensDir } from "./file-utils.js";
-import { createNdjsonLogger } from "./ndjson-logger.js";
+import { createLazyNdjsonLogger } from "./ndjson-logger.js";
 import { normalizeFilePath } from "./path-utils.js";
 import type {
 	ReviewGraph,
 	ReviewGraphPersistCoverage,
 } from "./review-graph/types.js";
 
-const REVIEW_GRAPH_LOG_DIR = getGlobalPiLensDir();
-const REVIEW_GRAPH_LOG_FILE = path.join(
-	REVIEW_GRAPH_LOG_DIR,
-	"review-graph.log",
-);
-
-const writer = createNdjsonLogger({ filePath: REVIEW_GRAPH_LOG_FILE });
+// #2506: resolved lazily (first real write), not at module-import time — see
+// `createLazyNdjsonLogger`'s doc comment for why a top-level `getGlobalPiLensDir()`
+// call here froze every write to whichever `PI_LENS_HOME` was live at the
+// FIRST process that imported this module — confirmed for `latency-logger.ts`/
+// `extension-log.ts` via vitest's `globalSetup`, which imports them
+// transitively (`grammar-source.ts` -> `degradation-ledger.ts`) before
+// `vitest-setup.ts`'s per-worker `PI_LENS_HOME` pin is ever set; the same
+// import-order hazard applies to any other process that reaches this module
+// first, test or otherwise.
+const writer = createLazyNdjsonLogger(() => ({
+	filePath: path.join(getGlobalPiLensDir(), "review-graph.log"),
+}));
 
 export type ReviewGraphBuildMode =
 	| "full"
@@ -198,7 +203,7 @@ export function logReviewGraph(entry: ReviewGraphLogEntry): void {
 }
 
 export function getReviewGraphLogPath(): string {
-	return REVIEW_GRAPH_LOG_FILE;
+	return writer.getFilePath();
 }
 
 /** Resolve once all enqueued review-graph writes are on disk (tests/shutdown). */
@@ -209,4 +214,12 @@ export function flushReviewGraphLog(): Promise<void> {
 /** Teardown-only: force queued entries to disk before the process exits. */
 export function flushReviewGraphLogSync(): void {
 	writer.flushSync();
+}
+
+/**
+ * Test-only: drop the memoized writer so the next call re-resolves
+ * `getGlobalPiLensDir()` against the CURRENT env (#2506).
+ */
+export function _resetReviewGraphLoggerForTests(): void {
+	writer._resetForTests();
 }

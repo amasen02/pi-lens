@@ -27,8 +27,19 @@ import { getGlobalPiLensDir } from "./file-utils.js";
 import { getRegisteredLogFiles } from "./ndjson-logger.js";
 import { pathsEqual } from "./path-utils.js";
 
-const LOG_DIR = getGlobalPiLensDir();
-const LOGS_SUBDIR = path.join(LOG_DIR, "logs");
+// #2506: lazy, not a module-top-level `const` — `getGlobalPiLensDir()` reads
+// `PI_LENS_HOME`, and freezing its result at import time bound every caller
+// below to whatever `PI_LENS_HOME` was live at the FIRST process that
+// imported this module (see `createLazyNdjsonLogger`'s doc comment in
+// ndjson-logger.ts for the confirmed vitest `globalSetup` instance of this
+// hazard). Every call site here already re-invokes this per call, so no
+// caller needs to change.
+function getLogDir(): string {
+	return getGlobalPiLensDir();
+}
+function getLogsSubdir(): string {
+	return path.join(getLogDir(), "logs");
+}
 
 /**
  * Every global `.log` pi-lens writes under ~/.pi-lens, resolved dynamically so
@@ -53,7 +64,7 @@ const LOGS_SUBDIR = path.join(LOG_DIR, "logs");
  * `dir` is overridable for tests; production callers use the default
  * (real `~/.pi-lens`).
  */
-export function getManagedLogFiles(dir: string = LOG_DIR): string[] {
+export function getManagedLogFiles(dir: string = getLogDir()): string[] {
 	const names = new Set<string>();
 
 	for (const absPath of getRegisteredLogFiles()) {
@@ -217,9 +228,11 @@ export function runLogCleanup(dbg?: (msg: string) => void): {
 		report: "",
 	};
 
+	const logDir = getLogDir();
+
 	// Cleanup old daily diagnostic logs (*.jsonl)
 	const dailyLogs = cleanupOldLogs(
-		LOGS_SUBDIR,
+		getLogsSubdir(),
 		/\.jsonl$/,
 		config.retentionDays,
 	);
@@ -231,14 +244,14 @@ export function runLogCleanup(dbg?: (msg: string) => void): {
 	// `/\.log\./` only matched the legacy `name.log.<ts>` shape, never the
 	// current `name.<ts>.log`, so backups accumulated indefinitely.)
 	const rotatedLogs = cleanupOldLogs(
-		LOG_DIR,
+		logDir,
 		ROTATED_BACKUP_RE,
 		config.retentionDays,
 	);
 	results.cleaned += rotatedLogs.deleted.length;
 
 	// Check main logs for rotation
-	const mainLogs = getManagedLogFiles().map((name) => path.join(LOG_DIR, name));
+	const mainLogs = getManagedLogFiles().map((name) => path.join(logDir, name));
 
 	for (const logFile of mainLogs) {
 		const rotation = rotateLogIfNeeded(logFile, config.maxSizeMB);
@@ -288,10 +301,12 @@ export function getLogStorageSummary(): {
 } {
 	const files: { name: string; sizeMB: number; ageDays: number }[] = [];
 	let totalMB = 0;
+	const logDir = getLogDir();
+	const logsSubdir = getLogsSubdir();
 
 	// Main logs
 	for (const name of getManagedLogFiles()) {
-		const filePath = path.join(LOG_DIR, name);
+		const filePath = path.join(logDir, name);
 		if (fs.existsSync(filePath)) {
 			const sizeMB = getFileSizeMB(filePath);
 			const ageDays = getFileAgeDays(filePath);
@@ -302,11 +317,11 @@ export function getLogStorageSummary(): {
 
 	// Daily logs
 	try {
-		if (fs.existsSync(LOGS_SUBDIR)) {
-			const dailyFiles = fs.readdirSync(LOGS_SUBDIR);
+		if (fs.existsSync(logsSubdir)) {
+			const dailyFiles = fs.readdirSync(logsSubdir);
 			for (const name of dailyFiles) {
 				if (!name.endsWith(".jsonl")) continue;
-				const filePath = path.join(LOGS_SUBDIR, name);
+				const filePath = path.join(logsSubdir, name);
 				const sizeMB = getFileSizeMB(filePath);
 				const ageDays = getFileAgeDays(filePath);
 				files.push({ name: `logs/${name}`, sizeMB, ageDays });
