@@ -87,17 +87,45 @@
  * degrade; they satisfy the same rule by dropping the authority marker
  * alongside the coordinate.
  *
- * ── Retirement (#1944) ────────────────────────────────────────────────────
- * Demote-not-drop assumes the agent CAN re-run to confirm. A past-EOF
- * demotion breaks that assumption: the file shrank past the cited lines, so
- * no re-run can ever speak to them, and the record re-served on every turn
- * end for the life of the session. Such a record is delivered ONCE, degraded,
- * then retired (`RuntimeCoordinator.retireDemotedPastEofBlocker`). The
- * suppression is recorded in the degradation ledger under
- * `demoted-finding-retired`, whose subject keeps the store and file, and the
- * delivered payload says so in its own words — so an empty advisory section
- * can only mean "nothing to say". Dependency-drift demotions keep in-bounds
- * coordinates the agent can act on and are NOT retired.
+ * ── Retirement (#1944, #1950, #2275) ──────────────────────────────────────
+ * Demote-not-drop assumes the agent CAN re-run to confirm. Retirement is what
+ * happens when re-serving a demotion forever stops being honest. Every kind
+ * of retirement records itself in the degradation ledger under
+ * `demoted-finding-retired`, whose subject keeps the store and the file
+ * (`inline-blocker:` / `widget-blocker:`), so an empty section can only mean
+ * "nothing to say". There are three, and they differ in WHY and in HOW MUCH
+ * they remove:
+ *
+ * 1. Past-EOF, unrecoverable (#1944). The file shrank past the cited lines,
+ *    so no re-run can ever speak to them. Delivered ONCE, degraded, then the
+ *    record is DROPPED (`RuntimeCoordinator.retireDemotedPastEofBlocker`).
+ *
+ * 2. Dependency-drift, inline-blocker channel (#1950). The coordinates are
+ *    still in bounds and a re-run COULD confirm them, so this is a delivery
+ *    cap, not a verdict: after `DEPENDENCY_DRIFT_MAX_DELIVERIES` turn-end
+ *    deliveries with no re-run the record is dropped from
+ *    `_pendingInlineBlockers`, and the LAST delivery carries a note saying it
+ *    will not be shown again and can still be confirmed
+ *    (`formatDeliveryCapNote`). Counting is deferred until the turn's content
+ *    is known not to be suppressed, so the count is deliveries the agent
+ *    actually received (#1950 fix round F1).
+ *
+ * 3. Dependency-drift, widget footer (#2275). The same cap number over the
+ *    widget store, which unlike the inline-blocker map backs MORE THAN ONE
+ *    surface — `lens_diagnostics mode=all` and `lens_diagnostic_mark` read
+ *    the same `allDiagnostics` list the footer draws from. So this retirement
+ *    HIDES rather than drops: the entry keeps its demotion and its place in
+ *    the error tally, gains `WidgetDiagnostic.footerRetired`, and only the
+ *    footer stops rendering it; mode=all carries the "capped, no longer shown
+ *    in the footer, re-run can still confirm" note in place of the inline
+ *    channel's last-delivery note. Its count is RENDERS, not turn ends — the
+ *    footer serves one record per pass, so `renderWidget` marks what it drew
+ *    and the turn-end step drains those marks. Dropping the record instead
+ *    would have made an unconfirmed LSP error read as CLEAN on mode=all.
+ *
+ * The rule the three share: a retirement may remove a finding from the
+ * surface that has re-served it, never from every surface at once, unless no
+ * re-run could ever confirm it (case 1).
  *
  * ── Explicit lag labels (the non-gated escape hatch) ──────────────────────
  * A store that cannot afford the freshness/disposition stack — because it
