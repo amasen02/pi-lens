@@ -671,7 +671,9 @@ describe("#2464 — the observed-settle path also dispatches pipeline analysis",
 				// #2449 round-3 property, unregressed by adding the dispatch.
 				expect(
 					readChangesSince(env.tmpDir, 0).map((change) => change.source),
-				).toEqual(Array.from({ length: index + 1 }, () => "agent-tool:patch_file"));
+				).toEqual(
+					Array.from({ length: index + 1 }, () => "agent-tool:patch_file"),
+				);
 			}
 		} finally {
 			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
@@ -704,7 +706,7 @@ describe("#2464 — the observed-settle path also dispatches pipeline analysis",
 			await handleToolResult(toolResultDeps({ event, runtime, cacheManager }));
 
 			expect(vi.mocked(runPipeline)).toHaveBeenCalledTimes(1);
-			const ctx = vi.mocked(runPipeline).mock.calls[0][0] as Record<
+			const ctx = vi.mocked(runPipeline).mock.calls[0][0] as unknown as Record<
 				string,
 				unknown
 			>;
@@ -739,6 +741,11 @@ describe("#2464 — the observed-settle path also dispatches pipeline analysis",
 		// the file, and without the re-stamp the NEXT edit is blocked with a
 		// spurious `file_modified`), the #2402 after-write hash stamp, and the
 		// already-analysed latch.
+		//
+		// Driven through call TWO deliberately. Call two ALREADY dispatched before
+		// this round, so every red below is attributable to the missing
+		// post-conditions rather than to the missing call-one dispatch the case
+		// above covers — two findings, two independent reds.
 		const env = setupTestEnvironment("pi-lens-2464-postconditions-");
 		const previousDataDir = process.env.PILENS_DATA_DIR;
 		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
@@ -751,9 +758,10 @@ describe("#2464 — the observed-settle path also dispatches pipeline analysis",
 			vi.mocked(runPipeline).mockClear();
 			// Production-faithful on the axis under test: a pipeline that FORMATS
 			// rewrites the file and reports it in `changedFiles`. A double that
-			// left the bytes alone could not tell the fix from the bug.
-			vi.mocked(runPipeline).mockImplementationOnce((async () => {
-				fs.writeFileSync(filePath, `${SOURCE}const d = 4;\n\n// formatted\n`);
+			// left the bytes alone could not tell the fix from the bug — the
+			// after-write stamp is gated on the bytes actually having moved.
+			const formattingPipeline = (async () => {
+				fs.appendFileSync(filePath, "\n// formatted\n");
 				return {
 					output: "",
 					hasBlockers: false,
@@ -761,7 +769,9 @@ describe("#2464 — the observed-settle path also dispatches pipeline analysis",
 					fileModified: true,
 					changedFiles: [filePath],
 				};
-			}) as never);
+			}) as never;
+			vi.mocked(runPipeline).mockImplementationOnce(formattingPipeline);
+			vi.mocked(runPipeline).mockImplementationOnce(formattingPipeline);
 
 			const recordWritten = vi.fn();
 			const readGuard = {
@@ -778,17 +788,21 @@ describe("#2464 — the observed-settle path also dispatches pipeline analysis",
 			// `retryEvent` carries the oldText/newText pair the #2402 applied-edit
 			// records are built from — without a recorded pair there is nothing for
 			// the after-write hash to stamp.
-			const event = retryEvent(filePath, "call-2464-post-0");
-			await handleToolCall(
-				toolCallDeps({ event, cwd: env.tmpDir, runtime, cacheManager }),
-			);
-			fs.writeFileSync(filePath, `${SOURCE}const d = 4;\n`);
-			await handleToolResult({
-				...toolResultDeps({ event, runtime, cacheManager }),
-				readGuard,
-			});
+			for (const [index, body] of [
+				`${SOURCE}const d = 4;\n`,
+				`${SOURCE}const d = 4;\nconst e = 5;\n`,
+			].entries()) {
+				const event = retryEvent(filePath, `call-2464-post-${index}`);
+				await handleToolCall(
+					toolCallDeps({ event, cwd: env.tmpDir, runtime, cacheManager }),
+				);
+				fs.writeFileSync(filePath, body);
+				await handleToolResult({
+					...toolResultDeps({ event, runtime, cacheManager }),
+					readGuard,
+				});
+			}
 
-			expect(vi.mocked(runPipeline)).toHaveBeenCalledTimes(1);
 			// 1. The staleness stamp is re-taken over the file the pipeline itself
 			//    rewrote, so the agent's next edit is judged by read coverage.
 			expect(recordWritten).toHaveBeenCalledWith(path.resolve(filePath));
@@ -805,6 +819,7 @@ describe("#2464 — the observed-settle path also dispatches pipeline analysis",
 
 			// 3. The already-analysed latch is set, so a duplicate tool_result for
 			//    the SAME bytes in the same turn does not analyse the file twice.
+			const dispatchesSoFar = vi.mocked(runPipeline).mock.calls.length;
 			await handleToolResult({
 				...toolResultDeps({
 					event: {
@@ -819,8 +834,66 @@ describe("#2464 — the observed-settle path also dispatches pipeline analysis",
 				readGuard,
 				_bypassDebounce: true,
 			});
-			expect(vi.mocked(runPipeline)).toHaveBeenCalledTimes(1);
+			expect(vi.mocked(runPipeline)).toHaveBeenCalledTimes(dispatchesSoFar);
 		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+
+	it("surfaces a pipeline crash on the observed path the way the classified path does", async () => {
+		// #2464 review round 2, S6. A crash used to be swallowed into a `dbg`
+		// line the model never sees, so an observed tool's edit came back looking
+		// analysed when nothing had run. The classified chain returns the crash
+		// notice with `isError: true`; the observed path now matches it.
+		//
+		// Asserted on call TWO, which already dispatched before this round, so
+		// the red is the swallowed crash rather than the missing call-one
+		// dispatch the first case covers.
+		const env = setupTestEnvironment("pi-lens-2464-crash-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		try {
+			const filePath = path.join(env.tmpDir, "crashed.ts");
+			fs.writeFileSync(filePath, SOURCE);
+			const { runtime, cacheManager } = newSession(env.tmpDir);
+
+			vi.mocked(runPipeline).mockClear();
+			vi.mocked(runPipeline).mockImplementation((async () => {
+				throw new Error("pipeline exploded");
+			}) as never);
+
+			let outcome: Awaited<ReturnType<typeof handleToolResult>> = undefined;
+			for (const [index, body] of [
+				`${SOURCE}const d = 4;\n`,
+				`${SOURCE}const d = 4;\nconst e = 5;\n`,
+			].entries()) {
+				const event = patchEvent(filePath, `call-2464-crash-${index}`);
+				await handleToolCall(
+					toolCallDeps({ event, cwd: env.tmpDir, runtime, cacheManager }),
+				);
+				fs.writeFileSync(filePath, body);
+				outcome = await handleToolResult(
+					toolResultDeps({ event, runtime, cacheManager }),
+				);
+			}
+
+			expect(outcome?.isError).toBe(true);
+			// The edit itself still stands in the change log — only the analysis
+			// was lost, and the notice says so rather than the record vanishing.
+			expect(
+				readChangesSince(env.tmpDir, 0).map((change) => change.source),
+			).toEqual(["agent-tool:patch_file", "agent-tool:patch_file"]);
+		} finally {
+			// The mock is module-level and shared by every case in this file.
+			vi.mocked(runPipeline).mockImplementation((async () => ({
+				output: "",
+				hasBlockers: false,
+				isError: false,
+				fileModified: false,
+			})) as never);
 			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
 			else process.env.PILENS_DATA_DIR = previousDataDir;
 			env.cleanup();

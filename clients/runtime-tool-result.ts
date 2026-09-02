@@ -1488,8 +1488,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 					pathsEqual(candidate, filePath),
 				)
 			) {
-				const observedReadGuardCorrelationId =
-					getReadGuardCorrelationId(event);
+				const observedReadGuardCorrelationId = getReadGuardCorrelationId(event);
 				const observedDispatchOutcome = await dispatchPipelineAnalysis({
 					deps,
 					runtime,
