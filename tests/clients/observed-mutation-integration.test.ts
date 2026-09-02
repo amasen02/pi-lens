@@ -35,11 +35,8 @@ import { countFileLines } from "../../clients/read-guard-tool-lines.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { handleToolCall } from "../../clients/runtime-tool-call.js";
 import {
-	claimPipelineDispatch,
 	clearLastAnalyzedStateCache,
 	handleToolResult,
-	registerInFlightPipeline,
-	releaseInFlightPipeline,
 } from "../../clients/runtime-tool-result.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
@@ -1209,6 +1206,15 @@ describe("#2464 review round 3 — F1: the observed dispatch shares the classifi
 		// directly is the only honest way to prove the guard is doing work.
 		// Delete the `inFlightPipelines.get(filePath) === registered` conjunct and
 		// the last assertion goes red.
+		//
+		// Imported dynamically, and ONLY here, so the module-level imports of this
+		// file stay to symbols that exist on pre-fix code — every other case in
+		// it then fails on an assertion rather than on a missing export.
+		const {
+			claimPipelineDispatch,
+			registerInFlightPipeline,
+			releaseInFlightPipeline,
+		} = await import("../../clients/runtime-tool-result.js");
 		clearLastAnalyzedStateCache();
 		const filePath = path.join(
 			process.cwd(),
