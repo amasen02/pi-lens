@@ -105,9 +105,15 @@ describe("dependency boundary governance", () => {
 		// otherwise have added: `resolveConfig` moved out of the `config-core`
 		// barrel so a resolver no longer drags `process-spec` -> `project-trust`,
 		// and `config-core` lost both of its sink imports
-		// (`reportMigrationRecords` -> `config-resolve.js`,
+		// (`reportPiLensConfigRecords` -> `config-resolve.js`,
 		// `DEGRADATION_ENTRIES_PER_KIND` -> the `ledger-bounds.js` leaf), which is
 		// what that module's own doc always claimed of it.
+		//
+		// #2426 review round 2 adds NO entry: `workspace-topology.js` now imports
+		// the shared basename table from `config-locations.js` instead of carrying
+		// its own copy, and that module's transitive set
+		// (`config-diagnostic-codes.js`, `path-utils.js`) reaches nothing that
+		// imports back into the topology index, so the edge closes no cycle.
 		const baseline = parseJson5(
 			readFileSync(
 				resolve(repoRoot, ".dependency-cruiser-known-violations.json"),
