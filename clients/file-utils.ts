@@ -19,6 +19,7 @@ import {
 	getPiLensGlobalConfigPath,
 } from "./lens-config.js";
 import {
+	isExternalOrVendorFile,
 	isUnderDir,
 	normalizeEphemeralMapKey,
 	normalizeFilePath,
@@ -828,6 +829,27 @@ export function isPathIgnoredByProject(
 	isDirectory = false,
 ): boolean {
 	return getProjectIgnoreMatcher(rootDir).isIgnored(filePath, isDirectory);
+}
+
+/**
+ * "Is this a project-source path pi-lens's bookkeeping should care about" —
+ * the `isPathIgnoredByProject` + `isExternalOrVendorFile` pair, previously
+ * hand-duplicated at each of its 2 call sites (`registerReadBridge` and
+ * `registerMutationBridge` in `index.ts`, both #2423). Consolidated here
+ * (#2450 review round 2, F4) when a THIRD call site — `tools/lsp-navigation.ts`
+ * threading the same gate onto its directly-threaded `LspMutationContext`, so
+ * the direct LSP-mutation path and the mutation-bridge fallback path apply
+ * the identical gate instead of the fallback silently being narrower. A
+ * caller still layers its own `no-read-guard`-style flag check on top; that
+ * flag has no file path to check against, so it stays outside this helper.
+ */
+export function isRecordableProjectPath(
+	filePath: string,
+	projectRoot: string,
+): boolean {
+	if (isPathIgnoredByProject(filePath, projectRoot, false)) return false;
+	if (isExternalOrVendorFile(filePath, projectRoot)) return false;
+	return true;
 }
 
 const projectIgnoreGlobsCache = new Map<

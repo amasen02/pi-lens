@@ -2523,15 +2523,30 @@ export function setupIncomingHandlers(
 			if (state.serverEditsAllowed <= 0 || !params?.edit) {
 				return { applied: false, failureReason: "edit not solicited" };
 			}
-			const context =
-				(state.activeMutationDepth ?? 0) === 1
-					? state.activeMutationContext
-					: undefined;
+			// #2450 fix round 3 (F3): no `depth === 1` re-check here — dead code.
+			// `state.activeMutationContext` is set ONLY by `runServerCommand`
+			// (below in this file), which already enforces exactly that
+			// invariant: it stores `mutationContext` when `activeMutationDepth`
+			// becomes 1, and forces `activeMutationContext = undefined` for every
+			// OTHER depth (including back to 0 on unwind). By the time this
+			// handler reads it, `state.activeMutationContext` can therefore only
+			// ever be the outermost call's context (depth === 1) or `undefined` —
+			// re-testing the depth here was redundant with that invariant, not an
+			// independent gate.
+			const context = state.activeMutationContext;
+			// `workspace/applyEdit` is only ever honored inside the
+			// `serverEditsAllowed` window this handler just checked, which is
+			// opened exclusively by an executeCommand call — so a fallback here is
+			// always executeCommand-solicited, never a bare edit (#2450). This
+			// fallback context carries no runtime/cacheManager (there is no live
+			// reference to those singletons at this call site); lsp-mutation.ts's
+			// bookkeepLspMutation falls back to the mutation bridge for exactly
+			// that reason rather than silently dropping the write's bookkeeping.
 			const telemetryContext: LspMutationContext = context ?? {
 				cwd: state.root,
 				correlationId: newLspMutationCorrelationId(),
 				tool: "lsp-workspace-applyEdit",
-				source: "lsp-edit",
+				source: "lsp-execute-command",
 			};
 			try {
 				await applyWorkspaceEdit(

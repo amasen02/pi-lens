@@ -744,6 +744,24 @@ function handle(raw) {
 		const cmd = data.params?.command;
 		if (cmd === "fake.applyEdit") {
 			const uri = data.params?.arguments?.[0];
+			// #2450 review round 2 (F2): the target line/columns/replacement text
+			// are overridable via a second `arguments[1]` object so callers can
+			// exercise a real non-{1,1} range — a fixed line-0 edit made every
+			// caller's "real range" collide with the {1,1} resource-op/whole-file
+			// default, so a test asserting {1,1} passed whether or not the actual
+			// range plumbing worked. Omitted fields keep the original line-0/0-5
+			// default, so the pre-existing "applies a server-initiated edit..."
+			// test above is unaffected.
+			const editOpts = data.params?.arguments?.[1] ?? {};
+			const line = typeof editOpts.line === "number" ? editOpts.line : 0;
+			const startCharacter =
+				typeof editOpts.startCharacter === "number"
+					? editOpts.startCharacter
+					: 0;
+			const endCharacter =
+				typeof editOpts.endCharacter === "number" ? editOpts.endCharacter : 5;
+			const newText =
+				typeof editOpts.newText === "string" ? editOpts.newText : "EDITED";
 			const applyId = ++applyEditIdCounter;
 			pendingExec = { execId: data.id, command: cmd };
 			send({
@@ -756,10 +774,10 @@ function handle(raw) {
 							[uri]: [
 								{
 									range: {
-										start: { line: 0, character: 0 },
-										end: { line: 0, character: 5 },
+										start: { line, character: startCharacter },
+										end: { line, character: endCharacter },
 									},
-									newText: "EDITED",
+									newText,
 								},
 							],
 						},
