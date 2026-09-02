@@ -994,7 +994,7 @@ export function createLspNavigationTool(
 						},
 					],
 					details: {
-						...(payload.details ?? {}),
+						...payload.details,
 						failureKind: meta.failureKind,
 					},
 				};

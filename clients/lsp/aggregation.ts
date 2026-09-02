@@ -73,7 +73,9 @@ export async function raceToCompletion<T>(
 		auxGraceMs?: number;
 	} = { timeoutMs: 1500 },
 ): Promise<T[]> {
-	const results: (T | undefined)[] = new Array(promises.length).fill(undefined);
+	const results: (T | undefined)[] = [];
+	results.length = promises.length;
+	results.fill(undefined);
 	let graceTimer: ReturnType<typeof setTimeout> | undefined;
 	let auxGraceTimer: ReturnType<typeof setTimeout> | undefined;
 	let completed = false;

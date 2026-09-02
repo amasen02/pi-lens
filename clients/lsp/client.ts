@@ -494,6 +494,17 @@ export interface LSPClientInfo {
 	documentSymbol(filePath: string): Promise<LSPSymbol[]>;
 	/** Whether this exact document has already been opened on the server. */
 	isDocumentOpen(filePath: string): boolean;
+	/**
+	 * Every document currently open on this server, as normalized path keys
+	 * (#2430). Read-only over state already held in memory — it opens nothing,
+	 * closes nothing, and stats nothing. Used by the observational mutation
+	 * net's tracked-file set, which must never walk the workspace.
+	 *
+	 * Optional for the same reason `isBusy` is: a test double or a future client
+	 * shape may not implement it, and the sweep it feeds is advisory — a client
+	 * that cannot enumerate simply contributes no paths.
+	 */
+	openDocumentPaths?(): string[];
 	/** Whether this client currently has an LSP request in flight. */
 	isBusy?(): boolean;
 	/** URI spelling used when this document was opened. */
@@ -1663,7 +1674,7 @@ function retirePullSource(state: LSPClientState, identifier: string): void {
 	const suffix = `${PULL_SOURCE_KEY_SEPARATOR}${identifier}`;
 	for (const source of [state.pullResultIds, state.pullRequestSequences]) {
 		if (!source) continue;
-		for (const key of [...source.keys()]) {
+		for (const key of source.keys()) {
 			if (key.endsWith(suffix)) source.delete(key);
 		}
 	}
@@ -5685,6 +5696,10 @@ export async function createLSPClient(options: {
 
 		isDocumentOpen(filePath) {
 			return state.openDocuments.has(normalizeMapKey(filePath));
+		},
+
+		openDocumentPaths() {
+			return [...state.openDocuments];
 		},
 
 		isBusy() {

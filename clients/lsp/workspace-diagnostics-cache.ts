@@ -594,7 +594,7 @@ export function createWorkspaceDiagnosticsCacheContext(
 	const epoch = _cacheEpochs.capture(root);
 	const existing = loadWorkspaceDiagnosticsCache(root);
 	const entries: Record<string, WorkspaceDiagnosticsCacheEntry> = {
-		...(existing?.entries ?? {}),
+		...existing?.entries,
 	};
 	const reverseDepsIndex = loadReverseDependencyIndexFromSnapshot({
 		cwd: root,

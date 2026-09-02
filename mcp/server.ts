@@ -588,7 +588,7 @@ function schemaWithCwd(parameters: unknown): Record<string, unknown> {
 	return {
 		type: "object",
 		properties: {
-			...(p.properties ?? {}),
+			...p.properties,
 			cwd: {
 				type: "string",
 				description: "Project root (defaults to the server workspace).",

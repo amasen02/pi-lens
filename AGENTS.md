@@ -339,6 +339,10 @@ A separate, narrower family from the shapes above: not a recurring bug, but a re
 
 **Anti-slop pattern adoption (2026-08-19, refs #1718).** A maintainer-supervised comparison against dmmulroy/anti-slop's 15 Oxlint rules (src/rules/, MIT-licensed; ported patterns credit the origin in each rule file's note) confirmed the six then-shipped rules above were already clean on this tree — `no-chained-type-assertions` 0 non-exempt hits (pre-strictness), `no-unknown-laundering`'s alias arm 0, `no-reflect-apply` 0, `no-reflect-get` 0 outside the documented 3-argument Proxy-trap exemption, `no-object-parameters` 0, and the `Record<string, any>` dictionary-value arm went from 2 confirmed hits (a wider sweep later found 2 more in test fixtures, fixed and exempted — see `no-unsafe-dictionary-any.yml`'s note) down to 0. That audit's follow-up shipped the remaining feasible patterns as new catalog rules: `no-unsafe-dictionary-any`/`no-unsafe-dictionary-unknown` (the `Record<K, V>` value-type arms, `error`/`hint`), `no-unknown-parameters`/`no-unknown-returns` (`hint` — the arms `no-unknown-laundering.yml` deliberately dropped for THIS repo's own FP load, now shipped for repositories without that finding), `no-known-value-widening` (`hint`, narrowed to the one syntactically self-contained sub-case ast-grep can check: an annotated `const x: Record<K, V> = { ... }` — upstream's full data-flow variable-resolution version is out of ast-grep's reach), and `require-safety-comment-for-as-unknown-as` (`hint`, scoped to `as unknown as` chains rather than every non-const assertion, unifying defect shape 13's ad-hoc "justify it in a comment" ask with a checkable rule). `no-runtime-typeof` shipped at `hint` with three structural exemptions (type-predicate-returning functions, functions named `parse`/`decode`/`validate`/`is`/`assert`, `.d.ts` files) after the original audit found the bare rule unworkable against this tree's 404 client-side hits. `no-widen-then-assert` was NOT ported: upstream's implementation resolves `const` variable references transitively across statements, which needs symbol-table data flow ast-grep's structural matcher doesn't have; a narrowed syntactic subset wasn't found. `no-module-mocking` and the Effect-specific rule stay out of scope per the original audit (test-hygiene ratchet design, and no Effect dependency, respectively). Every new/extended rule's per-file self-hit count against `clients/`+`tests/` is recorded in the adopting PR body, not chased to zero — hint-tier rules are shipped for the catalog's users, not as a mandate that pi-lens's own history retroactively conform in the same PR (#1718 owns that decision).
 
+**oxlint/ast-grep rule ownership (#1718, refs #2454/PR #2461).** Two shapes where a bundled ast-grep rule and an oxlint rule both touch `new Array(...)`/string-prefix-or-suffix checks — recorded here so the ownership question is answered once, not re-derived per PR:
+- `unicorn/no-new-array` (oxlint) only fires on the ambiguous *single-argument* `new Array(n)` call (length-vs-only-element). `no-array-constructor` (`rules/ast-grep-rules/rules/no-array-constructor.yml`, ast-grep, `warning`) fires on `new Array($$$ARGS)` for ANY arity and auto-fixes to `[$$$ARGS]` — strictly broader. `LINTER_OVERLAP` in `clients/dispatch/runners/ast-grep-napi.ts` is meant to suppress the ast-grep hint when a project's own linter already owns the shape, but it only checks `hasEslintConfig`, not `hasOxlintConfig` — so on pi-lens's own `.oxlintrc.json`-configured tree (and any other oxlint-only project) the two rules both report single-argument `new Array(n)` sites. Pre-existing gap, out of `lint:js`-scope PRs (it lives in the dispatcher, not `package.json`) — tracked by **#2462**.
+- `unicorn/prefer-string-starts-ends-with` (oxlint) and `prefer-string-starts-ends-with` (ast-grep, `rules/ast-grep-rules/rules/prefer-string-starts-ends-with.yml`) share a name but are DISJOINT: oxlint's targets a `^literal`/`literal$`-anchored regex test (`/^foo/.test(x)` → `x.startsWith("foo")`); ast-grep's targets `str.indexOf(sub) === 0`. Same name, no overlap, no `LINTER_OVERLAP` entry needed for this one.
+
 ## Standing maintenance routines (invoke on request)
 
 These are named, well-scoped sweeps a maintainer can ask for by name; each is dispatched deliberately (often to a worker), never run autonomously, and the DELETION routines require proof + adversarial verification before anything is removed. Several overlap existing disciplines: bug-class sweeps, single-source-of-truth/consolidation, and red-first regression tests.
@@ -2182,7 +2186,7 @@ All pi packages are `@earendil-works/*` (migrated from `@mariozechner/*` in 0.74
   - Why: PRs squash-merge. A PR based on a feature branch gets merged *into that branch*, not master; if the base was already squashed to master, those commits land on a dead branch and never reach master. This happened (#321/#302 → reland #322).
   - Verify a merge actually hit master before moving on: `git show origin/master:<file> | grep <new-symbol>` — not just the PR's "merged" badge.
 - **When told (or when you observe) that a PR merged, fast-forward local `master` immediately — don't ask first.** `git fetch origin master && git merge --ff-only origin/master` (check `git status --short` beforehand as usual; leave any unrelated stray modified files untouched). This is pre-authorized standing behavior, not a per-instance confirmation.
-- Lint gate is `tsc` + `oxlint` (`npm run lint` = `tsc --project tsconfig.json && npm run lint:js`, the latter oxlint over `.mjs`/`.cjs`/plain `.js`, `--deny-warnings`, per `.oxlintrc.json`); the repo has **no biome config or CI biome gate**, so biome's default formatting is *not* enforced — don't repo-wide reformat. Run the full suite (`npm test`) before pushing; `npm run build` first if stale JS may shadow source edits.
+- Lint gate is `tsc` + `oxlint` (`npm run lint` = `tsc --project tsconfig.json && npm run lint:js`, the latter oxlint `--deny-warnings` per `.oxlintrc.json` over `.mjs`/`.cjs`/plain `.js` PLUS the production TypeScript tree — `clients/`, `tools/`, `mcp/`, root `index.ts` (#2454; `tests/**`/`cases/**` TS stayed ignored until #2454, `cases/**` dropped as dead-clean in #2454's review round, `tests/**` TS remains ignored — tracked by #2462 — `no-undef` stays off for `.ts`/`.tsx`, tsc is the source of truth there)); the repo has **no biome config or CI biome gate**, so biome's default formatting is *not* enforced — don't repo-wide reformat. Run the full suite (`npm test`) before pushing; `npm run build` first if stale JS may shadow source edits.
 - **Format gate is `oxfmt` (`npm run fmt:check`) and it must run before EVERY commit and push.** The deferred-format lane drains at `agent_end`, so a violation pushed MID-TURN escapes ahead of the formatter and reds the CI advisory (seen repeatedly 2026-08-23/24: three pushes raced the drain). Files written by scripts (bash/python heredocs) are especially exposed — write tools on Windows emit CRLF that oxfmt rejects as mixed EOL. If you skip hooks on a push (`PI_LENS_SKIP_HOOKS=1`), run `fmt:check` manually anyway.
 
 ## Issue triage (standing rule)
@@ -2197,7 +2201,7 @@ All pi packages are `@earendil-works/*` (migrated from `@mariozechner/*` in 0.74
 ```
 npm test              # vitest run (all tests)
 npx tsc --project tsconfig.json --noEmit   # type-check
-npm run lint          # tsc type-check + oxlint (npm run lint:js) over .mjs/.cjs/.js, --deny-warnings
+npm run lint          # tsc type-check + oxlint (npm run lint:js) over .mjs/.cjs/.js AND clients/tools/mcp/index.ts, --deny-warnings (tests/** TS still ignored, tracked by #2462)
 npm run build         # emit JS from TS; run before tests after source changes if stale JS may be present
 node scripts/smoke-tools.mjs [--install] [--step2] [--verbose] [lang ...]   # live tool-smoke (#209, opt-in/nightly): installs + runs each tool through the REAL dispatch path against tests/fixtures/tool-smoke/<lang>/; --step2 also asserts a parseable diagnostic. Add --lsp for the LSP-handshake layer, --format for the formatter pipeline, or --autofix for the pipeline safe-autofix phase. Not a per-PR gate, not shipped in the tarball.
 #   --lsp fixtures support two optional per-fixture fields (#530): `setup` (string/argv command run in the COPIED temp workspace before touchFile — e.g. `typescript7`/`typescript7-clean` run `npm install typescript@7 --no-save --no-audit --no-fund` there, since typescript-go's per-platform native binary can't be a committed static fixture; setup failure reports a distinct `setup-failed` status, never a false pass, bounded by a 120s timeout) and `expectLaunchVariant` (asserts the live `getCapabilitySnapshots(file)` `launchVariant` — e.g. `"native-ts7"` — so a silent fallback to the classic `typescript-language-server` FAILS even though a diagnostic arrived; the native and classic servers share the same `"typescript"` server id, so the diagnostic alone can't distinguish them). Both fixtures verified live 2026-07: typescript@7.0.2 installs from npm, its `tsc --lsp --stdio` genuinely speaks LSP framing (`\r\n\r\n` Content-Length headers over stdio, confirmed via a hand-rolled initialize), and PR #526's assumed invocation is correct.
@@ -2556,7 +2560,8 @@ state → deferred queue → `agent_settled` drain) used to hang below fifteen
 independent literal comparisons, so a host or extension edit tool under any
 other name was dropped before the first bookkeeping call, with its path already
 resolved. The seam answers with a `kind` (`write` or `edit`), a `provenance`
-(`builtin`, `bash-derived`, `declared`, `bridge`), and any lines a shape adapter
+(`builtin`, `bash-derived`, `declared`, `bridge`, plus `observed`, `learned` and
+`settled-sweep` from the #2430 net below), and any lines a shape adapter
 resolved. It recognizes pi's built-ins from a table and a third-party tool from
 its INPUT SHAPE through the ordered `MUTATION_SHAPE_ADAPTERS` registry, where
 the first non-`undefined` result wins. A new mutating-tool shape is a new
@@ -2569,6 +2574,102 @@ The write-side counterpart of the read bridge is `clients/mutation-bridge.ts`:
 an in-process producer that writes a file outside the tool-event path calls
 `recordMutation` at `Symbol.for("pi-lens:mutation-bridge")` and gets the same
 bookkeeping; `ast_grep_replace apply:true` is the in-repo consumer.
+
+**OBSERVATIONAL MUTATION NET (#2430):** the name table and the shape registry
+are finite and the population of third-party edit tools is not, so a fourth
+tier WATCHES. When `classifyMutatingTool` returns `undefined` for a call whose
+input still carries a path-shaped field, `clients/observed-mutation.ts` takes a
+bounded pre-snapshot and diffs it at the `tool_result`; whatever changed is
+replayed through the mutation bridge as `kind: "edit"` with `provenance:
+"observed"` and `editRanges` derived from the read-guard's stored per-line
+hashes. **The observation universe is the TARGET PATH ALONE** — that path's
+file, or, when it is a directory, that directory's own entries non-recursively
+and capped. Never siblings, never the tracked set: watching the neighbourhood
+attributed a background write to whatever tool happened to be running, so a
+`read`-shaped tool got learned as an editor from one coincidence. The tracked
+set is the SETTLED SWEEP's domain, and only its. When the directory cap BITES
+the universe is a TRUNCATION, so an empty diff over it is `unverifiable` and
+never clean — scoring the truncation as clean de-attributed a real codemod that
+rewrote the 84th entry of an 84-entry directory.
+
+`clients/mutation-attribution.ts` remembers the tool: `provenance: "learned"`
+for the session on the first observation, persisted under
+`getProjectDataDir(cwd)` on the second — and a session-learned tool STAYS armed
+until that second observation lands, because nothing else can produce it (latch
+off at observation one and the persist threshold is unreachable). A
+still-armed-and-already-classified tool is recorded by exactly ONE of the two
+paths: **when the settle replayed, the classification chain skips**, or the same
+physical edit lands in the change log twice (once with measured ranges, once
+whole-file). Three CONSECUTIVE clean observations withdraw a provisional
+attribution again, and withdrawing resets BOTH counters — leaving the clean
+count at three made the withdrawal terminal, so the tool was never armed again
+and could never be re-learned. An observation the net could not COMPLETE is
+`unverifiable`: it neither spends the arm latch nor votes in the
+de-attribution run. One `unclassified-mutating-tool` degradation per tool keeps
+the registry gap visible; a truncated directory watch adds an
+`observed-mutation-dir-cap` tally naming the tool.
+
+A tool that names no file is caught by the `agent_settled` sweep, which runs
+BEFORE the deferred drain and re-baselines after it so pi-lens's own formatter
+output is never read as third-party drift. The sweep is INCREMENTAL and
+**stat-first**: it stats a bounded window of the tracked set per turn from a
+carried cursor and reads a file only when its size or mtime moved, so coverage
+of a large tracked set accumulates across turns instead of timing out in one,
+and the record reports its own `scanned`/`notReachedThisPass`/`cursor`. Two rules there
+are not negotiable — **never replay on size+mtime alone** (a `touch` moves mtime
+without moving a byte, so a candidate is confirmed by content hash or named in
+`unverifiable`), and **never trust the stat short-circuit against a baseline
+recorded while the file's mtime was still fresh** (`LedgerEntry.seenAtMs`
+against `OBSERVED_LEDGER_SETTLE_MS`, the same-tick same-size rewrite of catalog
+shape 6). That comparison goes through `clients/freshness.ts`, like every other
+mtime-against-a-recorded-instant question in `clients/` (#1739). A file pi-lens
+has never seen has no baseline and is not covered, by design. The post-drain
+re-baseline retires the "pi-lens wrote these bytes" mark **per FILE**, not
+all-or-nothing: a mark drops exactly when the ledger has been moved onto that
+file's post-drain bytes (`rebaseline` inside `scanTrackedIncrementally`), so an
+aborted or truncated pass still clears the marks for the files it reached and
+correctly leaves the rest standing. Two earlier shapes both cost a fabricated
+mutation — clearing the whole set unconditionally (including on an abort)
+replayed pi-lens's own formatter output as third-party drift, and clearing only
+on a *complete* pass suppressed a genuine third-party change to an
+already-covered file until some later pass happened to finish. Its traversal is
+`handled` itself — the files THIS run's pipeline or drain actually wrote (see
+`noteMutationHandled`) — not the tracked set: every file the refresh needs to
+re-baseline is, by construction, already in `handled`, so walking it is
+O(handful) regardless of how large the tracked set is, and (barring an abort or
+a genuinely pathological handled-set size) completes in one pass every time.
+Walking `getTrackedPaths()` instead was the earlier shape, and it coupled this
+function's completion to the tracked-set size: `report: false` always starts
+its cursor at 0, so a tracked set too large to finish inside
+`OBSERVED_CAPTURE_BUDGET_MS` parked at the SAME prefix every turn and a mark
+past that prefix never retired, permanently suppressing drift reports for it
+(#2449 review round 5, F2/PROBE-B1).
+
+`deriveObservedEditRanges` reports ranges only when it can MEASURE them: a
+windowed read-guard baseline, a changed line count, an unreadable file or a
+spent read budget all return `undefined` so the bridge over-approximates to the
+whole file. Naming lines that were never touched is worse than naming none.
+
+Do not add a second scanner: the snapshot and diff primitives are
+`captureFileStatsForPaths` / `diffFileStats` in
+`clients/opaque-mutation-scan.ts`, shared with the #2000 bash recovery so the
+paths cannot disagree about what "changed" means. There is no synchronous twin
+any more, and adding one back is not the answer to an ordering problem. Every
+capture carries a timeout AND an abort race, a file cap, a hash-byte budget and
+a per-turn wall-clock budget; exceeding any of them writes a bounded record and
+a degradation-ledger tally, never a silent skip. The SETTLE is the deliberate
+exception to the BUDGET only: it has its own deadline rather than the arm's
+leftovers, because a settle clamped to a spent budget drops a mutation that was
+already measured. It is ASYNC, and the #1086 ordering contract is met at the
+CALL SITE instead: the pending-baseline probe (`hasPendingObservation`) is
+synchronous, and `handleToolResult` reads everything it derives from the
+post-result bytes — the state hash the in-flight composite key is built from —
+BEFORE the settle's yield. Move that read after the yield and a racing
+tool_result for the same path collapses two distinct pipelines into one.
+Steady-state cost is zero for a classified `write`/`edit` (the net is gated on
+`classifyMutatingTool` having returned `undefined` or the attribution still
+being provisional) and ~1.3ms for one armed observation of a file target, paid
+at most a handful of times per tool name per session.
 `tests/clients/mutating-tool-classification.test.ts` greps `clients/`, `tools/`
 and `index.ts` and fails when a mutation decision reappears outside the seam —
 `===`/`!==`/`==`/`!=` against `"write"`/`"edit"`/`"multiedit"` (any
@@ -3004,7 +3105,7 @@ evadable by construction, so its exception map records intentional non-sweeps.
 - New tool parameters → tool-level routing tests verifying the parameter reaches the right handler.
 - Bug fixes → a regression test that would have caught the bug.
 - Run `npm test` (or `npm run build && npm test` if `.js` artifacts may be stale) and confirm all tests pass before committing.
-- **Also run `npm run lint` before pushing — especially for test-file changes.** `npm run lint` (`tsc -p tsconfig.json && npm run lint:js`) is the strict CI gate: `tsc` type-checks the `tests/` tree, and `lint:js` (oxlint, `--deny-warnings`) covers plain `.mjs`/`.cjs`/`.js`; `npm run build` (`tsconfig.build.json`) **excludes tests** and `build:dist` uses `--noCheck`, so a type error in a test compiles clean locally but fails CI lint. (This has bitten us — build passing ≠ lint passing.)
+- **Also run `npm run lint` before pushing — especially for test-file changes.** `npm run lint` (`tsc -p tsconfig.json && npm run lint:js`) is the strict CI gate: `tsc` type-checks the `tests/` tree, and `lint:js` (oxlint, `--deny-warnings`) covers plain `.mjs`/`.cjs`/`.js` and, since #2454, the production TypeScript tree (`clients/`, `tools/`, `mcp/`, root `index.ts` — `tests/**` TS stays ignored, tracked by #2462); `npm run build` (`tsconfig.build.json`) **excludes tests** and `build:dist` uses `--noCheck`, so a type error in a test compiles clean locally but fails CI lint. (This has bitten us — build passing ≠ lint passing.)
 - **Assert telemetry against real sinks, not logger mocks (#1742 direction).** When a test must verify that a log/telemetry record was emitted, prefer reading the REAL emitted bytes — `await flushLatencyLog()` then read `path.join(getGlobalPiLensDir(), "latency.log")` from the worker's hermetic `PI_LENS_HOME` — over `vi.mock`-ing the logger module. Module mocks of loggers both re-introduce the instance-binding hazards the shared-writer registry exists to remove and assert against an imaginary surface; the real file is the same bytes a smell analyzer or human reads post-merge. If the logger no-ops under vitest (test-mode guard), the sanctioned opt-out is scoping `PI_LENS_TEST_MODE=0` to the single test that needs real writes.
 - **Adding an LSP server → add a smoke fixture, or the drift guard fails.** Registering a server in `LSP_SERVERS` does NOT automatically smoke-test it: the runner-level `smoke-fixture-coverage.test.ts` blanket-exempts the single `lsp` runner. `tests/clients/lsp/lsp-fixture-coverage.test.ts` is the SERVER-level guard — it fails unless every non-auxiliary server routes to an `LSP_FIXTURES` entry in `scripts/smoke-tools.mjs` (a fixture file whose extension resolves to it) and every auxiliary server is attached via a fixture's `auxiliaryServerIds`. Only the share-an-extension ALTERNATES (deno/python-jedi/omnisharp/expert) are exempt. The nightly `tool-smoke.yml` runs `--lsp --install` over the WHOLE list, so a self-contained github/npm server is then covered automatically (toolchain-gated ones — pwsh/.NET/go/rust — need the runner to provision the toolchain). `LspFixture` is typed in `scripts/smoke-tools.d.mts`.
 
