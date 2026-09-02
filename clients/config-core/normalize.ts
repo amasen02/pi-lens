@@ -73,6 +73,7 @@ import {
 	type MigrationRecord,
 	migrationSubject,
 } from "./records.js";
+import type { SourceTier } from "./provenance.js";
 
 /**
  * A config whose every field is one the schema claims, of the declared type.
@@ -100,6 +101,12 @@ export { MAX_CONFIG_DEPTH };
 export interface ValidateOptions {
 	/** The file the raw config came from, for the records' `file` field. */
 	readonly file?: string;
+	/**
+	 * The tier this source was read at, for the records' `tier` field (#2426
+	 * review round 3, F1) — `reportPiLensConfigRecords` needs it to route a
+	 * pi-lens-owned record to the right subsystem.
+	 */
+	readonly tier?: SourceTier;
 	/** Share one collector across several sources so the bound is per resolution. */
 	readonly collector?: MigrationRecordCollector;
 }
@@ -124,7 +131,12 @@ export function validate(
 ): NormalizedConfig {
 	const collector = options.collector ?? new MigrationRecordCollector();
 	const file = options.file ?? "";
-	const context: WalkContext = { collector, file, path: [] };
+	const context: WalkContext = {
+		collector,
+		file,
+		tier: options.tier,
+		path: [],
+	};
 	let walked: Walked;
 	try {
 		walked = walk(raw, schema, context, 0, new Set());
@@ -152,6 +164,7 @@ export function validate(
 interface WalkContext {
 	readonly collector: MigrationRecordCollector;
 	readonly file: string;
+	readonly tier: SourceTier | undefined;
 	path: string[];
 }
 
@@ -174,6 +187,7 @@ function record(
 		key,
 		subject: migrationSubject(context.file, key),
 		reason: entry.reason,
+		tier: context.tier,
 	});
 }
 

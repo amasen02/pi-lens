@@ -8,6 +8,12 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
+	extractTomlTableSection,
+	readCargoDependencyNames,
+	readCargoPackageName,
+	readCargoWorkspaceMembers,
+} from "../cargo-manifest.js";
+import {
 	getProjectIgnoreMatcher,
 	isExcludedDirName,
 	type ProjectIgnoreMatcher,
@@ -85,7 +91,21 @@ function detectWorkspaceType(cwd: string): WorkspaceType | null {
 	if (markers.hasCargoToml) {
 		try {
 			const content = fs.readFileSync(path.join(cwd, "Cargo.toml"), "utf-8");
-			if (content.includes("[workspace]")) return "cargo";
+			// A substring `.includes` also matches a COMMENTED-OUT `# [workspace]`
+			// heading, wrongly classifying the project as a cargo workspace (and,
+			// since Cargo.toml is checked before package.json, short-circuiting past
+			// a real npm/pnpm workspace living alongside it) — `[workspace]` proper
+			// is a real, active TOML table, so the shared table-scoped reader (which
+			// strips comments before matching) is the correct check (review round 2,
+			// F3). Presence is `!== undefined`, not `!== ""` (review round 3, F1):
+			// `extractTomlTableSection` returns `""` for BOTH "table absent" and
+			// "table present but empty" (e.g. a bare `[workspace]` heading as the
+			// last line of the file with no trailing newline) — a `!== ""` check
+			// misread the latter as the former and fell through to misclassify the
+			// project as npm/pnpm/go/none.
+			if (extractTomlTableSection(content, "workspace") !== undefined) {
+				return "cargo";
+			}
 		} catch {}
 	}
 	if (markers.hasPackageJson) {
@@ -186,67 +206,6 @@ function extractYamlList(content: string, key: string): string[] {
 	return values;
 }
 
-function extractTomlArray(content: string, key: string): string[] {
-	const prefix = `${key}`;
-	let collecting = false;
-	let buffer = "";
-	for (const rawLine of content.split(/\r?\n/)) {
-		const line = rawLine.split("#", 1)[0].trim();
-		if (!line) continue;
-		if (!collecting) {
-			if (!line.startsWith(prefix)) continue;
-			const equalsIndex = line.indexOf("=");
-			if (equalsIndex === -1 || line.slice(0, equalsIndex).trim() !== key)
-				continue;
-			const afterEquals = line.slice(equalsIndex + 1).trim();
-			if (!afterEquals.startsWith("[")) continue;
-			collecting = true;
-			buffer += afterEquals.slice(1);
-		} else {
-			buffer += `,${line}`;
-		}
-		const closeIndex = buffer.indexOf("]");
-		if (closeIndex !== -1) {
-			buffer = buffer.slice(0, closeIndex);
-			break;
-		}
-	}
-	return buffer
-		.split(",")
-		.map((s) => stripQuotes(s.trim()))
-		.filter(Boolean);
-}
-
-function extractTomlSection(content: string, section: string): string[] {
-	const lines: string[] = [];
-	let inSection = false;
-	for (const rawLine of content.split(/\r?\n/)) {
-		const trimmed = rawLine.trim();
-		if (trimmed === `[${section}]`) {
-			inSection = true;
-			continue;
-		}
-		if (inSection && trimmed.startsWith("[") && trimmed.endsWith("]")) break;
-		if (inSection) lines.push(rawLine);
-	}
-	return lines;
-}
-
-function extractTomlString(content: string, key: string): string | undefined {
-	for (const rawLine of content.split(/\r?\n/)) {
-		const line = rawLine.split("#", 1)[0].trim();
-		const equalsIndex = line.indexOf("=");
-		if (equalsIndex === -1 || line.slice(0, equalsIndex).trim() !== key)
-			continue;
-		const value = line.slice(equalsIndex + 1).trim();
-		const quote = value[0];
-		if ((quote !== '"' && quote !== "'") || value.length < 2) return undefined;
-		const endIndex = value.indexOf(quote, 1);
-		return endIndex === -1 ? undefined : value.slice(1, endIndex);
-	}
-	return undefined;
-}
-
 function moduleFromPackageJson(
 	cwd: string,
 	pkgRoot: string,
@@ -298,7 +257,7 @@ function scanCargoModules(cwd: string): WorkspaceModule[] {
 	let members: string[] = [];
 	try {
 		const content = fs.readFileSync(path.join(cwd, "Cargo.toml"), "utf-8");
-		members = extractTomlArray(content, "members");
+		members = readCargoWorkspaceMembers(content);
 	} catch {
 		return [];
 	}
@@ -308,14 +267,11 @@ function scanCargoModules(cwd: string): WorkspaceModule[] {
 		const pkgRoot = path.resolve(cwd, member);
 		const memberToml = path.join(pkgRoot, "Cargo.toml");
 		let name = "";
-		const deps: string[] = [];
+		let deps: string[] = [];
 		try {
 			const content = fs.readFileSync(memberToml, "utf-8");
-			name = extractTomlString(content, "name") ?? "";
-			for (const line of extractTomlSection(content, "dependencies")) {
-				const depName = line.trim().match(/^([A-Za-z0-9_-]+)\s*=/);
-				if (depName) deps.push(depName[1]);
-			}
+			name = readCargoPackageName(content) ?? "";
+			deps = readCargoDependencyNames(content);
 		} catch {
 			continue;
 		}

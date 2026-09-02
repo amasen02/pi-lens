@@ -103,6 +103,7 @@ migrate-*.js
 !docs/api-ports-inventory.md
 !docs/astplayground.md
 !docs/public-api-stability.md
+!docs/configuration.md
 !skills/**/*.md
 !.github/PULL_REQUEST_TEMPLATE.md
 

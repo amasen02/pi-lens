@@ -1,5 +1,8 @@
+import * as path from "node:path";
+import { win32 } from "node:path";
 import type { FactStore } from "../dispatch/fact-store.js";
-import { normalizeMapKey } from "../path-utils.js";
+import { recordDegradationOnce } from "../degradation-ledger.js";
+import { isWindowsPath, normalizeMapKey } from "../path-utils.js";
 import {
 	computeImpactCascade as computeImpactCascadeImpl,
 	computeTransitiveImpact as computeTransitiveImpactImpl,
@@ -50,11 +53,63 @@ export function computeTransitiveImpact(
 	return computeTransitiveImpactImpl(graph, seedFile, options);
 }
 
+/**
+ * Shape-based absolute check (mirrors `toProjectRelativePath`'s idiom): a
+ * Windows-shaped path (drive-letter/UNC) is parsed with `win32.isAbsolute`
+ * regardless of host OS, since the host-default `path.isAbsolute` returns
+ * FALSE for a Windows-shaped path on POSIX (#1150 class) and would let a
+ * cross-platform-persisted relative path slip past this guard on Linux CI.
+ * MUST run on the RAW `filePath`, before `normalizeMapKey`: on Windows,
+ * `normalizeMapKey`'s nonexistent-path fallback (`resolveNonExisting`) calls
+ * `win32.resolve`, which silently makes any relative path absolute against
+ * `process.cwd()` — checking the normalized value would defeat this guard
+ * entirely on Windows.
+ */
+function isAbsoluteFilePath(filePath: string): boolean {
+	const p = isWindowsPath(filePath) ? win32 : path;
+	return p.isAbsolute(filePath);
+}
+
 export function recordEntitySnapshotDiff(
 	facts: FactStore,
 	filePath: string,
 	nextSnapshot: Map<string, string>,
 ): { added: string[]; removed: string[]; modified: string[] } {
+	// #2477 round 2 (reviewer F1/F2): folding `cwd` into this key was REVERTED.
+	// The writer (`clients/dispatch/runners/tree-sitter.ts`) passes `ctx.cwd`,
+	// which `createDispatchContext` (`clients/dispatch/dispatcher.ts:324-326`)
+	// sets to the file's NEAREST LANGUAGE-ROOT (`resolveLanguageRootForFile`),
+	// while the reader (`upsertChangedSymbols`, `clients/review-graph/builder.ts`,
+	// reached via `computeCascadeForFile` → `buildOrUpdateGraph`) keys off the
+	// WORKSPACE cwd. In a monorepo/cargo-workspace/go-module layout those two
+	// cwd values diverge, so a folded `(cwd, path)` key the builder reader can
+	// never hit zeroed `graphChangedSymbolCount` on every build — reproduced:
+	// master returns `["alpha","beta"]`, the folded-key version returns `[]`
+	// — and made the cascade over-fan to every symbol (`query.ts:230-238`
+	// treats an empty `changedSymbols` as "no narrowing").
+	//
+	// The #2477 cross-project collision this was meant to close cannot reach
+	// this function in production: the sole writer always passes `ctx.filePath`,
+	// which `createDispatchContext` sets via `resolveRunnerPath` to an
+	// ALWAYS-ABSOLUTE path (the #2016 invariant, `dispatcher.ts:320,327,346`).
+	// A relative `filePath` here can only happen through a caller regression.
+	// Enforce that instead of re-keying: reject a non-absolute `filePath` with
+	// a visible, bounded ledger record (never silently, per AGENTS.md) and
+	// skip the diff rather than compute one under a key the real reader could
+	// never reach anyway. `recordDegradationOnce` (not a thrown error) is used
+	// because the sole call site's surrounding try/catch
+	// (`tree-sitter.ts` — "entity snapshot / blast-radius enrichment is
+	// best-effort") is a BARE, UNLOGGED catch: a thrown error there vanishes
+	// with no trace, which is strictly worse than a ledger record.
+	if (!isAbsoluteFilePath(filePath)) {
+		recordDegradationOnce({
+			kind: "review-graph-non-absolute-entity-path",
+			subject: filePath,
+			reason:
+				"recordEntitySnapshotDiff requires an absolute filePath (refs #2477)",
+		});
+		return { added: [], removed: [], modified: [] };
+	}
 	// Normalize once at this boundary, then reuse the folded path for both
 	// per-file facts. An unnormalized write is a key the builder reader can never
 	// hit, and an unnormalized snapshot forks a second empty diff (#2355).

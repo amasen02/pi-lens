@@ -72,40 +72,50 @@ import {
 	LENS_FLAGS,
 	type LensFlagSpec,
 	PROJECT_FOREIGN_CONFIG_NAMESPACES,
+	PROJECT_FOREIGN_NAMESPACE_HONORED_KEYS,
+	PROJECT_NON_FLAG_CONFIG_SECTIONS,
 	PROJECT_SCOPED_LENS_FLAGS,
 	readFlagConfigValue,
 } from "./lens-flag-registry.js";
-import { isAtOrAboveHomeDir, walkUpDirs } from "./path-utils.js";
+import {
+	type ConfigLocation,
+	configSearchDirs,
+	getPiLensGlobalConfigPath,
+	PROJECT_CONFIG_BASENAMES,
+	PROJECT_CONFIG_LOCATIONS,
+} from "./config-locations.js";
+import {
+	type ConfigDocument,
+	deprecationRecords,
+	ignoredRecordCollector,
+	type NoteIgnored,
+	projectLocationFor,
+	readConfigDocument,
+	reportConfigReadFailure,
+	reportPiLensConfigRecords,
+	resolveOnePiLensConfigDocument,
+} from "./config-resolve.js";
+import {
+	finalizeRecords,
+	type MigrationRecord,
+} from "./config-core/records.js";
+import {
+	homeRelativePath,
+	isAtOrAboveHomeDir,
+	walkUpDirs,
+} from "./path-utils.js";
 import { findPiLensConfigMarkerInDir } from "./workspace-topology.js";
 
 /**
- * Project config basenames, in precedence order. Exported so the
- * deprecation-window registry test (#2418) checks deprecated FILE rows against
- * the basenames actually read rather than a hand-copied second list.
+ * Project config basenames, in DESCENDING precedence (first match wins), for
+ * this loader's own discovery.
+ *
+ * Re-exported from `config-locations.ts`, which owns the derivation, so this
+ * loader's long-standing export keeps working while there is exactly ONE list
+ * (#2426 review round 2: `workspace-topology.ts` was still carrying a third
+ * copy).
  */
-export const PROJECT_CONFIG_BASENAMES = [".pi-lens.json", "pi-lens.json"];
-
-/**
- * The project loader's OWN recognized top-level keys — pi-lens-native sections,
- * whether parsed here into typed fields (`ignore`, `rules`, `maxProjectFiles`,
- * `reviewGraph`) or read off `PiLensProjectConfig.raw` by another pi-lens
- * consumer (`trivy`, read via `.raw` in `trivy-client.ts`). The project-scoped
- * flag sections (`format`, `autofix`, `actionableWarnings`) are NOT listed here;
- * they are derived from `PROJECT_SCOPED_LENS_FLAGS` so the registry stays the
- * single source of truth (#883). Foreign (non-pi-lens) namespaces the shared
- * file also carries live in `PROJECT_FOREIGN_CONFIG_NAMESPACES` beside the
- * registry.
- */
-const PROJECT_OWN_CONFIG_KEYS = [
-	"ignore",
-	"rules",
-	"maxProjectFiles",
-	"reviewGraph",
-	"trivy",
-	// `helm.renderValidation.enabled` — the opt-in for rendered-manifest
-	// validation, read via `.raw` in the helm-render runner (#1283).
-	"helm",
-] as const;
+export { PROJECT_CONFIG_BASENAMES } from "./config-locations.js";
 
 export interface PiLensProjectRuleConfig {
 	/** Optional override for the rule's primary numeric threshold. */
@@ -204,11 +214,48 @@ interface CacheEntry {
 	 */
 	size: number;
 	config: PiLensProjectConfig;
+	/**
+	 * The migration records `parseConfigFile` produced for this file (#2426
+	 * review round 3, F2) — cached alongside the config so a cache HIT can still
+	 * re-report them (cheap: no I/O, just replays through the warn seam, whose
+	 * own per-session latch decides whether anything new actually fires).
+	 * Without this, a repeat load of the SAME unchanged deprecated file recorded
+	 * a `config-deprecated` ledger row only in the session that first parsed it.
+	 */
+	records: readonly MigrationRecord[];
+	/**
+	 * This loader's OWN `config-ignored` records — the unknown-key, bad-value
+	 * and malformed-`rules` warnings `parseConfigFile` composes (#2426 review
+	 * round 4, F3).
+	 *
+	 * They were emitted DURING the parse and never captured, so the cache-HIT
+	 * replay carried only the deprecation half: session 2 of a warm process
+	 * recorded a `config-deprecated` row for the same file and no
+	 * `config-ignored` row at all, even though every one of those settings was
+	 * still being dropped. Same lifetime argument as `records` above — content
+	 * caching and per-session reporting are different lifetimes.
+	 */
+	ignored: readonly MigrationRecord[];
+}
+
+/** The identity of one file a cached derivation was computed from. */
+interface FileStamp {
+	path: string;
+	mtimeMs: number;
+	size: number;
 }
 
 interface DiscoveryCacheEntry {
 	info: PiLensProjectConfigFileInfo | undefined;
 	dirMtimes: Array<{ dir: string; mtimeMs: number }>;
+	/**
+	 * Deprecation records for every LEGACY config document at or above the start
+	 * directory (#2426 review round 4, F4) — for RECORD purposes only; none of
+	 * these documents is merged into the returned config.
+	 */
+	legacyRecords: readonly MigrationRecord[];
+	/** The legacy documents `legacyRecords` was derived from, for freshness. */
+	legacySources: readonly FileStamp[];
 }
 
 /** Cache by absolute config path; we read each candidate's mtime before reuse. */
@@ -216,32 +263,89 @@ const configCache = new Map<string, CacheEntry>();
 const discoveryCache = new Map<string, DiscoveryCacheEntry>();
 
 /**
+ * The shared body of `loadPiLensProjectConfig` and `loadPiLensConfigInDir`:
+ * reuse a fresh cache entry, or parse and cache one, and — EITHER WAY (#2426
+ * review round 3, F2) — report the resolution's migration records. Content
+ * caching (skip re-reading unchanged bytes off disk) and per-session
+ * reporting (tell the user once a session about a deprecated setting) are two
+ * different lifetimes; folding "already cached" into "already reported"
+ * silently dropped the report the moment the file stopped changing.
+ */
+function loadCachedConfigFile(
+	info: PiLensProjectConfigFileInfo,
+): PiLensProjectConfig {
+	const cached = configCache.get(info.path);
+	if (cached && cached.mtimeMs === info.mtimeMs && cached.size === info.size) {
+		replayConfigNotices(cached);
+		return cached.config;
+	}
+
+	const parsed = parseConfigFile(info.path);
+	const entry: CacheEntry = {
+		mtimeMs: info.mtimeMs,
+		size: info.size,
+		config: parsed.config,
+		records: parsed.records,
+		ignored: parsed.ignored,
+	};
+	configCache.set(info.path, entry);
+	replayConfigNotices(entry);
+	return parsed.config;
+}
+
+/**
+ * Report BOTH classes of notice a parse produced (#2426 review round 4, F3).
+ *
+ * The resolution's records go through the shared seam, which derives each
+ * one's subsystem from the record. This loader's own records do not: they are
+ * `project-lens-config`'s by construction — it composed their prose — so
+ * routing them through that derivation would relabel `"lsp.enabled" is a
+ * global-only pi-lens setting` as an LSP-config problem, which is the opposite
+ * of what it says.
+ */
+function replayConfigNotices(entry: {
+	records: readonly MigrationRecord[];
+	ignored: readonly MigrationRecord[];
+}): void {
+	reportPiLensConfigRecords(entry.records);
+	for (const record of entry.ignored) {
+		warnIgnoredConfigOnce({
+			subsystem: "project-lens-config",
+			file: record.file,
+			reason: record.reason,
+			code: record.code,
+		});
+	}
+}
+
+/**
  * Walk up from `startDir` looking for a `.pi-lens.json` or `pi-lens.json`.
  * Returns the parsed config, or an empty config if none was found.
  */
 export function loadPiLensProjectConfig(
 	startDir: string,
-	preloadedInfo = findPiLensProjectConfig(startDir),
+	preloadedInfo?: PiLensProjectConfigFileInfo,
 ): PiLensProjectConfig {
-	const configInfo = preloadedInfo;
+	// ONE discovery per load (#2426 review round 5, F-C). The legacy-document
+	// enumeration below and the config-file lookup are two READS of the same
+	// cache entry, and resolving that entry twice — the default argument once,
+	// the record replay again — doubled the freshness stats every warm load
+	// pays, on a path called per dispatch. The entry is resolved here and both
+	// halves read it.
+	const entry = discoveryEntryFor(startDir);
+	// #2426 review round 4, F4. The half-migrated notices — a legacy
+	// `pi-lens.json` sitting BESIDE or ABOVE the canonical `.pi-lens.json` this
+	// walk stops at — used to be produced only by `loadLSPConfig`, whose
+	// discovery collects from every bearing directory rather than stopping at
+	// the first. Under `--no-lsp`, `lsp.enabled: false`, or a subagent session
+	// (#449, routine) that loader never runs, and the pi-lens-OWNED records for
+	// a pi-lens-owned file were then produced by nobody at all. The pi-lens
+	// loader now enumerates those documents itself, for records only: nothing
+	// here is merged, and which file supplies a VALUE is unchanged.
+	reportPiLensConfigRecords(entry.legacyRecords);
+	const configInfo = preloadedInfo ?? freshInfoFor(entry);
 	if (!configInfo) return EMPTY_PROJECT_CONFIG;
-
-	const cached = configCache.get(configInfo.path);
-	if (
-		cached &&
-		cached.mtimeMs === configInfo.mtimeMs &&
-		cached.size === configInfo.size
-	) {
-		return cached.config;
-	}
-
-	const config = parseConfigFile(configInfo.path);
-	configCache.set(configInfo.path, {
-		mtimeMs: configInfo.mtimeMs,
-		size: configInfo.size,
-		config,
-	});
-	return config;
+	return loadCachedConfigFile(configInfo);
 }
 
 /** For tests + callers that need to force a re-read (e.g. config-watcher hooks). */
@@ -325,36 +429,41 @@ export function findNestedProjectMutationValue(
 export function loadPiLensConfigInDir(dir: string): PiLensProjectConfig {
 	const info = findPiLensConfigInDir(dir);
 	if (!info) return EMPTY_PROJECT_CONFIG;
+	return loadCachedConfigFile(info);
+}
 
-	const cached = configCache.get(info.path);
-	if (cached && cached.mtimeMs === info.mtimeMs && cached.size === info.size) {
-		return cached.config;
-	}
-
-	const config = parseConfigFile(info.path);
-	configCache.set(info.path, {
-		mtimeMs: info.mtimeMs,
-		size: info.size,
-		config,
-	});
-	return config;
+/** The cached discovery for `startDir`, recomputed when it is no longer fresh. */
+function discoveryEntryFor(startDir: string): DiscoveryCacheEntry {
+	const cacheKey = path.resolve(startDir);
+	const cached = discoveryCache.get(cacheKey);
+	if (cached && discoveryCacheStillFresh(cached)) return cached;
+	const discovered = discoverPiLensProjectConfig(cacheKey);
+	discoveryCache.set(cacheKey, discovered);
+	return discovered;
 }
 
 export function findPiLensProjectConfig(
 	startDir: string,
 ): PiLensProjectConfigFileInfo | undefined {
-	const cacheKey = path.resolve(startDir);
-	const cached = discoveryCache.get(cacheKey);
-	if (cached && discoveryCacheStillFresh(cached)) {
-		if (!cached.info) return undefined;
-		const stat = safeFileStat(cached.info.path);
-		if (stat?.isFile())
-			return { ...cached.info, mtimeMs: stat.mtimeMs, size: stat.size };
-	}
+	return freshInfoFor(discoveryEntryFor(startDir));
+}
 
-	const discovered = discoverPiLensProjectConfig(cacheKey);
-	discoveryCache.set(cacheKey, discovered);
-	return discovered.info;
+/**
+ * The winning config file's info, re-statted.
+ *
+ * Split out of `findPiLensProjectConfig` so a caller that already holds the
+ * discovery entry does not resolve it a second time to get here (#2426 review
+ * round 5, F-C). The re-stat itself stays: the entry can be fresh by directory
+ * mtime while the config file was rewritten in place, and the caller keys its
+ * content cache on the mtime/size this returns.
+ */
+function freshInfoFor(
+	entry: DiscoveryCacheEntry,
+): PiLensProjectConfigFileInfo | undefined {
+	if (!entry.info) return undefined;
+	const stat = safeFileStat(entry.info.path);
+	if (!stat?.isFile()) return entry.info;
+	return { ...entry.info, mtimeMs: stat.mtimeMs, size: stat.size };
 }
 
 function safeFileStat(filePath: string): fs.Stats | undefined {
@@ -374,63 +483,164 @@ function safeDirMtimeMs(dir: string): number {
 }
 
 function discoveryCacheStillFresh(entry: DiscoveryCacheEntry): boolean {
-	return entry.dirMtimes.every(
-		(cached) => safeDirMtimeMs(cached.dir) === cached.mtimeMs,
-	);
+	if (
+		!entry.dirMtimes.every(
+			(cached) => safeDirMtimeMs(cached.dir) === cached.mtimeMs,
+		)
+	) {
+		return false;
+	}
+	// A legacy document can be EDITED in place without its directory's mtime
+	// moving, and its top-level key set is what `legacyRecords` describes — so
+	// those files carry their own freshness axis, the same (mtime, size) pair
+	// `CacheEntry` uses.
+	return entry.legacySources.every((source) => {
+		const stat = safeFileStat(source.path);
+		return (
+			stat?.isFile() === true &&
+			stat.mtimeMs === source.mtimeMs &&
+			stat.size === source.size
+		);
+	});
 }
+
+const LEGACY_PROJECT_LOCATIONS: readonly ConfigLocation[] =
+	PROJECT_CONFIG_LOCATIONS.filter((location) => location.legacy);
 
 function discoverPiLensProjectConfig(startDir: string): DiscoveryCacheEntry {
 	const dirMtimes: Array<{ dir: string; mtimeMs: number }> = [];
-	for (const dir of walkUpDirs(startDir)) {
+	const legacyDocuments: ConfigDocument[] = [];
+	const legacySources: FileStamp[] = [];
+	let info: PiLensProjectConfigFileInfo | undefined;
+	// #2426: ceiling-bounded, same rule and same shared primitive as the LSP
+	// loader and as `findNestedProjectMutationValue` below. This walk ran to the
+	// filesystem root before, so a `.pi-lens.json` in `$HOME` (or at `C:\`) was
+	// adopted by every project on the machine — the #622/#625 class.
+	//
+	// It no longer STOPS at the first bearing directory (#2426 review round 4,
+	// F4): the first hit still decides `info`, and therefore still decides every
+	// value this loader returns, but the walk continues to the ceiling so the
+	// legacy documents a user is being asked to migrate are enumerated wherever
+	// they sit — beside the winning file or above it.
+	for (const dir of configSearchDirs(startDir)) {
 		dirMtimes.push({ dir, mtimeMs: safeDirMtimeMs(dir) });
-		for (const name of PROJECT_CONFIG_BASENAMES) {
-			const candidate = path.join(dir, name);
-			const stat = safeFileStat(candidate);
-			if (stat?.isFile()) {
-				return {
-					info: {
+		if (!info) {
+			for (const name of PROJECT_CONFIG_BASENAMES) {
+				const candidate = path.join(dir, name);
+				const stat = safeFileStat(candidate);
+				if (stat?.isFile()) {
+					info = {
 						path: candidate,
 						dir,
 						mtimeMs: stat.mtimeMs,
 						size: stat.size,
-					},
-					dirMtimes,
-				};
+					};
+					break;
+				}
 			}
 		}
+		for (const location of LEGACY_PROJECT_LOCATIONS) {
+			const file = path.join(dir, location.relativePath);
+			const stat = safeFileStat(file);
+			if (!stat?.isFile()) continue;
+			legacySources.push({
+				path: file,
+				mtimeMs: stat.mtimeMs,
+				size: stat.size,
+			});
+			const outcome = readConfigDocument(file);
+			if (outcome.status === "error") {
+				reportConfigReadFailure({
+					file,
+					location,
+					tier: "project",
+					error: outcome.error,
+				});
+				continue;
+			}
+			if (outcome.status !== "ok") continue;
+			legacyDocuments.push({
+				tier: "project",
+				file,
+				location,
+				value: outcome.value,
+			});
+		}
 	}
-	return { info: undefined, dirMtimes };
+	return {
+		info,
+		dirMtimes: bearingDirMtimes(dirMtimes, info),
+		legacyRecords: legacyDeprecationRecords(legacyDocuments),
+		legacySources,
+	};
 }
 
-function warnInvalidConfigOnce(
-	configPath: string,
-	// A hand-authored string for a validated bad value/wrong type (every call
-	// site below but the JSON.parse catch); `{ parseError }` for a caught
-	// parse/read error, so `warnIgnoredConfigOnce` — not this wrapper — decides
-	// how much of a `JSON.parse` `SyntaxError#message` (which embeds a snippet
-	// of the source file on Node >=20, #2431) survives into the three sinks.
-	reason: string | { readonly parseError: unknown },
-): void {
-	// Shared seam since #2418: latch, extension.log line, durable
-	// `config-ignored` ledger row, and stable-coded notification in one place.
-	warnIgnoredConfigOnce({
-		subsystem: "project-lens-config",
-		file: configPath,
-		reason,
-	});
+/**
+ * The legacy documents' deprecation records, BOUNDED per document (#2426
+ * review round 5, F-A/F-B).
+ *
+ * This path shipped its records raw. A legacy file's recognized top-level key
+ * count is user input, so one 28-key `pi-lens.json` produced 28 notifications
+ * through this loader while the LSP loader — which finalizes the same records —
+ * produced the bound plus a count for the identical file, and five nested
+ * legacy files produced 145 with no suppression record anywhere. Every producer
+ * now goes through the one \`finalizeRecords\`.
+ *
+ * Per DOCUMENT rather than per walk, because these are not one resolution: each
+ * file is separately actionable ("move these keys out of THIS file"), and a
+ * per-walk bound would silently drop whole files' advice while naming only the
+ * last one. Per document also makes the two loaders agree on the count for a
+ * given file, which is the parity `config-notice-ownership` asserts.
+ */
+function legacyDeprecationRecords(
+	documents: readonly ConfigDocument[],
+): readonly MigrationRecord[] {
+	const home = os.homedir();
+	return documents.flatMap((document) =>
+		finalizeRecords(deprecationRecords([document], home), {
+			file: document.file,
+			tier: document.tier,
+		}),
+	);
+}
+
+/**
+ * The directory mtimes this entry's freshness is keyed on: the BEARING chain —
+ * `startDir` up to and including the directory that supplied `info` (#2426
+ * review round 5, F-C).
+ *
+ * The walk itself no longer stops at the first bearing directory, because the
+ * legacy documents a user is asked to migrate can sit above it. Keying
+ * freshness on every directory it VISITS is a different decision, and a bad
+ * one: the walk runs to just below `$HOME`, so the entry was invalidated by any
+ * churn in an ancestor like `~/Desktop` — a full re-walk, re-read and re-parse
+ * of every legacy document, on a hot path, triggered by an unrelated directory.
+ *
+ * Scoping it back to the bearing chain restores the pre-#2426 invalidation
+ * surface exactly. Nothing that decides a VALUE is outside that chain, and an
+ * already-discovered legacy document above it carries its own (mtime, size)
+ * stamp in `legacySources`, so an EDIT to one is still noticed. What is given
+ * up is noticing a legacy file NEWLY CREATED above the bearing directory
+ * mid-process — records-only, and strictly more than the pre-#2426 loader saw,
+ * since it never looked above that directory at all.
+ */
+function bearingDirMtimes(
+	dirMtimes: readonly { dir: string; mtimeMs: number }[],
+	info: PiLensProjectConfigFileInfo | undefined,
+): Array<{ dir: string; mtimeMs: number }> {
+	if (!info) return [...dirMtimes];
+	const bearing = dirMtimes.findIndex((entry) => entry.dir === info.dir);
+	return bearing < 0 ? [...dirMtimes] : dirMtimes.slice(0, bearing + 1);
 }
 
 function parseRulePolicyList(
-	configPath: string,
+	note: NoteIgnored,
 	ruleId: string,
 	key: "disable" | "select",
 	value: unknown,
 ): { list: string[]; invalid: boolean } {
 	if (!Array.isArray(value)) {
-		warnInvalidConfigOnce(
-			configPath,
-			`rules.${ruleId}.${key} must be an array of strings`,
-		);
+		note(`rules.${ruleId}.${key} must be an array of strings`);
 		return { list: [], invalid: true };
 	}
 	const list: string[] = [];
@@ -445,10 +655,7 @@ function parseRulePolicyList(
 		// but none were usable strings (all blank / non-string), which is a real
 		// authoring mistake that must not fail silently.
 		if (value.length > 0) {
-			warnInvalidConfigOnce(
-				configPath,
-				`rules.${ruleId}.${key} must contain at least one non-empty string`,
-			);
+			note(`rules.${ruleId}.${key} must contain at least one non-empty string`);
 			return { list: [], invalid: true };
 		}
 		return { list: [], invalid: false };
@@ -456,31 +663,89 @@ function parseRulePolicyList(
 	return { list, invalid: false };
 }
 
-function parseConfigFile(configPath: string): PiLensProjectConfig {
-	let raw: unknown;
-	try {
-		const text = fs.readFileSync(configPath, "utf-8");
-		raw = JSON.parse(text);
-	} catch (error) {
-		warnInvalidConfigOnce(configPath, { parseError: error });
-		return EMPTY_PROJECT_CONFIG;
+/** A parsed config plus the two classes of record it produced. */
+interface ParsedConfigFile {
+	config: PiLensProjectConfig;
+	/** From the shared resolution: deprecations and core validation drops. */
+	records: readonly MigrationRecord[];
+	/** This loader's own `config-ignored` records (#2426 review round 4, F3). */
+	ignored: readonly MigrationRecord[];
+}
+
+const NO_RECORDS: readonly MigrationRecord[] = [];
+
+function parseConfigFile(configPath: string): ParsedConfigFile {
+	const { note, records: ignoredRecords } = ignoredRecordCollector(
+		configPath,
+		"project",
+	);
+	const outcome = readConfigDocument(configPath);
+	if (outcome.status === "error") {
+		// `{ parseError }`, not a pre-stringified message (#2431): the raw error
+		// reaches one seam, which decides how much of a `JSON.parse`
+		// `SyntaxError#message` (which embeds a snippet of the file being parsed)
+		// survives into the sinks.
+		note({ parseError: outcome.error });
+		return {
+			config: EMPTY_PROJECT_CONFIG,
+			records: NO_RECORDS,
+			ignored: ignoredRecords(),
+		};
+	}
+	// The file was stat'd as present by the discovery above, so `missing` here is
+	// a delete that raced the read. Nothing to warn about — the next call
+	// re-discovers and finds no config at all.
+	if (outcome.status === "missing") {
+		return {
+			config: EMPTY_PROJECT_CONFIG,
+			records: NO_RECORDS,
+			ignored: NO_RECORDS,
+		};
 	}
 
-	if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-		warnInvalidConfigOnce(configPath, "top-level value must be an object");
-		return EMPTY_PROJECT_CONFIG;
+	if (
+		!outcome.value ||
+		typeof outcome.value !== "object" ||
+		Array.isArray(outcome.value)
+	) {
+		note("top-level value must be an object");
+		return {
+			config: EMPTY_PROJECT_CONFIG,
+			records: NO_RECORDS,
+			ignored: ignoredRecords(),
+		};
 	}
 
-	const obj = raw as Record<string, unknown>;
+	// Through the #2425 core (#2426): the value is validated against the
+	// canonical schema before this loader's own field parsing sees it, so the
+	// depth bound, the prototype-key policy and the declared `lsp.*` types apply
+	// here exactly as they do in the LSP loader. `raw` is the VALIDATED value
+	// rather than the parse output, which is the one place the field's
+	// documented "the parsed JSON as-is" narrows: a `__proto__` key or a
+	// 4000-deep blob no longer rides into `.raw`'s consumers (`trivy-client.ts`,
+	// the helm-render runner).
+	const resolved = resolveOnePiLensConfigDocument({
+		tier: "project",
+		file: configPath,
+		location: projectLocationFor(configPath),
+		value: outcome.value,
+	});
+	// The records are RETURNED, not reported here (#2426 review round 3, F2):
+	// this function's result is what the caller caches, and a cache HIT must
+	// still report them every session — a call this function never makes on a
+	// hit. Reporting here would fire only on a cache MISS (session 1), and
+	// `resetProjectLensConfigCache` has no production caller, so every session
+	// after the first silently lost the `config-deprecated` ledger row despite
+	// the file still being the exact deprecated one on disk.
+	const raw: unknown = resolved.value;
+	const obj = resolved.value;
 
 	const ignore = Array.isArray(obj.ignore)
 		? obj.ignore.filter((p): p is string => typeof p === "string")
 		: [];
 	const mutations: Record<string, unknown> = {};
 	for (const spec of PROJECT_SCOPED_LENS_FLAGS) {
-		assignFlagConfigSection(obj, mutations, spec.configKey, (reason) =>
-			warnInvalidConfigOnce(configPath, reason),
-		);
+		assignFlagConfigSection(obj, mutations, spec.configKey, note);
 	}
 
 	const rules: Record<string, PiLensProjectRuleConfig> = {};
@@ -491,8 +756,7 @@ function parseConfigFile(configPath: string): PiLensProjectConfig {
 			// disable`), which lands here as an array and would otherwise be
 			// dropped without a word — the one shape a user is most likely to try.
 			if (!ruleCfg || typeof ruleCfg !== "object" || Array.isArray(ruleCfg)) {
-				warnInvalidConfigOnce(
-					configPath,
+				note(
 					`rules.${ruleId} must be an object with threshold, disable, or select; ignored`,
 				);
 				continue;
@@ -506,30 +770,17 @@ function parseConfigFile(configPath: string): PiLensProjectConfig {
 			) {
 				entry.threshold = r.threshold;
 			} else if ("threshold" in r) {
-				warnInvalidConfigOnce(
-					configPath,
-					`rules.${ruleId}.threshold must be a positive finite number`,
-				);
+				note(`rules.${ruleId}.threshold must be a positive finite number`);
 			}
 			if ("disable" in r) {
-				const parsed = parseRulePolicyList(
-					configPath,
-					ruleId,
-					"disable",
-					r.disable,
-				);
+				const parsed = parseRulePolicyList(note, ruleId, "disable", r.disable);
 				// #1087: an explicitly empty list is valid-but-empty (no warning);
 				// don't store a pointless no-op entry for it.
 				if (!parsed.invalid && parsed.list.length > 0)
 					entry.disable = parsed.list;
 			}
 			if ("select" in r) {
-				const parsed = parseRulePolicyList(
-					configPath,
-					ruleId,
-					"select",
-					r.select,
-				);
+				const parsed = parseRulePolicyList(note, ruleId, "select", r.select);
 				if (!parsed.invalid && parsed.list.length > 0)
 					entry.select = parsed.list;
 			}
@@ -541,8 +792,7 @@ function parseConfigFile(configPath: string): PiLensProjectConfig {
 			if (entry.threshold !== undefined || entry.disable || entry.select) {
 				rules[ruleId] = entry;
 			} else if (!("threshold" in r) && !("disable" in r) && !("select" in r)) {
-				warnInvalidConfigOnce(
-					configPath,
+				note(
 					`rules.${ruleId} has no recognized setting (threshold, disable, select); ignored`,
 				);
 			}
@@ -558,10 +808,7 @@ function parseConfigFile(configPath: string): PiLensProjectConfig {
 		) {
 			maxProjectFiles = obj.maxProjectFiles;
 		} else {
-			warnInvalidConfigOnce(
-				configPath,
-				"maxProjectFiles must be a positive finite number",
-			);
+			note("maxProjectFiles must be a positive finite number");
 		}
 	}
 
@@ -572,7 +819,7 @@ function parseConfigFile(configPath: string): PiLensProjectConfig {
 			typeof obj.reviewGraph !== "object" ||
 			Array.isArray(obj.reviewGraph)
 		) {
-			warnInvalidConfigOnce(configPath, "reviewGraph must be an object");
+			note("reviewGraph must be an object");
 		} else {
 			const rg = obj.reviewGraph as Record<string, unknown>;
 			if ("maxFiles" in rg) {
@@ -584,10 +831,7 @@ function parseConfigFile(configPath: string): PiLensProjectConfig {
 					);
 					reviewGraph = { maxFiles: clamped };
 				} else {
-					warnInvalidConfigOnce(
-						configPath,
-						"reviewGraph.maxFiles must be a positive finite number",
-					);
+					note("reviewGraph.maxFiles must be a positive finite number");
 				}
 			}
 		}
@@ -603,7 +847,7 @@ function parseConfigFile(configPath: string): PiLensProjectConfig {
 	// than being lumped in with typos — docs previously called this "silently
 	// ignored".
 	const knownProjectKeys = new Set<string>([
-		...PROJECT_OWN_CONFIG_KEYS,
+		...PROJECT_NON_FLAG_CONFIG_SECTIONS,
 		...flagConfigSectionKeys(PROJECT_SCOPED_LENS_FLAGS),
 		...PROJECT_FOREIGN_CONFIG_NAMESPACES,
 	]);
@@ -613,31 +857,75 @@ function parseConfigFile(configPath: string): PiLensProjectConfig {
 			...GLOBAL_NON_FLAG_CONFIG_SECTIONS,
 		].filter((key) => !knownProjectKeys.has(key)),
 	);
+	// The full DOTTED config keys of the flags a project file cannot set, for the
+	// sub-key scan below. Section-level keys are too coarse for a namespace that
+	// mixes scopes: `lsp` holds four project-scoped settings AND the global-only
+	// `lsp.enabled`.
+	const projectScoped = new Set<string>(
+		PROJECT_SCOPED_LENS_FLAGS.map((spec) => spec.configKey),
+	);
+	const globalScopeOnlyFlagKeys = LENS_FLAGS.map(
+		(spec) => spec.configKey,
+	).filter((configKey) => !projectScoped.has(configKey));
+	// The literal path is derived, not hand-typed (#2426 review round 3, S1):
+	// under `PI_LENS_CONFIG_PATH` the canonical global config is NOT
+	// `~/.pi-lens/config.json`, and a hardcoded string in this notice would name
+	// a file the resolver never reads.
+	const globalConfigLabel = homeRelativePath(
+		getPiLensGlobalConfigPath(),
+		os.homedir(),
+	);
+	const warnUnhonoredKey = (label: string, globalOnly: boolean): void => {
+		note(
+			globalOnly
+				? `"${label}" is a global-only pi-lens setting and is not honored in a project .pi-lens.json (set it in ${globalConfigLabel} or pass the matching CLI flag); ignored`
+				: `unknown key "${label}" is not a recognized pi-lens setting (check for a typo); ignored`,
+		);
+	};
 	for (const key of Object.keys(obj)) {
 		if (knownProjectKeys.has(key)) continue;
-		if (globalScopeOnlyKeys.has(key)) {
-			warnInvalidConfigOnce(
-				configPath,
-				`"${key}" is a global-only pi-lens setting and is not honored in a project .pi-lens.json (set it in ~/.pi-lens/config.json or pass the matching CLI flag); ignored`,
-			);
-		} else {
-			warnInvalidConfigOnce(
-				configPath,
-				`unknown key "${key}" is not a recognized pi-lens setting (check for a typo); ignored`,
+		warnUnhonoredKey(key, globalScopeOnlyKeys.has(key));
+	}
+
+	// A tolerated foreign namespace is tolerated KEY BY KEY (#2426 review round
+	// 2, F3). `lsp` is read out of this file by the LSP loader, but only four of
+	// its keys are project-scoped; `lsp.enabled` is the `--no-lsp` flag, which is
+	// `scope: "global"`. Blanket namespace tolerance swallowed it silently, which
+	// `docs/configuration.md`'s "nothing is ignored silently" forbids — so every
+	// other sub-key gets the same global-only-vs-typo signal a top-level key does,
+	// named with its DOTTED path so the notice says which setting is meant.
+	for (const [namespace, honored] of PROJECT_FOREIGN_NAMESPACE_HONORED_KEYS) {
+		const section = obj[namespace];
+		if (!section || typeof section !== "object" || Array.isArray(section)) {
+			continue;
+		}
+		for (const key of Object.keys(section as Record<string, unknown>)) {
+			if (honored.includes(key)) continue;
+			const dotted = `${namespace}.${key}`;
+			warnUnhonoredKey(
+				dotted,
+				globalScopeOnlyFlagKeys.some(
+					(configKey) =>
+						configKey === dotted || configKey.startsWith(`${dotted}.`),
+				),
 			);
 		}
 	}
 
 	return {
-		ignore,
-		rules,
-		...(mutations as Pick<
-			PiLensProjectConfig,
-			"format" | "autofix" | "actionableWarnings"
-		>),
-		maxProjectFiles,
-		reviewGraph,
-		raw,
-		configPath,
+		config: {
+			ignore,
+			rules,
+			...(mutations as Pick<
+				PiLensProjectConfig,
+				"format" | "autofix" | "actionableWarnings"
+			>),
+			maxProjectFiles,
+			reviewGraph,
+			raw,
+			configPath,
+		},
+		records: resolved.records,
+		ignored: ignoredRecords(),
 	};
 }

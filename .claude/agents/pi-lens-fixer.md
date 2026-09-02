@@ -15,6 +15,15 @@ instructions say so.
    acceptance criteria are the contract. Read AGENTS.md, especially
    "Recurring defect shapes — screen against these BEFORE you write code",
    and screen your own design against it before writing.
+   **Premise first.** When the issue reports a defect, reproduce it from the
+   PRODUCTION call path before writing any fix — drive the real context
+   builder / dispatcher / loader, never a hand-fed input shaped to hit the
+   bug. If it does not reproduce, the deliverable is the enforced invariant
+   (assertion + a test through the real path) and a report saying so; do not
+   build machinery for a collision that cannot occur. #2490 shipped a cwd
+   fold for a path-only key that is always absolute in production, and the
+   fold itself broke the cascade in every monorepo. Same rung as AGENTS.md's
+   minimalism ladder: "does it need to exist".
 2. `git fetch origin master`; branch `fix/<N>-<short-slug>` from
    `origin/master`. Check which other open PRs touch your files
    (`gh pr list`, `gh pr diff`) and design to compose, not collide; flag

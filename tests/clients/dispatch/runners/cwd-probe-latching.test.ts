@@ -52,10 +52,11 @@ vi.mock("../../../../clients/dispatch/runners/utils/lazy-installer.js", () => ({
 	getLazyInstallAttempt,
 }));
 
+// #2455 fix round 4, F2: `rust-client.ts` now owns the process's ONE
+// RustClient and the runner imports that instance, so the double is the
+// INSTANCE, not the class.
 vi.mock("../../../../clients/rust-client.js", () => ({
-	RustClient: class {
-		findCargoPathAsync = findCargoPathAsync;
-	},
+	rustClient: { findCargoPathAsync },
 }));
 
 const timeoutResult = () => ({

@@ -8,11 +8,15 @@ const { safeSpawnAsync, goExePath } = vi.hoisted(() => ({
 	goExePath: { current: "/usr/local/bin/go" as string | null },
 }));
 
+// #2455 fix round 4, F2: `go-client.ts` now owns the process's ONE GoClient
+// and the runner imports that instance, so the double is the INSTANCE, not the
+// class. Production-faithful on the axis under test: the runner calls
+// `findGoPathAsync()` on it exactly as before.
 vi.mock("../../../../clients/go-client.js", () => ({
-	GoClient: class {
+	goClient: {
 		async findGoPathAsync() {
 			return goExePath.current;
-		}
+		},
 	},
 }));
 
