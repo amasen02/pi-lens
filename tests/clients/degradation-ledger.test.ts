@@ -257,6 +257,37 @@ describe("session degradation ledger", () => {
 		]);
 	});
 
+	// #2505 review: a routine rotation at the configured bound is the sink
+	// working as designed. Flagging it with the same warning marker a real
+	// degradation gets trains the reader to ignore the marker; the FAILED
+	// rotation (the sink cannot bound itself, so the file grows) is the line
+	// that has to stand out.
+	it("renders a routine sink rotation informationally and a failed one as a warning", () => {
+		const sink = "read-guard.log";
+		const lines = renderDegradationLines([
+			{
+				kind: "log-sink-rotated",
+				count: 3,
+				droppedCount: 0,
+				latestReasons: [
+					{ subject: sink, reason: "3 rotations at the byte bound" },
+				],
+			},
+			{
+				kind: "log-sink-rotate-failed",
+				count: 2,
+				droppedCount: 0,
+				latestReasons: [
+					{ subject: sink, reason: "2 failed rotations, sink still growing" },
+				],
+			},
+		]);
+		expect(lines[0]).toBe("Degradations:");
+		expect(lines[1]).toBe("  log-sink-rotated: 3");
+		expect(lines[1]).not.toContain("⚠");
+		expect(lines[2]).toContain("⚠ log-sink-rotate-failed: 2");
+		expect(lines[2]).toContain(sink);
+	});
 	it("renders newly wired degradation kinds", () => {
 		recordDegradation({
 			kind: "formatter-failure",

@@ -5,7 +5,12 @@
  * half of that guarantee — every module that LOOKS like an ndjson log sink
  * (the established `*-logger.ts` naming convention, plus the small set of
  * known non-suffix producers) actually delegates to `createNdjsonLogger`
- * rather than defining its own private write/rotate path.
+ * rather than defining its own private write/rotate path — and the second
+ * half of it: delegating is not enough, the delegation has to actually
+ * CONFIGURE a bound. `maxBytes` is optional on the writer, so an unbounded
+ * sink is a one-word omission away, and three of them (diagnostic-logger,
+ * review-graph-logger, sessionstart-logger) shipped exactly that way while
+ * this file only asserted the import.
  *
  * The negative half — no `clients/*.ts` file does a raw `fs.appendFile(Sync)`
  * bypassing the shared seam — is already covered by
@@ -29,29 +34,77 @@ import { assertNonEmptyScan } from "../support/sweep-kit.js";
 const CREATE_LOGGER_IMPORT =
 	/import\s*\{[^}]*\bcreateNdjsonLogger\b[^}]*\}\s*from\s*["']\.\/ndjson-logger\.js["']/;
 
-/** Known ndjson producers that don't match the `*-logger.ts` naming shape. */
+/** Known ndjson producers that do not match the `*-logger.ts` naming shape. */
 const KNOWN_NON_SUFFIX_PRODUCERS = [
 	"extension-log.ts",
 	"debug-handles.ts",
 	"debug-heap.ts",
 ];
 
+/** One `createNdjsonLogger(...)` call site found under `clients/`. */
+interface LoggerCallSite {
+	/** Path relative to `clients/`, forward slashes. */
+	file: string;
+	/** 1-based line of the call. */
+	line: number;
+	/** The whole call expression, parens balanced. */
+	text: string;
+}
+
 function relativeToClients(absolute: string): string {
 	return path
 		.relative(path.join(repoRoot, "clients"), absolute)
-		.replace(/\\/g, "/");
+		.split(path.sep)
+		.join("/");
+}
+
+/**
+ * Every `createNdjsonLogger(` call in one source file, with its full argument
+ * list. Paren-balanced rather than line- or regex-delimited: the option object
+ * spans several lines in most sinks and a single line in others, and a regex
+ * that only matched one of those shapes would silently under-report the very
+ * omission this scan exists to catch.
+ */
+function loggerCallSites(absolute: string): LoggerCallSite[] {
+	const source = fs.readFileSync(absolute, "utf8");
+	const sites: LoggerCallSite[] = [];
+	const call = /createNdjsonLogger\s*\(/g;
+	let match = call.exec(source);
+	while (match !== null) {
+		let depth = 0;
+		let index = match.index + match[0].length - 1;
+		for (; index < source.length; index += 1) {
+			const ch = source[index];
+			if (ch === "(") depth += 1;
+			else if (ch === ")") {
+				depth -= 1;
+				if (depth === 0) break;
+			}
+		}
+		sites.push({
+			file: relativeToClients(absolute),
+			line: source.slice(0, match.index).split("\n").length,
+			text: source.slice(match.index, index + 1),
+		});
+		match = call.exec(source);
+	}
+	return sites;
+}
+
+function loggerModules(): string[] {
+	return clientSourceFiles()
+		.filter((file) => path.basename(file) !== "ndjson-logger.ts")
+		.filter((file) => /-logger\.ts$/.test(path.basename(file)));
 }
 
 describe("NDJSON writer conformance (#2505)", () => {
 	it("every *-logger.ts module (except ndjson-logger.ts itself) delegates to createNdjsonLogger", () => {
-		const population = clientSourceFiles()
-			.filter((file) => path.basename(file) !== "ndjson-logger.ts")
-			.filter((file) => /-logger\.ts$/.test(path.basename(file)));
+		const population = loggerModules();
 
 		// Floor, not an exact count: a derived population that silently drops
 		// to zero (e.g. after a mass rename) would make every assertion below
 		// vacuously true. Currently 13 files match; keep some margin below
-		// that so an unrelated future removal doesn't make this test flaky.
+		// that so an unrelated future removal does not make this test flaky.
 		assertNonEmptyScan("clients/*-logger.ts population", population.length, 10);
 
 		const violations = population
@@ -74,5 +127,27 @@ describe("NDJSON writer conformance (#2505)", () => {
 				`${name} should import createNdjsonLogger`,
 			).toBe(true);
 		}
+	});
+
+	it("every createNdjsonLogger call site under clients/ configures a maxBytes bound", () => {
+		const sites = clientSourceFiles()
+			.filter((file) => path.basename(file) !== "ndjson-logger.ts")
+			.flatMap((file) => loggerCallSites(file));
+
+		assertNonEmptyScan(
+			"clients/ createNdjsonLogger call sites",
+			sites.length,
+			12,
+		);
+
+		const unbounded = sites
+			.filter((site) => !/\bmaxBytes\s*:/.test(site.text))
+			.map((site) => `${site.file}:${site.line}`);
+
+		// An unbounded sink is the #2505 defect itself: no size check runs on
+		// the write path at all, so the file grows until the once-per-process
+		// session-start sweep happens to look at it — which, in a long-lived
+		// process (the warm MCP server), may be never.
+		expect(unbounded).toEqual([]);
 	});
 });

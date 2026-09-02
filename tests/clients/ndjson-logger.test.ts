@@ -150,37 +150,39 @@ describe("createNdjsonLogger", () => {
 		expect(readLines(logFile)).toEqual([third]);
 	});
 
-	it("rotates BEFORE a write that alone would cross the bound, not after (#2505)", async () => {
-		// The pre-existing behavior only checked the size already on disk
-		// before writing a batch; a batch that itself is far larger than
-		// maxBytes could sail straight past the bound with nothing left to
-		// trigger a follow-up check. Seed some real on-disk content first (a
-		// session that has already been logging for a while), then send a
-		// burst that alone dwarfs maxBytes in one synchronous sweep (no awaits
-		// between enqueues) — the same shape a busy session or a slow
-		// filesystem (#462) produces when production outruns the drain.
+	it("caps a drain batch at the bound — a burst that alone dwarfs maxBytes never lands whole (#2505)", async () => {
+		// The bound has to hold for the write that CROSSES it, not only for the
+		// file that was already on disk. A busy session (or a slow filesystem,
+		// #462, backing the queue up faster than the drain empties it) coalesces
+		// hundreds of queued lines into ONE drain batch, and rotation only ever
+		// moves PRE-EXISTING content aside — so a batch written whole into an
+		// empty (or just-rotated) file lands at whatever size it happens to be,
+		// with nothing left on disk to rotate away. 100x the bound in a single
+		// sweep is not hypothetical; it is what the drain does when production
+		// outruns it.
 		const backup = `${logFile}.1`;
-		const logger = createNdjsonLogger({ filePath: logFile, maxBytes: 1024 });
-
-		logger.log({ seed: true });
-		await logger.flush();
-		const seedSize = fs.statSync(logFile).size;
-		expect(seedSize).toBeGreaterThan(0);
-		expect(seedSize).toBeLessThan(1024);
+		const maxBytes = 1024;
+		const logger = createNdjsonLogger({ filePath: logFile, maxBytes });
 
 		const line = "x".repeat(200);
-		for (let i = 0; i < 50; i++) logger.log({ i, line });
+		for (let i = 0; i < 500; i++) logger.log({ i, line });
 		await logger.flush();
 
-		// The oversized burst rotated the SEED content away before writing
-		// itself — the crossing is caught at the write that causes it, not
-		// deferred until some later write (or, absent one, the next
-		// session-start sweep).
+		const active = fs.statSync(logFile).size;
+		const largestLine = Math.max(
+			...readLines(logFile).map((entry) => Buffer.byteLength(`${entry}\n`)),
+		);
+		// A single NDJSON line is atomic — it cannot be split — so the enforced
+		// invariant is "the bound plus at most ONE line", never "the bound plus
+		// an unbounded batch".
+		expect(active).toBeLessThanOrEqual(maxBytes + largestLine);
 		expect(fs.existsSync(backup)).toBe(true);
-		expect(fs.statSync(backup).size).toBe(seedSize);
-		const lines = readLines(logFile).map((l) => JSON.parse(l));
-		expect(lines).toHaveLength(50);
-		expect(lines[0]).toEqual({ i: 0, line });
+		expect(fs.statSync(backup).size).toBeLessThanOrEqual(
+			maxBytes + largestLine,
+		);
+		// ...and the burst was written, not dropped: many rotations, every line
+		// through the sink.
+		expect(getSinkRotations()[0]?.rotationCount ?? 0).toBeGreaterThan(1);
 	});
 
 	it("never rotates when maxBytes is absent", async () => {
@@ -902,6 +904,118 @@ describe("createNdjsonLogger", () => {
 			).toBe(true);
 
 			resetDegradationLedger();
+		});
+
+		it("resetDegradationLedger re-arms the rotation tally at the session boundary", async () => {
+			const { getDegradationSummary, resetDegradationLedger } =
+				await import("../../clients/degradation-ledger.js");
+			resetDegradationLedger();
+			const logger = createNdjsonLogger({ filePath: logFile, maxBytes: 80 });
+			logger.append('{"entry":"1234567890123456789"}');
+			await logger.flush();
+			logger.append('{"entry":"abcdefghijABCDEFGHIJ"}');
+			await logger.flush();
+			logger.append('{"entry":"third"}'); // rotates
+			await logger.flush();
+			expect(
+				getDegradationSummary().find((g) => g.kind === "log-sink-rotated"),
+			).toBeDefined();
+
+			// The re-arm has to run THROUGH the ledger's own session-boundary
+			// reset (catalog shape 17) — calling resetSinkRotations() directly
+			// would pass even if the ledger never wired it up.
+			resetDegradationLedger();
+			expect(
+				getDegradationSummary().find((g) => g.kind === "log-sink-rotated"),
+			).toBeUndefined();
+		});
+
+		it("records a failed rotation as a degradation and backs off instead of retrying it every write", async () => {
+			// A rename that cannot succeed (an unwritable backup path, or the
+			// Windows sharing violation another process holding the file open
+			// produces) must not be silent: pre-fix the catch swallowed it and
+			// rotationCount only moved on SUCCESS, so an unbounded log looked
+			// exactly like a healthy one. It must also not be re-attempted on
+			// every single write — that is a syscall storm that never succeeds.
+			const { getDegradationSummary, resetDegradationLedger } =
+				await import("../../clients/degradation-ledger.js");
+			resetDegradationLedger();
+			const renameSync = vi.spyOn(fs, "renameSync").mockImplementation(() => {
+				const err = new Error(
+					"EPERM: operation not permitted, rename",
+				) as NodeJS.ErrnoException;
+				err.code = "EPERM";
+				throw err;
+			});
+
+			const logger = createNdjsonLogger({ filePath: logFile, maxBytes: 200 });
+			for (let i = 0; i < 30; i++) {
+				logger.log({ i, pad: "y".repeat(50) });
+				await logger.flush();
+			}
+
+			// Most of those 30 writes believe a rotation is due; the failing
+			// rename is attempted on a cadence, not once per write.
+			expect(renameSync.mock.calls.length).toBeGreaterThan(0);
+			expect(renameSync.mock.calls.length).toBeLessThan(5);
+
+			const rotations = getSinkRotations();
+			expect(rotations).toHaveLength(1);
+			expect(rotations[0]?.rotationCount).toBe(0);
+			expect(rotations[0]?.failureCount).toBeGreaterThan(0);
+
+			const summary = getDegradationSummary();
+			const failed = summary.find((g) => g.kind === "log-sink-rotate-failed");
+			expect(failed).toBeDefined();
+			expect(failed?.count).toBeGreaterThan(0);
+			expect(
+				failed?.latestReasons.some((entry) =>
+					entry.subject.includes("test.log"),
+				),
+			).toBe(true);
+			// A sink that never actually rotated must not also claim a rotation.
+			expect(
+				summary.find((g) => g.kind === "log-sink-rotated"),
+			).toBeUndefined();
+
+			// Lines are still written — a sink that cannot rotate degrades to
+			// "grows, and says so", never to "drops".
+			expect(readLines(logFile)).toHaveLength(30);
+			resetDegradationLedger();
+		});
+
+		it("confirms the real file size before renaming, so another process rotation is not clobbered", async () => {
+			// Two processes share one global log (a pi session and the warm MCP
+			// server both write the same global read-guard.log). A rotates: its
+			// old content is now the backup and the active file is small again.
+			// B's in-memory size is still the PRE-rotation figure, so B believes
+			// a rotation is due — and rotating on that stale belief force-removes
+			// A's backup and moves A's fresh file aside, destroying real log
+			// data. The clock is frozen so the periodic resync cannot mask the
+			// staleness: this pins the CACHED-size decision path specifically.
+			vi.useFakeTimers({ toFake: ["Date"] });
+			try {
+				const backup = `${logFile}.1`;
+				const logger = createNdjsonLogger({ filePath: logFile, maxBytes: 400 });
+				for (let i = 0; i < 5; i++) logger.log({ i, pad: "z".repeat(50) });
+				await logger.flush();
+				const primed = fs.statSync(logFile).size;
+				expect(primed).toBeGreaterThan(300);
+				expect(primed).toBeLessThan(400);
+
+				// Process A rotates underneath us.
+				fs.writeFileSync(backup, "A-BACKUP\n");
+				fs.writeFileSync(logFile, "A-FRESH\n");
+
+				logger.log({ i: 5, pad: "z".repeat(50) });
+				await logger.flush();
+
+				expect(fs.readFileSync(backup, "utf-8")).toBe("A-BACKUP\n");
+				expect(fs.readFileSync(logFile, "utf-8")).toContain("A-FRESH");
+				expect(getSinkRotations()).toEqual([]);
+			} finally {
+				vi.useRealTimers();
+			}
 		});
 	});
 });

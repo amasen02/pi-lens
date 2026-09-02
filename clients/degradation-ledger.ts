@@ -524,6 +524,16 @@ export type DegradationKind =
 	 */
 	| "log-sink-rotated"
 	/**
+	 * A rotation that `ndjson-logger.ts` attempted and could NOT complete
+	 * (#2505 review F2) — an unwritable backup path, or the Windows sharing
+	 * violation another process holding the file open produces. This is the
+	 * one that matters: the sink cannot bound itself, so the file keeps
+	 * growing past `maxBytes` until something outside the writer moves it.
+	 * Its sibling above is informational; this one renders as a warning.
+	 * Same read-time pull, same cycle reason.
+	 */
+	| "log-sink-rotate-failed"
+	/**
 	 * A word-index posting named a file id the file table could not resolve to
 	 * a path, so the posting was dropped from a search result or a decoded hit
 	 * list (#2069). Since #2069 a posting carries an integer id rather than a
@@ -913,18 +923,33 @@ export function getDegradationSummary(): DegradationGroup[] {
 	// reporting on — see the `log-sink-rotated` doc comment on
 	// `DegradationKind`.
 	const sinkRotations = getSinkRotations();
-	if (sinkRotations.length > 0) {
+	const rotated = sinkRotations.filter((sink) => sink.rotationCount > 0);
+	if (rotated.length > 0) {
 		summary.push({
 			kind: "log-sink-rotated",
-			count: sinkRotations.reduce(
-				(total, sink) => total + sink.rotationCount,
-				0,
-			),
+			count: rotated.reduce((total, sink) => total + sink.rotationCount, 0),
 			droppedCount: 0,
-			latestReasons: sinkRotations.map((sink) => ({
+			latestReasons: rotated.map((sink) => ({
 				subject: truncateForLedger(sink.file),
 				reason: truncateForLedger(
 					`${sink.rotationCount} rotation(s) at the configured byte bound`,
+				),
+			})),
+		});
+	}
+	// A rotation the writer ATTEMPTED and could not complete is a different
+	// fact from a rotation that happened, and the only signal that a sink is
+	// growing past its bound right now (#2505 review F2).
+	const rotateFailed = sinkRotations.filter((sink) => sink.failureCount > 0);
+	if (rotateFailed.length > 0) {
+		summary.push({
+			kind: "log-sink-rotate-failed",
+			count: rotateFailed.reduce((total, sink) => total + sink.failureCount, 0),
+			droppedCount: 0,
+			latestReasons: rotateFailed.map((sink) => ({
+				subject: truncateForLedger(sink.file),
+				reason: truncateForLedger(
+					`${sink.failureCount} failed rotation attempt(s); this sink is growing past its byte bound`,
 				),
 			})),
 		});
@@ -967,6 +992,19 @@ function isRenderableSummary(value: unknown): value is DegradationGroup[] {
 	});
 }
 
+/**
+ * Kinds that record something the system did ON PURPOSE, correctly, and
+ * that a reader only needs a tally of — never a call to action (#2505
+ * review). A routine log rotation at the configured bound is the writer
+ * working as designed; giving it the same warning marker a real
+ * degradation gets trains the reader to ignore the marker. The FAILED
+ * rotation is the line that has to stand out, so it is deliberately NOT
+ * in this set.
+ */
+const INFORMATIONAL_DEGRADATION_KINDS: ReadonlySet<string> = new Set([
+	"log-sink-rotated",
+]);
+
 export function renderDegradationLines(
 	summary: unknown = getDegradationSummary(),
 ): string[] {
@@ -975,6 +1013,9 @@ export function renderDegradationLines(
 	return [
 		"Degradations:",
 		...summary.map((group) => {
+			if (INFORMATIONAL_DEGRADATION_KINDS.has(group.kind)) {
+				return `  ${group.kind}: ${group.count}`;
+			}
 			const latest = group.latestReasons.at(-1);
 			return `  ⚠ ${group.kind}: ${group.count}${latest ? ` — ${latest.subject}: ${latest.reason}` : ""}`;
 		}),
