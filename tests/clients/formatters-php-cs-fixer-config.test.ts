@@ -194,8 +194,6 @@ describe("phpCsFixerFormatter — ancestor config carriage (#2472)", () => {
 
 		// Cross-form (forward-slash) filePath must be guarded identically.
 		const crossFormFilePath = filePath.split(path.sep).join("/");
-		expect(
-			resolvePhpCsFixerConfig(crossFormFilePath, homeDir),
-		).toBeUndefined();
+		expect(resolvePhpCsFixerConfig(crossFormFilePath, homeDir)).toBeUndefined();
 	});
 });

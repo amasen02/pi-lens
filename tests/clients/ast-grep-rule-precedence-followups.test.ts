@@ -745,9 +745,7 @@ describe(
 
 			// Cross-form (forward-slash) startDir must be guarded identically.
 			const crossFormStartDir = startDir.split(path.sep).join("/");
-			expect(
-				findLocalSgconfig(crossFormStartDir, homeDir),
-			).toBeUndefined();
+			expect(findLocalSgconfig(crossFormStartDir, homeDir)).toBeUndefined();
 		});
 	},
 );

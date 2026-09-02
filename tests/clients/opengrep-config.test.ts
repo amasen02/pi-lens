@@ -62,9 +62,7 @@ describe("opengrep config resolution", () => {
 		// Cross-form (forward-slash) startDir must be guarded identically —
 		// a raw string comparison against homeDir would miss it.
 		const crossFormStartDir = startDir.split(path.sep).join("/");
-		expect(
-			findLocalOpengrepConfig(crossFormStartDir, homeDir),
-		).toBeUndefined();
+		expect(findLocalOpengrepConfig(crossFormStartDir, homeDir)).toBeUndefined();
 	});
 
 	it("--lens-opengrep alone defaults to the 'auto' ruleset (seamless)", () => {

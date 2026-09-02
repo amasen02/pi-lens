@@ -105,9 +105,7 @@ describe("findLocalZizmorConfig (#272)", () => {
 
 		// Cross-form (forward-slash) startDir must be guarded identically.
 		const crossFormStartDir = startDir.split(path.sep).join("/");
-		expect(
-			findLocalZizmorConfig(crossFormStartDir, homeDir),
-		).toBeUndefined();
+		expect(findLocalZizmorConfig(crossFormStartDir, homeDir)).toBeUndefined();
 	});
 });
 

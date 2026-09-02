@@ -60,8 +60,6 @@ describe("findLocalTyposConfig (#283)", () => {
 
 		// Cross-form (forward-slash) startDir must be guarded identically.
 		const crossFormStartDir = startDir.split(path.sep).join("/");
-		expect(
-			findLocalTyposConfig(crossFormStartDir, homeDir),
-		).toBeUndefined();
+		expect(findLocalTyposConfig(crossFormStartDir, homeDir)).toBeUndefined();
 	});
 });
