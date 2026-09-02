@@ -321,6 +321,38 @@ const storeScenarios = {
       hashesAfter: mapStableHashes(before, hashesBefore, after, new Set()),
     };
   })(),
+  // Review round 4, finding F1, mechanism (b): content uniqueness does not
+  // imply base-index uniqueness. `const value29 = 29;` and
+  // `const value298 = 298;` are two DISTINCT, each-unique-in-the-file line
+  // contents whose `baseIdx = (xxh32(hashSource) >>> 14) % 238328` collide
+  // (found by brute-force search over this exact vendored arithmetic — see
+  // `find-collision` in the round-4 PR notes). The first line to be scanned
+  // claims the shared base-index slot; the second is probed to a DIFFERENT
+  // slot by the identical open-addressing mechanism a literal duplicate line
+  // uses, even though its content is not a duplicate of anything else in the
+  // file. The edit here (append an unrelated trailer function at the very
+  // bottom) does not touch either colliding line or anything before them, so
+  // both survive `mapStableHashes` with their pre-edit anchors carried
+  // forward unchanged.
+  collidingBaseIndexUniqueContent: (() => {
+    const collidingLineA = "const value29 = 29;";
+    const collidingLineB = "const value298 = 298;";
+    const before =
+      [collidingLineA, collidingLineB, "", "function noop() {}", ""].join("\n") + "\n";
+    const after = before + "function trailer() {\n\treturn 1;\n}\n";
+    const hashesBefore = lineHashesPure(before);
+    return {
+      description:
+        "two distinct, each-unique-in-the-file line contents collide on baseIdx; the " +
+        "second is probed to a different slot even though it has no duplicate content, " +
+        "and an unrelated trailing append does not disturb either anchor",
+      before,
+      after,
+      removedHashes: [],
+      hashesBefore,
+      hashesAfter: mapStableHashes(before, hashesBefore, after, new Set()),
+    };
+  })(),
 };
 
 console.log(

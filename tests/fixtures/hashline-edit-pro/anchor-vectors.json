@@ -257,6 +257,29 @@
         "9xy",
         "Ayz"
       ]
+    },
+    "collidingBaseIndexUniqueContent": {
+      "description": "two distinct, each-unique-in-the-file line contents collide on baseIdx; the second is probed to a different slot even though it has no duplicate content, and an unrelated trailing append does not disturb either anchor",
+      "before": "const value29 = 29;\nconst value298 = 298;\n\nfunction noop() {}\n\n",
+      "after": "const value29 = 29;\nconst value298 = 298;\n\nfunction noop() {}\n\nfunction trailer() {\n\treturn 1;\n}\n",
+      "removedHashes": [],
+      "hashesBefore": [
+        "925",
+        "A36",
+        "AuN",
+        "JQO",
+        "KRP"
+      ],
+      "hashesAfter": [
+        "925",
+        "A36",
+        "AuN",
+        "JQO",
+        "KRP",
+        "J8s",
+        "kxJ",
+        "AU6"
+      ]
     }
   }
 }

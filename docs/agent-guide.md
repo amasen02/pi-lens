@@ -188,10 +188,14 @@ pi-lens writes to files **outside your own tool calls** (`docs/features.md`
 - **Any other tool that edits a file:** pi-lens recognizes it by the SHAPE of
   its arguments rather than its name (`clients/mutating-tool.ts`), so a host or
   extension tool called `replace` or `insert` gets the same chain `edit` gets:
-  the read-before-edit guard, a turn-state entry, a change-log receipt
-  attributed to that tool, and a *deferred* auto-fix. Deferred is the default
-  for every edit-shaped tool pi-lens cannot place, because formatting between
-  the steps of a multi-call rewrite fights the tool that is still writing.
+  a turn-state entry, a change-log receipt attributed to that tool, and a
+  *deferred* auto-fix. Its lines are resolved when the anchor is unambiguous
+  (roughly two-thirds of anchors in practice — `clients/hashline-anchor.ts`);
+  otherwise the mutation is recorded whole-file with lines unknown, and the
+  read-before-edit guard takes its no-line-info arm rather than guessing.
+  Deferred is the default for every edit-shaped tool pi-lens cannot place,
+  because formatting between the steps of a multi-call rewrite fights the tool
+  that is still writing.
 - The conservative actionable-warnings autofix (LSP quickfixes, hard-capped)
   is unchanged: it always runs at `agent_end`.
 

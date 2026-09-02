@@ -6,6 +6,7 @@ import { recordDegradationOnce } from "./degradation-ledger.js";
 import { detectFileKind } from "./file-kinds.js";
 import { isPathIgnoredByProject } from "./file-utils.js";
 import { evaluateGitGuard, isGitCommitOrPushAttempt } from "./git-guard.js";
+import { dropHashlineAnchorMemo } from "./hashline-anchor.js";
 import { evaluateSharedCheckoutGuard } from "./shared-checkout-guard.js";
 import { logLatency } from "./latency-logger.js";
 import { normalizeMapKey } from "./path-utils.js";
@@ -471,6 +472,13 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 		resetLSPService,
 		getTreeSitterClient = getSharedTreeSitterClient,
 	} = deps;
+
+	// #2423 review round 4, finding F5: the hashline anchor memo is keyed by
+	// mtime+size, which a same-size rewrite inside one mtime tick cannot
+	// distinguish from stale content. It only ever needs to survive the
+	// several `classifyMutatingTool` asks WITHIN this one tool_call, so drop
+	// it here at the boundary rather than trusting mtime+size across calls.
+	dropHashlineAnchorMemo();
 
 	const readGuardCorrelationId = getReadGuardCorrelationId(event);
 	let filePath: string | undefined;
