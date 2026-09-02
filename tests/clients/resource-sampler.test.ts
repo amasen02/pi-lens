@@ -5,9 +5,10 @@
  *
  * The sampler is platform-split: on Linux/macOS it uses `pidusage` (mocked
  * here so tests never touch a real process table); on Windows it runs a fully
- * guarded `Get-CimInstance Win32_Process` query (the `node:child_process`
- * `spawn` is mocked so tests never spawn a real process, and each test drives
- * the fake child's stdout / error / exit to exercise a specific path). Both
+ * guarded process-table query through the shared #2443 seam (the
+ * `node:child_process` `spawn` is mocked so tests never spawn a real process,
+ * and each test drives the fake child's stdout / error / exit to exercise a
+ * specific path; the seam emits TAB-joined columns). Both
  * branches are exercised by forcing `process.platform` per describe block, so
  * coverage is identical regardless of the host OS this suite runs on.
  *
@@ -293,7 +294,7 @@ describe("sampleProcesses (Windows / guarded CIM path)", () => {
 	it("never calls pidusage on Windows — the whole point of the fix", async () => {
 		fakeSpawn = () =>
 			makeFakeChild({
-				stdout: "111,1024,0,0,2026-08-30T00:00:00Z\r\n",
+				stdout: "111\t1024\t0\t0\t2026-08-30T00:00:00Z\r\n",
 				code: 0,
 			});
 		await sampleProcesses([111]);
@@ -301,11 +302,11 @@ describe("sampleProcesses (Windows / guarded CIM path)", () => {
 	});
 
 	it("parses RSS (WorkingSetSize) from the CIM output; first tick reports cpu 0", async () => {
-		// One line: pid,workingSet,kernel100ns,user100ns
+		// One row per pid: pid, workingSet, kernel100ns, user100ns, creationDate.
 		fakeSpawn = () =>
 			makeFakeChild({
 				stdout:
-					"111,4096,0,0,2026-08-30T00:00:00Z\r\n222,8192,0,0,2026-08-30T00:00:01Z\r\n",
+					"111\t4096\t0\t0\t2026-08-30T00:00:00Z\r\n222\t8192\t0\t0\t2026-08-30T00:00:01Z\r\n",
 				code: 0,
 			});
 
@@ -321,7 +322,7 @@ describe("sampleProcesses (Windows / guarded CIM path)", () => {
 			// Tick 1: cumulative CPU time = 0 (kernel=0,user=0). Seeds history.
 			fakeSpawn = () =>
 				makeFakeChild({
-					stdout: "111,4096,0,0,2026-08-30T00:00:00Z\r\n",
+					stdout: "111\t4096\t0\t0\t2026-08-30T00:00:00Z\r\n",
 					code: 0,
 				});
 			const first = requireMap(await sampleProcesses([111]));
@@ -332,7 +333,7 @@ describe("sampleProcesses (Windows / guarded CIM path)", () => {
 			vi.setSystemTime(10_000);
 			fakeSpawn = () =>
 				makeFakeChild({
-					stdout: "111,4096,0,50000000,2026-08-30T00:00:00Z\r\n",
+					stdout: "111\t4096\t0\t50000000\t2026-08-30T00:00:00Z\r\n",
 					code: 0,
 				});
 			const second = requireMap(await sampleProcesses([111]));
@@ -349,12 +350,12 @@ describe("sampleProcesses (Windows / guarded CIM path)", () => {
 		try {
 			vi.setSystemTime(0);
 			fakeSpawn = () =>
-				makeFakeChild({ stdout: "111,4096,0,0,2026-08-30T00:00:00Z\r\n" });
+				makeFakeChild({ stdout: "111\t4096\t0\t0\t2026-08-30T00:00:00Z\r\n" });
 			await sampleProcesses([111]);
 			vi.setSystemTime(10_000);
 			fakeSpawn = () =>
 				makeFakeChild({
-					stdout: "111,4096,0,50000000,2026-08-30T00:01:00Z\r\n",
+					stdout: "111\t4096\t0\t50000000\t2026-08-30T00:01:00Z\r\n",
 				});
 			const replacement = requireMap(await sampleProcesses([111]));
 			// The large inherited counter delta belongs to the predecessor. A
@@ -371,27 +372,32 @@ describe("sampleProcesses (Windows / guarded CIM path)", () => {
 			vi.setSystemTime(0);
 			fakeSpawn = () =>
 				makeFakeChild({
-					stdout: "111,4096,10000000,0,2026-08-30T00:00:00Z\r\n",
+					stdout: "111\t4096\t10000000\t0\t2026-08-30T00:00:00Z\r\n",
 				});
 			await sampleProcesses([111]);
 			vi.setSystemTime(10_000);
 			fakeSpawn = () =>
-				makeFakeChild({ stdout: "111,4096,0,0,2026-08-30T00:00:00Z\r\n" });
+				makeFakeChild({ stdout: "111\t4096\t0\t0\t2026-08-30T00:00:00Z\r\n" });
 			expect(requireMap(await sampleProcesses([111])).has(111)).toBe(false);
 		} finally {
 			vi.useRealTimers();
 		}
 	});
 
+	// Every row here is a WELL-FORMED table line (the right column count, tab
+	// separated) carrying ONE unusable value, so the assertion exercises the
+	// per-column rejection rather than passing because the whole line failed to
+	// parse — the CSV spelling these used to carry would have been rejected
+	// wholesale by the tab parser and passed vacuously (#2443).
 	for (const [label, row] of [
-		["empty kernel", "111,4096,,0,2026-08-30T00:00:00Z"],
-		["empty user", "111,4096,0,,2026-08-30T00:00:00Z"],
-		["nonfinite kernel", "111,4096,NaN,0,2026-08-30T00:00:00Z"],
-		["nonfinite user", "111,4096,0,Infinity,2026-08-30T00:00:00Z"],
-		["negative kernel", "111,4096,-1,0,2026-08-30T00:00:00Z"],
-		["negative user", "111,4096,0,-1,2026-08-30T00:00:00Z"],
-		["negative RSS", "111,-1,0,0,2026-08-30T00:00:00Z"],
-		["missing creation identity", "111,4096,0,0,"],
+		["empty kernel", "111\t4096\t\t0\t2026-08-30T00:00:00Z"],
+		["empty user", "111\t4096\t0\t\t2026-08-30T00:00:00Z"],
+		["nonfinite kernel", "111\t4096\tNaN\t0\t2026-08-30T00:00:00Z"],
+		["nonfinite user", "111\t4096\t0\tInfinity\t2026-08-30T00:00:00Z"],
+		["negative kernel", "111\t4096\t-1\t0\t2026-08-30T00:00:00Z"],
+		["negative user", "111\t4096\t0\t-1\t2026-08-30T00:00:00Z"],
+		["negative RSS", "111\t-1\t0\t0\t2026-08-30T00:00:00Z"],
+		["missing creation identity", "111\t4096\t0\t0\t"],
 	] as const) {
 		it(`leaves ${label} Windows usage unmeasured`, async () => {
 			fakeSpawn = () => makeFakeChild({ stdout: `${row}\r\n` });
@@ -402,7 +408,7 @@ describe("sampleProcesses (Windows / guarded CIM path)", () => {
 	it("caps dated PID history and evicts the oldest entry", async () => {
 		const rows = Array.from(
 			{ length: 4_097 },
-			(_, index) => `${index + 1},1,0,0,2026-08-30T00:00:${index}Z`,
+			(_, index) => `${index + 1}\t1\t0\t0\t2026-08-30T00:00:${index}Z`,
 		).join("\r\n");
 		fakeSpawn = () => makeFakeChild({ stdout: rows });
 		await sampleProcesses(Array.from({ length: 4_097 }, (_, i) => i + 1));
@@ -420,10 +426,10 @@ describe("sampleProcesses (Windows / guarded CIM path)", () => {
 		try {
 			vi.setSystemTime(0);
 			const outputs = [
-				"200,0\r\n", // descendant query: one child
-				"111,4096,0,0,2026-08-30T00:00:00Z\r\n", // target only
-				"200,0\r\n",
-				"200,4096,0,50000000,2026-08-30T00:00:00Z\r\n", // target gone
+				"200\t0\r\n", // descendant query: one child
+				"111\t4096\t0\t0\t2026-08-30T00:00:00Z\r\n", // target only
+				"200\t0\r\n",
+				"200\t4096\t0\t50000000\t2026-08-30T00:00:00Z\r\n", // target gone
 			];
 			fakeSpawn = () => makeFakeChild({ stdout: outputs.shift() ?? "" });
 			const resultPromise = sampleProcessTreeCpuPercent(111, 1, 10);
@@ -475,7 +481,7 @@ describe("sampleProcesses (Windows / guarded CIM path)", () => {
 
 	it("reports an errored outcome when the child exits non-zero with garbage stdout", async () => {
 		fakeSpawn = () =>
-			makeFakeChild({ stdout: "not-a-csv-line\r\n<<broken>>\r\n", code: 1 });
+			makeFakeChild({ stdout: "not-a-table-line\r\n<<broken>>\r\n", code: 1 });
 		await expect(sampleProcesses([111])).resolves.toBeNull();
 		expect(
 			getDegradationSummary().find(
@@ -562,7 +568,7 @@ describe("resource-sampler: fire-and-forget CIM spawns are unref'd (#1155)", () 
 		const spawned: ReturnType<typeof makeFakeChild>[] = [];
 		fakeSpawn = () => {
 			const child = makeFakeChild({
-				stdout: "111,4096,0,0,2026-08-30T00:00:00Z\r\n",
+				stdout: "111\t4096\t0\t0\t2026-08-30T00:00:00Z\r\n",
 				code: 0,
 			});
 			spawned.push(child);
@@ -582,7 +588,7 @@ describe("resource-sampler: fire-and-forget CIM spawns are unref'd (#1155)", () 
 		vi.useFakeTimers();
 		const spawned: ReturnType<typeof makeFakeChild>[] = [];
 		fakeSpawn = () => {
-			// Every call here is the descendant-lookup query (pid,parentPid CSV) —
+			// Every call here is the descendant-lookup query (pid/parentPid rows) —
 			// empty output resolves to no descendants, which is fine; the point is
 			// only to observe the spawned child's unref calls.
 			const child = makeFakeChild({ stdout: "", code: 0 });

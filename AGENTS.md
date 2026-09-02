@@ -1719,6 +1719,31 @@ anywhere else on a command line is a reader, not an occupant; kills are by
 pid, never `taskkill`-by-name. All of that is pure and unit-tested in
 `scripts/lib/worktree-hygiene.mjs`.
 
+**One process-table seam, in scripts/ (#2443).** Every Windows
+`Get-CimInstance Win32_Process` and POSIX `ps` listing in this repo is
+composed and parsed in ONE place, `scripts/lib/process-scan.mjs`:
+`buildProcessQuery(fields, {filter, excludeSelfPid})` builds the command,
+`parseProcessTable` reads it back, and a `fields` projection (`pid`, `ppid`,
+`ageMs`, `rssBytes`, `cpuKernel100ns`, `cpuUser100ns`, `startedAt`,
+`command`) is how a caller asks for the columns it needs. There used to be
+five copies — the instance reaper's three queries, the resource sampler's two,
+and the two scripts — which is how PR #2438's exit-code hardening (a `ps` that
+prints a partial table then dies must not read as complete) reached one and
+not the rest. `tests/config/process-table-seam.test.ts` fails on any second
+file that spells the query.
+
+The seam lives in `scripts/` and NOT in `clients/` on purpose: `clients/*.js`
+is gitignored build output, and `scripts/prune-agent-worktrees.mjs` runs as a
+SessionStart/SubagentStop hook inside freshly created agent worktrees, which
+have neither `node_modules` nor a build. clients/ reaches it through the ONE
+crossing point, `clients/process-snapshot.ts`, which adds the extension's own
+spawn rails (unref'd child + stdout, injected tree-kill-and-verify timeout
+handler, a `SpawnCollectStatus` so an empty table stays distinguishable from
+a query that never ran). Because tsc resolves the `.mjs` through its
+`.d.mts` and would emit nothing, `tsconfig.dist.json` names the file in
+`include` with `allowJs` — without that, `bundle:dist` cannot resolve the
+import (pinned in `tests/packaging.test.ts`).
+
 **Idle is measured from signals the sweep does not write.** A worktree's age
 comes from `WORKTREE_ACTIVITY_SIGNALS` — the checkout directory's mtime, the
 worktree's `<admin>/HEAD` mtime, and the last entry timestamp in

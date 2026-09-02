@@ -25,11 +25,11 @@
  * **synchronously in that detached callback**, which no `try { await pidusage }
  * catch {}` at the call site can catch → uncaughtException → the pi host
  * crashes (#620, #533). pidusage 4.0.1 exposes no option to avoid the gwmi
- * path. So on Windows this module runs its OWN fully guarded
- * `Get-CimInstance Win32_Process` query (see `sampleProcessesWindows`),
- * mirroring `findDescendantPidsWindows`'s guard pattern, and computes CPU%
- * from the same KernelModeTime/UserModeTime delta-over-elapsed formula gwmi
- * uses — so a spawn failure can only ever lose a data point, never throw.
+ * path. So on Windows this module asks the shared, fully guarded process-table
+ * seam (`clients/process-snapshot.ts` over `scripts/lib/process-scan.mjs`,
+ * #2443) for the CPU/RSS columns instead, and computes CPU% from the same
+ * KernelModeTime/UserModeTime delta-over-elapsed formula gwmi uses — so a
+ * spawn failure can only ever lose a data point, never throw.
  *
  * Every export here is best-effort: a sampling failure (pid already exited,
  * `pidusage` throwing, permission denied, etc.) must never throw into the
@@ -45,9 +45,9 @@
  */
 
 import pidusage from "pidusage";
-import { spawnCollectStdoutResult } from "./child-unref.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
-import { terminateScannerChild, windowsExe } from "./instance-reaper.js";
+import { terminateScannerChild } from "./instance-reaper.js";
+import { queryProcessTable } from "./process-snapshot.js";
 
 export const RESOURCE_SAMPLE_QUERY_TIMEOUT_MS = 2_000;
 
@@ -130,25 +130,17 @@ async function findDescendantPidsWindows(
 ): Promise<number[] | null> {
 	if (!runningOnWindows() || !Number.isFinite(rootPid) || rootPid <= 0)
 		return [];
-	// One WQL query pulls every process's (pid, parentPid) pair; walk the BFS
-	// in JS rather than issuing N queries for N tree levels.
-	const psScript =
-		"Get-CimInstance Win32_Process " +
-		"| Select-Object -Property ProcessId,ParentProcessId " +
-		'| ForEach-Object { "$($_.ProcessId),$($_.ParentProcessId)" }';
-	const powershell = windowsExe("WindowsPowerShell\\v1.0\\powershell.exe");
-	// Fire-and-forget, per-poll-tick spawn (#1155): `spawnCollectStdout` unrefs
-	// the child AND its piped stdout so this one-shot CIM query can never keep
-	// a settled `pi --print` process alive past its own close — mirrors the
-	// reaper's identical spawn→collect plumbing (#1153/#1160). Sampling still
-	// works normally in an interactive/long-lived session: unref only means
-	// "don't hold the loop open FOR this alone," the collected stdout is still
-	// delivered whenever `close` fires. The result status keeps a failed query
-	// distinct from a successful empty process table.
-	const result = await spawnCollectStdoutResult(
-		powershell,
-		["-NoProfile", "-NonInteractive", "-Command", psScript],
-		{ shell: false, windowsHide: true, stdio: ["ignore", "pipe", "ignore"] },
+	// One query pulls every process's (pid, parentPid) pair; walk the BFS in
+	// JS rather than issuing N queries for N tree levels. The listing itself is
+	// the shared seam (#2443), which also supplies the fire-and-forget spawn
+	// rails this call has always needed (#1155): the child AND its piped stdout
+	// are unref'd, so this one-shot query can never keep a settled
+	// `pi --print` process alive past its own close, and a scanner child that
+	// blows the timeout is tree-killed and verified rather than abandoned. The
+	// result status keeps a failed query distinct from a successful empty
+	// process table.
+	const result = await queryProcessTable(
+		{ fields: ["pid", "ppid"] },
 		{
 			timeoutMs: RESOURCE_SAMPLE_QUERY_TIMEOUT_MS,
 			onTimeout: (child) => terminateScannerChild(child, {}),
@@ -162,17 +154,11 @@ async function findDescendantPidsWindows(
 		);
 		return null;
 	}
-	const pairs: Array<[number, number]> = [];
-	for (const line of result.stdout.split(/\r?\n/)) {
-		const [pidStr, ppidStr] = line.split(",");
-		const pid = Number(pidStr);
-		const ppid = Number(ppidStr);
-		if (Number.isFinite(pid) && Number.isFinite(ppid)) {
-			pairs.push([pid, ppid]);
-		}
-	}
 
-	return walkDescendantPids(rootPid, pairs);
+	return walkDescendantPids(
+		rootPid,
+		result.rows.map((row) => [row.pid, row.ppid] as [number, number]),
+	);
 }
 
 /**
@@ -214,18 +200,21 @@ export function __windowsCpuHistoryHasForTests(
 }
 
 /**
- * Windows-only CPU%/RSS sampling via a FULLY GUARDED `Get-CimInstance
- * Win32_Process` query (mirrors `findDescendantPidsWindows`): a synchronous
- * throw from `spawn` (the `spawn UNKNOWN` crash vector, #620), a `child`
- * `error` event, or a non-zero/garbage exit all resolve to an errored/absent
- * map — this function can NEVER throw or reject. Deliberately does NOT call
- * `pidusage`, whose unguarded internal `gwmi` spawn is the crash we're fixing.
+ * Windows-only CPU%/RSS sampling through the FULLY GUARDED process-table
+ * seam (mirrors `findDescendantPidsWindows`): a synchronous throw from
+ * `spawn` (the `spawn UNKNOWN` crash vector, #620), a `child` `error` event,
+ * or a non-zero/garbage exit all resolve to an errored/absent map — this
+ * function can NEVER throw or reject. Deliberately does NOT call `pidusage`,
+ * whose unguarded internal `gwmi` spawn is the crash we're fixing.
  *
- * RSS comes from `WorkingSetSize`; CPU% from `KernelModeTime`+`UserModeTime`
- * (both in 100 ns units → ms via `/1e4`) differenced against this pid's prior
- * sample over the elapsed wall time — the same computation pidusage's gwmi
- * path uses. The first time a pid is seen it has no prior sample, so CPU% is
- * reported as 0 for that tick and a real rate lands on the next one.
+ * RSS comes from `WorkingSetSize` (`rssBytes`); CPU% from `KernelModeTime`
+ * plus `UserModeTime` (both in 100 ns units → ms via `/1e4`) differenced
+ * against this pid's prior sample over the elapsed wall time — the same
+ * computation pidusage's gwmi path uses. The first time a pid is seen it has
+ * no prior sample, so CPU% is reported as 0 for that tick and a real rate
+ * lands on the next one. The process creation date (`startedAt`) is the
+ * pid-reuse discriminator: a recycled pid must not inherit the previous
+ * process's CPU baseline.
  */
 async function sampleProcessesWindows(
 	valid: number[],
@@ -233,28 +222,26 @@ async function sampleProcessesWindows(
 	const samples = new Map<number, ProcessUsage>();
 	if (valid.length === 0) return samples;
 
-	// pids are pre-validated finite positive integers, so this WQL filter is
-	// injection-safe. One line per pid: "pid,workingSet,kernel100ns,user100ns,creationDate".
-	const filter = valid.map((p) => `ProcessId=${p}`).join(" or ");
-	const psScript =
-		`Get-CimInstance Win32_Process -Filter "${filter}" ` +
-		"| Select-Object -Property ProcessId,WorkingSetSize,KernelModeTime,UserModeTime,CreationDate " +
-		'| ForEach-Object { "$($_.ProcessId),$($_.WorkingSetSize),$($_.KernelModeTime),$($_.UserModeTime),$($_.CreationDate)" }';
-
-	const powershell = windowsExe("WindowsPowerShell\\v1.0\\powershell.exe");
-	// Fire-and-forget, per-poll-tick spawn (#1155): `spawnCollectStdout` unrefs
-	// the child AND its piped stdout so this one-shot CIM query can never keep
-	// a settled `pi --print` process alive past its own close — mirrors the
-	// reaper's identical spawn→collect plumbing (#1153/#1160). It also absorbs
-	// both failure modes this function used to guard inline — a synchronous
-	// `spawn` throw (the `spawn UNKNOWN` crash vector, #620) and an async
-	// `error` event, or a non-zero exit — the result status keeps failure distinct
-	// map. Sampling still works normally in an interactive/long-lived
-	// session: unref only means "don't hold the loop open FOR this alone."
-	const query = await spawnCollectStdoutResult(
-		powershell,
-		["-NoProfile", "-NonInteractive", "-Command", psScript],
-		{ shell: false, windowsHide: true, stdio: ["ignore", "pipe", "ignore"] },
+	// pids are pre-validated finite positive integers, and the seam validates
+	// them again before they reach the query text, so the filter is
+	// injection-safe. The seam also supplies the fire-and-forget spawn rails
+	// (#1155: the child and its piped stdout are unref'd, so this one-shot
+	// query cannot keep a settled `pi --print` alive past its own close) and
+	// absorbs every failure mode this function used to guard inline — a
+	// synchronous `spawn` throw (the `spawn UNKNOWN` crash vector, #620), an
+	// async `error` event, a timeout, or a non-zero exit — reporting each
+	// through `status` rather than as an indistinguishable empty table.
+	const query = await queryProcessTable(
+		{
+			fields: [
+				"pid",
+				"rssBytes",
+				"cpuKernel100ns",
+				"cpuUser100ns",
+				"startedAt",
+			],
+			filter: { column: "ProcessId", op: "eq", values: valid },
+		},
 		{
 			timeoutMs: RESOURCE_SAMPLE_QUERY_TIMEOUT_MS,
 			onTimeout: (child) => terminateScannerChild(child, {}),
@@ -267,23 +254,19 @@ async function sampleProcessesWindows(
 	try {
 		const now = Date.now();
 		const seen = new Set<number>();
-		for (const line of query.stdout.split(/\r?\n/)) {
-			const parts = line.split(",");
-			if (parts.length < 5) continue;
-			if (parts.slice(0, 5).some((part) => part.trim().length === 0)) continue;
-			const pid = Number(parts[0]);
-			const workingSet = Number(parts[1]);
-			const kernel100ns = Number(parts[2]);
-			const user100ns = Number(parts[3]);
-			const processIdentity = parts.slice(4).join(",").trim();
-			if (!Number.isFinite(pid) || pid <= 0) continue;
+		for (const row of query.rows) {
+			const pid = row.pid;
+			const workingSet = row.rssBytes;
+			const kernel100ns = row.cpuKernel100ns;
+			const user100ns = row.cpuUser100ns;
+			const processIdentity = row.startedAt ?? "";
+			// The seam already rejects a non-integer or negative column as
+			// UNKNOWN (undefined), so an absent value here means the row cannot
+			// be sampled — never that the process used zero.
 			if (
-				!Number.isFinite(workingSet) ||
-				workingSet < 0 ||
-				!Number.isFinite(kernel100ns) ||
-				kernel100ns < 0 ||
-				!Number.isFinite(user100ns) ||
-				user100ns < 0 ||
+				workingSet === undefined ||
+				kernel100ns === undefined ||
+				user100ns === undefined ||
 				processIdentity.length === 0
 			)
 				continue;
