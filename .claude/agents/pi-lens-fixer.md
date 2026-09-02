@@ -74,7 +74,9 @@ instructions say so.
    grep missed). Do NOT hand-pick them from memory — #2470 round 3 shipped
    with Unit tests red because its "governance set" of eleven files omitted
    `generation-guard-sweep`. Select them mechanically, every time:
-   `ls tests/clients/*-{sweep,ratchet,conformance,coverage,gate,governance}*.test.ts`
+   `ls tests/clients/*{sweep,ratchet,conformance,coverage,gate,governance,silence,hermeticity,invariant,contract}*.test.ts`
+   (#2511 round 2 shipped CI red because `extension-terminal-silence` and the
+   hermeticity suites matched none of the old six words)
    plus EVERY `tests/config/*.test.ts` (those walk `scripts/` and `tests/`
    too; #2438 shipped red because a scripts-only PR read the clients/-walking
    list as not applying). Quote the file count you ran in the PR body. The full suite is CI's
@@ -173,6 +175,18 @@ finding with its red-run evidence.
   explicitly in your report that you delegated the full suite to CI and why.
   Ending your turn is for "deliverable produced" or "blocked on the
   orchestrator," never "waiting on a process."
+
+## Probe hygiene (mandatory)
+
+Any ad-hoc probe you run against the built `clients/*.js` outside vitest — a
+`node -e`, a throwaway `.mjs`, a harness script — runs with NO test-mode gate
+and NO home pin, so every logger, ledger and cache it touches writes into the
+MAINTAINER'S REAL `~/.pi-lens` (latency.log, extension.log, probe-cache,
+turn-state). On 2026-09-02 two review probes wrote 42 rows of `/p/.pi-lens.json`
+fixture garbage into the real telemetry (#2506). Before every such probe:
+`export PI_LENS_HOME=<your worktree>/.probe-home` (or set it inline), and
+`PILENS_DATA_DIR` likewise when the probe touches project-scoped data. A probe
+that forgets is a finding against YOUR report, not the PR's.
 
 ## Report format
 

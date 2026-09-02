@@ -1402,7 +1402,14 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	// #2504 review round 2 (F3): the deferred-work slot — one AbortController
 	// and one promise handle, both retired by resetLSPService.
 	"deferred-lsp-work.ts": 0,
-	"degradation-ledger.ts": 3,
+	// #2505: 3 -> 4. The fourth symbol is `INFORMATIONAL_DEGRADATION_KINDS`,
+	// an import-time `ReadonlySet` of kind names the health renderer prints
+	// without the warning marker — a lookup table, not session state
+	// (SWEEP_HEURISTIC_LIMITS item 5: the scan cannot tell a constant `Set`
+	// from a mutable one). It is never written after module evaluation, so
+	// resetting it would be meaningless; this file's real session state is
+	// still the ledger map, its once-keys, and the generation counter.
+	"degradation-ledger.ts": 4,
 	"diagnostic-dispositions.ts": 1,
 	"diagnostic-line-freshness.ts": 1,
 	"diagnostics-publish.ts": 1,
