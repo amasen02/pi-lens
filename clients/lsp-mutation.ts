@@ -32,6 +32,16 @@ let noBridgeDbgLogged = false;
 export function resetLspMutationNoBridgeDbgLatch(): void {
 	noBridgeDbgLogged = false;
 }
+/**
+ * Test-only peek at the latch's current value (#2450 fix round 5, F2) — lets
+ * the session-state registry probe the actual internal state instead of
+ * inferring it from captured dbg messages, the same pattern every other
+ * process-private-scalar probe in `tests/support/session-state-registry.ts`
+ * uses (e.g. `_observedMutationStateForTests`).
+ */
+export function _lspMutationNoBridgeDbgLoggedForTests(): boolean {
+	return noBridgeDbgLogged;
+}
 
 export interface LspMutationRuntime {
 	bumpFileSeq?: (filePath: string) => { projectSeq: number; fileSeq: number };
