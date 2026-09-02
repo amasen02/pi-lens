@@ -401,6 +401,7 @@ export function deprecationRecords(
 						file: document.file,
 						key,
 						canonicalKey,
+						tier: document.tier,
 						reason:
 							`move "${key}" to ${destination}` +
 							(canonicalKey === key ? "" : ` under "${canonicalKey}"`) +
@@ -421,6 +422,7 @@ export function deprecationRecords(
 					file: document.file,
 					key,
 					canonicalKey,
+					tier: document.tier,
 					reason: `move "${key}" to "${canonicalKey}" in the same file${windowSuffix(
 						key,
 					)}`,
@@ -436,6 +438,7 @@ function record(input: {
 	file: string;
 	key: string;
 	canonicalKey: string;
+	tier: SourceTier;
 	reason: string;
 }): MigrationRecord {
 	return {
@@ -445,35 +448,13 @@ function record(input: {
 		canonicalKey: input.canonicalKey,
 		subject: migrationSubject(input.file, input.key),
 		reason: input.reason,
+		tier: input.tier,
 	};
 }
 
 /**
- * Thread a resolution's records to the ONE config warning seam (#2418).
- *
- * The subsystem is the CALLER'S, not this module's: `warnIgnoredConfigOnce`
- * keys its latch and its `extension.log` line on the loader that is reporting,
- * and this module is shared by all three.
- *
- * It lives here rather than in `config-core/records.ts`, where #2425 first put
- * it (#2426). Putting the sink call inside the library contradicted the
- * library's own stated purity — `config-core` is documented as "no state, no
- * I/O, no ledger writes" — and the import it needed
- * (`records.ts` -> `config-warn.js` -> `degradation-ledger.js`) closed seven
- * cycles the moment a loader resolved through the core, because every config
- * loader sits downstream of `file-utils.ts`. Reporting is a loader decision;
- * this is the loaders' shared module.
- */
-/**
  * Which SUBSYSTEM a record belongs to — the LSP loader, or the two pi-lens
  * config loaders (#2426 review round 2, F2).
- *
- * Every loader resolves the SAME documents through this module, so before this
- * split each of them reported every record: `warnIgnoredConfigOnce` latches per
- * subsystem, so a session that ran the LSP loader and the project loader emitted
- * TWO notices for every `(file, key)` — and rendered a project setting's notice
- * as `deprecated LSP config location`, which names the wrong subsystem at the
- * user.
  *
  * Ownership is DERIVED from the key rather than from which loader is asking: an
  * `lsp.*` canonical key, or one of the legacy LSP root keys, is the LSP loader's
@@ -505,29 +486,95 @@ export function configRecordOwner(
 		: "pi-lens";
 }
 
-/** The records one loader must report; unattributable ones go to all of them. */
-export function recordsOwnedBy(
-	records: readonly MigrationRecord[],
-	owner: ConfigRecordOwner,
-): MigrationRecord[] {
-	return records.filter((record) => {
-		const actual = configRecordOwner(record);
-		return actual === undefined || actual === owner;
-	});
+/** The pi-lens-config subsystem a GLOBAL vs. PROJECT tier reports under. */
+function piLensSubsystemFor(
+	tier: SourceTier | undefined,
+): IgnoredConfigSubsystem | undefined {
+	if (tier === "global") return "lens-config";
+	if (tier === "project" || tier === "nested-project") {
+		return "project-lens-config";
+	}
+	// `builtin` / `env` / `cli` / `host` never produce a document today, and a
+	// merge-level bound refusal (see `MigrationRecord.tier`'s doc comment) names
+	// no single source at all — `undefined` in either case.
+	return undefined;
 }
 
+/**
+ * The subsystem(s) one record must be reported under (#2426 review round 3,
+ * F1).
+ *
+ * DERIVED from the record itself — owner (`configRecordOwner`) plus, for a
+ * pi-lens-owned record, the TIER it was read at — rather than from which
+ * loader is calling. Before this, a caller filtered to the records it "owned"
+ * with `recordsOwnedBy` before reporting, which meant a pi-lens-owned record
+ * from a document only the LSP loader's multi-file resolution actually
+ * discovered (a legacy sibling file `loadPiLensProjectConfig`'s single-nearest-
+ * file walk never opens) was filtered OUT by the LSP loader and never produced
+ * by the project loader either: dropped by construction, never reported by
+ * anyone.
+ *
+ * Deriving the subsystem from the record instead of the caller fixes that:
+ * EVERY loader that sees the record now reports it, always to the SAME
+ * subsystem set, so the warn-once latch (keyed on `subsystem\0file\0key\0
+ * reason`) naturally collapses duplicate reports from different callers into
+ * one notice — the F2 behavior — while a record no caller happened to "own"
+ * before is reported by whichever loader actually resolved it.
+ *
+ * An `lsp` owner always reports under `lsp-config`, regardless of tier — the
+ * LSP loader is the one home for every LSP setting. A `pi-lens` owner reports
+ * under the tier-appropriate pi-lens loader; when the tier is unknown (a
+ * merge-level bound refusal with no single source), it goes to BOTH pi-lens
+ * subsystems rather than guessing. An unattributable record (owner
+ * `undefined`) goes to `lsp-config` plus the tier-appropriate pi-lens
+ * subsystem (or both, tier unknown) — every subsystem that could plausibly
+ * have produced it, the same "reported by all" contract the type's doc
+ * comment states.
+ */
+function subsystemsFor(
+	record: MigrationRecord,
+): readonly IgnoredConfigSubsystem[] {
+	const owner = configRecordOwner(record);
+	const piLens = piLensSubsystemFor(record.tier);
+	const piLensSubsystems: readonly IgnoredConfigSubsystem[] = piLens
+		? [piLens]
+		: ["lens-config", "project-lens-config"];
+	if (owner === "lsp") return ["lsp-config"];
+	if (owner === "pi-lens") return piLensSubsystems;
+	return ["lsp-config", ...piLensSubsystems];
+}
+
+/**
+ * Thread a resolution's records to the ONE config warning seam (#2418).
+ *
+ * Every caller passes every record its OWN resolution produced — no filtering
+ * (#2426 review round 3, F1; see `subsystemsFor`). Calling this more than once
+ * with overlapping records (the LSP loader and a pi-lens loader resolving the
+ * same document) is by design: the warn-once latch dedupes across callers, so
+ * the user still sees exactly one notice per `(subsystem, file, key, reason)`.
+ *
+ * It lives here rather than in `config-core/records.ts`, where #2425 first put
+ * it (#2426). Putting the sink call inside the library contradicted the
+ * library's own stated purity — `config-core` is documented as "no state, no
+ * I/O, no ledger writes" — and the import it needed
+ * (`records.ts` -> `config-warn.js` -> `degradation-ledger.js`) closed seven
+ * cycles the moment a loader resolved through the core, because every config
+ * loader sits downstream of `file-utils.ts`. Reporting is a loader decision;
+ * this is the loaders' shared module.
+ */
 export function reportPiLensConfigRecords(
 	records: readonly MigrationRecord[],
-	subsystem: IgnoredConfigSubsystem,
 ): void {
 	for (const record of records) {
-		warnIgnoredConfigOnce({
-			subsystem,
-			file: record.file,
-			key: record.key.length > 0 ? record.key : undefined,
-			reason: record.reason,
-			code: record.code,
-		});
+		for (const subsystem of subsystemsFor(record)) {
+			warnIgnoredConfigOnce({
+				subsystem,
+				file: record.file,
+				key: record.key.length > 0 ? record.key : undefined,
+				reason: record.reason,
+				code: record.code,
+			});
+		}
 	}
 }
 

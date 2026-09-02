@@ -23,6 +23,7 @@
 import type { ConfigDiagnosticCode } from "../config-diagnostic-codes.js";
 import { DEGRADATION_ENTRIES_PER_KIND } from "../ledger-bounds.js";
 import { redactSecrets } from "../redact/secrets.js";
+import type { SourceTier } from "./provenance.js";
 
 /**
  * One rejected or migrated config key.
@@ -49,6 +50,18 @@ export interface MigrationRecord {
 	 * never has to parse a message whose prose is documented as free to change.
 	 */
 	readonly canonicalKey?: string;
+	/**
+	 * The tier the source that produced this record was read at, when the
+	 * producer knows it (#2426 review round 3, F1).
+	 *
+	 * `reportPiLensConfigRecords` needs this to tell a GLOBAL pi-lens-owned
+	 * record from a PROJECT one — the subsystem it reports under depends on
+	 * where the file lives, not on which loader happens to be calling. Absent
+	 * only for a whole-merge bound refusal (`merge.ts`'s own depth/key-count
+	 * guards), which spans every source at once and so cannot name a single
+	 * one's tier.
+	 */
+	readonly tier?: SourceTier;
 }
 
 /**

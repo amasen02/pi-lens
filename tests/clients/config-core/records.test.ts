@@ -34,11 +34,11 @@ describe("records reach the user through the ONE config warn seam (#2418/#2425)"
 		const result = validate(
 			{ nonsense: 1, lsp: { enabled: "yes" } },
 			DEMO_CONFIG_SCHEMA,
-			{ file: ".pi-lens.json" },
+			{ file: ".pi-lens.json", tier: "project" },
 		);
 		expect(result.records).toHaveLength(2);
 
-		reportMigrationRecords(result.records, "project-lens-config");
+		reportMigrationRecords(result.records);
 
 		const group = getDegradationSummary().find(
 			(entry) => entry.kind === "config-ignored",
@@ -55,9 +55,10 @@ describe("records reach the user through the ONE config warn seam (#2418/#2425)"
 	it("dedupes a repeated report on the ledger's own once-per-session key", () => {
 		const result = validate({ nonsense: 1 }, DEMO_CONFIG_SCHEMA, {
 			file: ".pi-lens.json",
+			tier: "global",
 		});
-		reportMigrationRecords(result.records, "lens-config");
-		reportMigrationRecords(result.records, "lens-config");
+		reportMigrationRecords(result.records);
+		reportMigrationRecords(result.records);
 
 		const group = getDegradationSummary().find(
 			(entry) => entry.kind === "config-ignored",
@@ -68,7 +69,7 @@ describe("records reach the user through the ONE config warn seam (#2418/#2425)"
 	it("reports nothing for a clean config", () => {
 		const result = validate({ lsp: { enabled: true } }, DEMO_CONFIG_SCHEMA);
 		expect(result.records).toEqual([]);
-		reportMigrationRecords(result.records, "lsp-config");
+		reportMigrationRecords(result.records);
 		expect(
 			getDegradationSummary().some((entry) => entry.kind === "config-ignored"),
 		).toBe(false);

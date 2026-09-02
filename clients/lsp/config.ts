@@ -65,7 +65,6 @@ import path from "node:path";
 import { BoundedLruCache } from "../bounded-cache.js";
 import {
 	lspSectionOf,
-	recordsOwnedBy,
 	reportPiLensConfigRecords,
 	resolvePiLensConfig,
 } from "../config-resolve.js";
@@ -206,14 +205,13 @@ export async function loadLSPConfig(
 		homeDir,
 		onReadError: warnInvalidLSPConfig,
 	});
-	// Only the records this loader OWNS (#2426 review round 2, F2). The other two
-	// loaders resolve the same documents and report the rest; reporting all of
-	// them here produced a second notice per (file, key) — the warn-once latch is
-	// keyed per subsystem — and labelled a project setting "deprecated LSP config".
-	reportPiLensConfigRecords(
-		recordsOwnedBy(resolution.records, "lsp"),
-		"lsp-config",
-	);
+	// EVERY record this resolution produced (#2426 review round 3, F1) — not
+	// filtered to what this loader "owns". `reportPiLensConfigRecords` derives
+	// the reporting subsystem per record; the warn-once latch collapses this
+	// loader's report with the pi-lens loaders' report of the SAME record into
+	// one notice. Filtering here (as round 2 did) silently dropped a pi-lens-
+	// owned record from a document only this multi-file resolution discovered.
+	reportPiLensConfigRecords(resolution.records);
 
 	const section = lspSectionOf(resolution.value);
 	const config: LSPConfig = {};

@@ -185,3 +185,24 @@ export function configSearchDirs(
 	}
 	return dirs;
 }
+
+/**
+ * The absolute path of the canonical GLOBAL config — `~/.pi-lens/config.json`,
+ * or `PI_LENS_CONFIG_PATH` when it overrides that.
+ *
+ * Lives here rather than in `lens-config.ts` (#2426 review round 3, S1),
+ * which is where it originated: this module is the one that already states
+ * "WHERE pi-lens config lives", and `project-lens-config.ts` needs this exact
+ * function — not a re-derivation of `PI_LENS_CONFIG_PATH` — to name the file a
+ * global-only setting belongs in. Importing it from `lens-config.ts` would
+ * close a cycle, since `lens-config.ts` itself imports from
+ * `project-lens-config.ts`. `lens-config.ts` re-exports this so its own,
+ * pre-existing import sites are unaffected.
+ */
+export function getPiLensGlobalConfigPath(
+	homeDir: string = os.homedir(),
+): string {
+	const override = process.env.PI_LENS_CONFIG_PATH;
+	if (override) return path.resolve(override);
+	return path.join(homeDir, ".pi-lens", CANONICAL_GLOBAL_CONFIG_FILE);
+}

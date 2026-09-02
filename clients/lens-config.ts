@@ -3,7 +3,6 @@ import {
 	warnIgnoredConfigOnce,
 } from "./config-warn.js";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import {
 	assignFlagConfigSection,
@@ -17,10 +16,14 @@ import {
 import {
 	type ConfigLocation,
 	CANONICAL_GLOBAL_CONFIG_FILE,
+	getPiLensGlobalConfigPath,
 	GLOBAL_CONFIG_LOCATIONS,
 } from "./config-locations.js";
+// Re-exported so this module's own, pre-existing import sites (`./lens-config.js`
+// / `../lens-config.js`) keep working. The function itself now lives in
+// `config-locations.ts` (#2426 review round 3, S1) — see the doc comment there.
+export { getPiLensGlobalConfigPath } from "./config-locations.js";
 import {
-	recordsOwnedBy,
 	reportPiLensConfigRecords,
 	resolveOnePiLensConfigDocument,
 } from "./config-resolve.js";
@@ -139,12 +142,6 @@ export interface PiLensGlobalConfig {
 	};
 }
 
-export function getPiLensGlobalConfigPath(homeDir = os.homedir()): string {
-	const override = process.env.PI_LENS_CONFIG_PATH;
-	if (override) return path.resolve(override);
-	return path.join(homeDir, ".pi-lens", "config.json");
-}
-
 /**
  * Same warn-once-per-(path, reason) contract as project-lens-config.ts's
  * `warnInvalidConfigOnce` — a malformed global config value is logged once
@@ -192,13 +189,12 @@ export function loadPiLensGlobalConfig(
 			value: parsed,
 		};
 		const resolved = resolveOnePiLensConfigDocument(document);
-		// Only what this loader owns (#2426 review round 2, F2). An `lsp.*` record
-		// from this very file is announced by the LSP loader, which resolves the
-		// canonical global too; reporting it here as well doubled the notice.
-		reportPiLensConfigRecords(
-			recordsOwnedBy(resolved.records, "pi-lens"),
-			"lens-config",
-		);
+		// EVERY record this document produced (#2426 review round 3, F1) — not
+		// filtered to what this loader "owns". `reportPiLensConfigRecords` derives
+		// the reporting subsystem per record; the warn-once latch collapses a
+		// duplicate report of the SAME record from the LSP loader's resolution of
+		// this same file (it resolves the canonical global too) into one notice.
+		reportPiLensConfigRecords(resolved.records);
 		const raw = resolved.value;
 		const warnInvalid = (reason: string) =>
 			warnInvalidGlobalConfigOnce(configPath, reason);

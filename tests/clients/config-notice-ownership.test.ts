@@ -186,3 +186,83 @@ describe("each loader reports only the records it owns (#2426 F2)", () => {
 		}
 	});
 });
+
+describe("a pi-lens-owned record is reported even when the project loader never opens the document (#2426 review round 3, F1)", () => {
+	it("reports a legacy sibling file's keys the project loader's precedence skips", async () => {
+		// `loadPiLensProjectConfig`'s discovery is a SINGLE nearest-file probe:
+		// with both a canonical `.pi-lens.json` AND a legacy `pi-lens.json` in the
+		// same directory, it opens only the canonical one (higher precedence) and
+		// never resolves the legacy file at all. `loadLSPConfig`'s multi-document
+		// walk resolves BOTH. Filtering the LSP loader's report to what it "owns"
+		// (round 2) dropped the legacy file's pi-lens-owned keys silently: the LSP
+		// loader saw them but wasn't allowed to report them, and the project
+		// loader never saw them to report in the first place.
+		const home = tmpRoot("pi-lens-sibling-home-");
+		process.env.PI_LENS_HOME = tmpRoot("pi-lens-sibling-global-");
+		const projectDir = path.join(home, "proj");
+		fs.mkdirSync(projectDir, { recursive: true });
+		write(path.join(projectDir, "pi-lens.json"), {
+			ignore: ["legacy/**"],
+			maxProjectFiles: 500,
+		});
+		write(path.join(projectDir, ".pi-lens.json"), { ignore: ["canonical/**"] });
+
+		const { loadLSPConfig } = await import("../../clients/lsp/config.js");
+		const { loadPiLensProjectConfig, resetProjectLensConfigCache } =
+			await import("../../clients/project-lens-config.js");
+		resetProjectLensConfigCache();
+		await loadLSPConfig(projectDir, home);
+		// The nearest-file walk finds `.pi-lens.json` and stops there — it never
+		// opens `pi-lens.json`, the exact gap this test pins.
+		loadPiLensProjectConfig(projectDir);
+
+		const emitted = deprecationNotices();
+		const forKey = (key: string): string[] =>
+			emitted.filter((message) => message.includes(`move "${key}" to`));
+
+		expect(forKey("ignore"), "ignore").toHaveLength(1);
+		expect(forKey("ignore")[0]).toContain("deprecated project config location");
+		expect(forKey("maxProjectFiles"), "maxProjectFiles").toHaveLength(1);
+		expect(forKey("maxProjectFiles")[0]).toContain(
+			"deprecated project config location",
+		);
+	});
+
+	it("reports a legacy ANCESTOR file's keys a nearer canonical file's precedence skips", async () => {
+		// Same gap, one directory further out: the project loader's upward walk
+		// stops at the FIRST directory carrying any recognized file — the nearer
+		// canonical `.pi-lens.json` in `root/pkg` — and never continues up to
+		// `root`'s legacy `pi-lens.json`. The LSP loader's walk is not a
+		// stop-at-first probe: it collects from every bearing directory between
+		// the start and the `$HOME` ceiling, so it resolves `root/pi-lens.json`
+		// too, at `project` tier (the OUTERMOST bearing directory).
+		const home = tmpRoot("pi-lens-ancestor-home-");
+		process.env.PI_LENS_HOME = tmpRoot("pi-lens-ancestor-global-");
+		const root = path.join(home, "root");
+		const nested = path.join(root, "pkg");
+		fs.mkdirSync(nested, { recursive: true });
+		write(path.join(root, "pi-lens.json"), {
+			ignore: ["root-legacy/**"],
+			maxProjectFiles: 700,
+		});
+		write(path.join(nested, ".pi-lens.json"), { ignore: ["pkg/**"] });
+
+		const { loadLSPConfig } = await import("../../clients/lsp/config.js");
+		const { loadPiLensProjectConfig, resetProjectLensConfigCache } =
+			await import("../../clients/project-lens-config.js");
+		resetProjectLensConfigCache();
+		await loadLSPConfig(nested, home);
+		loadPiLensProjectConfig(nested);
+
+		const emitted = deprecationNotices();
+		const forKey = (key: string): string[] =>
+			emitted.filter((message) => message.includes(`move "${key}" to`));
+
+		expect(forKey("ignore"), "ignore").toHaveLength(1);
+		expect(forKey("ignore")[0]).toContain("deprecated project config location");
+		expect(forKey("maxProjectFiles"), "maxProjectFiles").toHaveLength(1);
+		expect(forKey("maxProjectFiles")[0]).toContain(
+			"deprecated project config location",
+		);
+	});
+});

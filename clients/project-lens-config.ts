@@ -79,16 +79,21 @@ import {
 } from "./lens-flag-registry.js";
 import {
 	configSearchDirs,
+	getPiLensGlobalConfigPath,
 	PROJECT_CONFIG_BASENAMES,
 } from "./config-locations.js";
 import {
 	projectLocationFor,
 	readConfigDocument,
-	recordsOwnedBy,
 	reportPiLensConfigRecords,
 	resolveOnePiLensConfigDocument,
 } from "./config-resolve.js";
-import { isAtOrAboveHomeDir, walkUpDirs } from "./path-utils.js";
+import type { MigrationRecord } from "./config-core/records.js";
+import {
+	homeRelativePath,
+	isAtOrAboveHomeDir,
+	walkUpDirs,
+} from "./path-utils.js";
 import { findPiLensConfigMarkerInDir } from "./workspace-topology.js";
 
 /**
@@ -199,6 +204,15 @@ interface CacheEntry {
 	 */
 	size: number;
 	config: PiLensProjectConfig;
+	/**
+	 * The migration records `parseConfigFile` produced for this file (#2426
+	 * review round 3, F2) — cached alongside the config so a cache HIT can still
+	 * re-report them (cheap: no I/O, just replays through the warn seam, whose
+	 * own per-session latch decides whether anything new actually fires).
+	 * Without this, a repeat load of the SAME unchanged deprecated file recorded
+	 * a `config-deprecated` ledger row only in the session that first parsed it.
+	 */
+	records: readonly MigrationRecord[];
 }
 
 interface DiscoveryCacheEntry {
@@ -211,6 +225,35 @@ const configCache = new Map<string, CacheEntry>();
 const discoveryCache = new Map<string, DiscoveryCacheEntry>();
 
 /**
+ * The shared body of `loadPiLensProjectConfig` and `loadPiLensConfigInDir`:
+ * reuse a fresh cache entry, or parse and cache one, and — EITHER WAY (#2426
+ * review round 3, F2) — report the resolution's migration records. Content
+ * caching (skip re-reading unchanged bytes off disk) and per-session
+ * reporting (tell the user once a session about a deprecated setting) are two
+ * different lifetimes; folding "already cached" into "already reported"
+ * silently dropped the report the moment the file stopped changing.
+ */
+function loadCachedConfigFile(
+	info: PiLensProjectConfigFileInfo,
+): PiLensProjectConfig {
+	const cached = configCache.get(info.path);
+	if (cached && cached.mtimeMs === info.mtimeMs && cached.size === info.size) {
+		reportPiLensConfigRecords(cached.records);
+		return cached.config;
+	}
+
+	const { config, records } = parseConfigFile(info.path);
+	configCache.set(info.path, {
+		mtimeMs: info.mtimeMs,
+		size: info.size,
+		config,
+		records,
+	});
+	reportPiLensConfigRecords(records);
+	return config;
+}
+
+/**
  * Walk up from `startDir` looking for a `.pi-lens.json` or `pi-lens.json`.
  * Returns the parsed config, or an empty config if none was found.
  */
@@ -220,23 +263,7 @@ export function loadPiLensProjectConfig(
 ): PiLensProjectConfig {
 	const configInfo = preloadedInfo;
 	if (!configInfo) return EMPTY_PROJECT_CONFIG;
-
-	const cached = configCache.get(configInfo.path);
-	if (
-		cached &&
-		cached.mtimeMs === configInfo.mtimeMs &&
-		cached.size === configInfo.size
-	) {
-		return cached.config;
-	}
-
-	const config = parseConfigFile(configInfo.path);
-	configCache.set(configInfo.path, {
-		mtimeMs: configInfo.mtimeMs,
-		size: configInfo.size,
-		config,
-	});
-	return config;
+	return loadCachedConfigFile(configInfo);
 }
 
 /** For tests + callers that need to force a re-read (e.g. config-watcher hooks). */
@@ -320,19 +347,7 @@ export function findNestedProjectMutationValue(
 export function loadPiLensConfigInDir(dir: string): PiLensProjectConfig {
 	const info = findPiLensConfigInDir(dir);
 	if (!info) return EMPTY_PROJECT_CONFIG;
-
-	const cached = configCache.get(info.path);
-	if (cached && cached.mtimeMs === info.mtimeMs && cached.size === info.size) {
-		return cached.config;
-	}
-
-	const config = parseConfigFile(info.path);
-	configCache.set(info.path, {
-		mtimeMs: info.mtimeMs,
-		size: info.size,
-		config,
-	});
-	return config;
+	return loadCachedConfigFile(info);
 }
 
 export function findPiLensProjectConfig(
@@ -455,7 +470,15 @@ function parseRulePolicyList(
 	return { list, invalid: false };
 }
 
-function parseConfigFile(configPath: string): PiLensProjectConfig {
+/** A parsed config plus the migration records its resolution produced. */
+interface ParsedConfigFile {
+	config: PiLensProjectConfig;
+	records: readonly MigrationRecord[];
+}
+
+const NO_RECORDS: readonly MigrationRecord[] = [];
+
+function parseConfigFile(configPath: string): ParsedConfigFile {
 	const outcome = readConfigDocument(configPath);
 	if (outcome.status === "error") {
 		// `{ parseError }`, not a pre-stringified message (#2431): the shared read
@@ -463,12 +486,14 @@ function parseConfigFile(configPath: string): PiLensProjectConfig {
 		// the one seam — decides how much of a `JSON.parse` `SyntaxError#message`
 		// (which embeds a snippet of the file being parsed) reaches its sinks.
 		warnInvalidConfigOnce(configPath, { parseError: outcome.error });
-		return EMPTY_PROJECT_CONFIG;
+		return { config: EMPTY_PROJECT_CONFIG, records: NO_RECORDS };
 	}
 	// The file was stat'd as present by the discovery above, so `missing` here is
 	// a delete that raced the read. Nothing to warn about — the next call
 	// re-discovers and finds no config at all.
-	if (outcome.status === "missing") return EMPTY_PROJECT_CONFIG;
+	if (outcome.status === "missing") {
+		return { config: EMPTY_PROJECT_CONFIG, records: NO_RECORDS };
+	}
 
 	if (
 		!outcome.value ||
@@ -476,7 +501,7 @@ function parseConfigFile(configPath: string): PiLensProjectConfig {
 		Array.isArray(outcome.value)
 	) {
 		warnInvalidConfigOnce(configPath, "top-level value must be an object");
-		return EMPTY_PROJECT_CONFIG;
+		return { config: EMPTY_PROJECT_CONFIG, records: NO_RECORDS };
 	}
 
 	// Through the #2425 core (#2426): the value is validated against the
@@ -493,13 +518,13 @@ function parseConfigFile(configPath: string): PiLensProjectConfig {
 		location: projectLocationFor(configPath),
 		value: outcome.value,
 	});
-	// Only what this loader owns (#2426 review round 2, F2): the LSP keys in this
-	// same file are the LSP loader's to announce, and reporting them here too
-	// doubled every notice and mislabelled it.
-	reportPiLensConfigRecords(
-		recordsOwnedBy(resolved.records, "pi-lens"),
-		"project-lens-config",
-	);
+	// The records are RETURNED, not reported here (#2426 review round 3, F2):
+	// this function's result is what the caller caches, and a cache HIT must
+	// still report them every session — a call this function never makes on a
+	// hit. Reporting here would fire only on a cache MISS (session 1), and
+	// `resetProjectLensConfigCache` has no production caller, so every session
+	// after the first silently lost the `config-deprecated` ledger row despite
+	// the file still being the exact deprecated one on disk.
 	const raw: unknown = resolved.value;
 	const obj = resolved.value;
 
@@ -653,11 +678,19 @@ function parseConfigFile(configPath: string): PiLensProjectConfig {
 	const globalScopeOnlyFlagKeys = LENS_FLAGS.map(
 		(spec) => spec.configKey,
 	).filter((configKey) => !projectScoped.has(configKey));
+	// The literal path is derived, not hand-typed (#2426 review round 3, S1):
+	// under `PI_LENS_CONFIG_PATH` the canonical global config is NOT
+	// `~/.pi-lens/config.json`, and a hardcoded string in this notice would name
+	// a file the resolver never reads.
+	const globalConfigLabel = homeRelativePath(
+		getPiLensGlobalConfigPath(),
+		os.homedir(),
+	);
 	const warnUnhonoredKey = (label: string, globalOnly: boolean): void => {
 		warnInvalidConfigOnce(
 			configPath,
 			globalOnly
-				? `"${label}" is a global-only pi-lens setting and is not honored in a project .pi-lens.json (set it in ~/.pi-lens/config.json or pass the matching CLI flag); ignored`
+				? `"${label}" is a global-only pi-lens setting and is not honored in a project .pi-lens.json (set it in ${globalConfigLabel} or pass the matching CLI flag); ignored`
 				: `unknown key "${label}" is not a recognized pi-lens setting (check for a typo); ignored`,
 		);
 	};
@@ -692,15 +725,18 @@ function parseConfigFile(configPath: string): PiLensProjectConfig {
 	}
 
 	return {
-		ignore,
-		rules,
-		...(mutations as Pick<
-			PiLensProjectConfig,
-			"format" | "autofix" | "actionableWarnings"
-		>),
-		maxProjectFiles,
-		reviewGraph,
-		raw,
-		configPath,
+		config: {
+			ignore,
+			rules,
+			...(mutations as Pick<
+				PiLensProjectConfig,
+				"format" | "autofix" | "actionableWarnings"
+			>),
+			maxProjectFiles,
+			reviewGraph,
+			raw,
+			configPath,
+		},
+		records: resolved.records,
 	};
 }

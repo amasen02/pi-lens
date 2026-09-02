@@ -68,6 +68,7 @@ export function resolveConfig<T = unknown>(
 			...(source.trust === undefined ? {} : { trust: source.trust }),
 			value: validate(source.value, options.schema, {
 				file: source.file ?? "",
+				tier: source.tier,
 				collector,
 			}).value,
 		}));
