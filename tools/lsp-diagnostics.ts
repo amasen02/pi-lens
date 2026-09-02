@@ -313,9 +313,10 @@ function projectIgnorePredicate(
  * This walk was fully synchronous with NO yielding of any kind, bounded only by
  * `maxFiles` *kept* — an ignored-heavy or cloud-backed (OneDrive/network) tree
  * could traverse unboundedly many entries, and a single stalled `readdirSync`
- * held the loop for the whole stall. It is also called once PER LANGUAGE in
- * `runDirectoryDiagnostics`'s `SCAN_LANGUAGE_PRIORITY` loop (#2434), so a
- * directory-mode `lsp_diagnostics` could pay that cost several times over.
+ * held the loop for the whole stall. It is also called once PER FAMILY in
+ * `runDirectoryDiagnostics`'s `SCAN_LANGUAGE_PRIORITY` loop (#2434, grouped by
+ * family since #2458 fix-round F1), so a directory-mode `lsp_diagnostics`
+ * could pay that cost several times over.
  *
  * The traversal is deliberately still **depth-first with immediate descent**
  * (not the shared stack-based `walkTreeStackAsync`): the `maxFiles` cap makes
@@ -1947,31 +1948,59 @@ async function runBatchFileDiagnostics(
 	};
 }
 
+/**
+ * The scan-language DECISION `runDirectoryDiagnostics` makes, pulled out as
+ * its own function so `tests/tools/lsp-diagnostics-scan-family.test.ts` can
+ * pin it against the golden `LANG_EXTENSIONS` table for every 1- and
+ * 2-extension combination in that table's universe without spinning up one
+ * real directory (and the full LSP-mocked tool) per combination — `hasMatch`
+ * is the only I/O-shaped seam, so the caller decides whether it is backed by
+ * a real `collectFiles` walk (production) or an in-memory extension-set probe
+ * (tests).
+ *
+ * Walks `SCAN_LANGUAGE_PRIORITY`'s FAMILIES in order and unions each member
+ * id's {@link extensionsForLanguage} into ONE `hasMatch` call — the first
+ * family with any match wins the whole directory for this pass. Grouping by
+ * family (not trying each id alone) is what makes a directory mixing BOTH
+ * extensions of a registry-split pair (`.ts`+`.tsx`, `.css`+`.scss`, ...)
+ * behavior-preserving vs the pre-#2434 bundled-key table: a flat per-id loop
+ * stopped at the first id with ANY match, silently losing the sibling half of
+ * a split pair present in the same directory (#2458 fix-round F1).
+ */
+export async function resolveDirectoryScanExtensions(
+	hasMatch: (extensions: readonly string[]) => boolean | Promise<boolean>,
+): Promise<readonly string[] | undefined> {
+	for (const family of SCAN_LANGUAGE_PRIORITY) {
+		const exts = family.flatMap((languageId) =>
+			extensionsForLanguage(languageId),
+		);
+		if (await hasMatch(exts)) {
+			return exts;
+		}
+	}
+	return undefined;
+}
+
 async function runDirectoryDiagnostics(
 	absPath: string,
 	severity: string,
 	lspService: NonNullable<ReturnType<typeof getLSPService>>,
 	options: BatchOptions,
 ) {
-	let extension: string | undefined;
 	let collectedFiles: string[] = [];
 
 	const isIgnored = projectIgnorePredicate(absPath);
-	for (const languageId of SCAN_LANGUAGE_PRIORITY) {
-		const exts = extensionsForLanguage(languageId);
+	await resolveDirectoryScanExtensions(async (exts) => {
 		collectedFiles = await collectFiles(
 			absPath,
 			[...exts],
 			MAX_FILES + 1,
 			isIgnored,
 		);
-		if (collectedFiles.length > 0) {
-			extension = languageId;
-			break;
-		}
-	}
+		return collectedFiles.length > 0;
+	});
 
-	if (!extension || collectedFiles.length === 0) {
+	if (collectedFiles.length === 0) {
 		return {
 			content: [
 				{

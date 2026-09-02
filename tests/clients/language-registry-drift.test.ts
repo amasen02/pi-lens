@@ -672,9 +672,35 @@ describe("SCAN_LANGUAGE_PRIORITY (#2434 fold)", () => {
 		}
 	});
 
-	it("SCAN_LANGUAGE_PRIORITY is exactly the families, in golden order, ids concatenated", () => {
+	// #2458 fix-round F3: this used to compare a FLAT SCAN_LANGUAGE_PRIORITY
+	// against `FAMILIES.flatMap`, which collapsed family boundaries into one
+	// array and so could not, by construction, catch a family being reordered
+	// relative to its own golden position without ALSO catching plain id
+	// reordering — the two failure modes were indistinguishable and neither
+	// was independently pinned against a source outside this test file. Two
+	// checks now: family-level order against `golden.order` directly (not
+	// against `SCAN_LANGUAGE_PRIORITY`, so a bug that moves both in the same
+	// wrong direction still reds), and the full nested shape (family order AND
+	// intra-family id order) against `SCAN_LANGUAGE_PRIORITY` itself.
+	it("FAMILIES' family-level order matches golden.order exactly (goldenKeys[0], deduplicated)", () => {
+		// golden.order lists `.tsx` as its own entry even though it shares the
+		// `.ts` family's value (the old table's one true key duplicate) — drop
+		// every goldenKey that is not a family's FIRST one before comparing, or
+		// this would spuriously expect a 31st family that doesn't exist.
+		const nonLeadGoldenKeys = new Set(
+			FAMILIES.flatMap((family) => family.goldenKeys.slice(1)),
+		);
+		const dedupedGoldenOrder = golden.order.filter(
+			(key: string) => !nonLeadGoldenKeys.has(key),
+		);
+		expect(FAMILIES.map((family) => family.goldenKeys[0])).toEqual(
+			dedupedGoldenOrder,
+		);
+	});
+
+	it("SCAN_LANGUAGE_PRIORITY is exactly the families, family order AND intra-family id order both pinned", () => {
 		expect(SCAN_LANGUAGE_PRIORITY).toEqual(
-			FAMILIES.flatMap((family) => family.ids),
+			FAMILIES.map((family) => family.ids),
 		);
 	});
 
@@ -695,7 +721,9 @@ describe("SCAN_LANGUAGE_PRIORITY (#2434 fold)", () => {
 	it("drops no extension the old table could ever scan", () => {
 		const allGolden = new Set(Object.values(golden.extensions).flat());
 		const allProjected = new Set(
-			SCAN_LANGUAGE_PRIORITY.flatMap((id) => extensionsForLanguage(id)),
+			SCAN_LANGUAGE_PRIORITY.flatMap((family) =>
+				family.flatMap((id) => extensionsForLanguage(id)),
+			),
 		);
 		const missing = [...allGolden].filter((ext) => !allProjected.has(ext));
 		expect(missing).toEqual([]);
@@ -716,5 +744,20 @@ describe("SCAN_LANGUAGE_PRIORITY (#2434 fold)", () => {
 		);
 		expect(match, "AST_GREP_KINDS declaration not found").not.toBeNull();
 		expect(match?.[1]).not.toContain("solidity");
+	});
+
+	// #2458 fix-round F5: `tools/shared.ts`'s `LANGUAGES` — spread into the
+	// `lang` enum of four agent-facing tool schemas (ast_dump,
+	// ast_grep_outline, ast_grep_replace, ast_grep_search) — carried the same
+	// phantom "solidity" entry (#2424 review, S2's finding, never actually
+	// swept from this table): not a registry id, not an ast-grep napi
+	// language, not reachable from `extensionsForLanguageToken` (see the
+	// `symbol_search lang filter` describe block above), so selecting it in
+	// any of those four tools' `lang` param could only ever no-op. Runtime
+	// assertion (not source-grep): `LANGUAGES` is a real array these tools
+	// spread at schema-build time, so a reintroduction is directly observable.
+	it("tools/shared.ts's LANGUAGES names no phantom 'solidity' entry", async () => {
+		const { LANGUAGES } = await import("../../tools/shared.js");
+		expect(LANGUAGES).not.toContain("solidity");
 	});
 });

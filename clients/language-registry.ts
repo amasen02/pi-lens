@@ -686,64 +686,65 @@ export const KIND_TO_GRAMMAR: Readonly<Record<string, string>> = Object.freeze(
  * Directory-scan priority (#2434), folding `tools/lsp-diagnostics.ts`'s former
  * ad hoc `LANG_EXTENSIONS` table — the last one #2424 deliberately left out,
  * because its iteration ORDER decides which language a MIXED directory scans
- * as: `runDirectoryDiagnostics` walks this list and the first id whose
- * {@link extensionsForLanguage} matches any file wins the whole directory for
- * that pass. Order mirrors the old table's key order exactly (`typescript`
- * before `typescriptreact`, `javascript` before `javascriptreact`, ...,
- * `json` before `jsonc`, down to `prisma` last).
+ * as: `runDirectoryDiagnostics` walks this list of FAMILIES and, for each one,
+ * unions every member id's {@link extensionsForLanguage} into ONE
+ * `collectFiles` call — the first family with any matching file wins the
+ * whole directory for that pass. Family order mirrors the old table's key
+ * order exactly (`typescript`/`typescriptreact` before `javascript`/
+ * `javascriptreact`, ..., `json`/`jsonc` before `yaml`, down to `prisma`
+ * last).
  *
  * The old table sometimes bundled two now-distinct registry entries under one
- * key (`.ts` also matched `.tsx`; `.css` also matched `.scss`/`.less`) because
- * it predated the grammar split #2424 made explicit (`.tsx` needs the `tsx`
- * grammar, not `typescript`; `scss`/`less` are their own entries with no
- * grammar). Splitting those into adjacent ids here is a real, if narrow,
- * behavior change for a directory that mixes BOTH extensions of a split pair
- * (e.g. `.ts` AND `.tsx` side by side): the old code scanned them together,
- * the split scans whichever id is tried first and stops there. Every
- * extension individually stays reachable — no id here was dropped — and
- * `tests/clients/language-registry-drift.test.ts` pins each row against the
- * golden `tests/fixtures/lsp-diagnostics-lang-extensions.json` capture, with
- * every intentional widening/narrowing (and this split) enumerated there and
- * in the `.changelog/` entry, not left as a silent side effect.
+ * key (`.ts` also matched `.tsx`; `.css` also matched `.scss`/`.less`)
+ * because it predated the grammar split #2424 made explicit (`.tsx` needs the
+ * `tsx` grammar, not `typescript`; `scss`/`less` are their own entries with
+ * no grammar). Grouping each split into one FAMILY here — rather than listing
+ * the ids flat and scanning them one at a time — is what keeps a directory
+ * that mixes BOTH extensions of a split pair (e.g. `.ts` AND `.tsx` side by
+ * side) behavior-preserving: every member's extensions feed the SAME
+ * `collectFiles` call, so both sides are found in the one pass the old
+ * bundled key made, not whichever id happens to be tried first (a flat
+ * per-id loop broke this — #2458 fix-round F1). Every extension individually
+ * stays reachable — no id here was dropped — and
+ * `tests/clients/language-registry-drift.test.ts` pins each family against
+ * the golden `tests/fixtures/lsp-diagnostics-lang-extensions.json` capture,
+ * with every intentional widening (an id's registry extension set is a
+ * strict superset of the old table's) enumerated there and in the
+ * `.changelog/` entry, not left as a silent side effect.
  *
  * Reserved for #2416 (lsp namespace): this priority may become a config key
  * there. Not implemented as one here — no loader, no env var, no
  * `.pi-lens.json` field reads this array today.
  */
-export const SCAN_LANGUAGE_PRIORITY: readonly LanguageId[] = [
-	"typescript",
-	"typescriptreact",
-	"javascript",
-	"javascriptreact",
-	"python",
-	"rust",
-	"go",
-	"ruby",
-	"java",
-	"kotlin",
-	"swift",
-	"csharp",
-	"cpp",
-	"c",
-	"zig",
-	"haskell",
-	"elixir",
-	"gleam",
-	"terraform",
-	"nix",
-	"shell",
-	"php",
-	"lua",
-	"dart",
-	"vue",
-	"svelte",
-	"css",
-	"scss",
-	"less",
-	"html",
-	"json",
-	"jsonc",
-	"yaml",
-	"toml",
-	"prisma",
+export const SCAN_LANGUAGE_PRIORITY: readonly (readonly LanguageId[])[] = [
+	["typescript", "typescriptreact"],
+	["javascript", "javascriptreact"],
+	["python"],
+	["rust"],
+	["go"],
+	["ruby"],
+	["java"],
+	["kotlin"],
+	["swift"],
+	["csharp"],
+	["cpp"],
+	["c"],
+	["zig"],
+	["haskell"],
+	["elixir"],
+	["gleam"],
+	["terraform"],
+	["nix"],
+	["shell"],
+	["php"],
+	["lua"],
+	["dart"],
+	["vue"],
+	["svelte"],
+	["css", "scss", "less"],
+	["html"],
+	["json", "jsonc"],
+	["yaml"],
+	["toml"],
+	["prisma"],
 ];
