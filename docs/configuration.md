@@ -133,14 +133,28 @@ internally the whole file is ignored and said so under its own code
 effect" are never the same code. Nothing about your config is ever ignored
 silently.
 
-The number of notices one file can produce is bounded PER NOTICE CLASS —
-deprecations, and rejected values — each at 19 notices plus 1 summary, because
-the number of keys in a file is not bounded. Past the bound the remainder is
-summarised in a single `PILENS_CFG_0007` notice giving the count that was
-suppressed, so a truncated list always says that it is truncated. That notice
-is about the LIST, not about the file: a config whose every setting was applied
-can still overflow the bound, so it is worded and recorded as a summary rather
-than as an ignored config.
+The number of notices one file can produce is bounded PER NOTICE LIST, because
+the number of keys in a file is not. There are two lists, split by who composes
+them rather than by what they say — both are about values that were rejected:
+
+- what **resolving** the file produced — the per-field rejections
+  (`PILENS_CFG_0004`, `PILENS_CFG_0005`, `PILENS_CFG_0006`) together with the
+  deprecation notices (`PILENS_CFG_0002`, `PILENS_CFG_0003`), which share this
+  list;
+- what the **loader** reading the file produced on its own — unknown top-level
+  keys and settings it refused (`PILENS_CFG_0001`).
+
+Each list is bounded at 20 records: up to 19 notices plus, when the bound bit,
+a single `PILENS_CFG_0007` summary giving the count that was suppressed, so a
+truncated list always says that it is truncated. That summary is about the
+LIST, not about the file: a config whose every setting was applied can still
+overflow the bound, so it is worded and recorded as a summary rather than as an
+ignored config.
+
+One notice is never suppressed by that bound: `PILENS_CFG_0008`, which says the
+whole file is out of effect. It is not one more rejected key competing for a
+slot — it is what tells you the rejections above it are no longer the whole
+story — so it is kept however full the list already was.
 
 ## See also
 

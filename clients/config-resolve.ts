@@ -74,6 +74,7 @@ import type { Provenance, SourceTier } from "./config-core/provenance.js";
 import { PI_LENS_CONFIG_SCHEMA } from "./config-schema.js";
 import {
 	type IgnoredConfigSubsystem,
+	normalizeParseErrorReason,
 	warnIgnoredConfigOnce,
 } from "./config-warn.js";
 import { homeRelativePath } from "./path-utils.js";
@@ -745,6 +746,75 @@ export function reportPiLensConfigRecords(
 			});
 		}
 	}
+}
+
+/**
+ * How a loader records a document it is ignoring, or a value inside one it
+ * refused.
+ *
+ * A hand-authored string for a validated bad value or wrong type; a
+ * `{ parseError }` for a caught parse/read error, so this seam — not each call
+ * site — decides how much of a `JSON.parse` `SyntaxError#message` (which embeds
+ * a snippet of the source file on Node >=20, #2431) survives into the sinks.
+ */
+export type NoteIgnored = (
+	reason: string | { readonly parseError: unknown },
+) => void;
+
+/**
+ * Buffer a loader's own ignored-config notices for one document, then bound
+ * them once.
+ *
+ * A `NoteIgnored` COLLECTS rather than reports (#2426 review round 4, F3/F5).
+ * Two things follow. The notice survives into a loader's cache entry, so a warm
+ * cache HIT replays it instead of losing the whole `config-ignored` class from
+ * session 2 onwards. And the count is bounded: the number of these a file can
+ * produce is the number of keys the user typed — a 100-key file emitted 98
+ * unknown-key notifications — so the buffered list goes through the same
+ * `finalizeRecords` bound every other config record obeys, with one slot held
+ * back to say how many were suppressed.
+ *
+ * ONE COPY, in the module both loaders already import (#2426 review round 7,
+ * F2). Round 6 gave the global loader the bound the project loader already had
+ * — by copying it — leaving two spellings of one record literal
+ * (`PILENS_CFG_0001`, no key, `migrationSubject(configPath, "")`) and one flush,
+ * differing only in a tier literal. Two copies of one policy is the shape round
+ * 5 collapsed three copies of this same bound to avoid, so the tier is an
+ * argument and the copy is gone. `tests/clients/config-notice-bounds.test.ts`
+ * asserts on the SOURCE that no third copy grows back, because duplication is
+ * invisible to a behavioral probe until one copy is edited.
+ *
+ * The buffer is a plain array (round 6, S2). It used to be a pre-subtracted
+ * `finalizableCollector`, a second exported shape for the one policy round 5
+ * had just collapsed; the notes a single parse can accumulate are bounded by
+ * the document already in memory, which is a smaller cost than a second public
+ * entry point onto the same arithmetic.
+ */
+export function ignoredRecordCollector(
+	configPath: string,
+	tier: SourceTier,
+): {
+	note: NoteIgnored;
+	records: () => readonly MigrationRecord[];
+} {
+	const noted: MigrationRecord[] = [];
+	const note: NoteIgnored = (reason) => {
+		noted.push({
+			code: "PILENS_CFG_0001",
+			file: configPath,
+			key: "",
+			subject: migrationSubject(configPath, ""),
+			reason:
+				typeof reason === "string"
+					? reason
+					: normalizeParseErrorReason(reason.parseError),
+			tier,
+		});
+	};
+	return {
+		note,
+		records: () => finalizeRecords(noted, { file: configPath, tier }),
+	};
 }
 
 /**

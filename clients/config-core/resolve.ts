@@ -118,6 +118,21 @@ export function resolveConfig<T = unknown>(
 		// registered and documented as a per-FIELD rejection, so a user matching
 		// on it expects to have lost one setting. This record means the WHOLE
 		// configuration was dropped, which is a different thing to do about it.
+		//
+		// SURVIVES THE BOUND (#2426 review round 7, F1). The per-field records
+		// fill this same bounded collector, so a resolution that had already
+		// produced `MAX_MIGRATION_RECORDS` of them used to swallow this record
+		// into the anonymous suppression count — and the user then read "19 keys
+		// rejected, 11 further notices suppressed" about a resolution that
+		// applied NOTHING. That is the round-6 inversion arriving through the
+		// bound rather than through the prose round 6 fixed.
+		//
+		// The rule that keeps it lives in `MigrationRecordCollector.add`
+		// (`UNBOUNDED_RECORD_CODES`), not here, because appending it at THIS call
+		// site fixes only this call site: `config-resolve.ts` re-bounds the very
+		// list this function returns through `finalizeRecords`, whose collector
+		// would drop it a second time. One rule at the one choke point covers
+		// both bounds.
 		const anchor = anchorSource(options.sources);
 		const file = anchor?.file ?? "";
 		collector.add({

@@ -58,7 +58,6 @@
  * higher precedence than) the root config's `ignore` patterns.
  */
 import {
-	normalizeParseErrorReason,
 	resetIgnoredConfigWarnCache,
 	warnIgnoredConfigOnce,
 } from "./config-warn.js";
@@ -88,6 +87,8 @@ import {
 import {
 	type ConfigDocument,
 	deprecationRecords,
+	ignoredRecordCollector,
+	type NoteIgnored,
 	projectLocationFor,
 	readConfigDocument,
 	reportConfigReadFailure,
@@ -97,7 +98,6 @@ import {
 import {
 	finalizeRecords,
 	type MigrationRecord,
-	migrationSubject,
 } from "./config-core/records.js";
 import {
 	homeRelativePath,
@@ -633,58 +633,6 @@ function bearingDirMtimes(
 	return bearing < 0 ? [...dirMtimes] : dirMtimes.slice(0, bearing + 1);
 }
 
-/**
- * Records this loader composes itself, bounded, for one parse.
- *
- * A `NoteIgnored` COLLECTS rather than reports (#2426 review round 4, F3/F5).
- * Two things follow from that. The notice survives into the cache entry, so a
- * warm cache HIT replays it instead of losing the whole `config-ignored` class
- * from session 2 onwards. And the count is bounded: the number of these a file
- * can produce is the number of keys the user typed — a 100-key file emitted 98
- * unknown-key notifications — so the buffered list goes through the same
- * `finalizeRecords` bound every other config record obeys, with one slot held
- * back to say how many were suppressed.
- *
- * The buffer is a plain array (#2426 review round 6, S2). It used to be a
- * pre-subtracted `finalizableCollector`, a second exported shape for the one
- * policy round 5 had just collapsed into one; the notes a single parse can
- * accumulate are bounded by the document already in memory, which is a smaller
- * cost than a second public entry point onto the same arithmetic.
- */
-type NoteIgnored = (
-	// A hand-authored string for a validated bad value/wrong type (every call
-	// site below but the JSON.parse catch); `{ parseError }` for a caught
-	// parse/read error, so this seam — not each call site — decides how much of
-	// a `JSON.parse` `SyntaxError#message` (which embeds a snippet of the source
-	// file on Node >=20, #2431) survives into the three sinks.
-	reason: string | { readonly parseError: unknown },
-) => void;
-
-function ignoredRecordCollector(configPath: string): {
-	note: NoteIgnored;
-	records: () => readonly MigrationRecord[];
-} {
-	const noted: MigrationRecord[] = [];
-	const note: NoteIgnored = (reason) => {
-		noted.push({
-			code: "PILENS_CFG_0001",
-			file: configPath,
-			key: "",
-			subject: migrationSubject(configPath, ""),
-			reason:
-				typeof reason === "string"
-					? reason
-					: normalizeParseErrorReason(reason.parseError),
-			tier: "project",
-		});
-	};
-	return {
-		note,
-		records: () =>
-			finalizeRecords(noted, { file: configPath, tier: "project" }),
-	};
-}
-
 function parseRulePolicyList(
 	note: NoteIgnored,
 	ruleId: string,
@@ -727,7 +675,10 @@ interface ParsedConfigFile {
 const NO_RECORDS: readonly MigrationRecord[] = [];
 
 function parseConfigFile(configPath: string): ParsedConfigFile {
-	const { note, records: ignoredRecords } = ignoredRecordCollector(configPath);
+	const { note, records: ignoredRecords } = ignoredRecordCollector(
+		configPath,
+		"project",
+	);
 	const outcome = readConfigDocument(configPath);
 	if (outcome.status === "error") {
 		// `{ parseError }`, not a pre-stringified message (#2431): the raw error

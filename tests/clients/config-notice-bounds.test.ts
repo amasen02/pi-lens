@@ -30,6 +30,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MAX_MIGRATION_RECORDS } from "../../clients/config-core/records.js";
 import { PI_LENS_CONFIG_SCHEMA } from "../../clients/config-schema.js";
 import { resetIgnoredConfigWarnCache } from "../../clients/config-warn.js";
+import {
+	assertNonEmptyScan,
+	listSourceFiles,
+	relativePosix,
+	stripSource,
+} from "../support/sweep-kit.js";
 import { removeTempDirSync } from "./test-utils.js";
 
 const notices: string[] = [];
@@ -385,5 +391,141 @@ describe("S1: a WHOLE-config failure has its own code", () => {
 			detail,
 		).toEqual(["PILENS_CFG_0008"]);
 		expect(resolution.records[0]?.file, detail).toBe(file);
+	});
+});
+
+describe("round 7, F1: the whole-config failure record outranks the bound", () => {
+	function throwingSource(file: string) {
+		return {
+			tier: "project" as const,
+			file,
+			get trust(): never {
+				throw new Error("boom");
+			},
+			value: {},
+		};
+	}
+
+	/**
+	 * The record that says "NONE of this applied" used to go in through the same
+	 * `collector.add()` the per-field records fill, so a resolution that had
+	 * already produced `MAX_MIGRATION_RECORDS` per-field records swallowed it
+	 * into the anonymous drop count.
+	 *
+	 * That is the round-6 inversion arriving through the bound instead of
+	 * through prose: the user reads 19 "key rejected" notices plus "1 further
+	 * notice suppressed" and concludes the rest of the file is in effect, while
+	 * `merge([])` applied nothing at all. The failure record is not one more
+	 * notice competing for a slot — it is the statement that the other notices
+	 * are no longer the whole story — so it is appended OUTSIDE the limit, the
+	 * same shape `finalize()` uses for its own overflow record.
+	 */
+	it("survives a collector the per-field records already filled", async () => {
+		const { resolveConfig } =
+			await import("../../clients/config-core/resolve.js");
+		const root = tmpRoot("pi-lens-r7f1-");
+		const refusedFile = path.join(root, ".pi-lens.json");
+		const throwingFile = path.join(root, "nested", ".pi-lens.json");
+
+		const resolution = resolveConfig({
+			sources: [
+				{
+					tier: "project" as const,
+					file: refusedFile,
+					value: JSON.parse(protoSectionsJson(30)) as unknown,
+				},
+				throwingSource(throwingFile),
+			],
+			schema: PI_LENS_CONFIG_SCHEMA,
+		});
+
+		const codes = resolution.records.map((record) => record.code);
+		const detail = JSON.stringify({
+			codes,
+			dropped: resolution.droppedRecordCount,
+		});
+		// The bound really did bite: without it this proves nothing.
+		expect(resolution.droppedRecordCount, detail).toBeGreaterThan(0);
+		expect(codes, detail).toContain("PILENS_CFG_0008");
+		// Appended, not squeezed in: the per-field records keep every slot they
+		// had, and the failure record sits past them.
+		expect(
+			codes.filter((code) => code === "PILENS_CFG_0006").length,
+			detail,
+		).toBe(MAX_MIGRATION_RECORDS);
+		expect(codes[codes.length - 1], detail).toBe("PILENS_CFG_0008");
+		// And the failure record is never itself counted as suppressed.
+		expect(resolution.droppedRecordCount, detail).toBe(
+			30 - MAX_MIGRATION_RECORDS,
+		);
+		const failure = resolution.records.find(
+			(record) => record.code === "PILENS_CFG_0008",
+		);
+		expect(failure?.file, detail).toBe(throwingFile);
+		expect(failure?.tier, detail).toBe("project");
+	});
+});
+
+describe("round 7, F2: ONE buffer-notes-then-finalize seam, not one per loader", () => {
+	/**
+	 * Round 6 gave the global loader the bound the project loader already had —
+	 * by copying it. Both then held the same record literal (`PILENS_CFG_0001`,
+	 * key `""`, `migrationSubject(configPath, "")`) and the same
+	 * `finalizeRecords` flush, differing only in a tier literal. Two copies of
+	 * one policy is the shape round 5 collapsed three copies of this same bound
+	 * to avoid, so the seam moved to `config-resolve.ts` — which both loaders
+	 * already import — and takes the tier as an argument.
+	 *
+	 * Asserted on the SOURCE because the defect is duplication, which no
+	 * behavioral probe can see: two correct copies pass every behavioral test
+	 * right up until one of them is edited.
+	 */
+	it("composes the ignored-config note record in exactly one module", () => {
+		const repoRoot = path.resolve(__dirname, "..", "..");
+		const files = listSourceFiles(path.join(repoRoot, "clients"), {
+			extensions: [".ts"],
+			skipTests: true,
+		});
+		// A walk that found nothing must fail, not read as clean (defect shape 10).
+		assertNonEmptyScan("config-0001 record-literal sweep", files.length, 60);
+
+		const composers = files.filter((file) =>
+			// `strings: "keep"`: the needle IS a string literal, so blanking string
+			// contents would blind the sweep to every hit. Comments still go, which
+			// is what matters here — three modules DISCUSS this record in prose.
+			/\bcode:\s*"PILENS_CFG_0001"/.test(
+				stripSource(fs.readFileSync(file, "utf8"), { strings: "keep" }),
+			),
+		);
+
+		expect(
+			composers.map((file) => relativePosix(repoRoot, file)),
+			composers.join(", "),
+		).toEqual(["clients/config-resolve.ts"]);
+	});
+
+	it("bounds and tiers BOTH loaders' notes through that one seam", async () => {
+		const { ignoredRecordCollector } =
+			await import("../../clients/config-resolve.js");
+		const file = path.join(tmpRoot("pi-lens-r7f2-"), ".pi-lens.json");
+
+		for (const tier of ["global", "project"] as const) {
+			const { note, records } = ignoredRecordCollector(file, tier);
+			for (let index = 0; index < MAX_MIGRATION_RECORDS + 5; index += 1) {
+				note(`unknown top-level key "k${index}"`);
+			}
+			const finalized = records();
+			const detail = `${tier}: ${JSON.stringify(finalized)}`;
+			expect(finalized.length, detail).toBe(MAX_MIGRATION_RECORDS);
+			expect(
+				finalized.every((record) => record.tier === tier),
+				detail,
+			).toBe(true);
+			expect(finalized[0]?.code, detail).toBe("PILENS_CFG_0001");
+			expect(finalized[finalized.length - 1]?.code, detail).toBe(
+				"PILENS_CFG_0007",
+			);
+			expect(finalized[0]?.subject, detail).toBe(file);
+		}
 	});
 });

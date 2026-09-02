@@ -25,16 +25,12 @@ import {
 // `config-locations.ts` (#2426 review round 3, S1) — see the doc comment there.
 export { getPiLensGlobalConfigPath } from "./config-locations.js";
 import {
+	ignoredRecordCollector,
 	readConfigDocument,
 	reportConfigReadFailure,
 	reportPiLensConfigRecords,
 	resolveOnePiLensConfigDocument,
 } from "./config-resolve.js";
-import {
-	finalizeRecords,
-	type MigrationRecord,
-	migrationSubject,
-} from "./config-core/records.js";
 import {
 	findNestedProjectMutationValue,
 	type PiLensProjectConfig,
@@ -207,8 +203,8 @@ export function loadPiLensGlobalConfig(
 		return undefined;
 	}
 	// Every notice this projection composes is BUFFERED and bounded once, at the
-	// end, through the same `finalizeRecords` the project loader and the shared
-	// resolution use (#2426 review round 6, F3). It used to report each one the
+	// end, through the SAME `ignoredRecordCollector` the project loader uses
+	// (#2426 review round 6, F3; round 7, F2). It used to report each one the
 	// moment it was composed, with no collector anywhere in this function, so
 	// the unknown-top-level-key scan below — whose count is the number of keys
 	// the user typed — put 100 notifications on screen for a 100-key
@@ -217,20 +213,20 @@ export function loadPiLensGlobalConfig(
 	// claimed one bound for every producer; this is the producer that did not
 	// have one.
 	//
+	// Round 6 gave it that bound by COPYING the project loader's, which left two
+	// spellings of one record literal differing only in a tier. Round 7 moved
+	// the seam into `config-resolve.ts`, which both loaders already import, and
+	// made the tier an argument. This loader never passes a `{ parseError }`:
+	// its read/parse failure is reported above by `reportConfigReadFailure`,
+	// before the projection starts.
+	//
 	// The flush is in a `finally` so a throw in the projection still delivers
 	// what was composed before it, on top of the whole-config record the catch
 	// adds.
-	const noted: MigrationRecord[] = [];
-	const note = (reason: string): void => {
-		noted.push({
-			code: "PILENS_CFG_0001",
-			file: configPath,
-			key: "",
-			subject: migrationSubject(configPath, ""),
-			reason,
-			tier: "global",
-		});
-	};
+	const { note, records: notedRecords } = ignoredRecordCollector(
+		configPath,
+		"global",
+	);
 	try {
 		const parsed = outcome.value;
 		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
@@ -402,9 +398,7 @@ export function loadPiLensGlobalConfig(
 		);
 		return undefined;
 	} finally {
-		reportPiLensConfigRecords(
-			finalizeRecords(noted, { file: configPath, tier: "global" }),
-		);
+		reportPiLensConfigRecords(notedRecords());
 	}
 }
 

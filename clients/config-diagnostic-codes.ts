@@ -177,6 +177,13 @@ export const CONFIG_DIAGNOSTIC_CODES = {
 	 * who matches on it expects one setting to have been dropped and the rest to
 	 * be in effect. Here NOTHING in the file is in effect, so the two need
 	 * different codes to be worth matching on at all.
+	 *
+	 * The ONE code the per-resolution bound never suppresses (#2426 review round
+	 * 7, F1). Every other record is one more per-key notice, and past 20 of
+	 * those a count is worth more than the list; this record is the statement
+	 * that those notices are no longer the whole story, so letting a
+	 * `PILENS_CFG_0007` stand in for it told the user "19 keys rejected, N more
+	 * suppressed" about a configuration that applied nothing at all.
 	 */
 	PILENS_CFG_0008: "config resolution failed; whole configuration ignored",
 } as const satisfies Record<`PILENS_CFG_${string}`, string>;

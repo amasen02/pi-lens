@@ -74,6 +74,30 @@ export const MAX_MIGRATION_RECORDS = DEGRADATION_ENTRIES_PER_KIND;
 export const MAX_RECORD_KEY_LENGTH = 120;
 
 /**
+ * Codes whose record is a VERDICT ON THE WHOLE CONFIGURATION rather than one
+ * more notice about one key. They are kept however full the collector is, and
+ * are never counted as suppressed (#2426 review round 7, F1).
+ *
+ * The bound exists so that a file with 500 bad keys cannot put 500 notices on
+ * screen: past 20, the rest are worth a count. That reasoning holds for every
+ * PER-KEY record and inverts for this one. "Nothing in this file is in effect"
+ * is not more of the same information — it is the statement that the notices
+ * above it are no longer the whole story, and dropping it leaves the user
+ * reading "19 keys rejected, N more suppressed" about a configuration that
+ * applied nothing at all.
+ *
+ * Enforced in `add`, which is the single choke point BOTH bounds go through:
+ * `resolveConfig`'s own collector and the second `finalizeRecords` pass that
+ * `config-resolve.ts` runs over what the first one returned. A call site that
+ * appended the record itself would be re-bounded by the second pass.
+ *
+ * `PILENS_CFG_0007` is deliberately NOT here: it is produced by `finalize`
+ * after the bound has already been applied, so it can never meet it.
+ */
+const UNBOUNDED_RECORD_CODES: ReadonlySet<ConfigDiagnosticCode> =
+	new Set<ConfigDiagnosticCode>(["PILENS_CFG_0008"]);
+
+/**
  * The NUL separator `warnIgnoredConfigOnce` puts between file and key. Built
  * from its code point rather than written literally, so a literal NUL never
  * enters this source file.
@@ -176,6 +200,14 @@ export class MigrationRecordCollector {
 
 	add(record: MigrationRecord): void {
 		if (this.kept.length >= this.limit) {
+			// A whole-config verdict outranks the bound — see
+			// `UNBOUNDED_RECORD_CODES`. It is kept AND not counted as suppressed,
+			// so `droppedCount` stays the number of per-key notices the user is
+			// not seeing.
+			if (UNBOUNDED_RECORD_CODES.has(record.code)) {
+				this.kept.push(record);
+				return;
+			}
 			this.dropped += 1;
 			return;
 		}
@@ -240,7 +272,10 @@ export class MigrationRecordCollector {
  *
  * One slot of the bound is held back for the overflow record, so a finalized
  * list is never LONGER than `MAX_MIGRATION_RECORDS` however many records went
- * in. That subtraction is written here and at no call site.
+ * in. That subtraction is written here and at no call site. The one exception
+ * is a whole-config verdict (`UNBOUNDED_RECORD_CODES`), which is kept past the
+ * limit by `add` and can therefore make a finalized list one entry longer —
+ * deliberately, because that entry is what makes the other entries readable.
  *
  * `priorDropped` is what an earlier bound already discarded — see the
  * collector's constructor. A caller that finalizes a list some other bound has
