@@ -1838,7 +1838,7 @@ Removal belongs otherwise to
 `SessionStart` (default 30m min-age, at most ONE tree per run so the removal
 fits inside the 90s hook timeout — `git worktree remove` is itself bounded at
 60s with SIGKILL) and to a manual `npm run hygiene`. The `SessionStart`
-carries `"matcher": "startup|resume"`, so the sweep runs when a session begins
+registration carries `"matcher": "startup|resume"`, so the sweep runs when a session begins
 or resumes and NOT on `/clear`, compaction or a fork — without it a long
 session re-ran the whole sweep every time it auto-compacted, roughly every
 20 minutes. Both hooks are registered in
@@ -1895,8 +1895,11 @@ min/median/max for a 467-row Windows listing, overridable with
 calls that decide whether a tree is removable — and the enrichment reserves
 that ceiling only up to HALF the sweep budget (`scanReserveMs`), because
 reserving all 4s out of SubagentStop's 5s left every enrichment `git` call on
-its 250ms floor, which `isDirty` reads as "unreadable => dirty" and keeps the
-very tree the hook fired to reap.
+its 250ms floor, which `isDirty` reads as `"unreadable"` and the dirty rail
+still keeps the very tree the hook fired to reap — but as of PR #2493 review
+round 3 (F2) the ledger says WHY with a `keptReason` of `"status-unreadable"`,
+not `"dirty"`, so a budget too tight to ask is never misread as protected
+uncommitted work.
 
 The SubagentStop payload is Claude Code's contract, not ours: `agent_id` is
 required on that event and a managed agent worktree is named `agent-<agentId>`

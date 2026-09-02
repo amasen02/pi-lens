@@ -355,7 +355,13 @@ export function parseDuration(text) {
  * @property {string} path            Absolute worktree path.
  * @property {string|null} [head]     HEAD sha.
  * @property {string|null} [branch]   Full ref (`refs/heads/...`) or null.
- * @property {boolean} dirty          `git status --porcelain` was non-empty.
+ * @property {boolean} dirty          `git status --porcelain` was non-empty,
+ *   OR could not be read at all (see `dirtyUnreadable`).
+ * @property {boolean} [dirtyUnreadable] True when `dirty` is true because the
+ *   `git status` call itself failed or timed out, rather than because it
+ *   returned a genuine non-empty porcelain output (review round 3, F2). Both
+ *   still refuse removal; this only changes which `keptReason` the ledger
+ *   records (`status-unreadable` vs `dirty`).
  * @property {boolean} pushed         HEAD is contained in some `origin/*` ref.
  * @property {number} mtimeMs         Newest observed activity timestamp.
  * @property {boolean} [locked]
@@ -433,7 +439,18 @@ export function planWorktreePrune({
 		}
 		// Hard rails: no flag, --only included, overrides these two.
 		if (row.dirty) {
-			push("dirty", "uncommitted changes would be destroyed");
+			// `dirtyUnreadable` (review round 3, F2) marks the sub-case where
+			// `git status` itself could not be read -- a wedged git, a budget
+			// too tight -- rather than a genuine non-empty porcelain output.
+			// Both refuse removal identically; the ledger's reason differs so
+			// an operator can tell "work was protected" from "the scan never
+			// got to look".
+			push(
+				row.dirtyUnreadable ? "status-unreadable" : "dirty",
+				row.dirtyUnreadable
+					? "git status could not be read before the removal decision"
+					: "uncommitted changes would be destroyed",
+			);
 			continue;
 		}
 		if (!row.pushed) {

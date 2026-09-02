@@ -75,3 +75,8 @@ export function worktreePathFromHookPayload(
 export function worktreeActivityMs(worktreePath: string, nowMs: number): number;
 
 export function getHygieneLogPath(): string;
+
+export function isDirty(
+	worktreePath: string,
+	timeoutMs?: number,
+): "clean" | "dirty" | "unreadable";

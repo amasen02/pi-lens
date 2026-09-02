@@ -111,6 +111,18 @@ describe("planWorktreePrune — hard rails no flag can override", () => {
 		expect(keepReason(plan, wt("agent-aaa"))).toBe("dirty");
 	});
 
+	it("distinguishes an unreadable git status from a genuinely dirty one (review round 3, F2)", () => {
+		// Both refuse removal identically -- but a `git status` that could not
+		// be read (a wedged git, a budget too tight to ask) is not evidence of
+		// protected uncommitted work, and the ledger must not say it is.
+		const plan = planOf([candidate({ dirty: true, dirtyUnreadable: true })]);
+		expect(plan.remove).toEqual([]);
+		expect(keepReason(plan, wt("agent-aaa"))).toBe("status-unreadable");
+		// A genuinely dirty tree (no dirtyUnreadable flag) still reads "dirty".
+		const dirtyPlan = planOf([candidate({ dirty: true })]);
+		expect(keepReason(dirtyPlan, wt("agent-aaa"))).toBe("dirty");
+	});
+
 	it("never removes a tree whose HEAD is not contained in an origin ref", () => {
 		const plan = planOf([candidate({ pushed: false })]);
 		expect(plan.remove).toEqual([]);

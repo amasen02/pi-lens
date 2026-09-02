@@ -36,7 +36,16 @@ reviewed, zero unreviewed merges). Apply it to each PR in the queue.
    never removed at any age, by any sweep — so a fix round in flight is safe by
    its own state, not by the clock.
 3. **Verify.** The SAME reviewer verifies each fix round with its own probes.
-   Do not take the fixer's word; do not swap reviewers mid-PR.
+   Do not take the fixer's word; do not swap reviewers mid-PR. A reviewer's
+   worktree is an `agent-*` tree too, so once its report lands the tree is
+   clean+pushed and `SubagentStop` reaps it exactly like a fixer's — a
+   SendMessage resume finds no checkout, same as above. Recreate it: the
+   merge-train practice is a FRESH reviewer worktree per VERIFY round, not a
+   kept one. Continuity is the reviewer AGENT (SendMessage still reaches the
+   same identity, so the same judgment and probes carry over); the checkout
+   under it is expected to be rebuilt each round, not preserved. Do not set
+   `--keep-agent-tree` / `PILENS_HYGIENE_KEEP_AGENT_TREES=1` merely to dodge
+   this — that decision stays off by default (see step 2).
 4. **Merge gate.** Merge only when: verdict is merge-ready; Unit tests and
    Lint genuinely EXECUTED and passed on the exact head SHA (read check-runs —
    a DIRTY PR silently skips them, absent is not green); every failing check

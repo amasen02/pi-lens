@@ -35,6 +35,7 @@ export interface WorktreeCandidate {
 	head?: string | null;
 	branch?: string | null;
 	dirty: boolean;
+	dirtyUnreadable?: boolean;
 	pushed: boolean;
 	mtimeMs: number;
 	locked?: boolean;

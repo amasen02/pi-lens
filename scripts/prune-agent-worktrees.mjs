@@ -539,8 +539,11 @@ export function removeBoundMs(hook, policy) {
  * `--scan-timeout-ms`, CAPPED AT HALF the budget: with SubagentStop's 5s
  * budget and the 4s default ceiling the uncapped form left enrichment 1s, and
  * every `git` call then drops to its 250ms floor — which `isDirty` reads as
- * "unreadable => dirty" and keeps the very tree the hook fired to reap. At
- * SessionStart's 25s and a manual run's 60s the cap never binds.
+ * `"unreadable"` and the dirty rail still keeps the very tree the hook fired
+ * to reap, now with `keptReason: "status-unreadable"` rather than `"dirty"`
+ * (review round 3, F2) so the ledger does not read a tight budget as
+ * protected uncommitted work. At SessionStart's 25s and a manual run's 60s
+ * the cap never binds.
  *
  * @param {number} budgetMs
  * @param {number} scanTimeoutMs
@@ -855,17 +858,22 @@ function isContainedInOrigin(
 }
 
 /**
- * `git status --porcelain` non-empty. Unreadable => true => "dirty" => kept.
- * Fails safe in the direction that never destroys work.
+ * `git status --porcelain`, tri-state. `"unreadable"` (the call timed out,
+ * the process never spawned, or the worktree could not answer at all) is
+ * kept APART from a genuine `"dirty"` porcelain output — both still refuse
+ * removal (fails safe in the direction that never destroys work), but a
+ * ledger that calls a budget too tight to ask "dirty" is not the answer an
+ * operator needs (review round 3, F2): `keptReason: "dirty"` reads as
+ * protected work, when the real story is a scan that never got to look.
  *
  * @param {string} worktreePath
  * @param {number} [timeoutMs]
- * @returns {boolean}
+ * @returns {"clean"|"dirty"|"unreadable"}
  */
-function isDirty(worktreePath, timeoutMs = DEFAULT_GIT_TIMEOUT_MS) {
+export function isDirty(worktreePath, timeoutMs = DEFAULT_GIT_TIMEOUT_MS) {
 	const out = git(["status", "--porcelain"], worktreePath, timeoutMs);
-	if (out === null) return true;
-	return out.trim() !== "";
+	if (out === null) return "unreadable";
+	return out.trim() !== "" ? "dirty" : "clean";
 }
 
 // ---------------------------------------------------------------------------
@@ -1356,6 +1364,7 @@ async function main(argv) {
 		// that removes nothing shipped. Reading first means no future signal
 		// added to the gatherer can quietly re-open the hole.
 		const mtimeMs = worktreeActivityMs(row.path, nowMs);
+		const dirtyState = isDirty(row.path, enrichBudget());
 		return {
 			path: row.path,
 			head: row.head,
@@ -1363,7 +1372,12 @@ async function main(argv) {
 			locked: row.locked,
 			lockPid: parseLockPid(row.lockedReason),
 			mtimeMs,
-			dirty: isDirty(row.path, enrichBudget()),
+			dirty: dirtyState !== "clean",
+			// Threaded through to `planWorktreePrune`'s dirty rail so the
+			// ledger's `keptReason` can say `status-unreadable` instead of
+			// `dirty` when the real story is a budget too tight to ask
+			// (review round 3, F2) -- both still refuse removal.
+			dirtyUnreadable: dirtyState === "unreadable",
 			pushed: isContainedInOrigin(row.head, REPO_ROOT, enrichBudget()),
 		};
 	});
@@ -1514,6 +1528,14 @@ async function main(argv) {
 	const removedBranchRefs = [];
 	/** Trees actually removed — 0 on a dry run, which the record also says. */
 	let removedCount = 0;
+	/**
+	 * Paths the enrichment pass certified clean but that turned up dirty on
+	 * the immediate pre-remove recheck (review round 3, F1) -- fed into the
+	 * run-level `keptReason` below so a late write reads exactly like an
+	 * enrichment-time one, not `removed: 0` with no stated reason.
+	 * @type {Set<string>}
+	 */
+	const lateDirty = new Set();
 
 	if (!options.dryRun) {
 		for (const removal of removals) {
@@ -1533,6 +1555,33 @@ async function main(argv) {
 			}
 			const unlinked = unlinkTopLevelLinks(removal.path);
 			for (const link of unlinked) say(`    unlinked reparse point ${link}`);
+			// The enrichment `isDirty()` call and this removal are separated by
+			// two awaits above -- `readProcessTable` and one `terminatePid` per
+			// process the tree held, each with its own fixed grace period -- and
+			// either one gives a live process room to write into a tree
+			// enrichment already certified clean. A check-then-act split by
+			// awaits with a kill in the gap (review round 3, F1): re-running the
+			// SAME check immediately before the one operation that actually
+			// destroys anything closes it, rather than trusting a verdict that
+			// can be a second or more stale by the time it is acted on.
+			if (isDirty(removal.path, removeBound) !== "clean") {
+				console.error(
+					`[hygiene] ${removal.path} became dirty after enrichment; ` +
+						"skipping removal",
+				);
+				lateDirty.add(removal.path);
+				records.push(
+					formatWorktreeRecord({
+						path: removal.path,
+						branch: removal.branch,
+						ageMs: removal.ageMs,
+						removed: false,
+						error: "became dirty between enrichment and removal",
+						nowIso,
+					}),
+				);
+				continue;
+			}
 			// A locked worktree needs --force twice; passing it unconditionally
 			// is harmless for the unlocked case.
 			// Outside the SWEEP budget, but not unbounded: `git()` applies
@@ -1642,12 +1691,30 @@ async function main(argv) {
 	// hook reaped nothing and nobody knows why", which is the same
 	// indistinguishable-absence shape #2486 was about one level up.
 	const targetPath = only?.length === 1 ? only[0] : null;
+	const targetKey = targetPath ? toComparablePath(targetPath) : null;
+	// The run's one tree can be on disk (fs.existsSync passed the
+	// scopedToAgentTree check) and still be nothing `git worktree list`
+	// knows about -- a half-removed tree from an earlier interrupted removal
+	// plus `git worktree prune`, which drops the ADMIN registration but can
+	// leave the working directory behind (review round 3, F3). That tree
+	// never appears in `candidates`, so it is in neither `plan.keep` nor
+	// `deferred`, and `keptReasonFor` reads that absence as "removed" rather
+	// than "not ours to remove".
+	const targetRegistered =
+		!targetKey ||
+		candidates.some((c) => toComparablePath(c.path) === targetKey);
+	const keptReason =
+		targetPath && lateDirty.has(targetPath)
+			? "dirty"
+			: targetPath && !targetRegistered && removedCount === 0
+				? "not-a-worktree"
+				: keptReasonFor({ targetPath, plan, deferred, policy });
 	records.push(
 		formatRunRecord({
 			hook: options.hook,
 			outcome: "fired",
 			worktree: targetPath,
-			keptReason: keptReasonFor({ targetPath, plan, deferred, policy }),
+			keptReason,
 			removed: removedCount,
 			orphans: orphans.length,
 			rows: table.length,

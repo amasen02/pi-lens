@@ -11,7 +11,7 @@
  * is false under vitest.
  */
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -28,6 +28,7 @@ import {
 	REMOVE_TIMEOUT_MS,
 	getHygieneLogPath,
 	hookBudgetMs,
+	isDirty,
 	keptReasonFor,
 	parseArgs,
 	removeBoundMs,
@@ -563,6 +564,57 @@ describe("candidate enrichment order (review round 3, F1b)", () => {
 	});
 });
 
+describe("isDirty (review round 3, F2)", () => {
+	// A real repo, not a hand-fed input: the tri-state distinguishes a
+	// genuinely dirty porcelain output from a `git status` that could not be
+	// answered at all -- both must refuse removal, but only the first one is
+	// evidence of protected work.
+	let root = "";
+	let repo = "";
+
+	const git = (args: string[], cwd: string) =>
+		gitExecFileSync("git", args, {
+			cwd,
+			encoding: "utf8",
+			stdio: "pipe",
+		}) as string;
+
+	beforeEach(() => {
+		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-f2-"));
+		repo = path.join(root, "repo");
+		fs.mkdirSync(repo);
+		git(["init", "-q", "-b", "master"], repo);
+		git(["config", "user.email", "test@example.com"], repo);
+		git(["config", "user.name", "pi-lens test"], repo);
+		fs.writeFileSync(path.join(repo, "a.txt"), "hello\n");
+		git(["add", "a.txt"], repo);
+		git(["commit", "-qm", "init"], repo);
+	});
+
+	afterEach(() => {
+		fs.rmSync(root, { recursive: true, force: true });
+	});
+
+	it('reads a clean porcelain output as "clean"', () => {
+		expect(isDirty(repo)).toBe("clean");
+	});
+
+	it('reads a non-empty porcelain output as "dirty"', () => {
+		fs.writeFileSync(path.join(repo, "b.txt"), "uncommitted\n");
+		expect(isDirty(repo)).toBe("dirty");
+	});
+
+	it('reads a `git status` that cannot be answered as "unreadable", never "clean"', () => {
+		// Not a hand-fed string: a real `git status --porcelain` run with a cwd
+		// git cannot resolve a repository from -- the same execFileSync/catch
+		// path a wedged or timed-out call takes (`git()` returns null either
+		// way), covered here for the outcome that matters: never "clean".
+		const notARepo = path.join(root, "not-a-repo");
+		fs.mkdirSync(notARepo);
+		expect(isDirty(notARepo)).toBe("unreadable");
+	});
+});
+
 // ---------------------------------------------------------------------------
 // #2486 — the SubagentStop hook that silently reaped nothing
 // ---------------------------------------------------------------------------
@@ -1021,6 +1073,144 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 			expect(
 				ledgerRecords().find((record) => record.event === "hygiene.run"),
 			).toMatchObject({ removed: 0, keptReason: "unpushed" });
+		},
+	);
+
+	it(
+		"tells an unreadable git status apart from a genuinely dirty tree (review round 3, F2)",
+		{ timeout: 90_000 },
+		() => {
+			// Drives the REAL production `isDirty()` call: a `.git` gitlink file
+			// git itself cannot resolve, so `git status --porcelain` run with cwd
+			// inside the worktree fails outright -- the same execFileSync/catch
+			// path a timed-out call takes, without depending on real-clock
+			// timing to force one. `git worktree list --porcelain` (run from the
+			// MAIN checkout) still lists the tree fine; only the per-tree
+			// enrichment call inside it fails.
+			//
+			// unlink-then-write, not an in-place `writeFileSync` overwrite:
+			// Windows denies the O_TRUNC open `writeFileSync` performs on a
+			// `.git` gitlink file `git worktree add` just created (EPERM,
+			// reproducible outside vitest too) even though a fresh create at
+			// the same path succeeds immediately after -- an environment
+			// quirk of the just-created file, not something under test here.
+			const gitLinkPath = path.join(worktree, ".git");
+			fs.unlinkSync(gitLinkPath);
+			fs.writeFileSync(gitLinkPath, "gitdir: /nonexistent\n");
+			runCli(registeredArgv(), subagentStopPayload(AGENT_ID));
+
+			expect(fs.existsSync(worktree)).toBe(true);
+			expect(
+				ledgerRecords().find((record) => record.event === "hygiene.run"),
+			).toMatchObject({
+				hook: "subagent-stop",
+				outcome: "fired",
+				removed: 0,
+				worktree,
+				keptReason: "status-unreadable",
+			});
+		},
+	);
+
+	it(
+		"records not-a-worktree for an existing directory git no longer registers (review round 3, F3)",
+		{ timeout: 90_000 },
+		() => {
+			// The shape left behind by a half-failed removal: `git worktree
+			// remove` unregisters the tree (or fails after the admin dir is
+			// pruned) but the working directory itself survives on disk. The
+			// derived path exists (passes the scopedToAgentTree fs.existsSync
+			// check) yet `git worktree list --porcelain` says nothing about it.
+			const STALE_ID = "a0000000000000099";
+			const stale = path.join(
+				repo,
+				".claude",
+				"worktrees",
+				`agent-${STALE_ID}`,
+			);
+			fs.mkdirSync(stale, { recursive: true });
+			fs.writeFileSync(path.join(stale, "leftover.txt"), "orphaned\n");
+
+			runCli(registeredArgv(), subagentStopPayload(STALE_ID));
+
+			expect(fs.existsSync(stale)).toBe(true);
+			expect(
+				ledgerRecords().find((record) => record.event === "hygiene.run"),
+			).toMatchObject({
+				hook: "subagent-stop",
+				outcome: "fired",
+				removed: 0,
+				worktree: stale,
+				keptReason: "not-a-worktree",
+			});
+		},
+	);
+
+	it(
+		"never destroys a write that lands after enrichment but before the removal call (review round 3, F1)",
+		{ timeout: 90_000 },
+		async () => {
+			// The gap the finding names: `isDirty()` runs during enrichment, and
+			// the actual `git worktree remove` is separated from it by
+			// `await readProcessTable` plus one `await terminatePid()` PER
+			// process the tree holds -- a check-then-act split by awaits with a
+			// kill in the gap. A held process inside the tree (real, not
+			// hand-fed) forces terminatePid's fixed grace-period await, giving a
+			// deterministic window for a write timed from the TEST process to
+			// land inside it, exactly as the reviewer's probe did.
+			const helperScript = path.join(worktree, "keepalive.mjs");
+			fs.writeFileSync(helperScript, "setTimeout(() => {}, 30_000);\n");
+			const helper = spawn(process.execPath, [helperScript], {
+				cwd: worktree,
+				stdio: "ignore",
+			});
+			try {
+				const lateFile = path.join(worktree, "late-write.txt");
+				const cliRun = new Promise<void>((resolve, reject) => {
+					const child = spawn(
+						process.execPath,
+						[cli, "--hook", "subagent-stop", "--only", worktree],
+						{
+							cwd: repo,
+							env: {
+								...gitFixtureEnv(root),
+								PILENS_DATA_DIR: ledgerDir,
+							},
+							stdio: ["pipe", "pipe", "pipe"],
+						},
+					);
+					child.on("error", reject);
+					child.on("close", () => resolve());
+					child.stdin.write(subagentStopPayload(AGENT_ID));
+					child.stdin.end();
+				});
+				const write = new Promise<void>((resolve) => {
+					setTimeout(() => {
+						try {
+							fs.writeFileSync(lateFile, "written after enrichment\n");
+						} catch {
+							/* the tree may already be gone on the pre-fix path */
+						}
+						resolve();
+					}, 200);
+				});
+				await Promise.all([cliRun, write]);
+
+				// The late write must never be silently destroyed: either the
+				// removal is refused (tree AND file both survive), or the tree is
+				// gone and the write never had anywhere to land. What must not
+				// happen is "the tree is gone but the file existed a moment ago" --
+				// this only proves the direction that matters when the tree
+				// survives, which is the fixed outcome.
+				if (fs.existsSync(worktree)) {
+					expect(fs.existsSync(lateFile)).toBe(true);
+					expect(
+						ledgerRecords().find((record) => record.event === "hygiene.run"),
+					).toMatchObject({ removed: 0, keptReason: "dirty" });
+				}
+			} finally {
+				helper.kill();
+			}
 		},
 	);
 
