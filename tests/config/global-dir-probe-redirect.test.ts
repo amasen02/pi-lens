@@ -1,10 +1,16 @@
-import { execFileSync } from "node:child_process";
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+// `tests/config/git-fixture-governance.test.ts` requires every direct Git
+// spawn under tests/ to route through this helper. It is also the RIGHT
+// wrapper here rather than a concession: it pins GIT_CONFIG_NOSYSTEM and
+// points GIT_CONFIG_GLOBAL at a nonexistent fixture file, so a developer's
+// own `core.excludesFile` cannot be what makes the assertion below pass —
+// the repo's committed `.gitignore` has to do the work on its own.
+import { execFileSync } from "../support/git-fixture-env.js";
 import {
 	getGlobalPiLensDir,
 	getGlobalPiLensLogDir,
@@ -377,6 +383,10 @@ describe("the probe home is gitignored (#2506 F2)", () => {
 			["check-ignore", "-v", ".pi-lens-probe-home/latency.log"],
 			{ cwd: REPO_ROOT, encoding: "utf8" },
 		);
+		// check-ignore -v prints "<source>:<line>:<pattern>\t<path>", so this
+		// also proves the match came from .gitignore rather than from an
+		// ambient exclude file.
+		expect(probed).toContain(".gitignore");
 		expect(probed).toContain(".pi-lens-probe-home/");
 	});
 
