@@ -351,12 +351,26 @@ export async function initLSPConfig(cwd: string): Promise<void> {
 }
 
 /**
+ * Every server a workspace knows about, in registry-then-custom order and
+ * BEFORE any gate is applied.
+ *
+ * Spelled once because two callers need the same list for opposite purposes:
+ * `getAllServers` DROPS the disabled ones, `explainServersForFile` REPORTS
+ * them. A custom server that only one of the two composed would be a server
+ * the runtime runs and the introspection cannot see, or the reverse.
+ */
+function registeredServers(config: RegisteredLSPConfig): LSPServerInfo[] {
+	return [...LSP_SERVERS, ...config.customServers];
+}
+
+/**
  * Get all available servers (built-in + custom, minus disabled)
  */
 export function getAllServers(filePath?: string): LSPServerInfo[] {
 	const config = filePath ? getConfigForFile(filePath) : EMPTY_CONFIG;
-	const all = [...LSP_SERVERS, ...config.customServers];
-	return all.filter((s) => !config.disabledServerIds.has(s.id));
+	return registeredServers(config).filter(
+		(s) => !config.disabledServerIds.has(s.id),
+	);
 }
 
 /**
@@ -407,7 +421,7 @@ export function explainServersForFile(filePath: string): ServerSelection[] {
 	const config = getConfigForFile(filePath);
 	const ext = path.extname(filePath).toLowerCase();
 	const base = path.basename(filePath).toLowerCase();
-	return [...LSP_SERVERS, ...config.customServers].map((server) => {
+	return registeredServers(config).map((server) => {
 		if (config.disabledServerIds.has(server.id)) {
 			return { server, selected: false, reason: "disabled-by-config" as const };
 		}

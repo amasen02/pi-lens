@@ -160,7 +160,7 @@ describe("effectiveConfig — why is X running (#2415 AC)", () => {
 				},
 				startDir: "proj",
 			},
-			{ file: "proj/notes.md" },
+			{ file: "notes.md" },
 		);
 
 		const typos = view.file?.servers.find((entry) => entry.id === "typos");
@@ -223,7 +223,7 @@ describe("effectiveConfig — why is X running (#2415 AC)", () => {
 				},
 				startDir: "proj",
 			},
-			{ file: "proj/notes.md" },
+			{ file: "notes.md" },
 		);
 		const denied = new Set(
 			view.file?.servers
@@ -242,7 +242,7 @@ describe("effectiveConfig — why is X running (#2415 AC)", () => {
 				},
 				startDir: "proj",
 			},
-			{ file: "proj/notes.md" },
+			{ file: "notes.md" },
 		);
 		const reasons = new Map(
 			view.file?.servers.map((entry) => [entry.id, entry.reason]),
@@ -257,15 +257,17 @@ describe("effectiveConfig — why is X running (#2415 AC)", () => {
 	it("resolves the file's language and the runners that would dispatch for it", async () => {
 		const { view } = await viewFor(
 			{ files: {}, startDir: "proj" },
-			{ file: "proj/main.py" },
+			{ file: "main.py" },
 		);
 		expect(view.file?.language).toBe("python");
 		expect(view.file?.kind).toBe("python");
 		expect(view.file?.tools.length).toBeGreaterThan(0);
 		for (const tool of view.file?.tools ?? []) {
-			expect(["selected", "not-registered-for-kind", "no-dispatch-plan"]).toContain(
-				tool.reason,
-			);
+			expect([
+				"selected",
+				"not-registered-for-kind",
+				"no-dispatch-plan",
+			]).toContain(tool.reason);
 		}
 	});
 });
@@ -291,7 +293,7 @@ describe("effectiveConfig — redaction is unconditional", () => {
 				},
 				startDir: "proj",
 			},
-			{ file: "proj/notes.md" },
+			{ file: "notes.md" },
 		);
 
 		const serialized = JSON.stringify(view);

@@ -106,7 +106,8 @@ export function assertSchemaStabilityTiers(schema: unknown): void {
 		}
 		const tier = node[STABILITY_TIER_KEY];
 		if (tier === undefined) untiered.push(pointer);
-		else if (!isStabilityTier(tier)) badTier.push(`${pointer} (${String(tier)})`);
+		else if (!isStabilityTier(tier))
+			badTier.push(`${pointer} (${String(tier)})`);
 	});
 
 	const failures = [

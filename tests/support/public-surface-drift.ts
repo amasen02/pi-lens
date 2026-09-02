@@ -118,7 +118,9 @@ export function schemaEnumAt(
 	}
 	if (typeof node !== "object" || node === null) return undefined;
 	const values = (node as Record<string, unknown>).enum;
-	return Array.isArray(values) ? values.map((value) => String(value)) : undefined;
+	return Array.isArray(values)
+		? values.map((value) => String(value))
+		: undefined;
 }
 
 /**

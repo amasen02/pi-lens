@@ -92,9 +92,7 @@ describe("public surface drift — real surfaces", () => {
 		const codes = Object.keys(CONFIG_DIAGNOSTIC_CODES);
 		expect(codes.length).toBeGreaterThanOrEqual(8);
 		expect(DEPRECATED_CONFIG_SURFACES.length).toBeGreaterThanOrEqual(8);
-		expect(
-			Object.keys(SCHEMA_PROPERTIES).length,
-		).toBeGreaterThanOrEqual(20);
+		expect(Object.keys(SCHEMA_PROPERTIES).length).toBeGreaterThanOrEqual(20);
 	});
 });
 
@@ -197,7 +195,10 @@ describe("public surface drift — each check fails on a planted defect", () => 
 					{
 						...catalog,
 						fixtureExemptions: new Map([
-							["fixtureless-zzz", "alternate of rust; the preferred handshake covers it"],
+							[
+								"fixtureless-zzz",
+								"alternate of rust; the preferred handshake covers it",
+							],
 						]),
 					},
 				],

@@ -77,7 +77,23 @@ export function createEffectiveConfigTool(getProjectRoot: () => string) {
 						text: `${summary}\n\n${JSON.stringify(view)}`,
 					},
 				],
-				details: { ...view, summary },
+				// Summary-shaped, like `symbol_search`'s: the full view is already
+				// in `content[0].text`, and `details` exists for the renderer.
+				// Duplicating a whole provenance dump into it would double the
+				// payload of every call for one line of output.
+				details: {
+					summary,
+					documents: view.documents.length,
+					provenance: view.provenance.length,
+					...(view.file === undefined
+						? {}
+						: {
+								file: view.file.path,
+								selectedServers: view.file.servers.filter(
+									(entry) => entry.selected,
+								).length,
+							}),
+				},
 			};
 		},
 	};

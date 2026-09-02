@@ -240,20 +240,26 @@ function viewOf(
  * decision — and, for one file, which servers and tools that configuration
  * selects or denies and why.
  *
- * Async because it drives `initLSPConfig` first. That is not incidental: the
- * per-workspace disable set is materialized by `initLSPConfig` and
- * `getConfigForFile` falls back to an EMPTY config for an un-initialized tree,
- * so a view taken before it would report every server as selected — the
+ * Async because the per-file half drives `initLSPConfig` first. That is not
+ * incidental: the per-workspace disable set is materialized by `initLSPConfig`
+ * and `getConfigForFile` falls back to an EMPTY config for an un-initialized
+ * tree, so a view taken before it would report every server as selected — the
  * introspection surface confidently contradicting the runtime it describes.
  * `initLSPConfig` is idempotent and in-flight-deduplicated, so paying for it
- * here costs nothing when a session already ran it.
+ * costs nothing when a session already ran it.
+ *
+ * It runs ONLY when a `file` is asked about. The whole-config view is derived
+ * from `resolvePiLensConfig` alone, and `pilens_health` takes exactly that
+ * view on every call — initializing a workspace's LSP config as a side effect
+ * of asking for a health line would be a query that changes the thing it
+ * reports on.
  */
 export async function effectiveConfig(
 	options: EffectiveConfigOptions = {},
 ): Promise<EffectiveConfigView> {
 	const cwd = options.cwd ?? process.cwd();
 	const homeDir = options.homeDir ?? os.homedir();
-	await initLSPConfig(cwd);
+	if (options.file !== undefined) await initLSPConfig(cwd);
 
 	const resolution = resolvePiLensConfig({
 		cwd,
@@ -327,40 +333,40 @@ async function fileView(
 		homeDir,
 	);
 
-	const servers: EffectiveServerDecision[] = explainServersForFile(absolute).map(
-		(entry) => {
-			const spec = redactServerSpec(customServers[entry.server.id]);
-			return {
-				id: entry.server.id,
-				selected: entry.selected,
-				reason: entry.reason,
-				...(entry.server.role === undefined ? {} : { role: entry.server.role }),
-				...(entry.reason === "disabled-by-config" && denyProvenance
-					? { decidedBy: denyProvenance }
-					: {}),
-				...(spec === undefined
-					? {}
-					: {
-							spec,
-							...(entry.reason === "disabled-by-config"
-								? {}
-								: {
-										decidedBy: viewOf(
+	const servers: EffectiveServerDecision[] = explainServersForFile(
+		absolute,
+	).map((entry) => {
+		const spec = redactServerSpec(customServers[entry.server.id]);
+		return {
+			id: entry.server.id,
+			selected: entry.selected,
+			reason: entry.reason,
+			...(entry.server.role === undefined ? {} : { role: entry.server.role }),
+			...(entry.reason === "disabled-by-config" && denyProvenance
+				? { decidedBy: denyProvenance }
+				: {}),
+			...(spec === undefined
+				? {}
+				: {
+						spec,
+						...(entry.reason === "disabled-by-config"
+							? {}
+							: {
+									decidedBy: viewOf(
+										provenanceOfSubtree(
+											resolved,
+											`/${LSP_NAMESPACE_KEY}/servers/${entry.server.id}`,
+										) ??
 											provenanceOfSubtree(
 												resolved,
-												`/${LSP_NAMESPACE_KEY}/servers/${entry.server.id}`,
-											) ??
-												provenanceOfSubtree(
-													resolved,
-													`/servers/${entry.server.id}`,
-												),
-											homeDir,
-										),
-									}),
-						}),
-			};
-		},
-	);
+												`/servers/${entry.server.id}`,
+											),
+										homeDir,
+									),
+								}),
+					}),
+		};
+	});
 
 	const available = new Set(await getAvailableRunners(absolute));
 	const planned = kind
