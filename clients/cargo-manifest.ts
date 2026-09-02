@@ -10,12 +10,18 @@
  * `--edition` resolution (#2466) reuses the exact same parser instead of a
  * second hand-rolled one. `clients/lsp/server.ts` re-imports them from here.
  *
- * NOT yet the only Cargo.toml reader in the tree: `clients/review-graph/
- * workspace-modules.ts`'s `scanCargoModules`/`detectWorkspaceType` still
+ * The ONE Cargo.toml reader in the tree (#2473): `clients/review-graph/
+ * workspace-modules.ts`'s `scanCargoModules`/`detectWorkspaceType` used to
  * carry an independent regex TOML reader (`extractTomlArray`/
- * `extractTomlSection`/`extractTomlString`) for module-graph construction —
- * a third copy, not folded onto this module in #2466 (see the follow-up
- * issue referenced from AGENTS.md's Cargo.toml entry).
+ * `extractTomlSection`/`extractTomlString`) for module-graph construction — a
+ * third copy, folded onto `readCargoPackageName`/`readCargoWorkspaceMembers`/
+ * `readCargoDependencyNames` below. That fold also fixed a latent defect:
+ * the old `extractTomlString` was NOT table-scoped — it scanned the whole
+ * file for the first `key = "value"` line regardless of which table it fell
+ * under, so a member manifest with a `name` key under an EARLIER non-package
+ * table (a `[[bin]] name = "..."` or `[package.metadata.*]` block preceding
+ * `[package]`) silently returned the wrong crate name. `readCargoPackageName`
+ * is table-scoped via `extractTomlTableSection` like every other reader here.
  */
 
 import { readFile } from "node:fs/promises";
@@ -82,6 +88,45 @@ export function parseTomlScalarString(
 	);
 	if (!match) return undefined;
 	return match[1] ?? match[2];
+}
+
+/**
+ * Read a crate's `[package] name`, table-scoped to the `[package]` section
+ * specifically (#2473) — NOT the first `name = "..."` line in the file. A
+ * member manifest commonly has other tables with their own `name` key
+ * (`[[bin]] name = "..."`, `[package.metadata.*]` blocks); reading unscoped
+ * silently returns whichever happens to sit first in the file.
+ */
+export function readCargoPackageName(content: string): string | undefined {
+	const packageSection = extractTomlTableSection(content, "package");
+	return parseTomlScalarString(packageSection, "name");
+}
+
+/**
+ * Read `members` off a (typically root/virtual) Cargo.toml for workspace
+ * expansion. Matches `parseTomlStringArray`'s existing unscoped behavior —
+ * `members` has no realistic collision with another table's same-named key,
+ * unlike `[package] name` above, so this stays a thin wrapper rather than
+ * adding `[workspace]` table-scoping the fold didn't set out to change.
+ */
+export function readCargoWorkspaceMembers(content: string): string[] {
+	return parseTomlStringArray(content, "members");
+}
+
+/**
+ * List the dependency names declared directly under `[dependencies]` (key
+ * only — not the version/spec value, which may be a bare string, an inline
+ * table, or workspace-inherited).
+ */
+export function readCargoDependencyNames(content: string): string[] {
+	const section = extractTomlTableSection(content, "dependencies");
+	const names: string[] = [];
+	for (const rawLine of section.split(/\r?\n/)) {
+		const line = rawLine.split("#", 1)[0].trim();
+		const match = line.match(/^([A-Za-z0-9_-]+)\s*=/);
+		if (match) names.push(match[1]);
+	}
+	return names;
 }
 
 /**
