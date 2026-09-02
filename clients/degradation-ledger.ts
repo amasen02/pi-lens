@@ -669,7 +669,20 @@ export type DegradationKind =
 	 * unanswerable, since the ledger could no longer tell a rejection from a
 	 * long list. One row per file per session.
 	 */
-	| "config-notice-suppressed";
+	| "config-notice-suppressed"
+	/**
+	 * `getGlobalPiLensDir()` (`clients/file-utils.ts`, #2506) redirected its
+	 * default resolution away from the real `~/.pi-lens` because `PI_LENS_HOME`
+	 * was unset outside test mode and the process's `cwd` looked like a
+	 * probe/worktree context (`.claude/worktrees/…` or under `os.tmpdir()`), or
+	 * `PILENS_PROBE=1` forced the redirect. Without this kind a probe run
+	 * outside vitest that forgot to pin `PI_LENS_HOME` would silently write
+	 * into the maintainer's real telemetry with no durable trace — the exact
+	 * gap that let two review probes leave 42 fixture rows in real `~/.pi-lens`
+	 * files on 2026-09-02. Subject is the redirected probe-home path; recorded
+	 * once per session since the redirect decision does not change mid-process.
+	 */
+	| "global-dir-probe-redirect";
 
 export interface DegradationRecord {
 	kind: unknown;

@@ -6,6 +6,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Minimatch, type MinimatchOptions } from "./deps/minimatch.js";
+import { isTestMode } from "./env-utils.js";
 import {
 	isInSpawnTimeoutCooldown,
 	noteSpawnTimeout,
@@ -85,11 +86,80 @@ export function getProjectDataDir(cwd: string): string {
  * (project-scoped) and produces per-project subdirectories. Callers writing
  * project caches, snapshots, or worklogs should use `getProjectDataDir(cwd)`
  * instead — `PI_LENS_HOME` is the MACHINE-scoped sibling of that override.
+ *
+ * Probe-hygiene redirect (#2506): an ad-hoc probe against the BUILT
+ * `clients/*.js` (a bare `node -e`, a throwaway `.mjs`, a harness script run
+ * outside vitest — vitest itself already gets a real `PI_LENS_HOME` pin from
+ * `tests/support/vitest-setup.ts`) has no test-mode gate and no home pin, so
+ * every logger/ledger/cache it touches writes into the maintainer's REAL
+ * `~/.pi-lens` — confirmed live on 2026-09-02 (two review probes wrote 42
+ * rows of fixture garbage into real telemetry). When `PI_LENS_HOME` is unset,
+ * `isTestMode()` is false, and `process.cwd()` sits under a `.claude/worktrees/`
+ * segment or under `os.tmpdir()` — the two shapes an agent worktree or a
+ * throwaway probe script actually runs from — every writer routed through
+ * this function is redirected to `<cwd>/.pi-lens-probe-home` instead, never
+ * the real home directory. `PILENS_PROBE=1` forces the same redirect
+ * regardless of cwd, for a probe run from an ordinary project checkout.
+ * `getProjectDataDir(cwd)`'s default branch composes through this function,
+ * so it inherits the same redirect for free; see the "Data directory
+ * conventions" section below for the account of why this only guards the
+ * DEFAULT resolution and not an explicit `PILENS_DATA_DIR` override.
  */
 export function getGlobalPiLensDir(): string {
 	const override = process.env.PI_LENS_HOME?.trim();
 	if (override) return path.resolve(override);
+	const cwd = process.cwd();
+	if (shouldRedirectGlobalDirToProbeHome(cwd)) {
+		return redirectGlobalDirToProbeHome(cwd);
+	}
 	return path.join(os.homedir(), ".pi-lens");
+}
+
+const WORKTREES_SEGMENT_RE = /(^|\/)\.claude\/worktrees(\/|$)/;
+
+function shouldRedirectGlobalDirToProbeHome(cwd: string): boolean {
+	if (process.env.PILENS_PROBE === "1") return true;
+	if (isTestMode()) return false;
+	if (WORKTREES_SEGMENT_RE.test(normalizeFilePath(cwd))) return true;
+	return isUnderDir(cwd, os.tmpdir());
+}
+
+let probeHomeRedirectWarned = false;
+
+function redirectGlobalDirToProbeHome(cwd: string): string {
+	const probeHome = path.join(cwd, ".pi-lens-probe-home");
+	if (!probeHomeRedirectWarned) {
+		probeHomeRedirectWarned = true;
+		process.stderr.write(
+			`[pi-lens] PI_LENS_HOME is unset and cwd (${cwd}) looks like a probe/worktree context; redirecting the global pi-lens dir to ${probeHome} instead of the real home directory. Set PI_LENS_HOME to silence this.\n`,
+		);
+		recordProbeHomeRedirectDegradation(probeHome, cwd);
+	}
+	return probeHome;
+}
+
+/**
+ * Dynamic import only (never a static one): `degradation-ledger.ts`
+ * transitively imports THIS module through `extension-log.ts`/
+ * `latency-logger.ts`, so a static import here would close a
+ * `no-client-cycles` violation. A dynamic `import()` is exempt from that
+ * rule (`.dependency-cruiser.cjs`'s `dependencyTypesNot: ["dynamic-import"]`)
+ * and is safe at runtime too — this only ever runs well after both modules
+ * have finished their own top-level evaluation. Fire-and-forget: telemetry
+ * must never gate or fail the caller that just wants its directory back.
+ */
+function recordProbeHomeRedirectDegradation(probeHome: string, cwd: string): void {
+	import("./degradation-ledger.js")
+		.then(({ recordDegradationOnce }) => {
+			recordDegradationOnce({
+				kind: "global-dir-probe-redirect",
+				subject: probeHome,
+				reason: `PI_LENS_HOME unset outside test mode with cwd under a worktree/tmp probe context (${cwd}); redirected away from the real home directory`,
+			});
+		})
+		.catch(() => {
+			// Telemetry must never break the observed path.
+		});
 }
 
 /**
