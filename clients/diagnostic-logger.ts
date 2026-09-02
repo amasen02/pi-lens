@@ -6,7 +6,8 @@
 
 import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
-import { getGlobalPiLensDir } from "./file-utils.js";
+import { getGlobalPiLensLogDir } from "./file-utils.js";
+import { getMaxLogSizeMB } from "./log-cleanup.js";
 import { createNdjsonLogger } from "./ndjson-logger.js";
 
 export interface DiagnosticEntry {
@@ -66,7 +67,7 @@ export interface LogContext {
 }
 
 function getLogDir(): string {
-	return path.join(getGlobalPiLensDir(), "logs");
+	return path.join(getGlobalPiLensLogDir(), "logs");
 }
 
 function getLogFile(): string {
@@ -86,8 +87,17 @@ export function getDiagnosticLogger(): DiagnosticLogger {
 
 export function createDiagnosticLogger(): DiagnosticLogger {
 	// Lazy filePath: the log file is keyed on the current date, resolved per
-	// drain so a long-lived logger rolls over at midnight.
-	const writer = createNdjsonLogger({ filePath: () => getLogFile() });
+	// drain so a long-lived logger rolls over at midnight. A daily rollover
+	// is NOT a size bound (#2505): one very busy day, or a long-lived
+	// process that never re-runs the session-start sweep, grows a single
+	// day file without limit. The backup keeps the .jsonl extension so the
+	// retention sweep in log-cleanup.ts (which matches /\.jsonl$/ under
+	// logs/) reaps it like any other daily file.
+	const writer = createNdjsonLogger({
+		filePath: () => getLogFile(),
+		maxBytes: getMaxLogSizeMB() * 1024 * 1024,
+		backupPath: () => getLogFile().replace(/\.jsonl$/, ".rotated.jsonl"),
+	});
 
 	return {
 		log(entry: DiagnosticEntry) {

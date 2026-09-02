@@ -51,7 +51,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as v8 from "node:v8";
-import { getGlobalPiLensDir } from "./file-utils.js";
+import { getGlobalPiLensLogDir } from "./file-utils.js";
 import { getMaxLogSizeMB } from "./log-cleanup.js";
 import { createNdjsonLogger, type NdjsonLogger } from "./ndjson-logger.js";
 
@@ -67,7 +67,7 @@ const SNAPSHOT_PREFIX = "heap-";
 const SNAPSHOT_SUFFIX = ".heapsnapshot";
 
 const HEAP_SNAPSHOT_LOG_FILE = path.join(
-	getGlobalPiLensDir(),
+	getGlobalPiLensLogDir(),
 	"heap-snapshots.log",
 );
 
@@ -166,7 +166,7 @@ export interface HeapSnapshotResult {
  */
 export function writeHeapSnapshotNow(label: string): HeapSnapshotResult | null {
 	if (!DEBUG_HEAP_ENABLED) return null;
-	const dir = getGlobalPiLensDir();
+	const dir = getGlobalPiLensLogDir();
 	try {
 		fs.mkdirSync(dir, { recursive: true });
 	} catch {
