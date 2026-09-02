@@ -588,4 +588,27 @@ describe("resolveKtfmtGradleStyle — enclosing-block scope (#2468 review round 
 		expect(await resolveKtfmtGradleStyle(moduleFile, homeDir)).toBeUndefined();
 		expect(await resolveKtfmtGradleStyle(rootFile, homeDir)).toBeUndefined();
 	});
+
+	it("S2: allprojects { subprojects { ktfmt { } } } — two RECOGNIZED enclosing blocks still reach neither project", async () => {
+		// S1 proved an unrecognized wrapper fails closed; this is the negative
+		// twin for two blocks the resolver DOES recognize individually.
+		// `scopeOfKtfmtBlock` rejects any `ktfmt { }` with more than one
+		// enclosing block outright (`enclosing.length > 1 → undefined`) before
+		// ever consulting SCOPE_BY_ENCLOSING_BLOCK — composing `allprojects { }`
+		// and `subprojects { }` is exactly the kind of build-script evaluation
+		// this lexical pass cannot do, so it must fail closed here too, not
+		// pick one of the two enclosing names and grant its scope. Deleting
+		// that length check would let `enclosing[0]` (the outermost —
+		// `allprojects`, "both") decide instead, wrongly handing --google-style
+		// to the root's own sources (an `allprojects` never actually applies
+		// to here) and to the module (via a `subprojects` nesting that
+		// pi-lens cannot evaluate).
+		const { rootFile, moduleFile, homeDir } = makeScopeFixture(
+			"pi-lens-ktfmt-double-wrapper-",
+			"allprojects {\n  subprojects {\n    ktfmt {\n      googleStyle()\n    }\n  }\n}\n",
+		);
+
+		expect(await resolveKtfmtGradleStyle(moduleFile, homeDir)).toBeUndefined();
+		expect(await resolveKtfmtGradleStyle(rootFile, homeDir)).toBeUndefined();
+	});
 });

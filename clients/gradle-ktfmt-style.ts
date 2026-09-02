@@ -67,11 +67,16 @@
  * the climb is treated as the project that OWNS the file. A module directory
  * that is `include(…)`d by `settings.gradle(.kts)` but holds NO build file of
  * its own therefore resolves hop 0 to an ANCESTOR, and asks it for `own`
- * scope when `descendants` is what Gradle would apply — so a root
- * `subprojects { ktfmt { … } }` is missed for such a module. Closing it means
- * reading `settings.gradle`'s `include(…)` list to map a directory to a
- * Gradle project, which this module does not do. The miss is fail-safe: the
- * result is the pre-#2468 bare invocation, never a wrong flag.
+ * scope when `descendants` is what Gradle would apply. Against a root
+ * `subprojects { ktfmt { … } }` this is a fail-safe miss — no flag, the
+ * pre-#2468 bare invocation — because `subprojects` only ever fills the
+ * `descendants` slot, which hop 0 never reads. But against a root's
+ * TOP-LEVEL `ktfmt { }` (`own` scope, by the table above) it is a WRONG
+ * flag: hop 0 reads `own` regardless of which project it actually belongs
+ * to, so the module is handed the ROOT's own style even though Gradle gives
+ * the module its own `KtfmtExtension` and applies no style there. Closing it
+ * means reading `settings.gradle`'s `include(…)` list to map a directory to
+ * a Gradle project, which this module does not do.
  */
 
 import * as os from "node:os";
@@ -243,8 +248,9 @@ async function stylesForGradleDir(
  *   TAKEN to be the project that OWNS the file, so its `own`-scope
  *   declaration applies; every further hop is an ancestor, so only its
  *   `descendants`-scope declaration does. See the module header's KNOWN GAP
- *   note for the `include(…)`-only module directory where that identification
- *   is wrong (fail-safe: a missed flag, never a wrong one).
+ *   note for the `include(…)`-only module directory where that
+ *   identification is wrong — a missed flag against a `subprojects { }` root,
+ *   but a WRONG flag (the root's own style) against a root TOP-LEVEL one.
  * - A nested module's OWN style declaration still wins over an ancestor's —
  *   the climb only continues past a gradle directory that declares NO style
  *   applying to this file, so nearest-wins is unchanged where a nearer

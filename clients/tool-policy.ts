@@ -2723,15 +2723,14 @@ export function gradleBlockRanges(source: string): NamedGradleBlockRange[] {
  * blocks happen to have identical bodies. `namedGradleBlockBodies` stays the
  * ergonomic form for callers that only need the text.
  */
-export function namedGradleBlockRanges(
+function namedGradleBlockRanges(
 	source: string,
 	name: string,
 ): GradleBlockRange[] {
 	return gradleBlockRanges(source).filter((range) => range.name === name);
 }
 
-/** Exported for `clients/gradle-ktfmt-style.ts` (#2468) — see the note above. */
-export function namedGradleBlockBodies(source: string, name: string): string[] {
+function namedGradleBlockBodies(source: string, name: string): string[] {
 	return namedGradleBlockRanges(source, name).map((range) =>
 		source.slice(range.start, range.end),
 	);
