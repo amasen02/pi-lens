@@ -39,6 +39,12 @@ import {
 import { PathKeyedMap } from "./path-keyed-map.js";
 import { resolveLanguageRootForFile } from "./language-profile.js";
 import { logLatency } from "./latency-logger.js";
+import {
+	classifyMutatingTool,
+	PI_LENS_SYNTHETIC_MUTATION_FIELD,
+	type MutatingToolClassification,
+	type MutationKind,
+} from "./mutating-tool.js";
 import { resolveToolCallCorrelationId } from "./tool-event.js";
 import {
 	boundedIndexesForCount,
@@ -427,18 +433,31 @@ function getFileStateHash(filePath: string): string {
 	}
 }
 
-function getRequestedEditCount(event: ToolResultEvent): number {
-	if (event.toolName === "write") return 1;
+function getRequestedEditCount(
+	event: ToolResultEvent,
+	kind: MutationKind,
+): number {
+	if (kind === "write") return 1;
 	const edits = (event.input as { edits?: unknown[] } | undefined)?.edits;
 	return Array.isArray(edits) && edits.length > 0 ? edits.length : 1;
 }
 
-function getRequestedEditIndexes(event: ToolResultEvent): number[] {
-	return boundedIndexesForCount(getRequestedEditCount(event));
+function getRequestedEditIndexes(
+	event: ToolResultEvent,
+	kind: MutationKind,
+): number[] {
+	return boundedIndexesForCount(getRequestedEditCount(event, kind));
 }
 
-function sourceForToolName(
-	toolName: string,
+/**
+ * Change-log attribution for one classified mutation (#2423).
+ *
+ * A third-party tool gets its OWN source (`agent-tool:<name>`) rather than
+ * being folded into `agent-edit`: a report that attributes a change to "the
+ * model's edit tool" must not silently absorb an extension's rewrite.
+ */
+function sourceForMutation(
+	classification: MutatingToolClassification,
 	details?: unknown,
 ): ProjectChangeSource {
 	if (
@@ -447,7 +466,13 @@ function sourceForToolName(
 	) {
 		return "partial-apply";
 	}
-	return toolName === "write" ? "agent-write" : "agent-edit";
+	if (
+		classification.provenance === "builtin" ||
+		classification.provenance === "bash-derived"
+	) {
+		return classification.kind === "write" ? "agent-write" : "agent-edit";
+	}
+	return `agent-tool:${classification.toolName}`;
 }
 
 function singleRange(
@@ -774,6 +799,10 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 				toolName: "write",
 				input: { path: wp },
 				isError: false,
+				// #2423: pi-lens SYNTHESIZED this write from a bash command, so the
+				// seam reports `provenance: "bash-derived"` and a consumer can tell
+				// it apart from the host's own write tool.
+				[PI_LENS_SYNTHETIC_MUTATION_FIELD]: "bash",
 			};
 			const syntheticResult = await handleToolResult({
 				...deps,
@@ -880,9 +909,18 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		}
 	}
 
-	if (event.toolName !== "write" && event.toolName !== "edit") {
+	// #2423: THE inbound gate. Everything below this line is the mutation
+	// bookkeeping chain — read-guard staleness stamp, turn state, change-log
+	// receipt, deferred autofix and format. Before the seam this compared
+	// `event.toolName` to two literals, so a host or extension edit tool under
+	// any other name was dropped here with the path already resolved.
+	const mutation = classifyMutatingTool(event, {
+		filePath: filePath || undefined,
+		sessionId: deps.sessionId,
+	});
+	if (mutation === undefined) {
 		dbg(
-			`tool_result: skipped turn tracking - toolName="${event.toolName}" (not write/edit)`,
+			`tool_result: skipped turn tracking - toolName="${event.toolName}" is not a classified mutation`,
 		);
 		return syntheticWriteContent.length > 0
 			? { content: [...event.content, ...syntheticWriteContent] }
@@ -903,8 +941,8 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	const readGuardCorrelationId = getReadGuardCorrelationId(event);
 	const resultDetails = (event.details ?? {}) as Record<string, unknown>;
 	const isPartialApplyResult = resultDetails.piLensPartialApply === true;
-	const requestedEditIndexes = getRequestedEditIndexes(event);
-	const requestedEditTotal = getRequestedEditCount(event);
+	const requestedEditIndexes = getRequestedEditIndexes(event, mutation.kind);
+	const requestedEditTotal = getRequestedEditCount(event, mutation.kind);
 	const participantIds = [
 		...(deps._telemetryParticipantIds ?? []),
 		readGuardCorrelationId,
@@ -954,7 +992,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		oldText: string;
 		newText: string | undefined;
 	}> = [];
-	if (event.toolName === "edit") {
+	if (mutation.kind === "edit") {
 		const appliedInput = event.input as {
 			oldText?: string;
 			newText?: string;
@@ -986,10 +1024,10 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		.recordMutationToolReceipt;
 	const autofixMode = deps._bypassDebounce
 		? (deps._autofixMode ??
-			(event.toolName === "edit" ? "deferred" : "immediate"))
+			(mutation.kind === "edit" ? "deferred" : "immediate"))
 		: receipt
-			? receipt.call(runtime, filePath, event.toolName).autofixMode
-			: event.toolName === "edit"
+			? receipt.call(runtime, filePath, mutation.kind).autofixMode
+			: mutation.kind === "edit"
 				? "deferred"
 				: "immediate";
 
@@ -1104,6 +1142,15 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	// see the `telemetry:` block handed to `runPipeline` below.
 	const writeIndex = runtime.nextWriteIndex();
 	let modifiedRanges: Array<{ start: number; end: number }> | undefined;
+	// #2423: ranges a shape adapter resolved from the tool's own input. Only a
+	// classified non-native edit shape sets these — a plain host `edit` carries
+	// its ranges in `details.diff` and is handled by the branch below.
+	const adapterRanges: Array<{ start: number; end: number }> | undefined =
+		mutation.editRanges && mutation.editRanges.length > 0
+			? mutation.editRanges.map(([start, end]) => ({ start, end }))
+			: mutation.touchedLines
+				? [{ start: mutation.touchedLines[0], end: mutation.touchedLines[1] }]
+				: undefined;
 	try {
 		// #1334 S6: the host DECLARES this payload (`EditToolDetails`, a
 		// type-only export), so use it instead of re-declaring `{ diff?: string }`
@@ -1116,7 +1163,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		dbg(
 			`tool_result: details.diff=${details?.diff ? "present" : "missing"}, details keys: ${Object.keys(event.details || {}).join(", ")}`,
 		);
-		if (event.toolName === "edit" && details?.diff) {
+		if (mutation.kind === "edit" && details?.diff) {
 			const diff = details.diff;
 			dbg(
 				`tool_result: diff content (first 500 chars): ${diff.substring(0, 500)}`,
@@ -1142,7 +1189,28 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			dbg(
 				`tool_result: turn state after add: ${JSON.stringify(cacheManager.readTurnState(turnStateCwd))}`,
 			);
-		} else if (event.toolName === "write" && nodeFs.existsSync(filePath)) {
+		} else if (
+			mutation.kind === "edit" &&
+			adapterRanges &&
+			nodeFs.existsSync(filePath)
+		) {
+			// #2423: a third-party edit tool ships no host `details.diff`, so the
+			// diff branch above never fires and the file used to leave `files: {}`
+			// empty in turn-state.json. The shape adapter already resolved which
+			// lines the call touched — use those.
+			const content = nodeFs.readFileSync(filePath, "utf-8");
+			const importsChanged = /^import\s/m.test(content);
+			modifiedRanges = adapterRanges;
+			for (const range of adapterRanges) {
+				cacheManager.addModifiedRange(
+					filePath,
+					range,
+					importsChanged,
+					turnStateCwd,
+					runtime.telemetrySessionId,
+				);
+			}
+		} else if (mutation.kind === "write" && nodeFs.existsSync(filePath)) {
 			const content = nodeFs.readFileSync(filePath, "utf-8");
 			const lineCount = content.split("\n").length;
 			const hasImports = /^import\s/m.test(content);
@@ -1166,7 +1234,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		filePath,
 		source:
 			deps._mutationSourceOverride ??
-			sourceForToolName(event.toolName, event.details),
+			sourceForMutation(mutation, event.details),
 		changedRange: singleRange(modifiedRanges),
 		dbg,
 	});
@@ -1448,7 +1516,12 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			publishFormatQueued({
 				filePath,
 				cwd: dispatchCwd,
-				tool: event.toolName,
+				// The v1 `pilens:format:queued` payload declares
+				// `tool: "write" | "edit"`, so a third-party tool publishes under
+				// its KIND rather than its name. Widening the published field is a
+				// public-API decision tracked in #2421; until then the kind is the
+				// honest projection.
+				tool: mutation.kind,
 				dbg,
 				kinds: autofixMode === "deferred" ? ["autofix", "format"] : ["format"],
 			});
@@ -1458,7 +1531,8 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		publishFormatQueued({
 			filePath,
 			cwd: dispatchCwd,
-			tool: event.toolName,
+			// Same #2421 projection as the queued-with-format publish above.
+			tool: mutation.kind,
 			kinds: ["autofix"],
 			dbg,
 		});

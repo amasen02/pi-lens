@@ -13,6 +13,7 @@ import {
 } from "./project-changes.js";
 import type { CodeQualityWarningRecord } from "./code-quality-warnings.js";
 import type { FileComplexity } from "./complexity-client.js";
+import type { MutationKind } from "./mutating-tool.js";
 import { normalizeMapKey, pathsEqual } from "./path-utils.js";
 import { PathKeyedMap } from "./path-keyed-map.js";
 import { BoundedLruCache } from "./bounded-cache.js";
@@ -83,7 +84,12 @@ export interface DeferredMutationRecord {
 	turnStateCwd: string;
 	firstTouchedAt: number;
 	lastTouchedAt: number;
-	toolNames: Set<"write" | "edit">;
+	/**
+	 * Tool names that touched this file, as the host reported them. Widened
+	 * from `"write" | "edit"` in #2423: a third-party mutating tool keeps its
+	 * OWN name here, so the requeue telemetry names the real producer.
+	 */
+	toolNames: Set<string>;
 	kinds: Set<DeferredMutationKind>;
 	/**
 	 * The runtime's turn counter at the moment this file was (most recently)
@@ -590,12 +596,18 @@ export class RuntimeCoordinator {
 		return this._droppedMutationReceipts;
 	}
 
-	/** Atomically records write/edit ordering before debounce can coalesce it. */
+	/**
+	 * Atomically records write/edit ordering before debounce can coalesce it.
+	 *
+	 * Takes the classified {@link MutationKind}, not a raw tool name (#2423):
+	 * an edit-shaped tool pi-lens does not name still demotes this file to the
+	 * deferred pass, which is the safe timing.
+	 */
 	recordMutationToolReceipt(
 		filePath: string,
-		toolName: "write" | "edit",
+		kind: MutationKind,
 	): { autofixMode: "immediate" | "deferred" } {
-		if (toolName === "write") {
+		if (kind === "write") {
 			this._writtenThisTurn.set(filePath, true);
 		} else if (this._writtenThisTurn.has(filePath)) {
 			this._autofixDemotedThisTurn.set(filePath, true);
@@ -605,7 +617,7 @@ export class RuntimeCoordinator {
 		}
 		return {
 			autofixMode:
-				toolName === "edit" || this._autofixDemotedThisTurn.has(filePath)
+				kind === "edit" || this._autofixDemotedThisTurn.has(filePath)
 					? "deferred"
 					: "immediate",
 		};
@@ -1366,7 +1378,8 @@ export class RuntimeCoordinator {
 	deferMutation(
 		filePath: string,
 		cwd: string,
-		toolName: "write" | "edit",
+		/** Host tool name; any mutating tool, not just `write`/`edit` (#2423). */
+		toolName: string,
 		turnStateCwd: string,
 		kind: DeferredMutationKind,
 		ownerSessionId?: string,
@@ -1406,7 +1419,8 @@ export class RuntimeCoordinator {
 	deferFormat(
 		filePath: string,
 		cwd: string,
-		toolName: "write" | "edit",
+		/** Host tool name; any mutating tool, not just `write`/`edit` (#2423). */
+		toolName: string,
 		turnStateCwd: string,
 		ownerSessionId?: string,
 		originCwd?: string,

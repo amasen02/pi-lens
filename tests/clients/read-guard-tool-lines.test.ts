@@ -15,6 +15,7 @@ import {
 	type PartiallyApplicableEdit,
 } from "../../clients/partial-edit-apply.js";
 import { logReadGuardEvent } from "../../clients/read-guard-logger.js";
+import { ReadGuard } from "../../clients/read-guard.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
 vi.mock("../../clients/read-guard-logger.js", async (importOriginal) => ({
@@ -1865,6 +1866,180 @@ describe("getTouchedLinesForGuard — preflight spans and exact-retry recognitio
 			// honestly instead of being absorbed by the record.
 			expect(result.alreadyAppliedEdits).toBeUndefined();
 			expect(result.preflightError).toMatch(/edits\[0\]\.oldText/);
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+// ── #2423: shape adapters behind the mutation-classification seam ───────────
+//
+// `getTouchedLinesForGuard` used to answer only for tool names `edit` and
+// `write`; a host or extension edit tool under any other name fell straight to
+// `{ touchedLines: undefined }`, which reads as "no line info" and lets the
+// guard allow a blind edit. The adapters promoted into
+// `clients/mutating-tool.ts` recognize the INPUT SHAPE instead.
+
+describe("#2423 hashline-edit-pro adapter", () => {
+	it("resolves remove_from/remove_to to an inclusive range for a `replace` tool", () => {
+		const result = getTouchedLinesForGuard(
+			{
+				toolName: "replace",
+				input: {
+					path: "/src/file.ts",
+					remove_from: "12",
+					remove_to: "18",
+					replacement_lines: ["const x = 1;"],
+				},
+			},
+			"/src/file.ts",
+		);
+		expect(result.touchedLines).toEqual([12, 18]);
+		expect(result.preflightError).toBeUndefined();
+	});
+
+	it("accepts an anchor that carries its line content", () => {
+		const result = getTouchedLinesForGuard(
+			{
+				toolName: "replace",
+				input: {
+					path: "/src/file.ts",
+					remove_from: "4: const a = 1;",
+					remove_to: "4: const a = 1;",
+				},
+			},
+			"/src/file.ts",
+		);
+		expect(result.touchedLines).toEqual([4, 4]);
+	});
+
+	it("resolves an `insert` call to its anchor line", () => {
+		const result = getTouchedLinesForGuard(
+			{
+				toolName: "insert",
+				input: {
+					path: "/src/file.ts",
+					anchor: "7: return value;",
+					direction: "before",
+					lines: ["// note"],
+				},
+			},
+			"/src/file.ts",
+		);
+		expect(result.touchedLines).toEqual([7, 7]);
+	});
+
+	it("blocks instead of guessing when the replace range is inverted", () => {
+		const result = getTouchedLinesForGuard(
+			{
+				toolName: "replace",
+				input: { path: "/src/file.ts", remove_from: "20", remove_to: "3" },
+			},
+			"/src/file.ts",
+		);
+		expect(result.touchedLines).toBeUndefined();
+		expect(result.preflightError).toContain("inverted");
+	});
+
+	it("blocks an `insert` whose direction is not before/after", () => {
+		const result = getTouchedLinesForGuard(
+			{
+				toolName: "insert",
+				input: { path: "/src/file.ts", anchor: "7", direction: "sideways" },
+			},
+			"/src/file.ts",
+		);
+		expect(result.touchedLines).toBeUndefined();
+		expect(result.preflightError).toContain("direction");
+	});
+
+	it("stamps its own source discriminator into touched_lines_detected", () => {
+		getTouchedLinesForGuard(
+			{
+				toolName: "replace",
+				input: { path: "/src/file.ts", remove_from: "2", remove_to: "5" },
+			},
+			"/src/file.ts",
+			"session-2423",
+			"corr-2423",
+		);
+		expect(logReadGuardEvent).toHaveBeenCalledWith(
+			expect.objectContaining({
+				event: "touched_lines_detected",
+				metadata: expect.objectContaining({ source: "hashline_pro_replace" }),
+			}),
+		);
+	});
+
+	it("stamps its own source discriminator into edit_preflight_blocked", () => {
+		getTouchedLinesForGuard(
+			{
+				toolName: "insert",
+				input: { path: "/src/file.ts", anchor: "nope", direction: "after" },
+			},
+			"/src/file.ts",
+			"session-2423",
+			"corr-2423",
+		);
+		expect(logReadGuardEvent).toHaveBeenCalledWith(
+			expect.objectContaining({
+				event: "edit_preflight_blocked",
+				metadata: expect.objectContaining({
+					source: "hashline_edit_pro",
+					reasonKind: "unsupported_hashline_pro_insert",
+				}),
+			}),
+		);
+	});
+
+	it("leaves a tool that is neither named nor shaped as a mutation unclassified", () => {
+		const result = getTouchedLinesForGuard(
+			{ toolName: "search", input: { path: "/src/file.ts", query: "x" } },
+			"/src/file.ts",
+		);
+		expect(result.touchedLines).toBeUndefined();
+		expect(result.preflightError).toBeUndefined();
+	});
+});
+
+describe("#2423 the read-before-edit guard covers a third-party edit tool", () => {
+	it("blocks an unread `replace` and allows it after the range is read", () => {
+		const env = setupTestEnvironment("pi-lens-2423-guard-");
+		try {
+			const filePath = path.join(env.tmpDir, "guarded.ts");
+			fs.writeFileSync(
+				filePath,
+				Array.from({ length: 30 }, (_, i) => `const v${i} = ${i};`).join("\n") +
+					"\n",
+			);
+
+			const unread = new ReadGuard("guard-2423-unread", { mode: "block" });
+			const { touchedLines } = getTouchedLinesForGuard(
+				{
+					toolName: "replace",
+					input: { path: filePath, remove_from: "12", remove_to: "14" },
+				},
+				filePath,
+			);
+			expect(touchedLines).toEqual([12, 14]);
+			expect(unread.checkEdit(filePath, touchedLines).action).toBe("block");
+
+			// Positive control: the same call is allowed once the agent has read
+			// those lines, so the block above is about coverage, not about the
+			// tool name being unfamiliar.
+			const read = new ReadGuard("guard-2423-read", { mode: "block" });
+			read.recordRead({
+				filePath,
+				requestedOffset: 1,
+				requestedLimit: 30,
+				effectiveOffset: 1,
+				effectiveLimit: 30,
+				expandedByLsp: false,
+				turnIndex: 1,
+				writeIndex: 0,
+				timestamp: Date.now(),
+			});
+			expect(read.checkEdit(filePath, touchedLines).action).toBe("allow");
 		} finally {
 			env.cleanup();
 		}

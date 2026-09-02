@@ -54,6 +54,9 @@ import {
 } from "./clients/widget-state.js";
 import { selectLspStatus } from "./clients/lsp-status.js";
 import type { PersistedReadGuardState } from "./clients/read-guard.js";
+import { registerMutationBridge } from "./clients/mutation-bridge.js";
+import { resolveLanguageRootForFile } from "./clients/language-profile.js";
+import { countFileLines } from "./clients/read-guard-tool-lines.js";
 import { registerReadBridge } from "./clients/read-bridge.js";
 import {
 	isExternalOrVendorFile,
@@ -497,6 +500,13 @@ let _readBridgeRegistered = false;
 let _readBridgeGetFlag:
 	| ((name: string) => boolean | string | undefined)
 	| undefined;
+// #2423: the mutation bridge is the write-side sibling of the read bridge and
+// follows its registration discipline exactly — mount once per process, refresh
+// the flag getter on every activation.
+let _mutationBridgeRegistered = false;
+let _mutationBridgeGetFlag:
+	| ((name: string) => boolean | string | undefined)
+	| undefined;
 let _turnSummaryEmitRegistered = false;
 let _turnSummaryEmitCtx:
 	| {
@@ -846,6 +856,33 @@ function activateExtension(hostPi: ExtensionAPI) {
 				if (isExternalOrVendorFile(filePath, runtime.projectRoot)) return false;
 				return true;
 			},
+		});
+	}
+
+	// Mutation bridge (#2423): same live-getter discipline as the read bridge.
+	// An in-process producer that writes a file outside pi-lens's tool-event
+	// path records it here, and the same bookkeeping runs.
+	_mutationBridgeGetFlag = getLensFlag;
+	if (!_mutationBridgeRegistered) {
+		_mutationBridgeRegistered = true;
+		registerMutationBridge({
+			getRuntime: () => runtime,
+			getCacheManager: () => cacheManager,
+			getProjectRoot: () => runtime.projectRoot || process.cwd(),
+			getDispatchCwd: (filePath: string) =>
+				resolveLanguageRootForFile(
+					filePath,
+					runtime.projectRoot || process.cwd(),
+				),
+			countFileLines,
+			isRecordable(filePath: string): boolean {
+				if (_mutationBridgeGetFlag?.("no-read-guard")) return false;
+				if (isPathIgnoredByProject(filePath, runtime.projectRoot, false))
+					return false;
+				if (isExternalOrVendorFile(filePath, runtime.projectRoot)) return false;
+				return true;
+			},
+			dbg,
 		});
 	}
 	// Automatic context injection (the `context` hook). Independent of lensEnabled
