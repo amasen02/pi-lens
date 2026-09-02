@@ -503,9 +503,14 @@ export function containerClassNames(dir = CLIENTS_ROOT): Set<string> {
 		seen.add(name);
 		const found = classesByName.get(name);
 		if (!found) return false;
-		if (declaresOwnMethod(found.body, "clear") || declaresOwnMethod(found.body, "delete"))
+		if (
+			declaresOwnMethod(found.body, "clear") ||
+			declaresOwnMethod(found.body, "delete")
+		)
 			return true;
-		return found.extendsName ? ownsClearOrDelete(found.extendsName, seen) : false;
+		return found.extendsName
+			? ownsClearOrDelete(found.extendsName, seen)
+			: false;
 	};
 
 	const names = new Set<string>();
