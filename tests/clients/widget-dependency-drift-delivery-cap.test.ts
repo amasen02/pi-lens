@@ -142,7 +142,11 @@ function driveTurn(
  * must still run on this path — a quiet turn that repaints the footer and
  * draws a demoted row is still a delivery.
  */
-function driveQuietTurn(runtime: RuntimeCoordinator, cacheManager: CacheManager, cwd: string): Promise<void> {
+function driveQuietTurn(
+	runtime: RuntimeCoordinator,
+	cacheManager: CacheManager,
+	cwd: string,
+): Promise<void> {
 	runtime.beginTurn();
 	return handleTurnEnd(makeTurnEndDeps(runtime, cacheManager, cwd));
 }
