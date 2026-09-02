@@ -102,6 +102,7 @@ migrate-*.js
 !docs/analysisall.md
 !docs/api-ports-inventory.md
 !docs/astplayground.md
+!docs/public-api-stability.md
 !skills/**/*.md
 !.github/PULL_REQUEST_TEMPLATE.md
 

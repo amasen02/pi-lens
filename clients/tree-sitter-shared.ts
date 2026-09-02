@@ -19,6 +19,7 @@ import {
 	type ParsedTreeOutcome,
 	TreeSitterClient,
 } from "./tree-sitter-client.js";
+import { EXTENSION_TO_GRAMMAR } from "./language-registry.js";
 import { logTreeSitter } from "./tree-sitter-logger.js";
 
 let _shared: TreeSitterClient | null = null;
@@ -99,52 +100,19 @@ export function _resetSharedTreeSitterClientForTests(): void {
 	_wasmAbortedAt = undefined;
 }
 
-// Grammar selection by extension — the single ext→grammar-id authority. `.tsx` →
-// the tsx grammar (parses JSX); `.jsx` → the javascript grammar. The project
-// scanner (project-diagnostics/scanner.ts) DERIVES its map from this one and
-// module-report (module-report.ts `tsLangForFile`, #887) resolves its
-// extension-split kinds (jsts/cxx) through `resolveTreeSitterLanguage` below,
-// so neither can drift: post-#877 both key `.tsx`→tsx (the old note here said the
-// scanner mapped `.tsx`→typescript to reuse typescript queries — that stopped
-// being true when #877 moved typescript-rule inheritance into
-// `queriesForLanguage`). The scanner layers only java/kotlin on top, whose
-// grammars + rule dirs exist but are not wired into a per-edit runner `appliesTo`.
-export const EXT_TO_LANG: Record<string, string> = {
-	".ts": "typescript",
-	".mts": "typescript",
-	".cts": "typescript",
-	".tsx": "tsx",
-	".js": "javascript",
-	".mjs": "javascript",
-	".cjs": "javascript",
-	".jsx": "javascript",
-	".py": "python",
-	".go": "go",
-	".rs": "rust",
-	".rb": "ruby",
-	".c": "c",
-	".h": "c",
-	".cc": "cpp",
-	".cpp": "cpp",
-	".cxx": "cpp",
-	".c++": "cpp",
-	".hh": "cpp",
-	".hpp": "cpp",
-	".hxx": "cpp",
-	".inl": "cpp",
-	".ipp": "cpp",
-	".tpp": "cpp",
-	".txx": "cpp",
-	".cu": "cpp",
-	".hip": "cpp",
-	".cs": "csharp",
-	".php": "php",
-	".phtml": "php",
-	".php3": "php",
-	".php4": "php",
-	".php5": "php",
-	".css": "css",
-};
+// Grammar selection by extension — projected from the canonical language
+// registry (language-registry.ts, #2424), which is now THE ext→grammar
+// authority. `.tsx` → the tsx grammar (parses JSX); `.jsx` → the javascript
+// grammar. The project scanner (project-diagnostics/scanner.ts), read expansion
+// (read-expansion.ts) and module-report (`tsLangForFile`, #887) all project the
+// same registry column, so none of them can drift from this one: before #2424
+// the scanner spread this map and layered java/kotlin on top while read
+// expansion kept a hand-copied near-copy of it.
+// `Readonly` because the projection is `Object.freeze`d at the source, and the
+// mutable `Record` type let a caller type-check a write that would throw at
+// runtime (#2424 review, S4).
+export const EXT_TO_LANG: Readonly<Record<string, string>> =
+	EXTENSION_TO_GRAMMAR;
 
 /** Resolve a tree-sitter grammar/language id from a file path's extension. */
 export function resolveTreeSitterLanguage(

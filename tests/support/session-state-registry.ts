@@ -1064,8 +1064,20 @@ export const EXEMPT_SESSION_STATE_FILES: Readonly<Record<string, string>> = {
 	"module-report-lsp.ts": "module-report LSP config memo",
 	"project-lens-config.ts":
 		"project .pi-lens config cache with its own mtime-based invalidation",
-	"lens-config.ts":
-		"global config warn-once set, tied to the config file it warned about",
+	// #2418: the warn-once latch that used to live in lens-config.ts and
+	// project-lens-config.ts moved here when the three loaders' duplicated warn
+	// bodies were collapsed into one seam. Same lifetime as before — it is tied
+	// to the config file and reason it warned about, not to a session — and the
+	// loaders' own reset helpers delegate to resetIgnoredConfigWarnCache.
+	//
+	// Review round 3, F1: this latch guards the NOTIFICATION only. The durable
+	// ledger row is recorded ahead of it, so the per-session half of the seam
+	// is bounded by the ledger's own once-keys (which resetDegradationLedger
+	// clears) rather than by this process-lifetime Set. A gate in front of the
+	// record would have left every session after the first with no
+	// config-ignored row while the config was still being ignored.
+	"config-warn.ts":
+		"ignored-config warn-once NOTIFICATION latch, tied to the config file it warned about; the per-session ledger row is bounded by the degradation ledger, not by this Set",
 	"instance-registry.ts": "instance-registry enablement flag",
 	"process-singletons.ts":
 		"the globalThis-keyed container for process-scope state (#2146). It owns storage, never lifecycle: every family keeps whatever boundary it already had, and each one is a PROCESS boundary rather than a session boundary. session-lifecycle.ts releases its registration at the primary's own session_shutdown (releasePrimarySession), not at session_start. startup-timing.ts's host-ready anchor is registered here as policy process_lifetime with a ForTests-only reset, because resetting it at a session boundary would fabricate host stalls from the original process boot. The instance-registry mutation tail must outlive every session by construction. A reset in this module would therefore wipe state no session boundary owns. Its only module-scope binding is the Symbol.for container key, a constant.",
@@ -1157,6 +1169,9 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"bus-publish.ts": 0,
 	// #1071 added the per-session miss-attribution ledger (1 → 2).
 	"cache-observability.ts": 2,
+	// #2418: the one warn-once latch behind all three config loaders, moved
+	// here out of lens-config.ts and project-lens-config.ts.
+	"config-warn.ts": 1,
 	"degradation-ledger.ts": 3,
 	"diagnostic-dispositions.ts": 1,
 	"diagnostic-line-freshness.ts": 1,
@@ -1192,7 +1207,9 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"installer/index.ts": 12,
 	"instance-registry.ts": 0,
 	"latency-logger.ts": 2,
-	"lens-config.ts": 1,
+	// #2418 removed lens-config.ts's row: its only module-scope state was the
+	// warn-once set, now owned by config-warn.ts, so the scan no longer flags
+	// the file at all.
 	"lens-events.ts": 0,
 	"lsp-budget.ts": 0,
 	"lsp/cascade-tier.ts": 1,
@@ -1240,7 +1257,8 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	// #2146: the container key is a Symbol.for constant, so the scan sees no
 	// mutable module-scope container here.
 	"process-singletons.ts": 0,
-	"project-lens-config.ts": 3,
+	// #2418: 3 -> 2, the warn-once set moved to config-warn.ts.
+	"project-lens-config.ts": 2,
 	"project-report.ts": 1,
 	"project-scale.ts": 0,
 	// #1785: 5 -> 6 for _lastNarrowParseDigestForTests. #1997: 6 -> 10 for

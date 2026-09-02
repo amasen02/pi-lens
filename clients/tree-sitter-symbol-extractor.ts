@@ -4,6 +4,7 @@
  */
 
 import { logTreeSitterDiagnostic } from "./tree-sitter-logger.js";
+import { EXTENSION_TO_GRAMMAR, KIND_TO_GRAMMAR } from "./language-registry.js";
 import * as path from "node:path";
 import { loadWebTreeSitter } from "./deps/web-tree-sitter.js";
 import type { Symbol, SymbolKind, SymbolRef } from "./symbol-types.js";
@@ -570,6 +571,34 @@ SYMBOL_QUERIES.javascript = {
     `,
 };
 
+/**
+ * The grammar a KIND-keyed consumer (review-graph builder, module-report
+ * outline) should extract `filePath` with, or undefined when this file is not
+ * something the symbol extractor can read.
+ *
+ * Three registry-derived steps, no hand-kept table (#2424 replaced one switch
+ * in review-graph/builder.ts and one map in module-report.ts with this):
+ *  1. the kind must have a single grammar-bearing language, or declare a
+ *     `kindFallback` one — so extension-split `jsts` is excluded and its
+ *     callers keep resolving it by path;
+ *  2. the file's own extension wins where it has grammar wiring, which is what
+ *     splits `cxx` into `.c`/`.h` -> c and the rest -> cpp;
+ *  3. the grammar must actually have symbol queries here, which is what keeps
+ *     css/json/yaml/html/toml (grammars that ship, queries that do not) out.
+ */
+export function symbolExtractionGrammar(
+	kind: string | undefined,
+	filePath?: string,
+): string | undefined {
+	if (!kind) return undefined;
+	const kindGrammar = KIND_TO_GRAMMAR[kind];
+	if (!kindGrammar) return undefined;
+	const byExtension = filePath
+		? EXTENSION_TO_GRAMMAR[path.extname(filePath).toLowerCase()]
+		: undefined;
+	const grammar = byExtension ?? kindGrammar;
+	return grammar in SYMBOL_QUERIES ? grammar : undefined;
+}
 /** Language keys with symbol queries; used by fixture drift guards. */
 export function getSymbolQueryLanguages(): readonly string[] {
 	return Object.keys(SYMBOL_QUERIES);

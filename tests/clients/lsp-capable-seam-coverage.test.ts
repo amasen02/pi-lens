@@ -16,6 +16,7 @@ import {
 	SPECIAL_FILENAMES,
 } from "../../clients/file-kinds.js";
 import { getLspCapableKinds } from "../../clients/language-policy.js";
+import { LANGUAGES, lspLanguageId } from "../../clients/language-registry.js";
 import {
 	getLanguageId,
 	LANGUAGE_EXTENSIONS,
@@ -176,6 +177,22 @@ describe("lspCapable seam coverage", () => {
 		expect(reachable).toEqual([...PINNED_LSP_LANGUAGE_IDS].sort());
 	});
 
+	// #2424: LANGUAGE_EXTENSIONS is no longer a hand-curated table plus a
+	// derived fill-in — the curated half is a projection of the canonical
+	// language registry. The pin above is therefore a pin on the registry's
+	// lspId column, and this guard is what says so: an id reachable on didOpen
+	// that no registry entry declares would mean the projection has been
+	// side-stepped by a hand-added key.
+	it("sources every pinned language id from the canonical registry", () => {
+		const declared = new Set(LANGUAGES.map((entry) => lspLanguageId(entry)));
+		const unregistered = PINNED_LSP_LANGUAGE_IDS.filter(
+			(id) => !declared.has(id),
+		);
+		expect(
+			unregistered,
+			`LSP language id(s) reachable on didOpen with no language-registry entry: ${unregistered.join(", ")}`,
+		).toEqual([]);
+	});
 	// Sweep findings the derivation fixed alongside fish — powershell had no
 	// LANGUAGE_EXTENSIONS entry at all, and cxx covered only a third of its
 	// registered extensions.
