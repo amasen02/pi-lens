@@ -739,9 +739,21 @@ describe("review graph service", () => {
 			);
 			await new Promise((resolve) => setTimeout(resolve, 5));
 
+			// #2441: pin the clock so this rebuild's `builtAt` lands in the SAME
+			// millisecond as `initialGraph.builtAt`, deterministically — wall-clock
+			// ISO strings are allowed to collide between two builds (the `setTimeout`
+			// above only nudges mtime, it never guaranteed a distinct ms).
+			// `buildGeneration` (`builder.ts`'s process-wide `_graphGenerationCounter`)
+			// is bumped only on a real re-extract (#459) and is the field that must
+			// move here.
+			vi.spyOn(Date.prototype, "toISOString").mockReturnValue(
+				initialGraph.builtAt,
+			);
 			const graph = await buildOrUpdateGraph(env.tmpDir, [aPath], facts);
+			vi.restoreAllMocks();
 			expect(getLastGraphBuildInfo()).toMatchObject({ mode: "incremental" });
-			expect(graph.builtAt).not.toBe(initialGraph.builtAt);
+			expect(graph.builtAt).toBe(initialGraph.builtAt);
+			expect(graph.buildGeneration).not.toBe(initialGraph.buildGeneration);
 			const impact = computeImpactCascade(graph, aPath);
 			expect(impact.directImporters).toContain(normalizeMapKey(bPath));
 			expect(impact.directCallers).toContain(normalizeMapKey(bPath));

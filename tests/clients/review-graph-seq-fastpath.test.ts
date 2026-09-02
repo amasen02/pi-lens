@@ -1,5 +1,5 @@
 import * as fs from "node:fs";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { FactStore } from "../../clients/dispatch/fact-store.js";
 import { normalizeMapKey } from "../../clients/path-utils.js";
 import {
@@ -86,10 +86,20 @@ describe("review-graph seq fast path (#451)", () => {
 			);
 			hint.bump(aPath);
 
+			// #2441: pin the clock so this rebuild's `builtAt` lands in the SAME
+			// millisecond as `initialGraph.builtAt`, deterministically — wall-clock
+			// ISO strings are allowed to collide between two builds. `buildGeneration`
+			// (`builder.ts`'s process-wide `_graphGenerationCounter`) is bumped only
+			// on a real re-extract (#459) and is the field that must move here.
+			vi.spyOn(Date.prototype, "toISOString").mockReturnValue(
+				initialGraph.builtAt,
+			);
 			clearGraphCache();
 			const graph = await buildOrUpdateGraph(env.tmpDir, [aPath], facts, hint);
+			vi.restoreAllMocks();
 			expect(getLastGraphBuildInfo().mode).toBe("seq-fastpath");
-			expect(graph.builtAt).not.toBe(initialGraph.builtAt);
+			expect(graph.builtAt).toBe(initialGraph.builtAt);
+			expect(graph.buildGeneration).not.toBe(initialGraph.buildGeneration);
 			// The edit is reflected: gamma is now a symbol node.
 			const hasGamma = [...graph.nodes.values()].some(
 				(n) => n.symbolName === "gamma",
