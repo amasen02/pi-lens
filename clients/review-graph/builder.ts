@@ -63,6 +63,7 @@ import {
 import { getSharedTreeSitterClient } from "../tree-sitter-shared.js";
 import {
 	type ExtractedSymbols,
+	symbolExtractionGrammar,
 	TreeSitterSymbolExtractor,
 } from "../tree-sitter-symbol-extractor.js";
 import { withTreeSitterRoot } from "../tree-sitter-shared.js";
@@ -3979,51 +3980,16 @@ function addJsTsFile(
 	}
 }
 
-// Exported for the language-identity golden snapshot
-// (scripts/gen-language-snapshot.mjs), which records the review graph's
-// answer for every extension in the union of the language tables.
+// The review graph's kind -> tree-sitter grammar answer. Delegates to the
+// registry-derived resolver (#2424): this used to be a hand-written switch that
+// re-derived the `.c`/`.h` split inline and drifted from the ext -> grammar
+// authority. Exported for the language-identity golden snapshot
+// (scripts/gen-language-snapshot.mjs).
 export function mapKindToTreeSitterLanguage(
 	kind: string | undefined,
 	filePath?: string,
 ): string | undefined {
-	switch (kind) {
-		case "python":
-			return "python";
-		case "go":
-			return "go";
-		case "rust":
-			return "rust";
-		case "ruby":
-			return "ruby";
-		case "cxx": {
-			const ext = filePath ? path.extname(filePath).toLowerCase() : "";
-			return ext === ".c" || ext === ".h" ? "c" : "cpp";
-		}
-		case "java":
-			return "java";
-		case "kotlin":
-			return "kotlin";
-		case "dart":
-			return "dart";
-		case "elixir":
-			return "elixir";
-		case "csharp":
-			return "csharp";
-		case "php":
-			return "php";
-		case "swift":
-			return "swift";
-		case "lua":
-			return "lua";
-		case "ocaml":
-			return "ocaml";
-		case "zig":
-			return "zig";
-		case "shell":
-			return "bash";
-		default:
-			return undefined;
-	}
+	return symbolExtractionGrammar(kind, filePath);
 }
 
 async function getExtractor(

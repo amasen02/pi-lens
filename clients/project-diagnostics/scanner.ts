@@ -64,27 +64,22 @@ const FACT_RULE_EXTENSIONS = new Set([
 	".mjs",
 	".cjs",
 ]);
-// Which languages the scan runs tree-sitter rules for: every language that has
-// (a loadable grammar) AND (a non-disabled rules/tree-sitter-queries/<lang>/ dir).
+// Which languages the scan runs tree-sitter rules for. Identical to the shared
+// per-edit resolver (EXT_TO_LANG), which since #2424 is itself a projection of
+// the canonical language registry — so the scan and the per-edit path cannot
+// disagree about `.tsx`→tsx / `.jsx`→javascript / the c-vs-cpp header split.
+// (`.tsx` resolves to the tsx grammar, not typescript: the typescript grammar
+// ERRORs on JSX; typescript RULES still apply because `queriesForLanguage(...)`
+// below merges the typescript rule set onto tsx.)
 //
-// The base is the shared per-edit resolver (EXT_TO_LANG — the single
-// ext→grammar-id authority), so c/cpp/csharp/php/css and the .tsx→tsx /
-// .jsx→javascript nuances can never drift from the per-edit path. `.tsx` resolves
-// to the tsx grammar (not typescript: the typescript grammar ERRORs on JSX); // spellchecker:disable-line
-// typescript RULES still apply because `queriesForLanguage(...)` below merges the
-// typescript rule set onto tsx.
-//
-// java + kotlin are layered on here: they have loadable grammars and rule dirs
-// (java: 24 rules, kotlin: 1) but no per-edit runner `appliesTo` entry, so only
-// this broad project scan runs them. scanner.test.ts asserts this map covers
-// every non-disabled rule dir whose grammar is loadable, so adding a language dir
-// fails a test until its extension is registered here (or in EXT_TO_LANG).
-export const TREE_SITTER_EXT_TO_LANG: Record<string, string> = {
-	...EXT_TO_LANG,
-	".java": "java",
-	".kt": "kotlin",
-	".kts": "kotlin",
-};
+// java + kotlin used to be layered on here because EXT_TO_LANG lacked them:
+// they have loadable grammars and rule dirs (java: 24 rules, kotlin: 1) but no
+// per-edit runner `appliesTo` entry, so only this broad project scan runs them.
+// The registry now owns their extensions, so the spread is gone and this is a
+// plain alias. scanner.test.ts asserts this map covers every non-disabled rule
+// dir whose grammar is loadable, so adding a language dir fails a test until
+// its extension is registered in the registry.
+export const TREE_SITTER_EXT_TO_LANG: Record<string, string> = EXT_TO_LANG;
 
 function normalizeSeverity(
 	severity: string | undefined,
