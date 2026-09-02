@@ -62,11 +62,9 @@ export function resolvePhpCsFixerConfig(
 	homeDir: string = os.homedir(),
 ): string | undefined {
 	const startDir = path.dirname(path.resolve(filePath));
-	const configDir = findNearestMarkerRoot(
-		startDir,
-		PHP_CS_FIXER_CONFIG_NAMES,
-		{ homeDir },
-	);
+	const configDir = findNearestMarkerRoot(startDir, PHP_CS_FIXER_CONFIG_NAMES, {
+		homeDir,
+	});
 	if (!configDir) return undefined;
 	for (const name of PHP_CS_FIXER_CONFIG_NAMES) {
 		const candidate = path.join(configDir, name);
