@@ -24,12 +24,14 @@ export {
 	type AdditionalPropertyPolicy,
 	additionalPropertyPolicy,
 	type ConfigSchemaNode,
+	type ConfigValue,
 	DEFAULT_MERGE_STRATEGY,
 	DENY_KEY,
 	DENY_POLICIES,
 	type DenyPolicy,
 	denyPolicyOf,
 	isDenyPolicy,
+	isConfigObject,
 	isMergeStrategy,
 	isPlainObject,
 	isSchemaNode,
@@ -72,7 +74,6 @@ export {
 export {
 	MAX_CONFIG_DEPTH,
 	type NormalizedConfig,
-	type RawConfig,
 	type ValidateOptions,
 	validate,
 } from "./normalize.js";

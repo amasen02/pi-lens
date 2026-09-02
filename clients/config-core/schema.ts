@@ -29,6 +29,32 @@ export { STABILITY_TIER_KEY };
 /** A JSON-Schema-shaped node. Open bag on purpose: unknown keywords pass through. */
 export type ConfigSchemaNode = Readonly<Record<string, unknown>>;
 
+/**
+ * A validated configuration value.
+ *
+ * The domain type the pipeline works in AFTER `validate()`. Deliberately a real
+ * recursive JSON shape rather than `unknown`: past the validator, every value
+ * has been checked against a schema, so a consumer that still had to narrow
+ * from scratch would be paying for a check that already happened. `unknown`
+ * survives only at the raw-input boundary, which is `validate`'s first
+ * parameter and nowhere else.
+ */
+export type ConfigValue =
+	| string
+	| number
+	| boolean
+	| null
+	| ConfigValue[]
+	| { [key: string]: ConfigValue };
+
+/** A validated object value. */
+export type ConfigObject = { [key: string]: ConfigValue };
+
+/** Narrows to the recursive domain type, not to `unknown`. */
+export function isConfigObject(value: unknown): value is ConfigObject {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 // --- x-merge-strategy ---
 
 /** The annotation key selecting how an array node combines across tiers. */

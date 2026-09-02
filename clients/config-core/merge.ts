@@ -32,6 +32,7 @@ import {
 	resolveArrayDeny,
 	resolveBooleanDeny,
 } from "./deny.js";
+import type { ConfigObject } from "./schema.js";
 import {
 	type Provenance,
 	type Resolved,
@@ -41,7 +42,9 @@ import {
 } from "./provenance.js";
 import {
 	type ConfigSchemaNode,
+	type ConfigValue,
 	denyPolicyOf,
+	isConfigObject,
 	isPlainObject,
 	isSchemaNode,
 	itemsSchema,
@@ -60,13 +63,13 @@ export interface ConfigSource {
 	/** The trust decision that applied to that file. */
 	readonly trust?: TrustDecision;
 	/** The value AFTER `validate()`. Merging raw input is a type error waiting. */
-	readonly value: unknown;
+	readonly value: ConfigValue | undefined;
 }
 
 /** One source's value at the node currently being merged. */
 interface Contribution {
 	readonly source: ConfigSource;
-	readonly value: unknown;
+	readonly value: ConfigValue;
 	/** Index in the precedence-sorted source list; higher wins. */
 	readonly rank: number;
 }
@@ -90,13 +93,15 @@ export function merge<T = unknown>(
 		})
 		.map((entry, rank) => ({ source: entry.source, rank }));
 
-	const contributions: Contribution[] = ordered
-		.filter((entry) => entry.source.value !== undefined)
-		.map((entry) => ({
-			source: entry.source,
-			value: entry.source.value,
-			rank: entry.rank,
-		}));
+	const contributions: Contribution[] = [];
+	for (const entry of ordered) {
+		// A source whose value is `undefined` contributes nothing. Filtering with
+		// a narrowing loop rather than `.filter()` keeps the element type exact:
+		// `Array.filter` cannot drop `undefined` from the value's type on its own.
+		const value = entry.source.value;
+		if (value === undefined) continue;
+		contributions.push({ source: entry.source, value, rank: entry.rank });
+	}
 
 	const provenance = new Map<string, Provenance>();
 	const value = mergeNode(contributions, schema, "", provenance);
@@ -126,7 +131,7 @@ function mergeNode(
 	schema: ConfigSchemaNode | undefined,
 	key: string,
 	provenance: Map<string, Provenance>,
-): unknown {
+): ConfigValue | undefined {
 	if (contributions.length === 0) return undefined;
 
 	const denyPolicy = denyPolicyOf(schema);
@@ -176,7 +181,7 @@ function mergeDeny(
 	policy: "boolean-false" | "array-union",
 	key: string,
 	provenance: Map<string, Provenance>,
-): unknown {
+): ConfigValue | undefined {
 	const denyContributions: DenyContribution[] = contributions.map((entry) => ({
 		tier: entry.source.tier,
 		value: entry.value,
@@ -197,8 +202,8 @@ function mergeObject(
 	schema: ConfigSchemaNode | undefined,
 	key: string,
 	provenance: Map<string, Provenance>,
-): unknown {
-	const objects = contributions.filter((entry) => isPlainObject(entry.value));
+): ConfigValue | undefined {
+	const objects = contributions.filter((entry) => isConfigObject(entry.value));
 	if (objects.length === 0) {
 		const winner = contributions[contributions.length - 1];
 		stamp(provenance, winner, key);
@@ -210,23 +215,24 @@ function mergeObject(
 	// user's own files introduced things.
 	const names: string[] = [];
 	for (const entry of objects) {
-		for (const name of Object.keys(entry.value as Record<string, unknown>)) {
+		for (const name of Object.keys(entry.value as ConfigObject)) {
 			if (!names.includes(name)) names.push(name);
 		}
 	}
 
-	const out: Record<string, unknown> = {};
+	const out: ConfigObject = {};
 	for (const name of names) {
 		const childKey = `${key}/${name}`;
-		const childContributions = objects
-			.filter((entry) =>
-				Object.hasOwn(entry.value as Record<string, unknown>, name),
-			)
-			.map((entry) => ({
+		const childContributions: Contribution[] = [];
+		for (const entry of objects) {
+			const parent = entry.value as ConfigObject;
+			if (!Object.hasOwn(parent, name)) continue;
+			childContributions.push({
 				source: entry.source,
-				value: (entry.value as Record<string, unknown>)[name],
+				value: parent[name],
 				rank: entry.rank,
-			}));
+			});
+		}
 		const merged = mergeNode(
 			childContributions,
 			propertySchema(schema, name),
@@ -243,7 +249,7 @@ function mergeArray(
 	schema: ConfigSchemaNode | undefined,
 	key: string,
 	provenance: Map<string, Provenance>,
-): unknown {
+): ConfigValue | undefined {
 	const arrays = contributions.filter((entry) => Array.isArray(entry.value));
 	if (arrays.length === 0) {
 		const winner = contributions[contributions.length - 1];
@@ -262,17 +268,17 @@ function mergeArray(
 	// entries would be noise: every element has the same answer.
 	const winner = arrays[arrays.length - 1];
 	stamp(provenance, winner, key);
-	return [...(winner.value as unknown[])];
+	return [...(winner.value as ConfigValue[])];
 }
 
 function appendArrays(
 	arrays: readonly Contribution[],
 	key: string,
 	provenance: Map<string, Provenance>,
-): unknown {
-	const out: unknown[] = [];
+): ConfigValue {
+	const out: ConfigValue[] = [];
 	for (const entry of arrays) {
-		for (const member of entry.value as unknown[]) {
+		for (const member of entry.value as ConfigValue[]) {
 			stamp(provenance, entry, `${key}/${out.length}`);
 			out.push(member);
 		}
@@ -298,14 +304,14 @@ function mergeKeyedArray(
 	field: string,
 	key: string,
 	provenance: Map<string, Provenance>,
-): unknown {
+): ConfigValue {
 	const items = itemsSchema(schema);
 	const order: string[] = [];
 	const groups = new Map<string, Contribution[]>();
 	const unkeyed: Contribution[] = [];
 
 	for (const entry of arrays) {
-		for (const member of entry.value as unknown[]) {
+		for (const member of entry.value as ConfigValue[]) {
 			const identity = keyIdentity(member, field);
 			const memberContribution: Contribution = {
 				source: entry.source,
@@ -326,22 +332,24 @@ function mergeKeyedArray(
 		}
 	}
 
-	const out: unknown[] = [];
-	for (const identity of order) {
-		const group = groups.get(identity) ?? [];
-		out.push(mergeNode(group, items, `${key}/${out.length}`, provenance));
-	}
-	for (const entry of unkeyed) {
-		out.push(mergeNode([entry], items, `${key}/${out.length}`, provenance));
-	}
+	const out: ConfigValue[] = [];
+	const pushMerged = (group: readonly Contribution[]): void => {
+		const merged = mergeNode(group, items, `${key}/${out.length}`, provenance);
+		// An entry can only merge to `undefined` when its group is empty, which
+		// the construction above cannot produce; dropping it keeps the resolved
+		// list free of holes either way.
+		if (merged !== undefined) out.push(merged);
+	};
+	for (const identity of order) pushMerged(groups.get(identity) ?? []);
+	for (const entry of unkeyed) pushMerged([entry]);
 	// Attribute the list itself to its lowest-precedence contributor, matching
 	// `append`: a keyed list is a list every tier extends, not one a tier owns.
 	stamp(provenance, arrays[0], key);
 	return out;
 }
 
-function keyIdentity(member: unknown, field: string): string | undefined {
-	if (!isPlainObject(member)) return undefined;
+function keyIdentity(member: ConfigValue, field: string): string | undefined {
+	if (!isConfigObject(member)) return undefined;
 	const value = member[field];
 	if (typeof value === "string") return `s:${value}`;
 	if (typeof value === "number" && Number.isFinite(value)) {

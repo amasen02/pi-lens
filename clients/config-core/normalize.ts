@@ -26,6 +26,7 @@
 
 import {
 	type ConfigSchemaNode,
+	type ConfigValue,
 	additionalPropertyPolicy,
 	isPlainObject,
 	isSchemaNode,
@@ -41,13 +42,17 @@ import {
 	migrationSubject,
 } from "./records.js";
 
-/** Whatever the parser returned. Shape unknown until `validate` runs. */
-export type RawConfig = unknown;
-
-/** A config whose every field is one the schema claims, of the declared type. */
+/**
+ * A config whose every field is one the schema claims, of the declared type.
+ *
+ * The "RawConfig" of the pipeline description is deliberately NOT a type alias
+ * here: naming `unknown` adds a word and no information, and every consumer
+ * would still narrow from scratch. The raw shape lives at exactly one place in
+ * the codebase — `validate`'s first parameter — and says `unknown` there.
+ */
 export interface NormalizedConfig {
 	/** `undefined` when the whole document was rejected. */
-	readonly value: unknown;
+	readonly value: ConfigValue | undefined;
 	readonly records: readonly MigrationRecord[];
 	/** Records the bound discarded. Counted, never silently zero. */
 	readonly droppedRecordCount: number;
@@ -71,10 +76,10 @@ export interface ValidateOptions {
 /** Sentinel for "this node produced no value". `undefined` is a legal JSON absence. */
 const DROPPED = Symbol("dropped");
 
-type Walked = unknown | typeof DROPPED;
+type Walked = ConfigValue | typeof DROPPED;
 
 export function validate(
-	raw: RawConfig,
+	raw: unknown,
 	schema: ConfigSchemaNode,
 	options: ValidateOptions = {},
 ): NormalizedConfig {
@@ -168,6 +173,10 @@ function walk(
 	if (declared !== undefined)
 		return walkScalar(value, schema, context, declared);
 
+	// The opaque tail: the schema declares no `type`, so the value passes through
+	// as it stands. It reaches the domain type by assertion because the only
+	// producer is a JSON parser, which cannot make anything else.
+
 	// No `type` keyword: the schema is opaque about this node. Descend anyway
 	// when the VALUE is an object and the schema names properties, so a schema
 	// that omits the redundant `type: "object"` still gets field-wise treatment
@@ -175,7 +184,7 @@ function walk(
 	if (schema && isSchemaNode(schema.properties) && isPlainObject(value)) {
 		return walkObject(value, schema, context, depth, onPath);
 	}
-	return checkEnum(value, schema, context) ? value : DROPPED;
+	return checkEnum(value, schema, context) ? (value as ConfigValue) : DROPPED;
 }
 
 function walkObject(
@@ -195,7 +204,7 @@ function walkObject(
 	}
 	const nextPath = onPath.add(value);
 	const policy = additionalPropertyPolicy(schema);
-	const out: Record<string, unknown> = {};
+	const out: Record<string, ConfigValue> = {};
 	for (const [name, child] of Object.entries(value)) {
 		const childSchema = propertySchema(schema, name);
 		let effective: ConfigSchemaNode | undefined = childSchema;
@@ -238,7 +247,7 @@ function walkArray(
 	}
 	const nextPath = onPath.add(value);
 	const items = itemsSchema(schema);
-	const out: unknown[] = [];
+	const out: ConfigValue[] = [];
 	for (const [index, entry] of value.entries()) {
 		context.path.push(String(index));
 		const walked = walk(entry, items, context, depth + 1, nextPath);
@@ -249,12 +258,20 @@ function walkArray(
 	return out;
 }
 
-const SCALAR_CHECKS: Readonly<Record<string, (value: unknown) => boolean>> = {
-	string: (value) => typeof value === "string",
-	number: (value) => typeof value === "number" && Number.isFinite(value),
-	integer: (value) => typeof value === "number" && Number.isInteger(value),
-	boolean: (value) => typeof value === "boolean",
-	null: (value) => value === null,
+/**
+ * Type PREDICATES, not plain booleans: a check that only returned `true` would
+ * leave the caller re-asserting the very fact it had just proved.
+ */
+const SCALAR_CHECKS: Readonly<
+	Record<string, (value: unknown) => value is ConfigValue>
+> = {
+	string: (value): value is ConfigValue => typeof value === "string",
+	number: (value): value is ConfigValue =>
+		typeof value === "number" && Number.isFinite(value),
+	integer: (value): value is ConfigValue =>
+		typeof value === "number" && Number.isInteger(value),
+	boolean: (value): value is ConfigValue => typeof value === "boolean",
+	null: (value): value is ConfigValue => value === null,
 };
 
 function walkScalar(
@@ -266,7 +283,10 @@ function walkScalar(
 	const check = SCALAR_CHECKS[declared];
 	// An unrecognized `type` keyword is the schema's problem, not the user's:
 	// pass the value through rather than rejecting a field nobody can satisfy.
-	if (!check) return checkEnum(value, schema, context) ? value : DROPPED;
+	// Same JSON-parser provenance as the opaque tail in `walk`.
+	if (!check) {
+		return checkEnum(value, schema, context) ? (value as ConfigValue) : DROPPED;
+	}
 	if (!check(value)) {
 		record(context, {
 			code: "PILENS_CFG_0005",

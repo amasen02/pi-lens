@@ -26,6 +26,7 @@
  * being honored is the normal case, not a degradation.
  */
 
+import type { ConfigValue } from "./schema.js";
 import {
 	isRepoTier,
 	type Provenance,
@@ -39,12 +40,12 @@ export interface DenyContribution {
 	readonly tier: SourceTier;
 	readonly file?: string;
 	readonly trust?: TrustDecision;
-	readonly value: unknown;
+	readonly value: ConfigValue | undefined;
 }
 
 /** The resolved leaf plus the contribution that explains it. */
 export interface DenyResolution {
-	readonly value: unknown;
+	readonly value: ConfigValue | undefined;
 	/** Index into the contributions array; -1 when there were none. */
 	readonly winner: number;
 	/** True when a denial is in force and no nearer tier could lift it. */
@@ -149,7 +150,7 @@ export function resolveArrayDeny(
 ): DenyResolution {
 	const ordered = byPrecedence(contributions);
 	const seen = new Set<string>();
-	const members: unknown[] = [];
+	const members: ConfigValue[] = [];
 	let winner = -1;
 	for (const entry of ordered) {
 		const value = entry.contribution.value;
@@ -184,7 +185,7 @@ export function resolveArrayDeny(
  * different meaning, and keeping both is the conservative half of a deny list —
  * a union that dropped one would be un-denying something.
  */
-function primitiveIdentity(member: unknown): string | undefined {
+function primitiveIdentity(member: ConfigValue): string | undefined {
 	if (typeof member === "string") return `s:${member}`;
 	if (typeof member === "number" || typeof member === "boolean") {
 		return `p:${String(member)}`;

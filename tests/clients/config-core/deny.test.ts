@@ -8,6 +8,7 @@ import {
 	merge,
 } from "../../../clients/config-core/merge.js";
 import { SOURCE_TIERS } from "../../../clients/config-core/provenance.js";
+import type { ConfigValue } from "../../../clients/config-core/schema.js";
 import { DENY_ONLY_SCHEMA } from "../../support/config-core-fixtures.js";
 
 /** The whole resolution as one comparable string, provenance included. */
@@ -33,7 +34,7 @@ const OPERATOR_DENY: ConfigSource = {
  */
 const WEAKENING_MUTATIONS: ReadonlyArray<{
 	readonly name: string;
-	readonly value: unknown;
+	readonly value: ConfigValue;
 	readonly tier: "project" | "nested-project";
 }> = [
 	{
