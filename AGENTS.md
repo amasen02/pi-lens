@@ -2460,6 +2460,41 @@ The guard tracks more than the Read/Write/Edit tools. All of these register so a
 - **bash WRITES** (`extractWrittenPathsFromCommand`): `>`/`>>`/`N>`, `tee`, `sed -i`, `cp`/`mv` dest, `touch`. The agent authored the file, so — exactly like the Write tool — `noteCreatedFile` at tool_call + `recordWritten` at tool_result.
 - **search tools** (`clients/search-read-registration.ts` → `registerSearchReads`, ±2-line context margin): a tool exposes the lines it revealed via `details.searchReads: {file, startLine(1-based), endLine}[]`; `handleToolResult` consumes that for **any** tool and registers reads of only those lines (never the whole file). Populated by `ast_grep_search` (#169, done) and bash `grep -n`/`egrep`/`fgrep` (output parsed via `extractGrepSearchReadsFromOutput`). `ast_grep_search` also returns `details.matchLocations[]` with ready `readSlice` handles; keep those handles in sync with any formatter changes. `lsp_navigation` already populates `searchReads` for the location-revealing operations (definition/typeDefinition/declaration/references/implementation/workspaceSymbol/incoming+outgoingCalls via `collectSearchReadsForOperation`); `documentSymbol` deliberately does NOT (shape, not body — same rule as `module_report`). **Still remaining:** the pi built-in `grep`/`glob` tool (reveals an editable span — wire it for parity; `ls`/`glob`/`find` stay excluded as name-only). New producers only need to populate `details.searchReads` — no hook change.
 
+**MUTATION-CLASSIFICATION SEAM (#2423):** `classifyMutatingTool`
+(`clients/mutating-tool.ts`) is THE way to ask whether an inbound `tool_call` or
+`tool_result` mutates a file. Never compare `event.toolName` to `"write"` or
+`"edit"` at a call site — the whole edit-side chain (read-guard preflight → turn
+state → deferred queue → `agent_settled` drain) used to hang below fifteen
+independent literal comparisons, so a host or extension edit tool under any
+other name was dropped before the first bookkeeping call, with its path already
+resolved. The seam answers with a `kind` (`write` or `edit`), a `provenance`
+(`builtin`, `bash-derived`, `declared`, `bridge`), and any lines a shape adapter
+resolved. It recognizes pi's built-ins from a table and a third-party tool from
+its INPUT SHAPE through the ordered `MUTATION_SHAPE_ADAPTERS` registry, where
+the first non-`undefined` result wins. A new mutating-tool shape is a new
+adapter entry with its own `source` discriminator in the
+`touched_lines_detected` / `edit_preflight_blocked` telemetry, never a new name
+check. An edit-shaped tool the seam cannot place defaults to the DEFERRED
+autofix pass, the safe timing, and its changes get their own
+`agent-tool:<name>` change source rather than being folded onto `agent-edit`.
+The write-side counterpart of the read bridge is `clients/mutation-bridge.ts`:
+an in-process producer that writes a file outside the tool-event path calls
+`recordMutation` at `Symbol.for("pi-lens:mutation-bridge")` and gets the same
+bookkeeping; `ast_grep_replace apply:true` is the in-repo consumer.
+`tests/clients/mutating-tool-classification.test.ts` greps `clients/`, `tools/`
+and `index.ts` and fails when a mutation decision reappears outside the seam —
+`===`/`!==`/`==`/`!=` against `"write"`/`"edit"`/`"multiedit"` (any
+`…toolName`-shaped operand), an `isToolCallEventType` call, a `switch` over an
+expression ending in `.toolName`, a literal `["write", "edit"]`-style set with
+`.includes(`/`.has(`, and a local aliased from `<expr>.toolName` and compared to
+those literals later in the SAME file. Cross-file aliasing and helper-laundered
+comparisons are the guard's known blind spot; review covers those.
+Anchor resolution for `pi-hashline-edit-pro` (`clients/hashline-anchor.ts`)
+answers ONLY for a line whose canonical content occurs once in the file: the
+extension serves store-carried anchors (`mapStableHashes`), so a duplicate-line
+anchor otherwise resolves to a confident WRONG line and the guard acts on the
+wrong range. Unresolved is always a report, never a block.
+
 **PATH-KEY INVARIANT (hard-won — #210):** `ReadGuard` keys its `reads`/`edits`/`exemptions`/`pendingCreations`/`writtenThisSession` maps through `normalizeFilePath` (private `key()`), never the raw path. Read sources arrive with mixed separators/casing — the Read tool gives OS-native backslashes on Windows; search/LSP reads arrive slash-normalized from URIs — and `resolveToolCallFilePath` returns absolute paths verbatim. Keying on the raw string made a read recorded under one form invisible to an edit checked under another → false `zero_read` block despite the file having been read. **Any new map access MUST key through `key()`, and any new read-guard test MUST exercise cross-separator paths** (record one form, check the other) — same-form-on-both-sides is exactly what let #210 ship. Guarded by `tests/clients/read-guard-path-normalization.test.ts`.
 
 ## Dependencies & install constraints (hard-won — see #167-area fixes)

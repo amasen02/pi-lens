@@ -11,7 +11,15 @@ export type ProjectChangeSource =
 	| "partial-apply"
 	| "lsp-edit"
 	| "opaque-script"
-	| "external";
+	| "external"
+	/**
+	 * A mutation attributed to a named tool that is neither pi's `write`/`edit`
+	 * nor one of pi-lens's own passes (#2423) — a third-party edit tool, or a
+	 * producer recording through `clients/mutation-bridge.ts`. The tool name is
+	 * carried in the member itself rather than collapsed onto `agent-edit`, so a
+	 * change report can tell an extension's rewrite from the model's own edit.
+	 */
+	| `agent-tool:${string}`;
 
 export interface ProjectChangeRange {
 	start: number;

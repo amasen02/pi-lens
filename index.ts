@@ -54,6 +54,10 @@ import {
 } from "./clients/widget-state.js";
 import { selectLspStatus } from "./clients/lsp-status.js";
 import type { PersistedReadGuardState } from "./clients/read-guard.js";
+import { registerMutationBridge } from "./clients/mutation-bridge.js";
+import { classifyMutatingTool } from "./clients/mutating-tool.js";
+import { resolveLanguageRootForFile } from "./clients/language-profile.js";
+import { countFileLines } from "./clients/read-guard-tool-lines.js";
 import { registerReadBridge } from "./clients/read-bridge.js";
 import {
 	isExternalOrVendorFile,
@@ -487,6 +491,15 @@ function log(_msg: string) {
 // --- State ---
 
 const runtime = new RuntimeCoordinator();
+// #2423 review round 1 (F6): module scope, beside `runtime`, NOT inside
+// `activateExtension`. The mutation bridge and the read bridge are registered
+// once per process (`_mutationBridgeRegistered`) and hold their dependencies
+// through getters; a `cacheManager` declared inside the activation closure
+// would pin the FIRST activation's instance forever, so a re-activation
+// (#473 in-process subagent re-bind, extension reload) would write its turn
+// state into an object nothing else reads. `runtime` has always been module
+// scope for exactly this reason.
+const cacheManager = new CacheManager();
 // #484: the quiet-window task registry (clients/quiet-window.ts `_tasks`) is
 // module-level and survives factory re-activation in the same process (#473
 // in-process subagent re-binds, reload). Register the turn-summary emit task
@@ -495,6 +508,13 @@ const runtime = new RuntimeCoordinator();
 // holder, refreshed on every activation — never a stale captured `pi`.
 let _readBridgeRegistered = false;
 let _readBridgeGetFlag:
+	| ((name: string) => boolean | string | undefined)
+	| undefined;
+// #2423: the mutation bridge is the write-side sibling of the read bridge and
+// follows its registration discipline exactly — mount once per process, refresh
+// the flag getter on every activation.
+let _mutationBridgeRegistered = false;
+let _mutationBridgeGetFlag:
 	| ((name: string) => boolean | string | undefined)
 	| undefined;
 let _turnSummaryEmitRegistered = false;
@@ -705,7 +725,6 @@ function activateExtension(hostPi: ExtensionAPI) {
 		dbg,
 	});
 	const astGrepClient = new AstGrepClient();
-	const cacheManager = new CacheManager();
 
 	type LspStatusTheme = {
 		fg: (
@@ -846,6 +865,33 @@ function activateExtension(hostPi: ExtensionAPI) {
 				if (isExternalOrVendorFile(filePath, runtime.projectRoot)) return false;
 				return true;
 			},
+		});
+	}
+
+	// Mutation bridge (#2423): same live-getter discipline as the read bridge.
+	// An in-process producer that writes a file outside pi-lens's tool-event
+	// path records it here, and the same bookkeeping runs.
+	_mutationBridgeGetFlag = getLensFlag;
+	if (!_mutationBridgeRegistered) {
+		_mutationBridgeRegistered = true;
+		registerMutationBridge({
+			getRuntime: () => runtime,
+			getCacheManager: () => cacheManager,
+			getProjectRoot: () => runtime.projectRoot || process.cwd(),
+			getDispatchCwd: (filePath: string) =>
+				resolveLanguageRootForFile(
+					filePath,
+					runtime.projectRoot || process.cwd(),
+				),
+			countFileLines,
+			isRecordable(filePath: string): boolean {
+				if (_mutationBridgeGetFlag?.("no-read-guard")) return false;
+				if (isPathIgnoredByProject(filePath, runtime.projectRoot, false))
+					return false;
+				if (isExternalOrVendorFile(filePath, runtime.projectRoot)) return false;
+				return true;
+			},
+			dbg,
 		});
 	}
 	// Automatic context injection (the `context` hook). Independent of lensEnabled
@@ -2303,15 +2349,31 @@ function activateExtension(hostPi: ExtensionAPI) {
 		// is exactly why a wedged-LSP edit hang was invisible in latency.log. This
 		// row means "pi-lens received this edit"; if it is present but nothing
 		// follows, the stall is in the pipeline; if it is absent, it is upstream.
+		//
+		// #2423 review round 1 (F4): this was a SIXTEENTH comparison of the
+		// tool name against the two built-in literals, missed by the class sweep
+		// because it lives in `index.ts` — which the grep guard did not walk —
+		// under a local whose name the guard's pattern did not match. A
+		// third-party edit therefore reached the pipeline with no
+		// "pi-lens received this edit" row, which is precisely the trace the
+		// marker exists to leave. It now asks the seam, and the guard walks
+		// `index.ts` and `tools/` too.
 		const rtToolName = (event as { toolName?: string })?.toolName;
-		if (rtToolName === "edit" || rtToolName === "write") {
+		const rtMutation = classifyMutatingTool(event, { recognizeOnly: true });
+		if (rtMutation) {
 			logLatency({
 				type: "phase",
 				phase: "tool_result_received",
 				filePath:
-					(event as { input?: { path?: string } })?.input?.path ?? "<unknown>",
+					rtMutation.path ??
+					(event as { input?: { path?: string } })?.input?.path ??
+					"<unknown>",
 				durationMs: 0,
-				metadata: { toolName: rtToolName },
+				metadata: {
+					toolName: rtToolName,
+					mutationKind: rtMutation.kind,
+					mutationProvenance: rtMutation.provenance,
+				},
 			});
 		}
 		try {

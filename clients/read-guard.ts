@@ -95,7 +95,11 @@ export interface ReadContentBinding {
 
 export interface EditRecord {
 	filePath: string;
-	tool: "write" | "edit";
+	/**
+	 * Host tool name. Widened from `"write" | "edit"` in #2423 so a third-party
+	 * mutating tool is recorded under its own name instead of being relabelled.
+	 */
+	tool: string;
 	touchedLines: [start: number, end: number];
 	precedingReads: ReadRecord[];
 	verdict: "allowed" | "blocked" | "warned";
@@ -1893,7 +1897,7 @@ export class ReadGuard {
 
 	private recordEdit(
 		filePath: string,
-		tool: "write" | "edit",
+		tool: string,
 		touchedLines: [number, number],
 		verdict: ReadGuardVerdict,
 	): void {
@@ -1937,7 +1941,7 @@ export class ReadGuard {
 
 	private recordVerdict(
 		filePath: string,
-		tool: "write" | "edit",
+		tool: string,
 		touchedLines: [number, number] | undefined,
 		verdict: ReadGuardVerdict,
 		metadata: Record<string, unknown> = {},
