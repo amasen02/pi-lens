@@ -329,7 +329,12 @@ async function buildBootstrapClients(): Promise<BootstrapClients> {
 			async () =>
 				new (await import("./complexity-client.js")).ComplexityClient(),
 		),
-		load("go", async () => new (await import("./go-client.js")).GoClient()),
+		// The process-wide singleton, NOT a fresh instance (#2455 fix round 4,
+		// F2). `handleSessionStart` reads this object for its "Active tools"
+		// line while `resetGoAvailability` re-arms the singleton's latch; a
+		// second instance here meant the reset never reached the surface a
+		// user actually sees.
+		load("go", async () => (await import("./go-client.js")).goClient),
 		load(
 			"govulncheck",
 			async () =>
@@ -347,10 +352,8 @@ async function buildBootstrapClients(): Promise<BootstrapClients> {
 			"opengrep",
 			async () => new (await import("./opengrep-client.js")).OpengrepClient(),
 		),
-		load(
-			"rust",
-			async () => new (await import("./rust-client.js")).RustClient(),
-		),
+		// The process-wide singleton, for the same reason as "go" above.
+		load("rust", async () => (await import("./rust-client.js")).rustClient),
 		load(
 			"agent-behavior",
 			async () =>

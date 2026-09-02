@@ -27,6 +27,7 @@ import {
 	getProjectDataDir,
 } from "./file-utils.js";
 import { GitleaksClient, type GitleaksResult } from "./gitleaks-client.js";
+import { resetGoAvailability } from "./go-client.js";
 import {
 	GovulncheckClient,
 	type GovulncheckResult,
@@ -80,6 +81,7 @@ import {
 } from "./project-snapshot.js";
 import { scanProjectRules } from "./rules-scanner.js";
 import type { RuntimeCoordinator } from "./runtime-coordinator.js";
+import { resetRustAvailability } from "./rust-client.js";
 import { resetSafeSpawnWindowsCommandCache } from "./safe-spawn.js";
 import {
 	type BootstrapClients,
@@ -2282,6 +2284,18 @@ export async function handleSessionStart(
 	// login` and starts a fresh session still reads the previous session's
 	// stale "no token" verdict until the cooldown (if any) happens to expire.
 	resetZizmorTokenAvailability();
+	// #2455: same #1496/#1535 process-lifetime-latch shape, one caller later —
+	// the `goClient`/`rustClient` singletons each hold their own
+	// `createAvailabilityLatch()` outside the dispatch generation counter above
+	// (they predate `createCwdCachedProbe`). A "missing" verdict never expires
+	// on its own, so without these a go/cargo install between sessions stayed
+	// unobserved for the rest of the process's life. Found by hand while
+	// auditing #2455's detector widening, NOT surfaced by it: the sweep skips
+	// any file exporting no reset at all, and neither client module exported
+	// one, so no container predicate could have yielded them (#2455 fix round 4,
+	// F5 — an earlier draft of this comment had the causality backwards).
+	resetGoAvailability();
+	resetRustAvailability();
 	// psscriptanalyzer's three latches (interpreter, module, -File exec) are
 	// module-local, so the generation counter above does not reach them
 	// (#1490, #1540).

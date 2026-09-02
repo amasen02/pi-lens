@@ -1821,6 +1821,71 @@ describe("monorepo root hoisting (#1671)", () => {
 		await expect(RustServer.root(file)).resolves.toBe(crateDir);
 	});
 
+	it("RustServer.root ignores a commented-out members entry even though the crate still exists on disk (#2473 review round 2, F1)", async () => {
+		const { RustServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-cargo-commented-member-"),
+		);
+		dirs.push(tmp);
+
+		fs.writeFileSync(
+			path.join(tmp, "Cargo.toml"),
+			[
+				"[workspace]",
+				"members = [",
+				'    "crate-a",',
+				'    # "crate-b",',
+				"]",
+			].join("\n"),
+		);
+		const crateAFile = path.join(tmp, "crate-a", "src", "lib.rs");
+		fs.mkdirSync(path.dirname(crateAFile), { recursive: true });
+		fs.writeFileSync(
+			path.join(tmp, "crate-a", "Cargo.toml"),
+			'[package]\nname = "crate-a"\n',
+		);
+		fs.writeFileSync(crateAFile, "pub fn x() {}\n");
+
+		// crate-b physically exists on disk but its `members` entry is
+		// commented out — it must stay independently rooted, not get swept
+		// into the workspace's shared rust-analyzer root.
+		const crateBFile = path.join(tmp, "crate-b", "src", "lib.rs");
+		fs.mkdirSync(path.dirname(crateBFile), { recursive: true });
+		fs.writeFileSync(
+			path.join(tmp, "crate-b", "Cargo.toml"),
+			'[package]\nname = "crate-b"\n',
+		);
+		fs.writeFileSync(crateBFile, "pub fn y() {}\n");
+
+		await expect(RustServer.root(crateAFile)).resolves.toBe(tmp);
+		await expect(RustServer.root(crateBFile)).resolves.toBe(
+			path.join(tmp, "crate-b"),
+		);
+	});
+
+	it("RustServer.root hoists a member declared under an INDENTED [workspace] heading (#2473 review round 2, F2)", async () => {
+		const { RustServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-cargo-indented-heading-"),
+		);
+		dirs.push(tmp);
+
+		// Valid TOML: a table heading need not start in column 0.
+		fs.writeFileSync(
+			path.join(tmp, "Cargo.toml"),
+			'  [workspace]\n  members = ["crate-a"]\n',
+		);
+		const crateFile = path.join(tmp, "crate-a", "src", "lib.rs");
+		fs.mkdirSync(path.dirname(crateFile), { recursive: true });
+		fs.writeFileSync(
+			path.join(tmp, "crate-a", "Cargo.toml"),
+			'[package]\nname = "crate-a"\n',
+		);
+		fs.writeFileSync(crateFile, "pub fn x() {}\n");
+
+		await expect(RustServer.root(crateFile)).resolves.toBe(tmp);
+	});
+
 	it("JavaServer.root hoists declared Maven modules to the parent pom, but leaves an undeclared sibling crate-rooted", async () => {
 		const { JavaServer } = await import("../../../clients/lsp/server.js");
 		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-maven-ws-"));

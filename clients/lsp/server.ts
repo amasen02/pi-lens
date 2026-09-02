@@ -60,8 +60,8 @@ import { findLocalSgconfig, resolveBaselineSgconfig } from "../sgconfig.js";
 import { findLocalTyposConfig } from "../typos-config.js";
 import { resolvePackagePath } from "../package-root.js";
 import {
-	extractTomlTableSection,
-	parseTomlStringArray,
+	readCargoWorkspaceExclude,
+	readCargoWorkspaceMembers,
 	readTextFileOrUndefined,
 } from "../cargo-manifest.js";
 import { resolveAstGrepNativeExe } from "./wait-policy/index.js";
@@ -2539,11 +2539,13 @@ function cargoWorkspaceDeclaresMember(
 		.split(path.sep)
 		.join("/");
 	if (relativePath === "" || relativePath.startsWith("..")) return false;
-	const workspaceSection = extractTomlTableSection(
-		workspaceContent,
-		"workspace",
-	);
-	const excluded = parseTomlStringArray(workspaceSection, "exclude");
+	// Reuse the shared, `[workspace]`-scoped readers (review round 2, F4)
+	// instead of hand-composing `extractTomlTableSection` +
+	// `parseTomlStringArray` here — that hand-composition duplicated exactly
+	// what `readCargoWorkspaceMembers`/`readCargoWorkspaceExclude` do, the
+	// single-source-of-truth violation #2473 was filed to close for the OTHER
+	// two Cargo.toml readers.
+	const excluded = readCargoWorkspaceExclude(workspaceContent);
 	if (
 		excluded.some((pattern) =>
 			matchesCargoWorkspacePattern(pattern, relativePath),
@@ -2551,7 +2553,7 @@ function cargoWorkspaceDeclaresMember(
 	) {
 		return false;
 	}
-	const members = parseTomlStringArray(workspaceSection, "members");
+	const members = readCargoWorkspaceMembers(workspaceContent);
 	return members.some((pattern) =>
 		matchesCargoWorkspacePattern(pattern, relativePath),
 	);

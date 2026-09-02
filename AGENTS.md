@@ -1029,7 +1029,7 @@ baseline memoizes the file, the load would repeat on every later read.
 
 **Template-bearing extensions select no unconfigured formatter (#2384):** `FORMATTER_POLICY_BY_EXTENSION` sets `defaultWhenUnconfigured: false` for `.html`, `.htm`, `.yaml`, and `.yml` (the `.md`/#89 precedent). Real Prettier reinterprets template markers as code — an HTML `<script>{{JS}}</script>` embed became nested JavaScript blocks, and a Helm `{{ .Values.x }}` became `{ { .Values.x } }` (verified against prettier 3.3.3). A project `.prettierrc` or `package.json` `prettier` field opts in through the ordinary explicit-config branch; oxfmt's explicit-config path is unchanged. Do not restore a smart default for these extensions without solving marker preservation; a one-line fixture cannot prove safety because it hits `indentationArgs`/SKIP_FORMATTING before the tool runs.
 
-**`clients/cargo-manifest.ts` is the shared Cargo.toml reader for formatter/LSP argv (#2466) — `clients/review-graph/workspace-modules.ts` still carries its own, unfolded (#2473).** `extractTomlTableSection`/`parseTomlStringArray` (table-section slicing, string-array parsing) moved out of `clients/lsp/server.ts`'s rust-analyzer workspace-root hoisting (#1671/#1693), which now re-imports them instead of keeping a private copy — do not add a FOURTH regex TOML reader; the two existing ones already cover table-section slicing, string-array/scalar parsing, and workspace-inheritance detection. `resolveCargoPackageEdition` walks up from a file via the shared `findNearestMarkerRoot`/`isAtOrAboveHomeDir` primitives (home-ceiling guarded, never a private walker) to the nearest `Cargo.toml`; reads `[package] edition` directly, or — when it declares `edition.workspace = true` — checks whether that SAME manifest is also the workspace root (`[package]`+`[workspace]`+`[workspace.package]` in one file, a common non-virtual-workspace-root shape) before climbing ancestors for the nearest one that DECLARES `[workspace]` (Cargo's own rule — not merely the nearest ancestor Cargo.toml, which may be an unrelated intermediate package) and reading ITS `[workspace.package] edition`. Every resolved value is checked against rustfmt's actual `--edition` enum (2015/2018/2021/2024, `SUPPORTED_RUSTFMT_EDITIONS`) — not a bare four-digit pattern, which would let a typo'd or too-new edition (e.g. `"2019"`) pass through and turn every `.rs` format into a hard failure; `rustfmtFormatter.resolveCommand` carries the validated value through `--edition` because bare `rustfmt <file>` (unlike `cargo fmt`) does not read the manifest's edition itself and silently rejects newer-edition syntax under its 2015 default. Manifest-value-into-argv sweep (#2466): ruff/black already self-discover `pyproject.toml`'s `target-version` from the file path they are given (no pi-lens translation needed); gofmt has no version-dependent flag at all; clang-format's own default is `-style=file` (ancestor `.clang-format` search) with no flag required; prettier/biome/ruff/shfmt already carry detected indentation through `indentationArgs` (#1144); psscriptanalyzer-format already carries `-Settings` (#1572 F2); ktlint self-discovers `.editorconfig` the same way (no carriage needed — its Spotless `build.gradle` detection is a tool-SELECTION axis, ktlint vs ktfmt, not an argv-carriage one). Two gaps found: **ktfmt** — its CLI does not read the `googleStyle()`/`kotlinLangStyle()` selection out of a project's `build.gradle{.kts}` ktfmt-gradle-plugin block (`hasKtfmtConfig`'s `KTFMT_GRADLE_FILES` check only detects ktfmt's PRESENCE, never which style it selects) and `ktfmtFormatter.resolveCommand` passes no style flag — #2468. **php-cs-fixer** — `detect()` walks up for `.php-cs-fixer(.dist).php` via `findNearestContaining`, but `resolveCommand` never passes `--config <path>` and `formatFile` spawns with `cwd` = the file's own directory, which php-cs-fixer does not walk up from on its own — #2472. Neither fixed here.
+**`clients/cargo-manifest.ts` is the one Cargo.toml reader (#2466, folded #2473).** `extractTomlTableSection`/`parseTomlStringArray` (table-section slicing, string-array parsing) moved out of `clients/lsp/server.ts`'s rust-analyzer workspace-root hoisting (#1671/#1693), which now re-imports them instead of keeping a private copy — do not add a SECOND regex TOML reader; this one already covers table-section slicing, string-array/scalar parsing, and workspace-inheritance detection. `clients/review-graph/workspace-modules.ts`'s `scanCargoModules`/`detectWorkspaceType` (monorepo module-graph construction) used to carry an independent regex reader (`extractTomlArray`/`extractTomlSection`/`extractTomlString`) — a third copy, folded onto `readCargoWorkspaceMembers`/`readCargoDependencyNames`/`readCargoPackageName` (#2473). That fold also fixed a latent defect: the old `extractTomlString` was NOT table-scoped, so a member manifest whose `name` key appeared under an earlier non-`[package]` table (a `[[bin]] name = "..."` or `[package.metadata.*]` block preceding `[package]`) silently returned the wrong crate name for the module graph; `readCargoPackageName` is table-scoped like every other reader here. Review round 2 (#2473, PR #2480) hardened the fold: `extractTomlTableSection`/`parseTomlStringArray` now normalize CRLF→LF and strip `#`-to-EOL comments (quote-aware) before any regex runs — the pre-fold per-line reader did both and the fold's single multi-line-regex rewrite silently dropped the comment-strip pass, so a commented-out array entry (`# "member",`) stayed live; both the heading and its terminator are now anchored with `[ \t]*` rather than bare `^` so an indented (but valid) TOML heading is read, not silently treated as absent — and, since ECMAScript's multiline `$`/`^` already treat a bare `\r` as a line terminator, that SAME anchor change is also what made a CRLF manifest read correctly (review round 3 correction: the CRLF→LF normalize itself is defensive belt-and-braces, not a fix for a real match failure — verified by mutation, removing it leaves every test green). `readCargoWorkspaceMembers` gained `[workspace]` table-scoping and a sibling `readCargoWorkspaceExclude`, both now reused by `clients/lsp/server.ts`'s `cargoWorkspaceDeclaresMember` instead of that file hand-composing the same `extractTomlTableSection`+`parseTomlStringArray` pair itself — the same single-source-of-truth violation #2473 closed for the other two readers. `workspace-modules.ts`'s `detectWorkspaceType` also stopped using a bare `content.includes("[workspace]")` (true for a commented-out heading, wrongly short-circuiting past a real npm/pnpm workspace sitting next to it) in favor of a presence check on `extractTomlTableSection`. Review round 3 fixed a second sentinel-ambiguity defect in that same presence check: `extractTomlTableSection` used to return `""` for BOTH "table absent" and "table present but empty" (e.g. a bare `[workspace]` heading as the last line of the file with no trailing newline), so `!== ""` misread the second as the first — `detectWorkspaceType` and both `resolveCargoPackageEdition` "does this manifest declare `[workspace]`" checks now compare `!== undefined` instead, and `extractTomlTableSection`'s return type is `string | undefined`; `readCargoDependencyNames` also dropped a redundant, non-quote-aware `line.split("#", 1)[0]` re-strip left over from before the fold (its input is already comment-stripped by `normalizeToml`). `resolveCargoPackageEdition` walks up from a file via the shared `findNearestMarkerRoot`/`isAtOrAboveHomeDir` primitives (home-ceiling guarded, never a private walker) to the nearest `Cargo.toml`; reads `[package] edition` directly, or — when it declares `edition.workspace = true` — checks whether that SAME manifest is also the workspace root (`[package]`+`[workspace]`+`[workspace.package]` in one file, a common non-virtual-workspace-root shape) before climbing ancestors for the nearest one that DECLARES `[workspace]` (Cargo's own rule — not merely the nearest ancestor Cargo.toml, which may be an unrelated intermediate package) and reading ITS `[workspace.package] edition`. Every resolved value is checked against rustfmt's actual `--edition` enum (2015/2018/2021/2024, `SUPPORTED_RUSTFMT_EDITIONS`) — not a bare four-digit pattern, which would let a typo'd or too-new edition (e.g. `"2019"`) pass through and turn every `.rs` format into a hard failure; `rustfmtFormatter.resolveCommand` carries the validated value through `--edition` because bare `rustfmt <file>` (unlike `cargo fmt`) does not read the manifest's edition itself and silently rejects newer-edition syntax under its 2015 default. Manifest-value-into-argv sweep (#2466): ruff/black already self-discover `pyproject.toml`'s `target-version` from the file path they are given (no pi-lens translation needed); gofmt has no version-dependent flag at all; clang-format's own default is `-style=file` (ancestor `.clang-format` search) with no flag required; prettier/biome/ruff/shfmt already carry detected indentation through `indentationArgs` (#1144); psscriptanalyzer-format already carries `-Settings` (#1572 F2); ktlint self-discovers `.editorconfig` the same way (no carriage needed — its Spotless `build.gradle` detection is a tool-SELECTION axis, ktlint vs ktfmt, not an argv-carriage one). Two gaps found, tracked separately (not this fold's scope — see each issue for current status): **ktfmt** — its CLI does not read the `googleStyle()`/`kotlinLangStyle()` selection out of a project's `build.gradle{.kts}` ktfmt-gradle-plugin block (`hasKtfmtConfig`'s `KTFMT_GRADLE_FILES` check only detects ktfmt's PRESENCE, never which style it selects) and `ktfmtFormatter.resolveCommand` passes no style flag — #2468. **php-cs-fixer** — `detect()` walks up for `.php-cs-fixer(.dist).php` via `findNearestContaining`, but `resolveCommand` never passes `--config <path>` and `formatFile` spawns with `cwd` = the file's own directory, which php-cs-fixer does not walk up from on its own — #2472.
 
 ### Rules and analyzers
 
@@ -1772,6 +1772,31 @@ anywhere else on a command line is a reader, not an occupant; kills are by
 pid, never `taskkill`-by-name. All of that is pure and unit-tested in
 `scripts/lib/worktree-hygiene.mjs`.
 
+**One process-table seam, in scripts/ (#2443).** Every Windows
+`Get-CimInstance Win32_Process` and POSIX `ps` listing in this repo is
+composed and parsed in ONE place, `scripts/lib/process-scan.mjs`:
+`buildProcessQuery(fields, {filter, excludeSelfPid})` builds the command,
+`parseProcessTable` reads it back, and a `fields` projection (`pid`, `ppid`,
+`ageMs`, `rssBytes`, `cpuKernel100ns`, `cpuUser100ns`, `startedAt`,
+`command`) is how a caller asks for the columns it needs. There used to be
+five copies — the instance reaper's three queries, the resource sampler's two,
+and the two scripts — which is how PR #2438's exit-code hardening (a `ps` that
+prints a partial table then dies must not read as complete) reached one and
+not the rest. `tests/config/process-table-seam.test.ts` fails on any second
+file that spells the query.
+
+The seam lives in `scripts/` and NOT in `clients/` on purpose: `clients/*.js`
+is gitignored build output, and `scripts/prune-agent-worktrees.mjs` runs as a
+SessionStart/SubagentStop hook inside freshly created agent worktrees, which
+have neither `node_modules` nor a build. clients/ reaches it through the ONE
+crossing point, `clients/process-snapshot.ts`, which adds the extension's own
+spawn rails (unref'd child + stdout, injected tree-kill-and-verify timeout
+handler, a `SpawnCollectStatus` so an empty table stays distinguishable from
+a query that never ran). Because tsc resolves the `.mjs` through its
+`.d.mts` and would emit nothing, `tsconfig.dist.json` names the file in
+`include` with `allowJs` — without that, `bundle:dist` cannot resolve the
+import (pinned in `tests/packaging.test.ts`).
+
 **Idle is measured from signals the sweep does not write.** A worktree's age
 comes from `WORKTREE_ACTIVITY_SIGNALS` — the checkout directory's mtime, the
 worktree's `<admin>/HEAD` mtime, and the last entry timestamp in
@@ -2215,11 +2240,21 @@ a *second host adapter* alongside `index.ts`. Design rationale + progress: `mcp.
 
 ## Package scope
 
-LSP server definitions resolve in `clients/lsp/config.ts` as project
-`.pi-lens/lsp.json` (including its legacy project filenames) over machine-global
-`getGlobalPiLensDir()/lsp.json` over built-in defaults. `servers` and
-`serverOverrides` merge by ID; project `disabledServers` and `warmFiles` replace
-the global arrays when present.
+**Config location is settled and documented in ONE place: `docs/configuration.md`
+("Which file wins", #2426).** There are exactly two canonical files —
+`.pi-lens.json` (project, nearest-package-wins per field) and
+`~/.pi-lens/config.json` (machine-global) — with `lsp` as a namespace inside
+both. Every loader resolves through `clients/config-resolve.ts` over the
+canonical schema in `clients/config-schema.ts`, in the config core's own tier
+order (builtin → global → project → nested-project → env → cli → host); the
+walk is `$HOME`-ceiling-bounded like every other walk-UP in the repo. Legacy
+locations (`.pi-lens/lsp.json`, `pi-lsp.json`, `pi-lens.json`,
+`~/.pi-lens/lsp.json`) and the legacy root LSP keys are still read for the
+window in `DEPRECATED_CONFIG_SURFACES`, emit one `PILENS_CFG_0002`/`0003`
+migration notice per `(file, key)`, and LOSE every collision with the canonical
+spelling. Do not add a fourth discovery path, a second candidate list, or a
+per-loader merge: add a location to `clients/config-locations.ts` and a
+namespace to the schema.
 
 All pi packages are `@earendil-works/*` (migrated from `@mariozechner/*` in 0.74.0). Peer dep: `@earendil-works/pi-coding-agent`. Runtime dep: `@earendil-works/pi-tui`. The v4-safe dependency baseline resolves both host packages at `0.84.2`; the peer remains broad at runtime and the devDependency pins the SDK for type/compatibility checks. Re-audit host declarations before taking a future major/minor bump.
 
@@ -2860,9 +2895,9 @@ A 2026 audit against `@earendil-works/pi-coding-agent` confirmed a few places wh
 
 - **Project-diagnostics extractor registry (#179)** — the heavyweight project analyzers are normalized into `ProjectDiagnostic` records and surfaced via `lens_diagnostics` full mode. `clients/project-diagnostics/extractors.ts` is the single registry: each row maps an analyzer's **cached** result (by cache key) to per-file diagnostics via a pure `runner-adapters/*` function. **Cache-only — `mode=full` reads the caches and folds them in, it NEVER launches a scan** (so it can't relaunch or contend with the background session-start/turn-end runs, which share a global abort signal). **Done:** knip, jscpd (clone → both ends), madge (cycle → each file), gitleaks (secrets → blocking), govulncheck (reachable Go CVE → first traced source frame), trivy (dep CVE → manifest), dead-code (vulture/Python; unlisted → blocking), opengrep (CLI scan, #584; `ERROR` severity → blocking). **Not (cleanly) adaptable — left out on purpose:** type-coverage (wired but currently never run/cached — no cache to read), test-runner (caches a formatted string, not structured findings), call-graph (structural intelligence, not diagnostics). Adding an adaptable one is one adapter + one registry row — no `formatFullMode` surgery.
 
-- **LSP server `initializationOptions` overrides via project config** — `clients/lsp/config.ts` now also parses a `serverOverrides` key in `.pi-lens/lsp.json` (or `.pi-lens.json` / `pi-lsp.json`). Each entry is keyed by the built-in server `id` (e.g. `"rust"`, `"nix"`) and carries an `initializationOptions` object. In `clients/lsp/index.ts` `spawnClient()`, the override is fetched via `getServerInitOverride(server.id, filePath)` and deep-merged (user wins on conflicts) onto the server's built-in defaults via `mergeInitializationOptions`. Arrays are replaced, not merged (consistent with standard LSP settings merge semantics). Tests live in `tests/clients/lsp/server-init-overrides.test.ts`. Test files that mock `clients/lsp/config.js` must include `getServerInitOverride: vi.fn().mockReturnValue(undefined)` in the mock factory — existing service tests (`service-touch-collect`, `service-race`, `service-early-unblock`, `service-mode-grace`, `workspace-diagnostics-per-server`, `runtime-session-warm`) were updated accordingly.
+- **LSP server `initializationOptions` overrides via project config** — `clients/lsp/config.ts` projects a `serverOverrides` key out of the `lsp` namespace of the canonical config files (see "Package scope" above and `docs/configuration.md`; the legacy locations still resolve for their deprecation window). Each entry is keyed by the built-in server `id` (e.g. `"rust"`, `"nix"`) and carries an `initializationOptions` object. In `clients/lsp/index.ts` `spawnClient()`, the override is fetched via `getServerInitOverride(server.id, filePath)` and deep-merged (user wins on conflicts) onto the server's built-in defaults via `mergeInitializationOptions`. Arrays are replaced, not merged (consistent with standard LSP settings merge semantics). Tests live in `tests/clients/lsp/server-init-overrides.test.ts`. Test files that mock `clients/lsp/config.js` must include `getServerInitOverride: vi.fn().mockReturnValue(undefined)` in the mock factory — existing service tests (`service-touch-collect`, `service-race`, `service-early-unblock`, `service-mode-grace`, `workspace-diagnostics-per-server`, `runtime-session-warm`) were updated accordingly.
 
-- **LSP server preference via project config** — `clients/lsp/config.ts` supports `.pi-lens/lsp.json` with `disabledServers` and custom server entries, but there is no way to express a *preference* between built-in candidates (e.g. prefer `basedpyright` over `pyright` when both are installed). `PythonServer.spawn()` uses first-found-wins ordering: project-environment and Node-local `pyright-langserver`, then `basedpyright-langserver`, then project-environment or PATH `ty server` (#717), then pyright's managed-install tier. A future `preferredServer` key in `LSPConfig` should let projects override this ordering; the server policy layer (`clients/lsp/server-policy.ts`) is the right place to apply the preference before candidate resolution.
+- **LSP server preference via project config** — the `lsp` namespace supports `disabledServers` and custom server entries, but there is no way to express a *preference* between built-in candidates (e.g. prefer `basedpyright` over `pyright` when both are installed). `PythonServer.spawn()` uses first-found-wins ordering: project-environment and Node-local `pyright-langserver`, then `basedpyright-langserver`, then project-environment or PATH `ty server` (#717), then pyright's managed-install tier. A future `preferredServer` key in `LSPConfig` should let projects override this ordering; the server policy layer (`clients/lsp/server-policy.ts`) is the right place to apply the preference before candidate resolution.
 
 - **Python project environments apply without shell activation (#717, closes #2407, refs #1513)** — `clients/python-environment.ts` resolves `VIRTUAL_ENV`, `CONDA_PREFIX`, `.venv`, or `venv` without invoking a package manager. It supplies a child-only `PATH` and `VIRTUAL_ENV` to Python LSP, standalone Pyright, and pytest processes; never mutate `process.env`, because different roots can select different environments. `PythonServer.spawn()` prefers project-environment pyright/basedpyright/ty binaries before broader candidates. `TestRunnerClient` runs pytest through the detected project interpreter itself and uses generic `python -m pytest` only when no project environment exists. ty stays opt-in: it is not in the installer registry, and its `resolveAndLaunch` call keeps `allowInstall:false`, so managed pyright remains the default when the project and PATH provide no Python LSP. No `initializationOptions` are sent to ty because it has no stable `pythonPath` equivalent (astral-sh/ty#2032); its child environment and cwd drive interpreter discovery.
 
@@ -3308,6 +3343,58 @@ direct reset calls at that site and excludes nested or deferred callback bodies;
 the registry checks this derived set rather than a copied list. Keep resets for
 process-singleton session state behind the concurrent-secondary decision. The
 primary activation owns the tally, and a secondary must never clear it.
+
+`tests/support/session-state-scan.ts`'s container detector recognises a
+module-level `const`/`let` bound to `new <Ctor>(...)` where `<Ctor>` is a
+built-in (`Map`/`Set`/`WeakMap`/`WeakSet`) or ANY class declared anywhere in
+`clients/`, regardless of export shape (`export class`, `export default
+class`, `export abstract class`, a bare non-exported `class` later re-exported
+via `export { A }` / `export { A as B }`), scanned live once per run instead
+of hand-listed. #2442's `BoundedFifoMap`/`BoundedLruCache` migration had to be
+added to a hard-coded alternation by hand before the scan could see it again;
+#2455 fix round 1 replaced the alternation with a live scan gated on the class
+owning a `clear()`/`delete()` method (directly or through an `extends`
+chain) — round 2 found that gate was ITSELF a miss: `FactStore`'s own clear
+methods are named `clearAll`/`deleteFileFact`, not `clear`/`delete`, so two of
+its five production module-scope instances (`dispatch/integration.ts`,
+`mcp/analyze.ts`) stayed invisible. Round 2 dropped the method-name gate for
+the issue's own primary wording — "declared in `clients/`" — which also
+deleted the `extends`-chain walk and its cycle guard (nothing left to resolve
+without a method filter). A class that structurally qualifies but is proven
+NOT to hold session state gets a documented `CONTAINER_CLASS_EXCLUSIONS`
+entry rather than a special case at the call site — empty today; both a stale
+entry (names a class the live scan no longer finds) and a reason-less entry
+red via `auditContainerClassExclusions()`. Known boundaries the predicate
+still cannot see (`SWEEP_HEURISTIC_LIMITS`): a `new` bound to a constructor
+IMPORTED from outside `clients/` (a node_modules class), or built via a
+factory function instead of a bare `new Ctor(...)` call. The declaration may
+carry an `export` prefix (round 4) — it could not before, which made
+`export const goClient = new GoClient()` invisible for no reason but the
+keyword in front of it.
+
+**The container predicate is not the gate that decides what the sweep looks
+at.** `scanSessionStateCandidates` skips a file outright when it exports no
+reset (`if (resets.length === 0) continue`), so widening the predicate can
+only ever surface state in files that ALREADY have a reset seam. A file
+holding session state with no reset at all stays invisible however wide the
+predicate gets — MISS 3, "state with no reset seam at all", and no #2455
+round touched it. `go-client.ts` and `rust-client.ts` are the worked example:
+their `GoClient`/`RustClient` latches were found by HAND while auditing what
+the widening should have covered, and the files only entered the sweep once
+#2455 added `resetGoAvailability`/`resetRustAvailability`. Read a widened
+predicate as "the registry now describes more of what it already watches",
+never as "the sweep now finds unreset state".
+
+**A reset is only as total as the instance count behind it.** #2455 round 2
+added those two resets against the runner-module singletons while
+`bootstrap.ts` separately constructed its own `GoClient`/`RustClient` for
+`BootstrapClients`, which is what `handleSessionStart` reads for its "Active
+tools" line — so the reset re-armed a latch nothing user-visible consulted and
+the bug survived its own fix (round 4, F2). A per-session reset over a
+process-lived latch is wrong unless there is exactly ONE instance of that
+latch; put the instance in the module that owns the class, beside the reset,
+and let every consumer import it. `tests/clients/toolchain-client-singleton.test.ts`
+is the ratchet for the toolchain clients.
 
 ## Issue triage & labels
 

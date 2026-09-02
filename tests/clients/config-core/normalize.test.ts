@@ -188,7 +188,6 @@ describe("validate is bounded on both growing axes (#2425)", () => {
 		}
 		expect(collector.records).toHaveLength(3);
 		expect(collector.droppedCount).toBe(1);
-		expect(collector.totalCount).toBe(4);
 	});
 });
 

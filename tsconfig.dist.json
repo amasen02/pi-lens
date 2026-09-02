@@ -5,7 +5,8 @@
 		"outDir": "./dist",
 		"declaration": false,
 		"sourceMap": false,
-		"types": []
+		"types": [],
+		"allowJs": true
 	},
 	"include": [
 		"index.ts",
@@ -13,7 +14,8 @@
 		"clients/**/*.ts",
 		"commands/**/*.ts",
 		"tools/**/*.ts",
-		"mcp/**/*.ts"
+		"mcp/**/*.ts",
+		"scripts/lib/process-scan.mjs"
 	],
 	"exclude": ["node_modules", "tests", "**/*.test.ts"]
 }

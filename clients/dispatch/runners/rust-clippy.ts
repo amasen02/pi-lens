@@ -6,7 +6,7 @@
 
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { findNearestContaining } from "../../path-utils.js";
-import { RustClient } from "../../rust-client.js";
+import { rustClient } from "../../rust-client.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import { stripAnsi } from "../../sanitize.js";
 import {
@@ -25,8 +25,6 @@ import type {
 } from "../types.js";
 import { PRIORITY } from "../priorities.js";
 import { createCwdCachedProbe } from "./utils/runner-helpers.js";
-
-const rustClient = new RustClient();
 
 // Cached per-cwd `cargo clippy --version` probe (#120). Before this, the
 // probe fired on every Rust file save in a project where clippy was already

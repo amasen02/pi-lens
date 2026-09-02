@@ -25,11 +25,13 @@ vi.mock("../../../../clients/tool-policy.js", () => ({
 	}),
 }));
 
+// #2455 fix round 4, F2: the runner imports the process's ONE `goClient`
+// instance from go-client.ts, so the double is the instance, not the class.
 vi.mock("../../../../clients/go-client.js", () => ({
-	GoClient: class {
+	goClient: {
 		async findGoPathAsync() {
 			return "go";
-		}
+		},
 	},
 }));
 
