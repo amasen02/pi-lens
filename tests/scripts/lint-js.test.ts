@@ -5,15 +5,18 @@
  * shipped in scripts/prune-agent-worktrees.mjs and was only caught by running
  * the CLI by hand (#2435).
  *
- * These tests spawn the REAL `npm run lint:js` — oxlint via the shipped
- * `node_modules/oxlint/bin/oxlint` entry, against the repo's own committed
- * `.oxlintrc.json` — so a regression in either the npm script wiring or the
- * config's `no-undef` override fails here, not just in someone's manual
+ * These tests spawn the REAL shipped oxlint binary (resolved via Node module
+ * resolution, not a hard-coded path) against the repo's own committed
+ * `.oxlintrc.json`, and the real `npm run lint:js` script itself (case 5 —
+ * read from `package.json`, not a hand-rolled copy of its argv) — so a
+ * regression in the npm script wiring, the config's `no-undef` override, or
+ * a missing `--deny-warnings` fails here, not just in someone's manual
  * dogfood run.
  */
 
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -23,7 +26,18 @@ const REPO_ROOT = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
 	"../..",
 );
-const OXLINT_ENTRY = path.join(REPO_ROOT, "node_modules/oxlint/bin/oxlint");
+const IS_WIN = process.platform === "win32";
+const NPM = IS_WIN ? "npm.cmd" : "npm";
+// Resolved via Node's own module resolution (not a hard-coded
+// `<root>/node_modules/oxlint/bin/oxlint` path) so this still finds the
+// shipped binary in a worktree where oxlint is hoisted to a parent
+// `node_modules` rather than living directly under REPO_ROOT.
+const require = createRequire(import.meta.url);
+const OXLINT_ENTRY = path.join(
+	path.dirname(require.resolve("oxlint/package.json")),
+	"bin",
+	"oxlint",
+);
 const OXLINT_CONFIG = path.join(REPO_ROOT, ".oxlintrc.json");
 
 function runOxlint(targetFile: string) {
@@ -92,25 +106,18 @@ describe("lint:js (#2439 — oxlint wired over .mjs/.cjs)", () => {
 		}
 	});
 
-	it("the repo's own scripts/**/*.mjs and root *.mjs currently pass clean", () => {
-		const result = spawnSync(
-			process.execPath,
-			[
-				OXLINT_ENTRY,
-				"--ignore-pattern",
-				"tests/fixtures/**",
-				"--ignore-pattern",
-				"**/*.ts",
-				"--ignore-pattern",
-				"**/*.tsx",
-				"--ignore-pattern",
-				"**/*.d.mts",
-				"-f",
-				"unix",
-				".",
-			],
-			{ encoding: "utf8", cwd: REPO_ROOT },
-		);
+	it("`npm run lint:js` — the repo's real self-lint scope — currently passes clean", () => {
+		// Spawns the REAL `npm run lint:js` (package.json's own script, not a
+		// hand-rolled copy of its ignore-pattern argv) so a drift between this
+		// pin and the actual wiring fails here, not just in CI. `--deny-warnings`
+		// is baked into the script itself, so a warning-only regression (the
+		// #2452 review-round-1 gap — 19 baseline hits exited 0 pre-fix) reds
+		// this case too, not just errors.
+		const result = spawnSync(NPM, ["run", "lint:js"], {
+			encoding: "utf8",
+			cwd: REPO_ROOT,
+			shell: IS_WIN,
+		});
 		expect(result.status, result.stdout + result.stderr).toBe(0);
 	});
 });
