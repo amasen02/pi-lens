@@ -232,9 +232,7 @@ describe("no config input can reach an object's prototype (#2440 F1)", () => {
 					tier: "project",
 					file: "p.json",
 					value: {
-						diagnostics: parsed(
-							'{"__proto__":{"injected":"pwned"},"kept":1}',
-						),
+						diagnostics: parsed('{"__proto__":{"injected":"pwned"},"kept":1}'),
 					},
 				},
 			],
