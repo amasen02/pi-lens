@@ -171,17 +171,17 @@ interface SourcePathMemo {
 	cache: BoundedLruCache<string, string>;
 	normalizeCalls: { value: number };
 }
-const _sourcePathMemos = new Map<string, SourcePathMemo>();
+// BoundedLruCache, not BoundedFifoMap: a hit here must refresh the workspace's
+// recency (the hand-rolled version did its own delete+set for exactly that),
+// so a workspace still being built is never the one evicted (#2442).
+const _sourcePathMemos = new BoundedLruCache<string, SourcePathMemo>(
+	REVIEW_GRAPH_MAX_WARM_WORKSPACES,
+);
 
 function sourcePathMemo(cwd: string): SourcePathMemo {
 	const key = normalizeMapKey(path.resolve(cwd));
 	const existing = _sourcePathMemos.get(key);
-	if (existing) {
-		// The workspace map is also bounded LRU; a hit must refresh its recency.
-		_sourcePathMemos.delete(key);
-		_sourcePathMemos.set(key, existing);
-		return existing;
-	}
+	if (existing) return existing;
 	const memo: SourcePathMemo = {
 		cache: new BoundedLruCache<string, string>(
 			REVIEW_GRAPH_SOURCE_PATH_MEMO_ENTRIES,
@@ -189,11 +189,6 @@ function sourcePathMemo(cwd: string): SourcePathMemo {
 		normalizeCalls: { value: 0 },
 	};
 	_sourcePathMemos.set(key, memo);
-	while (_sourcePathMemos.size > REVIEW_GRAPH_MAX_WARM_WORKSPACES) {
-		const oldest = _sourcePathMemos.keys().next().value;
-		if (oldest === undefined) break;
-		_sourcePathMemos.delete(oldest);
-	}
 	return memo;
 }
 

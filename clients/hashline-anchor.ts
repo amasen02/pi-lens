@@ -103,6 +103,7 @@
  * unique content" is a reduction of the wrong-line rate, not its elimination.
  */
 import * as nodeFs from "node:fs";
+import { BoundedFifoMap } from "./bounded-cache.js";
 
 /** `HASH_LEN` in `src/hashline/alphabet.ts`. */
 const HASHLINE_ANCHOR_LENGTH = 3;
@@ -400,8 +401,10 @@ interface AnchorIndexEntry extends AnchorIndex {
  * entry) to bound its lifetime to that, rather than trusting mtime/size
  * across calls.
  */
-const ANCHOR_INDEX_CACHE = new Map<string, AnchorIndexEntry>();
 const ANCHOR_INDEX_CACHE_LIMIT = 8;
+const ANCHOR_INDEX_CACHE = new BoundedFifoMap<string, AnchorIndexEntry>(
+	ANCHOR_INDEX_CACHE_LIMIT,
+);
 
 /**
  * Drop the memo. Called at the `tool_call` boundary in production
@@ -472,10 +475,6 @@ function buildAnchorIndex(
 	}
 	const contentUnique = keys.map((key) => keyCounts.get(key) === 1);
 
-	if (ANCHOR_INDEX_CACHE.size >= ANCHOR_INDEX_CACHE_LIMIT) {
-		const oldest = ANCHOR_INDEX_CACHE.keys().next().value;
-		if (oldest !== undefined) ANCHOR_INDEX_CACHE.delete(oldest);
-	}
 	ANCHOR_INDEX_CACHE.set(filePath, {
 		mtimeMs: stats.mtimeMs,
 		size: stats.size,

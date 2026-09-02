@@ -619,3 +619,90 @@ describe("session-state sweep — symbol-count pin regression (#1817)", () => {
 		);
 	});
 });
+
+describe("session-state scan — repo container classes are containers (#2442 F2)", () => {
+	function withFixtureTree(
+		files: Record<string, string>,
+		run: (dir: string) => void,
+	): void {
+		const dir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-session-state-bounded-"),
+		);
+		try {
+			for (const [name, contents] of Object.entries(files)) {
+				fs.writeFileSync(path.join(dir, name), contents);
+			}
+			run(dir);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	}
+
+	// #2442 migrated ~20 module-level `new Map()` caches to BoundedFifoMap /
+	// BoundedLruCache. The container regex named only Map/Set/WeakMap/WeakSet/
+	// PathKeyedMap, so every migrated module silently DROPPED OUT of this
+	// sweep — cache-observability.ts went from two recognised containers to
+	// zero and no test noticed. A refactor from a raw Map to one of this
+	// repo's own container wrappers must never make session state invisible.
+	//
+	// MUTATION: delete `BoundedFifoMap` (or `BoundedLruCache`) from
+	// CONTAINER_DECLARATION's alternation in tests/support/session-state-scan.ts
+	// and this test reds — the containers array comes back short.
+	const BOUNDED_MODULE = [
+		'import { BoundedFifoMap, BoundedLruCache } from "./bounded-cache.js";',
+		"",
+		"const fifoLatch = new BoundedFifoMap<string, number>(8);",
+		"const lruLatch = new BoundedLruCache<string, number>(8);",
+		"",
+		"export function resetBoundedLatches(): void {",
+		"\tfifoLatch.clear();",
+		"\tlruLatch.clear();",
+		"}",
+		"",
+	].join("\n");
+
+	it("flags a module-level `new BoundedFifoMap()` / `new BoundedLruCache()`", () => {
+		withFixtureTree({ "bounded-holder.ts": BOUNDED_MODULE }, (dir) => {
+			const candidates = scanSessionStateCandidates(dir);
+			expect(candidates.map((c) => c.file)).toEqual(["bounded-holder.ts"]);
+			expect(candidates[0].containers).toEqual(["fifoLatch", "lruLatch"]);
+		});
+	});
+
+	it("counts them for the symbol-count pin, so a new bounded latch reds", () => {
+		withFixtureTree({ "bounded-holder.ts": BOUNDED_MODULE }, (dir) => {
+			const candidates = scanSessionStateCandidates(dir);
+			const counts: Record<string, number> = {};
+			for (const c of candidates) counts[c.file] = c.containers.length;
+			// A pin captured when the file held only the FIFO latch.
+			const pinAudit = auditSymbolCounts({
+				sweepName: "fixture symbol-count audit",
+				counts,
+				pinned: { "bounded-holder.ts": 1 },
+			});
+			expect(pinAudit.unaccounted).toEqual(["bounded-holder.ts@2"]);
+		});
+	});
+
+	it("still ignores a bounded container declared inside a function", () => {
+		// Column zero is the module-scope signal; a per-call container is
+		// re-armed by construction and must not be flagged.
+		withFixtureTree(
+			{
+				"per-call.ts": [
+					"export function makeCache(): unknown {",
+					"\tconst perCall = new BoundedFifoMap<string, number>(8);",
+					"\treturn perCall;",
+					"}",
+					"",
+					"export function resetNothing(): void {}",
+					"",
+				].join("\n"),
+			},
+			(dir) => {
+				const candidates = scanSessionStateCandidates(dir);
+				expect(candidates.flatMap((c) => c.containers)).toEqual([]);
+			},
+		);
+	});
+});

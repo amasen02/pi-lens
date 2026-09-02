@@ -53,6 +53,7 @@
  * to supersede it.
  */
 
+import { BoundedFifoMap } from "../bounded-cache.js";
 import { normalizeEphemeralMapKey } from "../path-utils.js";
 
 /** Maximum pending (filePath, serverId) pairs; oldest evicted beyond this. */
@@ -122,7 +123,9 @@ export function isPendingAuxiliaryPastRearmTtl(
 	return nowMs - anchor >= readLateAuxRearmTtlMs();
 }
 
-const pending = new Map<string, PendingAuxCoverageEntry>();
+const pending = new BoundedFifoMap<string, PendingAuxCoverageEntry>(
+	MAX_PENDING_AUX_ENTRIES,
+);
 
 /**
  * #2168: pairs evicted at the cap have no other retirement record — the
@@ -181,7 +184,7 @@ export function markPendingAuxiliaryCoverage(
 			);
 			continue;
 		}
-		pending.set(
+		const evicted = pending.set(
 			key,
 			rearmedAtMs === undefined
 				? { filePath, serverId, markedAtMs }
@@ -193,12 +196,7 @@ export function markPendingAuxiliaryCoverage(
 						rearmCount: rearmCount ?? 1,
 					},
 		);
-		while (pending.size > MAX_PENDING_AUX_ENTRIES) {
-			const oldest = pending.keys().next().value;
-			if (oldest === undefined) break;
-			pending.delete(oldest);
-			capEvictedCount += 1;
-		}
+		capEvictedCount += evicted.length;
 	}
 }
 
@@ -298,8 +296,10 @@ export function drainPendingAuxCapEvictedCount(): number {
  *
  * Bounded like the pending-pair store itself; oldest evicted first.
  */
-const napiFallbackCoverage = new Map<string, number>();
 export const MAX_NAPI_COVERAGE_ENTRIES = 50;
+const napiFallbackCoverage = new BoundedFifoMap<string, number>(
+	MAX_NAPI_COVERAGE_ENTRIES,
+);
 
 /** Record that napi actually evaluated rules for `filePath` at `atMs`. */
 export function recordNapiFallbackCoverage(
@@ -309,11 +309,6 @@ export function recordNapiFallbackCoverage(
 	const key = normalizeEphemeralMapKey(filePath);
 	napiFallbackCoverage.delete(key);
 	napiFallbackCoverage.set(key, atMs);
-	while (napiFallbackCoverage.size > MAX_NAPI_COVERAGE_ENTRIES) {
-		const oldest = napiFallbackCoverage.keys().next().value;
-		if (oldest === undefined) break;
-		napiFallbackCoverage.delete(oldest);
-	}
 }
 
 /**

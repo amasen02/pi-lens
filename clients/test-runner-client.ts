@@ -14,6 +14,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { BoundedFifoMap } from "./bounded-cache.js";
 import { emitBounded } from "./bounded-telemetry.js";
 import { LEDGER_FIELD_MAX } from "./degradation-ledger.js";
 import { minimatch } from "./deps/minimatch.js";
@@ -338,7 +339,7 @@ function canonicalProjectRoot(cwd: string): {
 	}
 }
 
-const MAX_CANONICAL_ROOT_MEMO_ENTRIES = 512;
+export const MAX_CANONICAL_ROOT_MEMO_ENTRIES = 512;
 
 interface RunnerAvailability {
 	available: boolean;
@@ -428,7 +429,9 @@ export class TestRunnerClient {
 	// resolve — a state where `detectRunner` already walks node_modules on every
 	// call. Keep the memo bounded so pathological spelling churn cannot grow it
 	// without limit.
-	private canonicalRootMemo = new Map<string, string>();
+	private canonicalRootMemo = new BoundedFifoMap<string, string>(
+		MAX_CANONICAL_ROOT_MEMO_ENTRIES,
+	);
 	private availableRunners = new PathKeyedMap<Map<string, RunnerAvailability>>(
 		normalizeEphemeralMapKey,
 	);
@@ -470,12 +473,13 @@ export class TestRunnerClient {
 
 		const { key, resolved } = canonicalProjectRoot(cwd);
 		if (!resolved) return key;
-		if (this.canonicalRootMemo.size >= MAX_CANONICAL_ROOT_MEMO_ENTRIES) {
-			const oldest = this.canonicalRootMemo.keys().next().value;
-			if (oldest !== undefined) this.canonicalRootMemo.delete(oldest);
-		}
 		this.canonicalRootMemo.set(cwd, key);
 		return key;
+	}
+
+	/** #2442 test-only: exercise canonicalRootMemo's bounded eviction directly. */
+	_getCanonicalProjectRootForTests(cwd: string): string {
+		return this.getCanonicalProjectRoot(cwd);
 	}
 
 	private getRunnerAvailability(
