@@ -4,7 +4,9 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	findPiLensProjectConfig,
+	loadPiLensConfigInDir,
 	loadPiLensProjectConfig,
+	PROJECT_CONFIG_BASENAMES,
 	resetProjectLensConfigCache,
 } from "../../clients/project-lens-config.js";
 import { removeTempDirSync } from "./test-utils.js";
@@ -128,6 +130,37 @@ describe("loadPiLensProjectConfig", () => {
 		);
 		const cfg = loadPiLensProjectConfig(tmpDir);
 		expect(cfg.ignore).toEqual(["dotfile-wins/**"]);
+	});
+
+	/**
+	 * #2426 review round 2, F4: the only canonical-wins coverage at this loader
+	 * used to be the `ignore` case above plus a shape assertion on the location
+	 * TABLE. Both halves below are BEHAVIORAL and both go red under a
+	 * `PROJECT_CONFIG_LOCATIONS.reverse()` mutation — the ordering is what
+	 * decides, not `lspSectionOf`'s namespace-over-root rule.
+	 */
+	it("reads a colliding maxProjectFiles from the canonical file (#2426)", () => {
+		fs.writeFileSync(
+			path.join(tmpDir, ".pi-lens.json"),
+			JSON.stringify({ maxProjectFiles: 2222 }),
+		);
+		fs.writeFileSync(
+			path.join(tmpDir, "pi-lens.json"),
+			JSON.stringify({ maxProjectFiles: 1111 }),
+		);
+		const cfg = loadPiLensProjectConfig(tmpDir);
+		expect(cfg.maxProjectFiles).toBe(2222);
+		expect(cfg.configPath).toBe(path.join(tmpDir, ".pi-lens.json"));
+		// The per-directory (no-walk) counterpart used for nested layering (#783)
+		// resolves the same collision the same way.
+		expect(loadPiLensConfigInDir(tmpDir).maxProjectFiles).toBe(2222);
+	});
+
+	it("orders PROJECT_CONFIG_BASENAMES canonical-first (#2426)", () => {
+		// DESCENDING precedence, first match wins — so the canonical basename is
+		// index 0. Pinned as an ordered list rather than as a set: the set is what
+		// is read, the ORDER is what decides a collision.
+		expect(PROJECT_CONFIG_BASENAMES).toEqual([".pi-lens.json", "pi-lens.json"]);
 	});
 
 	it("walks up to find a config in a parent directory", () => {
@@ -454,11 +487,19 @@ describe("loadPiLensProjectConfig", () => {
 			expect(console.error).not.toHaveBeenCalled();
 		});
 
-		it("warns a MIGRATION notice, not a typo, on a legacy root LSP key (#2426)", () => {
+		it("leaves a legacy root LSP key's migration notice to the LSP loader (#2426)", () => {
 			// The four legacy root keys are still honored for their deprecation
 			// window (`DEPRECATED_CONFIG_SURFACES`), so this is not an "unknown key"
-			// and not an "ignoring invalid" — the setting APPLIES. What the user
-			// gets is one notice per key naming where it moves to.
+			// and not an "ignoring invalid" — the setting APPLIES.
+			//
+			// WHO announces it changed in review round 2 (F2): every loader resolves
+			// the same documents, and the warn-once latch is per subsystem, so a
+			// loader that reported records it does not own produced a SECOND notice
+			// for the same `(file, key)` — labelled `deprecated project config` for
+			// a setting only the LSP subsystem reads. These four are LSP settings,
+			// so `clients/lsp/config.ts` owns their notice and this loader says
+			// nothing about them. The pairing is asserted end-to-end, both loaders
+			// in one session, in `config-notice-ownership.test.ts`.
 			fs.writeFileSync(
 				path.join(tmpDir, ".pi-lens.json"),
 				JSON.stringify({
@@ -476,17 +517,16 @@ describe("loadPiLensProjectConfig", () => {
 				"disabledServers",
 				"warmFiles",
 			]) {
-				expect(warnedFor(`move "${key}" to "lsp.${key}"`), key).toBe(true);
+				// Not a typo report, and not this loader's notice either.
 				expect(warnedFor(`unknown key "${key}"`), key).toBe(false);
+				expect(warnedFor(`move "${key}" to "lsp.${key}"`), key).toBe(false);
 			}
 			// The whole-file "ignoring invalid" prose must NOT appear: nothing was
 			// ignored.
 			expect(warnedFor("ignoring invalid")).toBe(false);
-			// One notice per (file, key) — four keys, four notices, no more.
-			const notices = (console.error as ReturnType<typeof vi.fn>).mock.calls
-				.flat()
-				.filter((arg) => typeof arg === "string" && arg.includes("deprecated"));
-			expect(notices).toHaveLength(4);
+			// Nothing at all from this loader for this file — the `ignore` key it
+			// does own is canonical, so there is no record to report.
+			expect(console.error).not.toHaveBeenCalled();
 		});
 
 		it("does NOT warn on the pi-lens-native `trivy` key (read via .raw)", () => {
@@ -528,6 +568,52 @@ describe("loadPiLensProjectConfig", () => {
 			loadPiLensProjectConfig(tmpDir);
 			expect(warnedFor('"lsp" is a global-only')).toBe(false);
 			expect(warnedFor('unknown key "lsp"')).toBe(false);
+		});
+
+		it("still says a GLOBAL-scope flag under `lsp` does nothing here (#2426 R2/F3)", () => {
+			// Tolerating the whole `lsp` namespace swallowed `lsp.enabled`, which is
+			// a `scope: "global"` flag (`--no-lsp`): a user who wrote it in a project
+			// file used to get the honest global-only notice and, after #2426's first
+			// round, got silence — while `docs/configuration.md` promises nothing is
+			// ignored silently. The namespace is tolerated KEY BY KEY: the four LSP
+			// settings a project file may carry pass, anything else is scanned by the
+			// same rules as a top-level key.
+			fs.writeFileSync(
+				path.join(tmpDir, ".pi-lens.json"),
+				JSON.stringify({
+					lsp: {
+						enabled: false,
+						disabledServers: ["go"],
+						servers: {},
+						serverOverrides: {},
+						warmFiles: [],
+					},
+				}),
+			);
+			loadPiLensProjectConfig(tmpDir);
+			expect(warnedFor("not honored in a project")).toBe(true);
+			expect(warnedFor('"lsp.enabled"')).toBe(true);
+			// The four honored LSP settings stay silent — they are read from this
+			// very file by the LSP loader.
+			for (const key of [
+				"disabledServers",
+				"servers",
+				"serverOverrides",
+				"warmFiles",
+			]) {
+				expect(warnedFor(`"lsp.${key}"`), key).toBe(false);
+			}
+			// And it is a scope signal, not a typo report.
+			expect(warnedFor('unknown key "lsp.enabled"')).toBe(false);
+		});
+
+		it("reports an unrecognized sub-key of `lsp` as a typo (#2426 R2/F3)", () => {
+			fs.writeFileSync(
+				path.join(tmpDir, ".pi-lens.json"),
+				JSON.stringify({ lsp: { disabledServer: ["go"] } }),
+			);
+			loadPiLensProjectConfig(tmpDir);
+			expect(warnedFor('unknown key "lsp.disabledServer"')).toBe(true);
 		});
 
 		it("warns once for the same typo across re-parses (warn-once dedup)", async () => {

@@ -65,6 +65,7 @@ import path from "node:path";
 import { BoundedLruCache } from "../bounded-cache.js";
 import {
 	lspSectionOf,
+	recordsOwnedBy,
 	reportPiLensConfigRecords,
 	resolvePiLensConfig,
 } from "../config-resolve.js";
@@ -195,11 +196,24 @@ export async function loadLSPConfig(
 	const resolution = resolvePiLensConfig({
 		cwd,
 		globalDir: getGlobalPiLensDir(),
-		globalConfigPath: getPiLensGlobalConfigPath(),
+		// `homeDir` is threaded, not dropped: it is the `$HOME` this call resolves
+		// against, and the canonical global config is `$HOME/.pi-lens/config.json`
+		// whenever `PI_LENS_CONFIG_PATH` does not override it. Production behavior
+		// is unchanged (the default IS `os.homedir()`); what it buys is that the
+		// seam means the same `$HOME` on both sides of the resolution, so a test
+		// can exercise a relocated `PI_LENS_HOME` without reaching the real one.
+		globalConfigPath: getPiLensGlobalConfigPath(homeDir),
 		homeDir,
 		onReadError: warnInvalidLSPConfig,
 	});
-	reportPiLensConfigRecords(resolution.records, "lsp-config");
+	// Only the records this loader OWNS (#2426 review round 2, F2). The other two
+	// loaders resolve the same documents and report the rest; reporting all of
+	// them here produced a second notice per (file, key) — the warn-once latch is
+	// keyed per subsystem — and labelled a project setting "deprecated LSP config".
+	reportPiLensConfigRecords(
+		recordsOwnedBy(resolution.records, "lsp"),
+		"lsp-config",
+	);
 
 	const section = lspSectionOf(resolution.value);
 	const config: LSPConfig = {};

@@ -100,9 +100,9 @@ this policy explicitly reserves the right to change.
 | Code | Meaning | Emitter |
 | --- | --- | --- |
 | `PILENS_CFG_0001` | A config file exists but could not be read or parsed, so it is ignored. | `warnIgnoredConfigOnce` (`clients/config-warn.ts`), the single choke point behind the LSP, global, and project config loaders. |
-| `PILENS_CFG_0002` | A deprecated config **key** was accepted inside its deprecation window. | Reserved. No emitter yet; #2416 slice 1 wires it when the migration path lands. |
-| `PILENS_CFG_0003` | A deprecated config **file location** was read inside its window. | Reserved. No emitter yet; same slice. |
-| `PILENS_CFG_0004` | A config field no schema property claims was dropped. | `validate()` (`clients/config-core/normalize.ts`) produces the record; `reportMigrationRecords` delivers it through `warnIgnoredConfigOnce` once a loader adopts the core (#2426). |
+| `PILENS_CFG_0002` | A deprecated config **key** was accepted inside its deprecation window. | `deprecationRecords` (`clients/config-resolve.ts`), one record per `(file, key)`, delivered by `reportPiLensConfigRecords` (#2426). |
+| `PILENS_CFG_0003` | A deprecated config **file location** was read inside its window. | Same producer and same delivery path as `PILENS_CFG_0002`. |
+| `PILENS_CFG_0004` | A config field no schema property claims was dropped. | `validate()` (`clients/config-core/normalize.ts`) produces the record; `reportPiLensConfigRecords` (`clients/config-resolve.ts`) delivers it through `warnIgnoredConfigOnce` (#2426). |
 | `PILENS_CFG_0005` | A config field's value did not match its schema and was dropped. | Same producer and same delivery path as `PILENS_CFG_0004`. |
 | `PILENS_CFG_0006` | A config key that would modify an object's prototype (`__proto__`, `constructor`, `prototype`) was refused. | Both halves of the config core, through the shared policy in `clients/config-core/safe-object.ts`. |
 
@@ -200,8 +200,11 @@ merged, and explained. Every loader, catalog, and selector resolves through it
 The pipeline is `RawConfig -> validate(schema) -> NormalizedConfig ->
 merge(sources) -> Resolved<T>`, and `resolveConfig` runs both halves. It is
 pure: no file reads, no logging, no ledger writes. Reporting is the separate,
-explicit `reportMigrationRecords` step, so the warn-once latch stays with the
-loader that owns the file.
+explicit `reportPiLensConfigRecords` step (`clients/config-resolve.ts`, which is
+where the loaders share it — never inside the core), so the warn-once latch
+stays with the loader that owns the file. Each loader reports only the records
+it OWNS, so a `(file, key)` that three loaders all resolve still produces one
+notice, labelled with the subsystem the setting belongs to.
 
 ### Source tiers
 

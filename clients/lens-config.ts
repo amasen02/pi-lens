@@ -20,6 +20,7 @@ import {
 	GLOBAL_CONFIG_LOCATIONS,
 } from "./config-locations.js";
 import {
+	recordsOwnedBy,
 	reportPiLensConfigRecords,
 	resolveOnePiLensConfigDocument,
 } from "./config-resolve.js";
@@ -191,7 +192,13 @@ export function loadPiLensGlobalConfig(
 			value: parsed,
 		};
 		const resolved = resolveOnePiLensConfigDocument(document);
-		reportPiLensConfigRecords(resolved.records, "lens-config");
+		// Only what this loader owns (#2426 review round 2, F2). An `lsp.*` record
+		// from this very file is announced by the LSP loader, which resolves the
+		// canonical global too; reporting it here as well doubled the notice.
+		reportPiLensConfigRecords(
+			recordsOwnedBy(resolved.records, "pi-lens"),
+			"lens-config",
+		);
 		const raw = resolved.value;
 		const warnInvalid = (reason: string) =>
 			warnInvalidGlobalConfigOnce(configPath, reason);

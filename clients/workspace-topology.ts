@@ -39,6 +39,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { PROJECT_CONFIG_BASENAMES } from "./config-locations.js";
 import { logLatency } from "./latency-logger.js";
 import {
 	isAtOrAboveHomeDir,
@@ -49,7 +50,13 @@ import {
 /** Depth cap on any upward marker walk — mirrors `findNearestMarkerRoot`'s bound. */
 const MAX_WALK_DEPTH = 64;
 
-const PI_LENS_CONFIG_BASENAMES = [".pi-lens.json", "pi-lens.json"] as const;
+/**
+ * The project config basenames, canonical first — the SHARED table, not a
+ * fourth copy of the pair (#2426 review round 2). `config-locations.ts` derives
+ * it from the one location table the resolver walks, so a change there cannot
+ * leave this marker index preferring a different file than the loaders do.
+ */
+const PI_LENS_CONFIG_BASENAMES = PROJECT_CONFIG_BASENAMES;
 
 /**
  * Every marker pi-lens subsystems currently probe for, keyed by the basename

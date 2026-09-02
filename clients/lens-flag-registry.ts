@@ -300,6 +300,17 @@ export const PROJECT_NON_FLAG_CONFIG_SECTIONS: readonly string[] = [
 ];
 
 /**
+ * The four LSP settings a PROJECT config file may carry — at its root during
+ * the deprecation window, and under `lsp` canonically. DERIVED from the
+ * registry's `kind: "key"` rows so the accepted set and the removal schedule
+ * cannot drift apart, and named once because two places below need it.
+ */
+const LSP_PROJECT_HONORED_KEYS: readonly string[] =
+	DEPRECATED_CONFIG_SURFACES.filter((row) => row.kind === "key").map(
+		(row) => row.surface,
+	);
+
+/**
  * Foreign top-level namespaces that legitimately appear in a SHARED
  * `.pi-lens.json` but belong to a DIFFERENT loader: the LSP config loader
  * (`clients/lsp/config.ts`) reads the `lsp` namespace — and, for its
@@ -312,7 +323,8 @@ export const PROJECT_NON_FLAG_CONFIG_SECTIONS: readonly string[] = [
  *
  * `lsp` joined this list in #2426: it is the canonical home of the four legacy
  * keys beside it, so a project config that has already been migrated must not
- * be told its `lsp` section is a global-only setting.
+ * be told its `lsp` section is a global-only setting. Its tolerance is
+ * SUB-KEY-SCOPED — see {@link PROJECT_FOREIGN_NAMESPACE_HONORED_KEYS}.
  */
 export const PROJECT_FOREIGN_CONFIG_NAMESPACES: readonly string[] = [
 	"lsp",
@@ -321,11 +333,28 @@ export const PROJECT_FOREIGN_CONFIG_NAMESPACES: readonly string[] = [
 	// list of them would be a place for the accepted set and the removal
 	// schedule to drift apart. `config-diagnostic-codes.ts` is a dependency-free
 	// data leaf, so importing it keeps this module's own no-cycle property.
-	...DEPRECATED_CONFIG_SURFACES.filter((row) => row.kind === "key").map(
-		(row) => row.surface,
-	),
+	...LSP_PROJECT_HONORED_KEYS,
 	"$schema",
 ];
+
+/**
+ * For a foreign namespace whose PROJECT-honored surface is only PART of what
+ * the namespace can hold: which sub-keys a `.pi-lens.json` may set.
+ *
+ * `lsp` is tolerated at the top level because the LSP loader reads it out of
+ * this same file — but only four of its keys are project-scoped. `lsp.enabled`
+ * is a `scope: "global"` flag (`--no-lsp`), so blanket namespace tolerance made
+ * a project-file `lsp.enabled: false` do nothing with no signal at all, where
+ * before #2426 the user got the honest "global-only setting" notice
+ * (#2426 review round 2, F3). `docs/configuration.md` promises that nothing
+ * about a config is ignored silently, so the namespace is tolerated KEY BY KEY
+ * and anything else under it is scanned by the same global-only-vs-typo rules a
+ * top-level key gets.
+ */
+export const PROJECT_FOREIGN_NAMESPACE_HONORED_KEYS: ReadonlyMap<
+	string,
+	readonly string[]
+> = new Map([["lsp", LSP_PROJECT_HONORED_KEYS]]);
 
 /**
  * The distinct TOP-LEVEL section keys a set of flags lives under (the first

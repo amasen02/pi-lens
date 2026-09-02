@@ -114,6 +114,27 @@ export const PROJECT_CONFIG_LOCATIONS: readonly ConfigLocation[] = [
 	},
 ];
 
+/**
+ * The project config BASENAMES a first-match-wins probe uses, in DESCENDING
+ * precedence — canonical first. The inverse view of the table above, for the
+ * two callers that look for one file in one directory rather than layering all
+ * of them: `project-lens-config.ts`'s upward walk and `workspace-topology.ts`'s
+ * directory-marker index.
+ *
+ * Derived here rather than restated there. Both of those modules carried their
+ * OWN literal pair before (#2426 folded the first one in; the marker index's
+ * copy outlived it), and two hand-maintained lists of the same filenames is the
+ * mirror the single-source-of-truth rule forbids — the failure mode being a
+ * table change that flips one probe's collision winner and not the other's.
+ *
+ * The LSP-scoped legacy locations are filtered out: their ROOT keys are LSP
+ * settings, not the pi-lens config sections these two probes project.
+ */
+export const PROJECT_CONFIG_BASENAMES: readonly string[] =
+	PROJECT_CONFIG_LOCATIONS.filter((location) => !location.lspScoped)
+		.map((location) => location.relativePath)
+		.reverse();
+
 /** Global locations in ASCENDING precedence; canonical last, same rule. */
 export const GLOBAL_CONFIG_LOCATIONS: readonly ConfigLocation[] = [
 	legacyLocation("lsp.json", `${GLOBAL_SURFACE_PREFIX}lsp.json`),

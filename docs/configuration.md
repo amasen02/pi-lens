@@ -7,8 +7,8 @@ There are **two** pi-lens config files:
 | `.pi-lens.json` | the project | Committed or not, your call. Nearest one wins **per field** — a package can override one setting without restating the repo root's. |
 | `~/.pi-lens/config.json` | the machine | Your defaults across every project. `PI_LENS_CONFIG_PATH` relocates it. |
 
-Both files have the same shape. Everything LSP-related lives under an `lsp`
-namespace inside them:
+Both files have the same shape, with one exception noted below the example:
+everything LSP-related lives under an `lsp` namespace inside them.
 
 ```jsonc
 {
@@ -17,7 +17,6 @@ namespace inside them:
   "maxProjectFiles": 8000,
   "rules": { "high-complexity": { "threshold": 25 } },
   "lsp": {
-    "enabled": true,
     "disabledServers": ["typos"],
     "warmFiles": ["src/main.rs"],
     "servers": {
@@ -37,21 +36,46 @@ namespace inside them:
 }
 ```
 
+**Some settings are global-only.** A handful of switches — `lsp.enabled`
+(`--no-lsp`), `tests.enabled`, `delta.enabled` and the other session-wide
+toggles — are decided once for the machine, not per project, so writing one in a
+`.pi-lens.json` does nothing. It is not ignored quietly: the project loader says
+so, naming the key. `docs/settings.md` lists which flags are which.
+
 ## Which file wins
 
 One order, lowest precedence first. A later tier replaces an earlier tier's
 value **for that field only** — objects are merged field-wise, never replaced
 whole, so setting one key never silently drops the rest of a section.
 
-1. **builtin** — pi-lens's shipped defaults.
-2. **global** — `~/.pi-lens/config.json`.
-3. **project root** — the outermost `.pi-lens.json` at or above your working
+1. **global** — `~/.pi-lens/config.json`.
+2. **project root** — the outermost `.pi-lens.json` at or above your working
    directory.
-4. **nested-project** — every `.pi-lens.json` between that root and your working
+3. **nested-project** — every `.pi-lens.json` between that root and your working
    directory, outermost first. The nearest file wins, per field.
-5. **env** — `PI_LENS_*` environment variables.
-6. **cli** — `--lens-*` flags.
-7. **host** — what the host application decides (including project trust).
+
+Those three are the tiers the config **files** resolve through, and they are the
+only ones this resolution populates. Four more tiers are reserved in the
+precedence table — `builtin` below them, and `env`, `cli`, `host` above — and
+nothing writes into them yet; #2427 (env/CLI) and #2416 (host and project trust)
+are what fill them in.
+
+Until they do, environment variables and CLI flags are read by their own
+accessors rather than through this resolution, and their effective precedence
+for a pi-lens toggle is:
+
+1. a `PI_LENS_*` environment variable set to `1` — checked first, and it wins
+   outright;
+2. the matching `--lens-*` / `--no-*` CLI flag;
+3. the nearest project `.pi-lens.json`, then the outer ones (project-scoped
+   settings only);
+4. `~/.pi-lens/config.json`;
+5. the built-in default.
+
+Subsystem-specific env overrides follow the same shape: a
+`PI_LENS_REVIEW_GRAPH_MAX_FILES` beats a `.pi-lens.json`'s
+`reviewGraph.maxFiles`. `docs/environment-variables.md` and `docs/settings.md`
+are the per-setting references.
 
 Two rules make the rest of the table unambiguous:
 

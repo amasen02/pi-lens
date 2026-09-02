@@ -72,17 +72,19 @@ import {
 	LENS_FLAGS,
 	type LensFlagSpec,
 	PROJECT_FOREIGN_CONFIG_NAMESPACES,
+	PROJECT_FOREIGN_NAMESPACE_HONORED_KEYS,
 	PROJECT_NON_FLAG_CONFIG_SECTIONS,
 	PROJECT_SCOPED_LENS_FLAGS,
 	readFlagConfigValue,
 } from "./lens-flag-registry.js";
 import {
 	configSearchDirs,
-	PROJECT_CONFIG_LOCATIONS,
+	PROJECT_CONFIG_BASENAMES,
 } from "./config-locations.js";
 import {
 	projectLocationFor,
 	readConfigDocument,
+	recordsOwnedBy,
 	reportPiLensConfigRecords,
 	resolveOnePiLensConfigDocument,
 } from "./config-resolve.js";
@@ -91,19 +93,14 @@ import { findPiLensConfigMarkerInDir } from "./workspace-topology.js";
 
 /**
  * Project config basenames, in DESCENDING precedence (first match wins), for
- * this loader's own discovery. Derived from the shared location table in
- * `config-locations.ts` (#2426) rather than restated: that table is what
- * `config-resolve.ts` walks, and two lists of the same filenames is exactly the
- * mirror the single-source-of-truth rule forbids.
+ * this loader's own discovery.
  *
- * The LSP-scoped legacy locations (`.pi-lens/lsp.json`, `pi-lsp.json`) are
- * filtered out: their root keys are LSP settings, not the pi-lens config
- * sections this loader projects.
+ * Re-exported from `config-locations.ts`, which owns the derivation, so this
+ * loader's long-standing export keeps working while there is exactly ONE list
+ * (#2426 review round 2: `workspace-topology.ts` was still carrying a third
+ * copy).
  */
-export const PROJECT_CONFIG_BASENAMES: string[] =
-	PROJECT_CONFIG_LOCATIONS.filter((location) => !location.lspScoped)
-		.map((location) => location.relativePath)
-		.reverse();
+export { PROJECT_CONFIG_BASENAMES } from "./config-locations.js";
 
 export interface PiLensProjectRuleConfig {
 	/** Optional override for the rule's primary numeric threshold. */
@@ -496,7 +493,13 @@ function parseConfigFile(configPath: string): PiLensProjectConfig {
 		location: projectLocationFor(configPath),
 		value: outcome.value,
 	});
-	reportPiLensConfigRecords(resolved.records, "project-lens-config");
+	// Only what this loader owns (#2426 review round 2, F2): the LSP keys in this
+	// same file are the LSP loader's to announce, and reporting them here too
+	// doubled every notice and mislabelled it.
+	reportPiLensConfigRecords(
+		recordsOwnedBy(resolved.records, "pi-lens"),
+		"project-lens-config",
+	);
 	const raw: unknown = resolved.value;
 	const obj = resolved.value;
 
@@ -640,17 +643,50 @@ function parseConfigFile(configPath: string): PiLensProjectConfig {
 			...GLOBAL_NON_FLAG_CONFIG_SECTIONS,
 		].filter((key) => !knownProjectKeys.has(key)),
 	);
+	// The full DOTTED config keys of the flags a project file cannot set, for the
+	// sub-key scan below. Section-level keys are too coarse for a namespace that
+	// mixes scopes: `lsp` holds four project-scoped settings AND the global-only
+	// `lsp.enabled`.
+	const projectScoped = new Set<string>(
+		PROJECT_SCOPED_LENS_FLAGS.map((spec) => spec.configKey),
+	);
+	const globalScopeOnlyFlagKeys = LENS_FLAGS.map(
+		(spec) => spec.configKey,
+	).filter((configKey) => !projectScoped.has(configKey));
+	const warnUnhonoredKey = (label: string, globalOnly: boolean): void => {
+		warnInvalidConfigOnce(
+			configPath,
+			globalOnly
+				? `"${label}" is a global-only pi-lens setting and is not honored in a project .pi-lens.json (set it in ~/.pi-lens/config.json or pass the matching CLI flag); ignored`
+				: `unknown key "${label}" is not a recognized pi-lens setting (check for a typo); ignored`,
+		);
+	};
 	for (const key of Object.keys(obj)) {
 		if (knownProjectKeys.has(key)) continue;
-		if (globalScopeOnlyKeys.has(key)) {
-			warnInvalidConfigOnce(
-				configPath,
-				`"${key}" is a global-only pi-lens setting and is not honored in a project .pi-lens.json (set it in ~/.pi-lens/config.json or pass the matching CLI flag); ignored`,
-			);
-		} else {
-			warnInvalidConfigOnce(
-				configPath,
-				`unknown key "${key}" is not a recognized pi-lens setting (check for a typo); ignored`,
+		warnUnhonoredKey(key, globalScopeOnlyKeys.has(key));
+	}
+
+	// A tolerated foreign namespace is tolerated KEY BY KEY (#2426 review round
+	// 2, F3). `lsp` is read out of this file by the LSP loader, but only four of
+	// its keys are project-scoped; `lsp.enabled` is the `--no-lsp` flag, which is
+	// `scope: "global"`. Blanket namespace tolerance swallowed it silently, which
+	// `docs/configuration.md`'s "nothing is ignored silently" forbids — so every
+	// other sub-key gets the same global-only-vs-typo signal a top-level key does,
+	// named with its DOTTED path so the notice says which setting is meant.
+	for (const [namespace, honored] of PROJECT_FOREIGN_NAMESPACE_HONORED_KEYS) {
+		const section = obj[namespace];
+		if (!section || typeof section !== "object" || Array.isArray(section)) {
+			continue;
+		}
+		for (const key of Object.keys(section as Record<string, unknown>)) {
+			if (honored.includes(key)) continue;
+			const dotted = `${namespace}.${key}`;
+			warnUnhonoredKey(
+				dotted,
+				globalScopeOnlyFlagKeys.some(
+					(configKey) =>
+						configKey === dotted || configKey.startsWith(`${dotted}.`),
+				),
 			);
 		}
 	}

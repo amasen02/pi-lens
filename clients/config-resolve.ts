@@ -17,6 +17,13 @@
  * documents the same order once, and `tests/clients/config-resolve.test.ts`
  * walks it.
  *
+ * Only THREE of those tiers are populated here — `global`, `project` and
+ * `nested-project` — because those are the tiers config FILES live in.
+ * `builtin`, `env`, `cli` and `host` are reserved (#2427 wires env/CLI, #2416
+ * the host tier); today's env vars and CLI flags reach a setting through their
+ * own accessors, and `docs/configuration.md` states that precedence rather than
+ * implying this resolution already carries it.
+ *
  * WITHIN a tier, the canonical file is added LAST and therefore wins, because
  * `merge` keeps caller order on a precedence tie. That is the whole deprecation
  * story in one line: a legacy file is still read, and it loses to the file the
@@ -131,6 +138,30 @@ export interface PiLensConfigResolution {
 	readonly documents: readonly ConfigDocument[];
 }
 
+/**
+ * The canonical GLOBAL config path this resolution uses — for READING it and
+ * for naming it in a migration notice, from one expression (#2426 review round
+ * 2, F1).
+ *
+ * The two used to be computed separately: the read came from
+ * `options.globalConfigPath` (`getPiLensGlobalConfigPath()`, `$HOME`-derived
+ * unless `PI_LENS_CONFIG_PATH` overrides it) while the notice was recomputed as
+ * `dirname(<legacy file>) + config.json` — and the legacy file lives under
+ * `getGlobalPiLensDir()`, which `PI_LENS_HOME` relocates. Set `PI_LENS_HOME`
+ * without `PI_LENS_CONFIG_PATH` and the two diverge, so the notice named a file
+ * the resolver never reads: a user who followed it moved their settings into a
+ * file that does nothing. Deriving both from here makes "the path we name" and
+ * "the path we read" the same value by construction rather than by agreement.
+ */
+function canonicalGlobalFile(
+	options: ResolvePiLensConfigOptions,
+): string | undefined {
+	if (options.globalConfigPath !== undefined) return options.globalConfigPath;
+	return options.globalDir === undefined
+		? undefined
+		: path.join(options.globalDir, CANONICAL_GLOBAL_CONFIG_FILE);
+}
+
 function collectDocuments(
 	dir: string,
 	locations: readonly ConfigLocation[],
@@ -163,7 +194,8 @@ export function collectPiLensConfigDocuments(
 	options: ResolvePiLensConfigOptions,
 ): ConfigDocument[] {
 	const documents: ConfigDocument[] = [];
-	const { globalDir, globalConfigPath, onReadError } = options;
+	const { globalDir, onReadError } = options;
+	const globalConfigPath = canonicalGlobalFile(options);
 
 	if (globalDir !== undefined || globalConfigPath !== undefined) {
 		for (const location of GLOBAL_CONFIG_LOCATIONS) {
@@ -230,7 +262,11 @@ export function resolvePiLensConfig(
 		provenance: resolution.resolved.provenance,
 		records: [
 			...resolution.records,
-			...deprecationRecords(documents, options.homeDir ?? os.homedir()),
+			...deprecationRecords(
+				documents,
+				options.homeDir ?? os.homedir(),
+				canonicalGlobalFile(options),
+			),
 		],
 		documents,
 	};
@@ -297,14 +333,26 @@ function windowSuffix(surface: string | undefined): string {
 		: "";
 }
 
-/** The canonical file a legacy document's keys belong in. */
+/**
+ * The canonical file a legacy document's keys belong in.
+ *
+ * `globalFile` is THREADED from the resolution that read the legacy document,
+ * never recomputed from that document's own directory (#2426 review round 2,
+ * F1) — see `canonicalGlobalFile`. The sibling fallback survives only for a
+ * caller that resolves ONE document in isolation and names no canonical global
+ * (no production caller does; `resolveOnePiLensConfigDocument`'s two callers
+ * pass a project document and a canonical global one respectively), and it is
+ * the only path this module can name at all in that case.
+ */
 function canonicalDestination(
 	document: ConfigDocument,
 	homeDir: string,
+	globalFile: string | undefined,
 ): string {
 	if (document.tier === "global") {
 		return homeRelativePath(
-			path.join(path.dirname(document.file), CANONICAL_GLOBAL_CONFIG_FILE),
+			globalFile ??
+				path.join(path.dirname(document.file), CANONICAL_GLOBAL_CONFIG_FILE),
 			homeDir,
 		);
 	}
@@ -339,11 +387,12 @@ function topLevelKeys(value: unknown): string[] {
 export function deprecationRecords(
 	documents: readonly ConfigDocument[],
 	homeDir: string,
+	globalFile?: string,
 ): MigrationRecord[] {
 	const records: MigrationRecord[] = [];
 	for (const document of documents) {
 		if (document.location.legacy) {
-			const destination = canonicalDestination(document, homeDir);
+			const destination = canonicalDestination(document, homeDir, globalFile);
 			for (const key of topLevelKeys(document.value)) {
 				const canonicalKey = canonicalKeyFor(document, key);
 				records.push(
@@ -415,6 +464,57 @@ function record(input: {
  * loader sits downstream of `file-utils.ts`. Reporting is a loader decision;
  * this is the loaders' shared module.
  */
+/**
+ * Which SUBSYSTEM a record belongs to — the LSP loader, or the two pi-lens
+ * config loaders (#2426 review round 2, F2).
+ *
+ * Every loader resolves the SAME documents through this module, so before this
+ * split each of them reported every record: `warnIgnoredConfigOnce` latches per
+ * subsystem, so a session that ran the LSP loader and the project loader emitted
+ * TWO notices for every `(file, key)` — and rendered a project setting's notice
+ * as `deprecated LSP config location`, which names the wrong subsystem at the
+ * user.
+ *
+ * Ownership is DERIVED from the key rather than from which loader is asking: an
+ * `lsp.*` canonical key, or one of the legacy LSP root keys, is the LSP loader's
+ * regardless of which file it was found in. Both key spellings the pipeline
+ * produces are handled — a deprecation record carries a DOTTED `canonicalKey`
+ * (`lsp.servers`), a validation record from the core carries a JSON POINTER
+ * (`/lsp/servers`) — because the two producers are different modules and neither
+ * exists to serve this classification.
+ */
+export type ConfigRecordOwner = "lsp" | "pi-lens";
+
+/**
+ * `undefined` for a record no key can attribute — the whole-file/whole-document
+ * failure records (`key: ""`) that both halves of the core emit when a resolution
+ * fails internally. Those are reported by EVERY loader rather than by none: a
+ * duplicate notice about a config that failed to load is noise, while silence
+ * about it is the failure mode this module exists to prevent.
+ */
+export function configRecordOwner(
+	record: MigrationRecord,
+): ConfigRecordOwner | undefined {
+	const key = record.canonicalKey ?? record.key;
+	if (key.length === 0) return undefined;
+	const head = (key.startsWith("/") ? key.slice(1) : key).split(/[./]/)[0] ?? "";
+	if (head.length === 0) return undefined;
+	return head === LSP_NAMESPACE_KEY || LEGACY_ROOT_LSP_KEYS.includes(head)
+		? "lsp"
+		: "pi-lens";
+}
+
+/** The records one loader must report; unattributable ones go to all of them. */
+export function recordsOwnedBy(
+	records: readonly MigrationRecord[],
+	owner: ConfigRecordOwner,
+): MigrationRecord[] {
+	return records.filter((record) => {
+		const actual = configRecordOwner(record);
+		return actual === undefined || actual === owner;
+	});
+}
+
 export function reportPiLensConfigRecords(
 	records: readonly MigrationRecord[],
 	subsystem: IgnoredConfigSubsystem,

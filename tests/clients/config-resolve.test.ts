@@ -240,6 +240,31 @@ describe("canonical wins on collision (#2426)", () => {
 		).toBe(false);
 	});
 
+	/**
+	 * #2426 review round 2, F4. The case above spells `warmFiles` at the ROOT of
+	 * the legacy files and under `lsp` in the canonical one, so `lspSectionOf`'s
+	 * namespace-over-root rule decides it and the LOCATION ORDER is never
+	 * exercised. Here both files spell the key the SAME way, which leaves the
+	 * table's ordering — canonical added last, `merge` keeping caller order on a
+	 * precedence tie — as the only thing that can decide. It goes red under a
+	 * `PROJECT_CONFIG_LOCATIONS.reverse()` mutation.
+	 */
+	it("prefers the canonical file on an identically spelled key", () => {
+		const root = tmpRoot();
+		const home = path.join(root, "home");
+		const projectRoot = path.join(home, "proj");
+		fs.mkdirSync(projectRoot, { recursive: true });
+		write(path.join(projectRoot, "pi-lsp.json"), {
+			warmFiles: ["from-pi-lsp-json"],
+		});
+		write(path.join(projectRoot, CANONICAL_PROJECT_CONFIG_FILE), {
+			warmFiles: ["from-canonical"],
+		});
+		const resolved = resolvePiLensConfig({ cwd: projectRoot, homeDir: home });
+		expect(resolved.value.warmFiles).toEqual(["from-canonical"]);
+		expect(lspSectionOf(resolved.value).warmFiles).toEqual(["from-canonical"]);
+	});
+
 	it("prefers a canonical lsp.* key over the legacy root key of the same name", () => {
 		const root = tmpRoot();
 		const home = path.join(root, "home");
