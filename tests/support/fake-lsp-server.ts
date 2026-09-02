@@ -50,14 +50,6 @@ export interface SpawnFakeLspServerOptions {
 	cwd?: string;
 	/** Defaults to `process.env` (unmodified) if omitted. */
 	env?: NodeJS.ProcessEnv;
-	/**
-	 * Skip the automatic `onTestFinished` kill registration. Only for a
-	 * caller that owns a more specific teardown itself (e.g. a test that
-	 * asserts on the exact kill sequence) — the default (`false`) is safe to
-	 * layer on top of a manual kill: the registered callback no-ops once the
-	 * process has already exited.
-	 */
-	skipAutoKill?: boolean;
 }
 
 /**
@@ -69,21 +61,19 @@ export interface SpawnFakeLspServerOptions {
 export async function spawnFakeLspServer(
 	options: SpawnFakeLspServerOptions = {},
 ): Promise<LSPProcess> {
-	const { cwd = process.cwd(), env, skipAutoKill = false } = options;
+	const { cwd = process.cwd(), env } = options;
 	const proc = await launchLSP(process.execPath, [FAKE_LSP_SERVER_PATH], {
 		cwd,
 		...(env ? { env } : {}),
 	});
-	if (!skipAutoKill) {
-		onTestFinished(() => {
-			const { process: child } = proc;
-			if (child.exitCode !== null || child.signalCode !== null) return;
-			try {
-				child.kill("SIGKILL");
-			} catch {
-				/* already gone */
-			}
-		});
-	}
+	onTestFinished(() => {
+		const { process: child } = proc;
+		if (child.exitCode !== null || child.signalCode !== null) return;
+		try {
+			child.kill("SIGKILL");
+		} catch {
+			/* already gone */
+		}
+	});
 	return proc;
 }

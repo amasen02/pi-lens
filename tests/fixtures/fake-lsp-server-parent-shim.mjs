@@ -10,18 +10,21 @@
 // and no JS-level cleanup ever running.
 //
 // Drives the minimal initialize -> initialized handshake so env-gated
-// post-init behavior (FAKE_LSP_WEDGE_STDIN_AFTER_INIT, inherited from this
-// shim's own env — set it on the shim's spawn, not the target's) actually
-// arms. That mode is the genuinely load-bearing repro case: outside it, an
-// idle fake-lsp-server process has no other active handle, so it already
-// exits on its own the instant Node's event loop empties after stdin EOF —
-// which proves nothing about the parent-death watchdog this fixture adds.
-// FAKE_LSP_WEDGE_STDIN_AFTER_INIT installs a real, non-`unref`'d
-// `setInterval`, so ONLY an explicit `process.exit()` (the watchdog) — not
-// stdin closing, not an empty loop — can end it. That is the shape a real
-// wedge/CPU-liveness test in tests/clients/lsp/service-notify-cpu-liveness.test.ts
-// and shutdown-live-wedged-process.test.ts spawns, and exactly the shape
-// that must not survive its parent regardless.
+// post-init behavior (FAKE_LSP_WEDGE_STDIN_AFTER_INIT / FAKE_LSP_SKIP_EOF_EXIT,
+// inherited from this shim's own env — set them on the shim's spawn, not the
+// target's) actually arms. FAKE_LSP_WEDGE_STDIN_AFTER_INIT installs a real,
+// non-`unref`'d `setInterval` in the target — the same shape a real
+// wedge/CPU-liveness test in
+// tests/clients/lsp/service-notify-cpu-liveness.test.ts and
+// shutdown-live-wedged-process.test.ts spawns — so the parent-death
+// watchdog test proves a process that is genuinely kept alive by something
+// other than an unconsumed event loop still dies once its parent is gone.
+// A paused stdin still delivers `end` once the underlying fd reports EOF
+// (see fake-lsp-server.mjs's own comment), so stdin-EOF alone already reaps
+// that case; the second target-side trigger — the `process.ppid` liveness
+// poll — is exercised in isolation by additionally setting
+// FAKE_LSP_SKIP_EOF_EXIT=1 on the target's env, which disables the EOF exit
+// and leaves the poll as the only thing that can end the target.
 //
 // Usage: node fake-lsp-server-parent-shim.mjs <fake-lsp-server.mjs path>
 // Prints "CHILD_PID:<pid>" to stdout once the handshake is sent, then idles

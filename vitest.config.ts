@@ -287,6 +287,12 @@ const lspSpawnHeavyInclude = [
 	// shim is SIGKILLed — a process-death-timing budget across two nested
 	// spawns, same #1022/#2332 contention class as its lane siblings.
 	"tests/clients/lsp/fake-lsp-server-parent-watchdog.test.ts",
+	// #2436 review round 2: pins spawnFakeLspServer's onTestFinished backstop
+	// by spawning a real fixture child via the shared helper and asserting,
+	// in a later test, that it died within a 2s ceiling with no explicit
+	// kill — same process-death-timing budget and contention class as the
+	// watchdog test above.
+	"tests/support/fake-lsp-server.test.ts",
 ];
 
 // #1920: files that assert REAL wall-clock elapsed-time budgets (Date.now()

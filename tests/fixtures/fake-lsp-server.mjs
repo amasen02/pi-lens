@@ -11,17 +11,27 @@
 //   - stdin EOF: the parent's write end of this process's stdio pipe closes
 //     the instant the parent's file descriptors are torn down — true
 //     whether it exits cleanly, crashes, or is SIGKILLed (the OS closes a
-//     dead process's handles/fds unconditionally, pipes included). This is
-//     the primary trigger and covers the large majority of real teardown
-//     paths well inside the interval below. It does NOT fire while a test
-//     deliberately holds this process paused mid-wedge
-//     (`FAKE_LSP_WEDGE_STDIN_AFTER_INIT`, which calls `stdin.pause()` and
-//     never drains) — that mode relies on the second trigger instead.
-//   - a `process.ppid` liveness poll, as a backstop for any shape where
-//     stdin doesn't close. POSIX reparents an orphan to init/a subreaper, so
-//     a changed `process.ppid` is itself conclusive; Windows does NOT do
-//     this — `process.ppid` is fixed at process-creation time and never
-//     updates to reflect the live parent, so a bare value comparison is a
+//     dead process's handles/fds unconditionally, pipes included). This
+//     covers the large majority of real teardown paths, INCLUDING a
+//     wedged/paused stdin (`FAKE_LSP_WEDGE_STDIN_AFTER_INIT` calls
+//     `stdin.pause()`, but a paused Readable still delivers the underlying
+//     `end` once the fd itself reports EOF — measured on both Windows and
+//     Linux at well under 100ms after the parent process dies; `pause()`
+//     only stops flowing `data`, it does not block `end`). Set
+//     `FAKE_LSP_SKIP_EOF_EXIT=1` to disable this trigger for a test that
+//     needs to isolate the second trigger below.
+//   - a `process.ppid` liveness poll — the backstop for the ONE shape stdin
+//     EOF cannot cover: a pipe write-end held open by something other than
+//     this process's direct parent (e.g. Windows handle-inheritance capture
+//     by a long-lived process — see the "#472 CORRECTION" comment at
+//     clients/lsp/client.ts:1278-1286). When some other live handle keeps
+//     the write end open, the OS never delivers EOF to this process no
+//     matter how dead the parent is, so stdin alone is not airtight; the
+//     poll is the only trigger that doesn't depend on the pipe staying
+//     closeable at all. POSIX reparents an orphan to init/a subreaper, so a
+//     changed `process.ppid` is itself conclusive; Windows does NOT do this
+//     — `process.ppid` is fixed at process-creation time and never updates
+//     to reflect the live parent, so a bare value comparison is a
 //     POSIX-only signal there. The portable check is whether the ORIGINAL
 //     parent pid is still alive at all: `process.kill(pid, 0)` sends no
 //     signal, it only probes existence (ESRCH means gone) — a syscall
@@ -49,9 +59,15 @@ const parentWatchdog = setInterval(() => {
 }, PARENT_WATCHDOG_INTERVAL_MS);
 parentWatchdog.unref();
 
-process.stdin.on("end", () => {
-	process.exit(0);
-});
+// FAKE_LSP_SKIP_EOF_EXIT=1 disables the stdin-EOF trigger above, isolating
+// the ppid poll so a test can prove IT ALONE reaps a parentless process —
+// see the second case in
+// tests/clients/lsp/fake-lsp-server-parent-watchdog.test.ts.
+if (process.env.FAKE_LSP_SKIP_EOF_EXIT !== "1") {
+	process.stdin.on("end", () => {
+		process.exit(0);
+	});
+}
 
 function encode(message) {
 	const json = JSON.stringify(message);
