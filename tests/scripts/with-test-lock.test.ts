@@ -24,6 +24,7 @@ import { describe, expect, it } from "vitest";
 import {
 	quoteForWindowsCmd,
 	resolveVitestEntry,
+	sharedModeRequiresPaths,
 } from "../../scripts/with-test-lock.mjs";
 
 describe("resolveVitestEntry", () => {
@@ -98,5 +99,54 @@ describe("quoteForWindowsCmd — KNOWN LIMITS (documented, not fixed here)", () 
 		// shape the review flagged as unsafe for untrusted input.
 		expect(quoted).toContain('\\"');
 		expect(quoted).toContain("&");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// PR #2438 review round 1 (S11)
+// ---------------------------------------------------------------------------
+
+describe("sharedModeRequiresPaths (review S11)", () => {
+	// `npm run test:targeted` with no file arguments expands to
+	// `with-test-lock.mjs --shared -- vitest run`, i.e. the FULL suite under a
+	// shared slot — several of which can run at once. That is precisely the
+	// contention #1101's exclusive lock exists to prevent, arrived at by the
+	// mechanism meant to relieve it.
+	it("flags a shared run with no arguments at all", () => {
+		expect(sharedModeRequiresPaths(["vitest", "run"])).toBe(true);
+	});
+
+	it("flags a shared run whose only arguments are flags", () => {
+		expect(
+			sharedModeRequiresPaths(["vitest", "run", "--project=default"]),
+		).toBe(true);
+	});
+
+	it("flags a name filter, which still collects the whole suite", () => {
+		expect(sharedModeRequiresPaths(["vitest", "run", "-t", "some name"])).toBe(
+			true,
+		);
+	});
+
+	it("accepts a shared run naming a test file", () => {
+		expect(
+			sharedModeRequiresPaths(["vitest", "run", "tests/scripts/x.test.ts"]),
+		).toBe(false);
+	});
+
+	it("accepts a shared run naming a glob", () => {
+		expect(
+			sharedModeRequiresPaths(["vitest", "run", "tests/config/*.test.ts"]),
+		).toBe(false);
+	});
+
+	it("accepts a bare file name with a test extension", () => {
+		expect(sharedModeRequiresPaths(["vitest", "run", "x.test.ts"])).toBe(false);
+	});
+
+	it("accepts a Windows-spelled path", () => {
+		expect(
+			sharedModeRequiresPaths(["vitest", "run", "tests\\scripts\\x.test.ts"]),
+		).toBe(false);
 	});
 });
