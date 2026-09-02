@@ -1,6 +1,6 @@
 /**
  * NDJSON telemetry log for diagnostic disposition marks (#690). Same shape as
- * clients/actionable-warnings-logger.ts: machine-global (getGlobalPiLensDir),
+ * clients/actionable-warnings-logger.ts: machine-global (getGlobalPiLensLogDir),
  * size-capped with a single `.log.1` backup, isTestMode no-op.
  *
  * Why a log at all: #181 identified false-positive marks flowing to telemetry
@@ -13,10 +13,10 @@
  */
 import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
-import { getGlobalPiLensDir } from "./file-utils.js";
+import { getGlobalPiLensLogDir } from "./file-utils.js";
 import { createNdjsonLogger } from "./ndjson-logger.js";
 
-const DISPOSITION_LOG_DIR = getGlobalPiLensDir();
+const DISPOSITION_LOG_DIR = getGlobalPiLensLogDir();
 const DISPOSITION_LOG_FILE = path.join(DISPOSITION_LOG_DIR, "dispositions.log");
 const DISPOSITION_LOG_BACKUP_FILE = path.join(
 	DISPOSITION_LOG_DIR,

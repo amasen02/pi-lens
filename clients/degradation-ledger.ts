@@ -9,7 +9,9 @@ import {
 } from "./ledger-bounds.js";
 import { logLatency } from "./latency-logger.js";
 import {
+	getSinkRotations,
 	getSinkWriteFailures,
+	resetSinkRotations,
 	resetSinkWriteFailures,
 } from "./ndjson-logger.js";
 // #2146: pulled at READ time, never pushed. `process-singletons.ts` is a
@@ -21,6 +23,13 @@ import {
 	getProcessSingletonResets,
 	PROCESS_SINGLETON_RESET_KIND,
 } from "./process-singletons.js";
+// #2506: same inversion, same reason — `file-utils.ts` cannot import this
+// module (directly OR dynamically) without closing a no-client-cycles cycle
+// through the existing extension-log.ts/latency-logger.ts/safe-spawn.js path,
+// so `getGlobalPiLensLogDir()`'s probe-home-redirect event is written to this
+// zero-import leaf and read back here instead. See
+// `probe-home-state.ts`'s doc comment for the full account.
+import { getProbeHomeRedirectEvent } from "./probe-home-state.js";
 
 // Re-exported so existing importers keep one name for the ledger's bound.
 export { LEDGER_FIELD_MAX, truncateForLedger };
@@ -508,6 +517,30 @@ export type DegradationKind =
 	 */
 	| "log-sink-write-failure"
 	/**
+	 * `ndjson-logger.ts` rotated a shared file-sink at its configured
+	 * `maxBytes` bound mid-session (#2505) — the write path itself caught the
+	 * crossing, not the once-per-process `runLogCleanup` session-start sweep
+	 * (which a long-lived process, e.g. the warm MCP server, may never run
+	 * again). Subject is the sink's absolute path, count is the number of
+	 * rotations this session. Same "pulled at READ time" shape as
+	 * `log-sink-write-failure` above and for the same reason:
+	 * `degradation-ledger.ts` already imports `ndjson-logger.ts`
+	 * (`getSinkWriteFailures`), so a reverse import to call
+	 * `recordDegradation`/`recordDegradationOnce` directly from there would
+	 * close a cycle — see `NdjsonWriterState.rotationCount`'s doc comment.
+	 */
+	| "log-sink-rotated"
+	/**
+	 * A rotation that `ndjson-logger.ts` attempted and could NOT complete
+	 * (#2505 review F2) — an unwritable backup path, or the Windows sharing
+	 * violation another process holding the file open produces. This is the
+	 * one that matters: the sink cannot bound itself, so the file keeps
+	 * growing past `maxBytes` until something outside the writer moves it.
+	 * Its sibling above is informational; this one renders as a warning.
+	 * Same read-time pull, same cycle reason.
+	 */
+	| "log-sink-rotate-failed"
+	/**
 	 * A word-index posting named a file id the file table could not resolve to
 	 * a path, so the posting was dropped from a search result or a decoded hit
 	 * list (#2069). Since #2069 a posting carries an integer id rather than a
@@ -669,7 +702,37 @@ export type DegradationKind =
 	 * unanswerable, since the ledger could no longer tell a rejection from a
 	 * long list. One row per file per session.
 	 */
-	| "config-notice-suppressed";
+	| "config-notice-suppressed"
+	/**
+	 * `getGlobalPiLensLogDir()` (`clients/file-utils.ts`, #2506) redirected the
+	 * LOG/ledger root away from the real `~/.pi-lens` because `PI_LENS_HOME`
+	 * was unset outside test mode and the process's `cwd` looked like a
+	 * probe context (inside a specific `.claude/worktrees/<worktree>/` or under
+	 * `os.tmpdir()`), or `PILENS_PROBE=1` forced the redirect. Without this kind
+	 * a probe run outside vitest that forgot to pin `PI_LENS_HOME` would
+	 * silently write into the maintainer's real telemetry with no durable trace
+	 * — the exact gap that let two review probes leave 42 fixture rows in real
+	 * `~/.pi-lens` files on 2026-09-02. Subject is the redirected probe-home
+	 * path.
+	 *
+	 * Scope note (#2506 round 3): only the log family moves.
+	 * `getGlobalPiLensDir()` — installed tools, `bin/`, `instances.json`, the
+	 * orphan-backstop lease, the probe cache, the global `config.json`, LSP
+	 * server storage — stays cwd-independent, so a pi session running from a
+	 * worktree keeps its tools and stays visible to the machine-wide registry.
+	 * This row therefore means "telemetry was diverted", never "this session
+	 * lost its tools".
+	 *
+	 * Never written via `recordDegradation`/`recordDegradationOnce` like every
+	 * other kind above — the same `log-sink-write-failure`/
+	 * `process-singleton-reset` shape: it is folded into
+	 * `getDegradationSummary()` at READ time from `probe-home-state.ts`'s own
+	 * process-scoped event, because `file-utils.ts` cannot import this module
+	 * (directly OR dynamically) without closing a `no-client-cycles` violation
+	 * through the existing `extension-log.ts`/`latency-logger.ts`/
+	 * `safe-spawn.js` cycle. See `probe-home-state.ts`'s doc comment.
+	 */
+	| "global-dir-probe-redirect";
 
 export interface DegradationRecord {
 	kind: unknown;
@@ -892,6 +955,42 @@ export function getDegradationSummary(): DegradationGroup[] {
 			})),
 		});
 	}
+	// #2505, same read-time fold: a mid-session rotation is visible without
+	// this module writing about it through the very sink family it is
+	// reporting on — see the `log-sink-rotated` doc comment on
+	// `DegradationKind`.
+	const sinkRotations = getSinkRotations();
+	const rotated = sinkRotations.filter((sink) => sink.rotationCount > 0);
+	if (rotated.length > 0) {
+		summary.push({
+			kind: "log-sink-rotated",
+			count: rotated.reduce((total, sink) => total + sink.rotationCount, 0),
+			droppedCount: 0,
+			latestReasons: rotated.map((sink) => ({
+				subject: truncateForLedger(sink.file),
+				reason: truncateForLedger(
+					`${sink.rotationCount} rotation(s) at the configured byte bound`,
+				),
+			})),
+		});
+	}
+	// A rotation the writer ATTEMPTED and could not complete is a different
+	// fact from a rotation that happened, and the only signal that a sink is
+	// growing past its bound right now (#2505 review F2).
+	const rotateFailed = sinkRotations.filter((sink) => sink.failureCount > 0);
+	if (rotateFailed.length > 0) {
+		summary.push({
+			kind: "log-sink-rotate-failed",
+			count: rotateFailed.reduce((total, sink) => total + sink.failureCount, 0),
+			droppedCount: 0,
+			latestReasons: rotateFailed.map((sink) => ({
+				subject: truncateForLedger(sink.file),
+				reason: truncateForLedger(
+					`${sink.failureCount} failed rotation attempt(s); this sink is growing past its byte bound`,
+				),
+			})),
+		});
+	}
 	// #2146, same read-time fold: process-singleton resets live in the leaf
 	// module's own bounded log. One entry per family, so this group's count is
 	// the number of families this build could not adopt, never an event tally.
@@ -905,6 +1004,25 @@ export function getDegradationSummary(): DegradationGroup[] {
 				subject: truncateForLedger(reset.family),
 				reason: truncateForLedger(reset.reason),
 			})),
+		});
+	}
+	// #2506, same read-time fold: `getGlobalPiLensLogDir()`'s probe-home redirect
+	// fires at most once per process (see `file-utils.ts`), so this is a
+	// presence check, not a tally.
+	const probeHomeRedirect = getProbeHomeRedirectEvent();
+	if (probeHomeRedirect) {
+		summary.push({
+			kind: "global-dir-probe-redirect",
+			count: 1,
+			droppedCount: 0,
+			latestReasons: [
+				{
+					subject: truncateForLedger(probeHomeRedirect.probeHome),
+					reason: truncateForLedger(
+						`PI_LENS_HOME unset outside test mode with cwd in a worktree/tmp probe context (${probeHomeRedirect.cwd}); LOGS redirected away from the real home directory (tools, bin and instances.json are unaffected)`,
+					),
+				},
+			],
 		});
 	}
 	return summary;
@@ -930,6 +1048,19 @@ function isRenderableSummary(value: unknown): value is DegradationGroup[] {
 	});
 }
 
+/**
+ * Kinds that record something the system did ON PURPOSE, correctly, and
+ * that a reader only needs a tally of — never a call to action (#2505
+ * review). A routine log rotation at the configured bound is the writer
+ * working as designed; giving it the same warning marker a real
+ * degradation gets trains the reader to ignore the marker. The FAILED
+ * rotation is the line that has to stand out, so it is deliberately NOT
+ * in this set.
+ */
+const INFORMATIONAL_DEGRADATION_KINDS: ReadonlySet<string> = new Set([
+	"log-sink-rotated",
+]);
+
 export function renderDegradationLines(
 	summary: unknown = getDegradationSummary(),
 ): string[] {
@@ -938,6 +1069,9 @@ export function renderDegradationLines(
 	return [
 		"Degradations:",
 		...summary.map((group) => {
+			if (INFORMATIONAL_DEGRADATION_KINDS.has(group.kind)) {
+				return `  ${group.kind}: ${group.count}`;
+			}
 			const latest = group.latestReasons.at(-1);
 			return `  ⚠ ${group.kind}: ${group.count}${latest ? ` — ${latest.subject}: ${latest.reason}` : ""}`;
 		}),
@@ -966,6 +1100,10 @@ export function resetDegradationLedger(): void {
 	// process-lifetime latch too — it re-arms alongside the rest of the
 	// ledger rather than surviving past the session that observed it.
 	resetSinkWriteFailures();
+	// #2505, same catalog shape 17 re-arm: a rotation tally recurs (new writes
+	// keep crossing the bound), so clearing it costs nothing and a later
+	// session re-observes the fact fresh.
+	resetSinkRotations();
 	// #2146 review F3: the OTHER pulled source, `getProcessSingletonResets()`,
 	// deliberately does NOT re-arm here, and the difference from its neighbour
 	// above is the point. A sink write failure recurs — new writes fail, so
@@ -978,6 +1116,13 @@ export function resetDegradationLedger(): void {
 	// session (one entry per family, capped at 16), so leaving it costs a fixed
 	// handful of lines and keeps a process-scope fact visible for the process's
 	// life. Deliberate exception to catalog shape 17, not an oversight.
+	//
+	// `getProbeHomeRedirectEvent()` (#2506) is the same shape as the
+	// process-singleton case above and for the same reason: the redirect is
+	// resolved at most once per PROCESS (memoized in the `globalThis` slot
+	// `probe-home-state.ts` owns, not a session-scoped one), so it cannot
+	// recur within this process's life either — clearing it here would hide
+	// the fact from every session after the first in the same probe process.
 }
 
 // Re-exported so every existing importer keeps its specifier. The value now

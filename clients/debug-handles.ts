@@ -44,7 +44,7 @@
 
 import * as asyncHooks from "node:async_hooks";
 import * as path from "node:path";
-import { getGlobalPiLensDir } from "./file-utils.js";
+import { getGlobalPiLensLogDir } from "./file-utils.js";
 import { getMaxLogSizeMB } from "./log-cleanup.js";
 import { createNdjsonLogger, type NdjsonLogger } from "./ndjson-logger.js";
 
@@ -52,7 +52,7 @@ import { createNdjsonLogger, type NdjsonLogger } from "./ndjson-logger.js";
 const DEBUG_HANDLES_ENABLED = process.env.PI_LENS_DEBUG_HANDLES === "1";
 
 const DEBUG_HANDLES_LOG_FILE = path.join(
-	getGlobalPiLensDir(),
+	getGlobalPiLensLogDir(),
 	"debug-handles.log",
 );
 
