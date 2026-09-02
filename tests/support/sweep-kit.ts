@@ -356,11 +356,23 @@ export function findEnclosingSymbol(
  * OWN text always appended (`lineContentHash`, already used by read-guard's
  * line-move relocation for exactly this "survive line movement, catch
  * content movement" property). The hash does two jobs: it disambiguates two
- * flagged occurrences that share one enclosing declaration (the name alone
- * cannot), and it is the WHOLE key when no declaration is found at all (a
- * top-level flagged site). Either way, editing the flagged line's own text —
- * as opposed to inserting a line elsewhere in the file — correctly changes
- * the key, which is the direction that must re-trigger review.
+ * flagged occurrences that share one enclosing declaration WHEN their flagged
+ * lines' text differs, and it is the WHOLE key when no declaration is found
+ * at all (a top-level flagged site). Either way, editing the flagged line's
+ * own text — as opposed to inserting a line elsewhere in the file — correctly
+ * changes the key, which is the direction that must re-trigger review.
+ *
+ * This does NOT guarantee two distinct occurrences always get distinct keys.
+ * In a class-shaped file every method's flagged line resolves to the SAME
+ * enclosing symbol (the class name — `findEnclosingSymbol` matches column-0
+ * declarations only, and a method sits indented), so two sibling methods that
+ * each flag a byte-identical line (a stereotyped idiom like
+ * `for (const key of map.keys()) {`) collide on one key (#2487 review F1).
+ * An exemption keyed to that string then excuses BOTH occurrences, not the
+ * one it was reasoned about — the same laundering `stableOccurrenceKey` was
+ * built to close, one layer down. `auditRegistry`'s `requireUniqueFlagged`
+ * (default on) is the backstop: it fails loud on any duplicate flagged key
+ * rather than let a caller of this function rely on the hash alone.
  */
 export function stableOccurrenceKey(
 	relPath: string,
@@ -372,13 +384,56 @@ export function stableOccurrenceKey(
 	return symbol ? `${relPath}#${symbol}:${hash}` : `${relPath}#${hash}`;
 }
 
+/**
+ * Give each occurrence sharing a key a distinguishing ordinal suffix, in the
+ * order given — `key` for the first, `key#2` for the second, `key#3` for the
+ * third, and so on. A key seen only once is left bare.
+ *
+ * For a caller whose own key derivation CAN legitimately collide across two
+ * genuinely separate, individually-reasoned occurrences (#2487 review F1 —
+ * `clients/safe-spawn.ts` has two `spawnSync` calls that both spread
+ * `...(options as SpawnOptions)`, so `sync-child-process-timeout.test.ts`'s
+ * substring-matched exemption key names both identically): call this AFTER
+ * building the flagged list and BEFORE auditing, and add one exemption entry
+ * per ordinal. The first occurrence keeps the bare key, so an exemption
+ * written before this helper existed still matches it with no re-key; every
+ * occurrence after the first needs its own `#n` exemption entry, reasoned
+ * explicitly. A THIRD, unreviewed occurrence sharing the same base key then
+ * lands on an ordinal nothing exempts — caught as unaccounted, which is the
+ * property per-occurrence keying exists to guarantee. Order matters: pass
+ * entries in a stable, deterministic order (source-scan order is fine) so the
+ * ordinal a given occurrence gets does not depend on iteration order.
+ */
+export function disambiguateFlaggedKeys(
+	entries: readonly { key: string; detail: string }[],
+): { key: string; detail: string }[] {
+	const seen = new Map<string, number>();
+	return entries.map((entry) => {
+		const ordinal = (seen.get(entry.key) ?? 0) + 1;
+		seen.set(entry.key, ordinal);
+		return ordinal === 1
+			? entry
+			: { key: `${entry.key}#${ordinal}`, detail: entry.detail };
+	});
+}
+
 // ── 2. Registry semantics ───────────────────────────────────────────────────
+
+/**
+ * One item the scan flags. A bare string is both the registry/exemption key
+ * AND the diagnostic detail shown in messages. A caller that can distinguish
+ * an occurrence's stable KEY from a human-readable DETAIL (a file:line, a
+ * snippet) should pass the object form so a duplicate-key collision message
+ * ({@link RegistryAuditInput.requireUniqueFlagged}) can name each colliding
+ * occurrence by its own detail rather than repeating the shared key.
+ */
+export type FlaggedEntry = string | { key: string; detail: string };
 
 export interface RegistryAuditInput {
 	/** Sweep name, used in every composed message. */
 	sweepName: string;
 	/** The items the scan currently flags — the sweep's REDS. */
-	flagged: Iterable<string>;
+	flagged: Iterable<FlaggedEntry>;
 	/** Items the registry covers. */
 	registered: Iterable<string>;
 	/** Exempted item → the reason it is exempt. A reason is REQUIRED. */
@@ -401,6 +456,18 @@ export interface RegistryAuditInput {
 	minScanned?: number;
 	/** Appended to the unaccounted-items message: what the author should do. */
 	remediation?: string;
+	/**
+	 * Fail loud when the same key appears more than once in `flagged` — two
+	 * distinct occurrences whose derived id collided (#2487 review F1: a
+	 * class's sibling methods can hash-collide under `stableOccurrenceKey`).
+	 * A duplicate key means one exemption or registry entry silently excuses
+	 * MORE than the single site it names, which is exactly the laundering this
+	 * kit's per-occurrence keying exists to prevent. Default `true` — no sweep
+	 * built on this kit legitimately relies on two distinct occurrences
+	 * sharing one flagged key. Set `false` only for a caller that deliberately
+	 * flags the same key more than once (none does today).
+	 */
+	requireUniqueFlagged?: boolean;
 }
 
 export interface RegistryAudit {
@@ -428,12 +495,16 @@ export interface RegistryAudit {
  * library behavior.
  */
 export function auditRegistry(input: RegistryAuditInput): RegistryAudit {
-	const flagged = [...input.flagged];
+	const flaggedEntries = [...input.flagged].map((entry) =>
+		typeof entry === "string" ? { key: entry, detail: entry } : entry,
+	);
+	const flagged = flaggedEntries.map((entry) => entry.key);
 	const flaggedSet = new Set(flagged);
 	const registered = new Set(input.registered);
 	const exemptions = input.exemptions ?? {};
 	const minReasonLength = input.minReasonLength ?? 15;
 	const minFlagged = input.minFlagged ?? 1;
+	const requireUniqueFlagged = input.requireUniqueFlagged ?? true;
 	const problems: string[] = [];
 
 	// Two distinct emptiness failures, reported separately (#1755 review F4).
@@ -458,6 +529,42 @@ export function auditRegistry(input: RegistryAuditInput): RegistryAudit {
 				`declared floor of ${minFlagged} — a sweep that matches nothing reads as ` +
 				"clean while guarding nothing. Fix the scan or lower the floor deliberately.",
 		);
+	}
+
+	// Duplicate-key collision (#2487 review F1). Two distinct occurrences that
+	// derived the SAME key are exactly the shape a per-occurrence exemption
+	// exists to forbid: one exemption entry then excuses both, silently.
+	// Checked on the raw entries (not `flaggedSet`) so the message can name
+	// every colliding occurrence's own detail — real diagnostic content in a
+	// MESSAGE, never folded into a key. Runs BEFORE the exemption-matching
+	// checks below: a caller should fix a collision, not exempt around it.
+	if (requireUniqueFlagged) {
+		const byKey = new Map<string, string[]>();
+		for (const entry of flaggedEntries) {
+			const details = byKey.get(entry.key) ?? [];
+			details.push(entry.detail);
+			byKey.set(entry.key, details);
+		}
+		const collisions = [...byKey.entries()].filter(
+			([, details]) => details.length > 1,
+		);
+		if (collisions.length > 0) {
+			problems.push(
+				`${input.sweepName}: ${collisions.length} flagged key(s) collide — ` +
+					"two or more distinct occurrences derived the SAME key, so one " +
+					"exemption or registry entry would silently excuse more than the " +
+					"single site it names:\n" +
+					collisions
+						.map(
+							([key, details]) =>
+								`  ${key} (${details.length}×): ${details.join(", ")}`,
+						)
+						.join("\n") +
+					"\n\nGive each occurrence a distinguishing key (or fix the " +
+					"generator that produced two identical ones) before exempting " +
+					"either.",
+			);
+		}
 	}
 
 	// `Object.hasOwn`, never `item in exemptions` (#1755 review F1). The `in`

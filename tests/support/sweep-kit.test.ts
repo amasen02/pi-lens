@@ -544,6 +544,73 @@ describe("sweep-kit: auditRegistry", () => {
 		});
 		expect(audit.problems.join("\n")).toContain("declared floor");
 	});
+
+	// PR #2487 review F1: `stableOccurrenceKey` anchors on the nearest COLUMN-0
+	// declaration, so in a class-shaped file every method's flagged occurrence
+	// resolves to the SAME symbol (the class name). Two sibling methods that
+	// each flag a stereotyped line (`for (const key of map.keys()) {`) then
+	// hash identically too, so both occurrences collide on one key — and a
+	// single exemption for that key silently excuses BOTH sites, exactly the
+	// #2442 F6 "exemption cannot launder a new sibling" shape this sweep exists
+	// to catch, reintroduced one layer down. `auditRegistry` must fail LOUD on
+	// a duplicate flagged key rather than let the second occurrence ride the
+	// first's exemption.
+	it("ATTACK_TWIN_OCCURRENCE_COLLISION (#2487 review F1): two distinct occurrences that hash to the same key cannot both ride one exemption", () => {
+		// One class, two methods, each with the identical stereotyped eviction
+		// line — the reviewer's exact probe shape.
+		const twinClassLines = [
+			"class ProbeTwinCache {",
+			"\tevictFirst() {",
+			"\t\tfor (const key of map.keys()) {",
+			"\t\t\tbreak;",
+			"\t\t}",
+			"\t}",
+			"\tevictSecond() {",
+			"\t\tfor (const key of map.keys()) {",
+			"\t\t\tbreak;",
+			"\t\t}",
+			"\t}",
+			"}",
+		];
+		const keyA = stableOccurrenceKey(
+			"clients/__probe_collision.ts",
+			twinClassLines,
+			2, // evictFirst's flagged line
+		);
+		const keyB = stableOccurrenceKey(
+			"clients/__probe_collision.ts",
+			twinClassLines,
+			7, // evictSecond's flagged line
+		);
+		// Confirms the collision precondition — same enclosing symbol
+		// (`ProbeTwinCache`, the nearest column-0 declaration for BOTH methods)
+		// and the same content hash (identical flagged line text).
+		expect(keyA).toBe(keyB);
+		expect(keyA).toBe("clients/__probe_collision.ts#ProbeTwinCache:3737b5dc");
+
+		const audit = auditRegistry({
+			sweepName: "probe twin-collision sweep",
+			flagged: [keyA, keyB],
+			registered: [],
+			exemptions: {
+				[keyA]: "a single reviewed exemption naming one occurrence",
+			},
+		});
+		// Pre-fix: `keyA`/`keyB` are literally the same string, so BOTH pass the
+		// `Object.hasOwn(exemptions, item)` check in `unaccounted` and the audit
+		// reads clean — one exemption laundered a second, un-reviewed site.
+		expect(audit.problems.join("\n")).toContain("collide");
+		expect(audit.problems.join("\n")).toContain(keyA);
+	});
+
+	it("a genuinely unique flagged list carries no collision problem", () => {
+		const audit = auditRegistry({
+			sweepName: "probe sweep",
+			flagged: ["a.ts", "b.ts"],
+			registered: ["a.ts", "b.ts"],
+		});
+		expect(audit.problems).toEqual([]);
+	});
 });
 
 describe("sweep-kit: assertNonEmptyScan", () => {

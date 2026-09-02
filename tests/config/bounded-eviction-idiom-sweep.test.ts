@@ -22,7 +22,16 @@
  *    NEW hand-rolled eviction appended to an already-exempted file passed
  *    silently — the exemption laundered it. Every flagged item is now keyed
  *    by `stableOccurrenceKey` (`tests/support/sweep-kit.ts`), so an exemption
- *    excuses exactly one occurrence and nothing else.
+ *    is supposed to excuse exactly one occurrence and nothing else — but the
+ *    key alone cannot fully guarantee that: in a class-shaped file, every
+ *    method's flagged line resolves to the SAME enclosing symbol (the class
+ *    name), so two sibling methods that each flag a byte-identical line
+ *    collide on one key, and one exemption would silently excuse both (#2487
+ *    review F1 — the exact laundering this property exists to prevent, one
+ *    layer down). `auditRegistry`'s `requireUniqueFlagged` (on by default)
+ *    is what actually closes that: a duplicate flagged key fails LOUD before
+ *    exemption-matching ever runs, so a real collision cannot ride through
+ *    silently regardless of how the key was derived.
  * 3. **Content-keyed, not line-keyed (#2475).** The first version of property
  *    2 keyed on `path:line`, which re-keys on every unrelated line inserted
  *    ABOVE a flagged site — #2459, #2449, and #2474 each had to re-pin a line
@@ -49,6 +58,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
 	auditRegistry,
+	disambiguateFlaggedKeys,
 	listSourceFiles,
 	relativePosix,
 	stableOccurrenceKey,
@@ -165,9 +175,18 @@ export function findEvictionLines(stripped: string): number[] {
 	return [...hits].sort((a, b) => a - b);
 }
 
-function findFlaggedOccurrences(): { flagged: string[]; scanned: number } {
+/** One flagged occurrence: its stable key plus a `file:line` diagnostic detail. */
+interface FlaggedOccurrence {
+	key: string;
+	detail: string;
+}
+
+function findFlaggedOccurrences(): {
+	occurrences: FlaggedOccurrence[];
+	scanned: number;
+} {
 	const files = shippedSourceFiles();
-	const flagged: string[] = [];
+	const occurrences: FlaggedOccurrence[] = [];
 	for (const abs of files) {
 		const rel = relativePosix(REPO_ROOT, abs);
 		if (rel === DEFINITION_FILE) continue;
@@ -177,14 +196,18 @@ function findFlaggedOccurrences(): { flagged: string[]; scanned: number } {
 		const stripped = stripSource(fs.readFileSync(abs, "utf8"));
 		const lines = stripped.split("\n");
 		for (const line of findEvictionLines(stripped)) {
-			flagged.push(stableOccurrenceKey(rel, lines, line - 1));
+			occurrences.push({
+				key: stableOccurrenceKey(rel, lines, line - 1),
+				detail: `${rel}:${line}`,
+			});
 		}
 	}
-	return { flagged, scanned: files.length };
+	return { occurrences, scanned: files.length };
 }
 
 describe("#2442 no new hand-rolled evict-oldest idiom outside bounded-cache.ts", () => {
-	const { flagged, scanned } = findFlaggedOccurrences();
+	const { occurrences, scanned } = findFlaggedOccurrences();
+	const flagged = occurrences.map((o) => o.key);
 
 	it("actually finds the family (a dead scan must not read as clean)", () => {
 		// Vacuity guard on the DETECTOR: as of #2449's review round 4, five
@@ -246,10 +269,79 @@ describe("#2442 no new hand-rolled evict-oldest idiom outside bounded-cache.ts",
 		}
 	});
 
+	// #2487 review F1: the test above ("flags per OCCURRENCE") is vacuous
+	// against a real collision, because `expect(item).toBe(...)` compares the
+	// SAME string to itself when two occurrences hash to one key — it cannot
+	// distinguish "this occurrence is exempted" from "some occurrence sharing
+	// this key is exempted". This test runs a REAL twin-collision fixture
+	// through the actual detection pipeline (`findEvictionLines` +
+	// `stableOccurrenceKey`, not a hand-typed key) and proves `auditRegistry`
+	// itself refuses to let one exemption cover both — the property the
+	// vacuous test above could never have caught.
+	it("ATTACK_TWIN_OCCURRENCE_COLLISION (#2487 review F1): two sibling methods with an identical flagged line cannot share one exemption", () => {
+		const rel = "clients/__probe_twin_cache.ts";
+		const source = [
+			"class ProbeTwinCache {",
+			"\tevictFirst() {",
+			"\t\tfor (const k of this.map.keys()) {",
+			"\t\t\tthis.map.delete(k);",
+			"\t\t\tbreak;",
+			"\t\t}",
+			"\t}",
+			"\tevictSecond() {",
+			"\t\tfor (const k of this.map.keys()) {",
+			"\t\t\tthis.map.delete(k);",
+			"\t\t\tbreak;",
+			"\t\t}",
+			"\t}",
+			"}",
+		].join("\n");
+		const evictionLines = findEvictionLines(source);
+		expect(evictionLines).toEqual([3, 9]); // both flagged by the REAL detector
+		const lines = source.split("\n");
+		const twinOccurrences = evictionLines.map((line) => ({
+			key: stableOccurrenceKey(rel, lines, line - 1),
+			detail: `${rel}:${line}`,
+		}));
+		// Precondition: both really do collide on one key — same enclosing
+		// symbol (the class), same flagged-line text.
+		expect(twinOccurrences[0]?.key).toBe(twinOccurrences[1]?.key);
+
+		// One exemption, keyed to the shared string: pre-guard this read clean
+		// (laundered); the collision guard must refuse it.
+		const laundered = auditRegistry({
+			sweepName: "probe twin sweep",
+			flagged: twinOccurrences,
+			registered: [],
+			exemptions: {
+				[twinOccurrences[0]!.key]: "reviewed exemption for one occurrence",
+			},
+		});
+		expect(laundered.problems.join("\n")).toContain("collide");
+
+		// The remedy this sweep ships: disambiguate before exempting, and give
+		// EACH occurrence its own reasoned entry. That passes.
+		const disambiguated = disambiguateFlaggedKeys(twinOccurrences);
+		expect(disambiguated.map((e) => e.key)).toEqual([
+			twinOccurrences[0]!.key,
+			`${twinOccurrences[0]!.key}#2`,
+		]);
+		const properlyExempted = auditRegistry({
+			sweepName: "probe twin sweep",
+			flagged: disambiguated,
+			registered: [],
+			exemptions: {
+				[disambiguated[0]!.key]: "reviewed exemption for occurrence 1 of 2",
+				[disambiguated[1]!.key]: "reviewed exemption for occurrence 2 of 2",
+			},
+		});
+		expect(properlyExempted.problems).toEqual([]);
+	});
+
 	it("every occurrence is the definition file, migrated, or exempted with a reason", () => {
 		const audit = auditRegistry({
 			sweepName: "bounded-eviction-idiom sweep",
-			flagged,
+			flagged: occurrences,
 			registered: [],
 			exemptions: EXEMPT_SITES,
 			scannedCount: scanned,

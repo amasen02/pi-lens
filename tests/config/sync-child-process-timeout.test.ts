@@ -32,6 +32,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
 	auditRegistry,
+	disambiguateFlaggedKeys,
 	listSourceFiles,
 	relativePosix,
 	stripSource,
@@ -51,6 +52,15 @@ const SYNC_SPAWN_CALLS = ["spawnSync", "execSync", "execFileSync"];
  * the snippet appears in the call's arguments or just above it, so a moved
  * call is still recognised but a genuinely new one is not.
  *
+ * A `file:snippet` key can match MORE THAN ONE call site — `safeSpawn`'s two
+ * internal `spawnSync` calls both spread `...(options as SpawnOptions)`, so
+ * both match the same substring. `disambiguateFlaggedKeys` (below) turns that
+ * into `key` for the first occurrence and `key#2`, `key#3`, ... for each one
+ * after it (source-scan order), so EVERY occurrence needs its own entry here
+ * — a THIRD `...(options as SpawnOptions)` call added later lands on `#3`,
+ * which nothing exempts, and is caught as unaccounted rather than riding the
+ * first two sites' reasoning silently (#2487 review F1).
+ *
  * Keep this SHORT and reasoned. "It is probably fast" is not a reason — both
  * bugs this guard exists for were probably fast.
  */
@@ -58,7 +68,9 @@ const EXEMPT_SITES: Readonly<Record<string, string>> = {
 	"clients/safe-spawn.ts:taskkill.exe":
 		"killPidTreeSync runs from process exit and signal handlers. The process is already tearing down, so there is no event loop left to protect, and a timeout would only orphan the kill it was asked to perform.",
 	"clients/safe-spawn.ts:...(options as SpawnOptions)":
-		"safeSpawn's own spawnSync calls spread the CALLER's options, which is where the timeout comes from; its only in-repo callers, isCommandAvailable and findCommand, both pass timeout: 5000.",
+		"safeSpawn's own spawnSync calls spread the CALLER's options, which is where the timeout comes from; its only in-repo callers, isCommandAvailable and findCommand, both pass timeout: 5000. This is occurrence 1 of 2 — see the #2 entry below for the sibling.",
+	"clients/safe-spawn.ts:...(options as SpawnOptions)#2":
+		"The second of safeSpawn's two internal spawnSync fallback calls (the PATH+PATHEXT resolved-path branch and the plain-command branch), both spreading the CALLER's options for the identical reason as occurrence 1: the timeout comes from the caller, and both in-repo callers pass timeout: 5000.",
 };
 
 /**
@@ -146,11 +158,24 @@ describe("#1980 every synchronous child-process call bounds the event-loop park"
 	const { sites, scanned } = findCallSites();
 	const unbounded = sites.filter((site) => !site.bounded);
 
+	// Flagged = the unbounded sites, reported under their exemption key when
+	// they have one, so a stale exemption is detectable by the kit itself.
+	// `disambiguateFlaggedKeys` gives each occurrence sharing an exemption key
+	// its own ordinal (`key`, `key#2`, ...) — `exemptionKey`'s substring match
+	// cannot tell apart two DIFFERENT call sites that both happen to spread
+	// the same snippet (safe-spawn.ts's two internal spawnSync fallbacks), and
+	// without this a single EXEMPT_SITES entry would silently excuse both
+	// (#2487 review F1).
+	const flagged = disambiguateFlaggedKeys(
+		unbounded.map((site) => ({
+			key: exemptionKey(site) ?? site.id,
+			detail: site.id,
+		})),
+	);
+
 	const audit = auditRegistry({
 		sweepName: "sync child-process timeout sweep",
-		// Flagged = the unbounded sites, reported under their exemption key when
-		// they have one, so a stale exemption is detectable by the kit itself.
-		flagged: unbounded.map((site) => exemptionKey(site) ?? site.id),
+		flagged,
 		registered: [],
 		exemptions: EXEMPT_SITES,
 		scannedCount: scanned,
