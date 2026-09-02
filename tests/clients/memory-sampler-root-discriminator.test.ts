@@ -15,21 +15,14 @@
  */
 
 import * as os from "node:os";
-import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { createLSPClient } from "../../clients/lsp/client.js";
-import { launchLSP, stopLSP } from "../../clients/lsp/launch.js";
+import { stopLSP } from "../../clients/lsp/launch.js";
 import {
 	buildMemorySample,
 	collectMemorySampleSubsystems,
 } from "../../clients/memory-sampler.js";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const FAKE_SERVER_PATH = path.join(
-	__dirname,
-	"../fixtures/fake-lsp-server.mjs",
-);
+import { spawnFakeLspServer } from "../support/fake-lsp-server.js";
 
 function fakeMem(): NodeJS.MemoryUsage {
 	return {
@@ -42,7 +35,7 @@ function fakeMem(): NodeJS.MemoryUsage {
 }
 
 async function spawnClientAt(root: string, serverId: string) {
-	const proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+	const proc = await spawnFakeLspServer({
 		cwd: root,
 		env: { ...process.env },
 	});

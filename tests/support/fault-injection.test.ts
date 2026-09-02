@@ -11,7 +11,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import {
 	delayInside,
 	fireResetAt,
@@ -255,4 +255,61 @@ describe("spawnWedgedChild", () => {
 		);
 		expect(fs.existsSync(fixture)).toBe(true);
 	});
+});
+
+// #2436 review round 2: pins spawnWedgedChild's onTestFinished backstop kill,
+// which previously had zero test coverage — every existing caller above
+// happens to call its own `.kill()`, so a refactor that silently dropped the
+// registration would go unnoticed. Test A spawns without killing; test B
+// (which runs after test A finishes, since vitest runs `it` blocks in a
+// `describe` sequentially by default) asserts test A's child is already
+// dead — proof the `onTestFinished` hook did the killing, not some
+// incidental cleanup. Deliberately no `afterEach` in this describe: one
+// would race the very backstop under test and could mask a broken backstop
+// by killing the leaked process before test B looks at it. The only cleanup
+// is `afterAll`, which runs strictly after test B's assertion.
+describe("spawnWedgedChild — onTestFinished backstop (#2436)", () => {
+	let leakedPid: number | undefined;
+
+	function isAlive(pid: number): boolean {
+		try {
+			process.kill(pid, 0);
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	afterAll(() => {
+		if (leakedPid !== undefined && isAlive(leakedPid)) {
+			try {
+				process.kill(leakedPid, "SIGKILL");
+			} catch {
+				/* already gone */
+			}
+		}
+	});
+
+	it("spawns the wedged child and deliberately does not kill it", async () => {
+		const wedged = await spawnWedgedChild();
+		expect(wedged.pid).toBeDefined();
+		expect(isAlive(wedged.pid as number)).toBe(true);
+		leakedPid = wedged.pid;
+		// No wedged.kill() here on purpose — the onTestFinished backstop
+		// registered inside spawnWedgedChild is the only thing that should
+		// reap this.
+	});
+
+	it(
+		"the backstop reaped the previous test's process once it finished",
+		{ timeout: 15_000 },
+		async () => {
+			expect(leakedPid).toBeDefined();
+			const deadline = Date.now() + 10_000;
+			while (Date.now() < deadline && isAlive(leakedPid as number)) {
+				await new Promise((resolve) => setTimeout(resolve, 50));
+			}
+			expect(isAlive(leakedPid as number)).toBe(false);
+		},
+	);
 });

@@ -20,19 +20,13 @@
  */
 
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
 	getDegradationSummary,
 	resetDegradationLedger,
 } from "../../../clients/degradation-ledger.js";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const FAKE_SERVER_PATH = path.join(
-	__dirname,
-	"../../fixtures/fake-lsp-server.mjs",
-);
+import { spawnFakeLspServer } from "../../support/fake-lsp-server.js";
 
 type Client = Awaited<
 	ReturnType<typeof import("../../../clients/lsp/client.js").createLSPClient>
@@ -40,8 +34,7 @@ type Client = Awaited<
 
 async function startClient(env: NodeJS.ProcessEnv = {}): Promise<Client> {
 	const { createLSPClient } = await import("../../../clients/lsp/client.js");
-	const { launchLSP } = await import("../../../clients/lsp/launch.js");
-	const proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+	const proc = await spawnFakeLspServer({
 		cwd: process.cwd(),
 		env,
 	});

@@ -9,8 +9,9 @@ import {
 } from "../../../clients/degradation-ledger.js";
 import { createLSPClient } from "../../../clients/lsp/client.js";
 import { LSPService } from "../../../clients/lsp/index.js";
-import { launchLSP, stopLSP } from "../../../clients/lsp/launch.js";
+import { stopLSP } from "../../../clients/lsp/launch.js";
 import { normalizeMapKey } from "../../../clients/path-utils.js";
+import { spawnFakeLspServer } from "../../support/fake-lsp-server.js";
 import { removeTempDirSync } from "../test-utils.js";
 
 type MockRenameClient = {
@@ -203,11 +204,10 @@ describe("LSPService.renameFile", () => {
 			const oldPath = path.join(tmpDir, "old.ts");
 			const newPath = path.join(tmpDir, "new.ts");
 			fs.writeFileSync(oldPath, "export const value = 1;\n", "utf-8");
-			const proc = await launchLSP(
-				process.execPath,
-				[path.join(process.cwd(), "tests/fixtures/fake-lsp-server.mjs")],
-				{ cwd: process.cwd(), env: { ...process.env, ...testCase.env } },
-			);
+			const proc = await spawnFakeLspServer({
+				cwd: process.cwd(),
+				env: { ...process.env, ...testCase.env },
+			});
 			const client = await createLSPClient({
 				serverId: `real-${testCase.name}`,
 				process: proc,
