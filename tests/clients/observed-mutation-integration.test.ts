@@ -618,3 +618,75 @@ describe("#2449 review round 4 — the observed-settle return skips only duplica
 		}
 	});
 });
+
+describe("#2464 — the observed-settle return also dispatches pipeline analysis", () => {
+	it("runs the pipeline exactly once for a provisionally-learned tool's second call, with no second change-log receipt", async () => {
+		// The early return under test used to skip the pipeline's own
+		// lint/diagnostics dispatch entirely (`runPipeline` never called) — that
+		// gap is #2464. It must NOT come back by re-running the classified
+		// chain's turn-state/change-log recording a second time either, which is
+		// exactly the defect the return exists to suppress (#2449 round 3, S2).
+		const env = setupTestEnvironment("pi-lens-2464-dispatch-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		try {
+			const filePath = path.join(env.tmpDir, "dispatched.ts");
+			fs.writeFileSync(filePath, SOURCE);
+			const { runtime, cacheManager } = newSession(env.tmpDir);
+
+			const { runPipeline } = await import("../../clients/pipeline.js");
+			vi.mocked(runPipeline).mockClear();
+
+			// Call 1: a tool pi-lens has never met. `classifyMutatingTool` returns
+			// undefined, so the classified chain (and the dispatch this fix adds,
+			// gated behind it) never runs — only the bridge records it, exactly
+			// like #2430 acceptance 1.
+			const firstEvent = patchEvent(filePath, "call-2464-dispatch-0");
+			await handleToolCall(
+				toolCallDeps({
+					event: firstEvent,
+					cwd: env.tmpDir,
+					runtime,
+					cacheManager,
+				}),
+			);
+			fs.writeFileSync(filePath, `${SOURCE}const d = 4;\n`);
+			await handleToolResult(
+				toolResultDeps({ event: firstEvent, runtime, cacheManager }),
+			);
+			expect(vi.mocked(runPipeline)).not.toHaveBeenCalled();
+
+			// Call 2: classified BY NAME from the round-1 attribution and still
+			// armed, so its tool_result takes the early return under test.
+			const secondEvent = patchEvent(filePath, "call-2464-dispatch-1");
+			await handleToolCall(
+				toolCallDeps({
+					event: secondEvent,
+					cwd: env.tmpDir,
+					runtime,
+					cacheManager,
+				}),
+			);
+			fs.writeFileSync(filePath, `${SOURCE}const d = 4;\nconst e = 5;\n`);
+			await handleToolResult(
+				toolResultDeps({ event: secondEvent, runtime, cacheManager }),
+			);
+
+			// The pipeline analysed the observed mutation exactly once — not zero
+			// (the #2464 gap) and not twice (the classified chain re-running would
+			// mean it also re-recorded turn-state/change-log, which the next
+			// assertion below independently catches).
+			expect(vi.mocked(runPipeline)).toHaveBeenCalledTimes(1);
+
+			// Still one change-log receipt per physical edit — the #2449 round-3
+			// property this early return exists for, unregressed by adding dispatch.
+			expect(
+				readChangesSince(env.tmpDir, 0).map((change) => change.source),
+			).toEqual(["agent-tool:patch_file", "agent-tool:patch_file"]);
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+});

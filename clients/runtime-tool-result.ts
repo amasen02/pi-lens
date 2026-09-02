@@ -593,6 +593,253 @@ function refreshCachedExports(
 	}
 }
 
+/**
+ * #2464: the pipeline's own lint/diagnostics dispatch, factored out of the
+ * block below that ALSO writes `turn-state.json` modified ranges and the
+ * attributed change-log receipt (`cacheManager.addModifiedRange` /
+ * `recordProjectChange`). The classified chain in `handleToolResult` still
+ * does both, in the same order as before this split — see the call site
+ * right after `recordProjectChange` below, which is byte-identical to what
+ * used to be inlined there.
+ *
+ * The observed-mutation early return (#2430/#2449 round 4, S4) is the SECOND
+ * caller: the mutation bridge already recorded the turn-state range and the
+ * change-log receipt for that edit, so it calls this helper for analysis
+ * WITHOUT asking for the recording a second time — which a shared "run the
+ * pipeline AND record" block could not express.
+ */
+async function dispatchPipelineAnalysis(args: {
+	deps: ToolResultDeps;
+	runtime: RuntimeCoordinator;
+	filePath: string;
+	dispatchCwd: string;
+	turnStateCwd: string;
+	autofixMode: "immediate" | "deferred";
+	modifiedRanges: Array<{ start: number; end: number }> | undefined;
+	writeIndex: number;
+	initialStateHash: string;
+	readGuardCorrelationId: string;
+	requestedEditIndexes: number[];
+	requestedEditTotal: number;
+	isPartialApplyResult: boolean;
+	participantIds: string[];
+	participantTotal: number;
+	toolResultStart: number;
+}): Promise<
+	| { crashed: false; result: PipelineResult }
+	| {
+			crashed: true;
+			response: {
+				content: Array<{ type: string; text?: string }>;
+				isError: true;
+			};
+	  }
+> {
+	const {
+		deps,
+		runtime,
+		filePath,
+		dispatchCwd,
+		turnStateCwd,
+		autofixMode,
+		modifiedRanges,
+		writeIndex,
+		initialStateHash,
+		readGuardCorrelationId,
+		requestedEditIndexes,
+		requestedEditTotal,
+		isPartialApplyResult,
+		toolResultStart,
+	} = args;
+	const {
+		event,
+		getFlag,
+		getFlagSource,
+		dbg,
+		biomeClient,
+		ruffClient,
+		metricsClient,
+		resetLSPService,
+	} = deps;
+
+	const pipelinePromise = runPipeline(
+		{
+			filePath,
+			cwd: dispatchCwd,
+			projectRoot: turnStateCwd,
+			toolName: event.toolName,
+			autofixMode,
+			modifiedRanges,
+			telemetry: {
+				model: runtime.telemetryModel,
+				sessionId: runtime.telemetrySessionId,
+				turnIndex: runtime.turnIndex,
+				writeIndex,
+				modelId: runtime.telemetryModelId,
+				provider: runtime.telemetryProviderId,
+			},
+			getFlag,
+			getFlagSource,
+			dbg,
+			// #451: hand the deferred cascade live sequence accessors so the
+			// review-graph builder can skip its per-build O(project) sweep when
+			// only pi-observed edits happened. projectSeq is a function because the
+			// cascade runs after this returns (#450) — read current, not captured.
+			seqState: {
+				projectSeq: () => runtime.projectSeq,
+				getFilesChangedSince: (seq: number) =>
+					runtime.getFilesChangedSince(seq),
+			},
+			// The settle clock is live because the deferred cascade may reach its
+			// budget derivation before or after turn_end starts waiting.
+			turnEndCascadeSettleStart: () => runtime.getTurnEndCascadeSettleStart(),
+			// #348 phase 2: live reference so the deferred cascade can update the
+			// warm word index in place at the same seam as the graph rebuild.
+			wordIndex: runtime.wordIndex,
+			onWordIndexUpdated: (index) => {
+				scheduleWordIndexPersist(dispatchCwd, index, dbg);
+			},
+		},
+		{
+			biomeClient,
+			ruffClient,
+			metricsClient,
+			getFormatService,
+			fixedThisTurn: runtime.fixedThisTurn,
+		},
+	);
+	const pipelineTelemetry: InFlightPipeline = {
+		promise: pipelinePromise,
+		participantIds: [...new Set(args.participantIds)].slice(0, 100),
+		participantTotal: args.participantTotal,
+	};
+	let filePipelines = inFlightPipelines.get(filePath);
+	if (!filePipelines) {
+		filePipelines = new Map<string, InFlightPipeline>();
+		inFlightPipelines.set(filePath, filePipelines);
+	}
+	filePipelines.set(initialStateHash, pipelineTelemetry);
+	let result: PipelineResult;
+	try {
+		result = await pipelinePromise;
+	} catch (pipelineErr) {
+		if (getFlag("lens-guard")) {
+			runtime.markGitGuardCacheUnknown("pipeline_crash");
+		}
+		dbg(`runPipeline crashed: ${pipelineErr}`);
+		logReadGuardEvent({
+			event: "edit_post_edit_pipeline_failed",
+			correlationId: readGuardCorrelationId,
+			filePath,
+			metadata: {
+				tool: event.toolName,
+				commitStatus: "committed",
+				reasonCode: "pipeline_failed",
+			},
+		});
+		logReadGuardEvent({
+			event: "edit_batch_summary",
+			correlationId: readGuardCorrelationId,
+			filePath,
+			metadata: {
+				tool: event.toolName,
+				editBatchSummary: createReadGuardEditBatchSummary({
+					requestedIndexes: requestedEditIndexes,
+					requestedTotal: requestedEditTotal,
+					resolvedIndexes: requestedEditIndexes,
+					resolvedTotal: requestedEditTotal,
+					appliedIndexes: requestedEditIndexes,
+					appliedTotal: requestedEditTotal,
+					participantIds: pipelineTelemetry.participantIds,
+					participantTotal: pipelineTelemetry.participantTotal,
+					commitStatus: "committed",
+					postEditStatus: "failed",
+					terminalStatus: "failed",
+					durationMs: Date.now() - toolResultStart,
+				}),
+			},
+		});
+		dbg(`runPipeline crash stack: ${(pipelineErr as Error).stack}`);
+		// The LSP fleet is process-wide, but a pipeline crash belongs to one
+		// evaluation. A registered primary owns the fleet; a known secondary
+		// must not tear it down. Keep the historical reset when no registration
+		// exists because synthetic callers and early startup have no role evidence.
+		const activePrimarySessionId = getActiveSessionId();
+		const crashBelongsToPrimary =
+			activePrimarySessionId === undefined ||
+			activePrimarySessionId === runtime.telemetrySessionId;
+		if (!getFlag("no-lsp") && crashBelongsToPrimary) {
+			resetLSPService({ fast: true, reason: "pipeline_crash" });
+		}
+
+		logLatency({
+			type: "tool_result",
+			toolName: event.toolName,
+			filePath,
+			durationMs: Date.now() - toolResultStart,
+			result: "pipeline_crash",
+		});
+
+		const notice = runtime.formatPipelineCrashNotice(filePath, pipelineErr);
+		return {
+			crashed: true,
+			response: {
+				content: notice
+					? [...event.content, { type: "text", text: notice }]
+					: event.content,
+				isError: true,
+			},
+		};
+	} finally {
+		// Prune the per-file inner map once it's empty so a file touched once
+		// this session doesn't leave a permanent empty entry in the outer map.
+		filePipelines.delete(initialStateHash);
+		if (filePipelines.size === 0) {
+			inFlightPipelines.delete(filePath);
+		}
+	}
+
+	if (!isPartialApplyResult) {
+		const postEditStatus = result.isError ? "failed" : "succeeded";
+		if (result.isError) {
+			logReadGuardEvent({
+				event: "edit_post_edit_pipeline_failed",
+				correlationId: readGuardCorrelationId,
+				filePath,
+				metadata: {
+					tool: event.toolName,
+					commitStatus: "committed",
+					reasonCode: "pipeline_failed",
+				},
+			});
+		}
+		logReadGuardEvent({
+			event: "edit_batch_summary",
+			correlationId: readGuardCorrelationId,
+			filePath,
+			metadata: {
+				tool: event.toolName,
+				editBatchSummary: createReadGuardEditBatchSummary({
+					requestedIndexes: requestedEditIndexes,
+					requestedTotal: requestedEditTotal,
+					resolvedIndexes: requestedEditIndexes,
+					resolvedTotal: requestedEditTotal,
+					appliedIndexes: requestedEditIndexes,
+					appliedTotal: requestedEditTotal,
+					participantIds: pipelineTelemetry.participantIds,
+					participantTotal: pipelineTelemetry.participantTotal,
+					commitStatus: "committed",
+					postEditStatus,
+					terminalStatus: postEditStatus === "failed" ? "failed" : "success",
+					durationMs: Date.now() - toolResultStart,
+				}),
+			},
+		});
+	}
+
+	return { crashed: false, result };
+}
+
 export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	content: Array<{ type: string; text?: string }>;
 	isError?: boolean;
@@ -1105,7 +1352,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	// instead would be the other way to fix this, and it is the wrong one — it
 	// makes PERSIST_AFTER_OBSERVATIONS unreachable again.
 	//
-	// ## What this return skips, stated in full (round 4, S4)
+	// ## What this return skips, stated in full (round 4, S4; #2464)
 	//
 	// The first cut called this "skipping turn tracking" and returned. It skipped
 	// considerably more than turn tracking, and THREE of those steps have no
@@ -1123,11 +1370,11 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	// What stays skipped is skipped because the BRIDGE already did it: the
 	// read-guard staleness stamp, the `turn-state.json` modified ranges, the
 	// attributed change-log receipt, and the deferred autofix/format pair —
-	// `recordMutationThroughSeam` steps 1-4. The one genuinely UNCOVERED step is
-	// the pipeline's own lint/diagnostics dispatch, and it cannot just be
-	// re-enabled here: the pipeline body is also what writes the duplicate ranges
-	// and receipt this return exists to suppress. Separating those is #2464,
-	// filed rather than half-done inside a review round.
+	// `recordMutationThroughSeam` steps 1-4. #2464 pulled the pipeline's own
+	// lint/diagnostics dispatch (`dispatchPipelineAnalysis`, defined above) out
+	// of the block below that also writes those same turn-state ranges and the
+	// change-log receipt, so it can be called HERE too — analysis without asking
+	// for the recording a second time.
 	if (observedReplayed > 0) {
 		const observedStateHash = preSettleStateHash ?? getFileStateHash(filePath);
 		recordNativeAppliedPairs({
@@ -1137,14 +1384,50 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			filePath,
 			stateHash: observedStateHash,
 		});
-		(runtime as Partial<RuntimeCoordinator>).recordMutationToolReceipt?.call(
+		const receiptOutcome = (
+			runtime as Partial<RuntimeCoordinator>
+		).recordMutationToolReceipt?.call(runtime, filePath, mutation.kind);
+		refreshCachedExports(runtime, filePath);
+		// Same fallback formula the classified chain uses below (a bash-derived
+		// synthetic call carries its own decision via `_autofixMode`); `mutation.kind`
+		// is always "edit" here (#2430 tier 4 only ever classifies "learned" as
+		// "edit"), so the un-receipted default is "deferred" either way.
+		const observedAutofixMode: "immediate" | "deferred" = deps._bypassDebounce
+			? (deps._autofixMode ?? (mutation.kind === "edit" ? "deferred" : "immediate"))
+			: (receiptOutcome?.autofixMode ??
+				(mutation.kind === "edit" ? "deferred" : "immediate"));
+		const observedReadGuardCorrelationId = getReadGuardCorrelationId(event);
+		const observedDispatchOutcome = await dispatchPipelineAnalysis({
+			deps,
 			runtime,
 			filePath,
-			mutation.kind,
-		);
-		refreshCachedExports(runtime, filePath);
+			dispatchCwd: resolveLanguageRootForFile(filePath, workspaceRoot),
+			turnStateCwd: path.resolve(workspaceRoot),
+			autofixMode: observedAutofixMode,
+			// #2423: no adapter/diff ranges exist for a "learned" (unnamed)
+			// tool — the classified chain below hits the same gap for this
+			// provenance and also leaves `modifiedRanges` undefined, so the
+			// dispatch runs unscoped (whole-file) exactly as it would there.
+			modifiedRanges: undefined,
+			writeIndex: runtime.nextWriteIndex(),
+			initialStateHash: observedStateHash,
+			readGuardCorrelationId: observedReadGuardCorrelationId,
+			requestedEditIndexes: getRequestedEditIndexes(event, mutation.kind),
+			requestedEditTotal: getRequestedEditCount(event, mutation.kind),
+			isPartialApplyResult:
+				((event.details ?? {}) as Record<string, unknown>)
+					.piLensPartialApply === true,
+			participantIds: [observedReadGuardCorrelationId],
+			participantTotal: 1,
+			toolResultStart: Date.now(),
+		});
+		if (observedDispatchOutcome.crashed) {
+			dbg(
+				`tool_result: pipeline analysis crashed for the observed mutation on ${filePath}; the recorded edit stands, analysis did not run this turn`,
+			);
+		}
 		dbg(
-			`tool_result: the observational settle already recorded ${observedReplayed} mutation(s) for "${event.toolName}"; kept the applied-edit records, mutation receipt and cachedExports refresh, skipped the bridge-covered staleness stamp / turn-state ranges / change-log receipt / deferred autofix+format, and the pipeline dispatch (#2464)`,
+			`tool_result: the observational settle already recorded ${observedReplayed} mutation(s) for "${event.toolName}"; kept the applied-edit records, mutation receipt, cachedExports refresh, and ran the pipeline dispatch (#2464); skipped the bridge-covered staleness stamp / turn-state ranges / change-log receipt / deferred autofix+format`,
 		);
 		return syntheticWriteContent.length > 0
 			? { content: [...event.content, ...syntheticWriteContent] }
@@ -1452,182 +1735,32 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	});
 	dbg(`tool_result fired for: ${filePath} (turn_state: ${turnStateMs}ms)`);
 
-	let result: PipelineResult;
-	const pipelinePromise = runPipeline(
-		{
-			filePath,
-			cwd: dispatchCwd,
-			projectRoot: turnStateCwd,
-			toolName: event.toolName,
-			autofixMode,
-			modifiedRanges,
-			telemetry: {
-				model: runtime.telemetryModel,
-				sessionId: runtime.telemetrySessionId,
-				turnIndex: runtime.turnIndex,
-				writeIndex,
-				modelId: runtime.telemetryModelId,
-				provider: runtime.telemetryProviderId,
-			},
-			getFlag,
-			getFlagSource,
-			dbg,
-			// #451: hand the deferred cascade live sequence accessors so the
-			// review-graph builder can skip its per-build O(project) sweep when
-			// only pi-observed edits happened. projectSeq is a function because the
-			// cascade runs after this returns (#450) — read current, not captured.
-			seqState: {
-				projectSeq: () => runtime.projectSeq,
-				getFilesChangedSince: (seq: number) =>
-					runtime.getFilesChangedSince(seq),
-			},
-			// The settle clock is live because the deferred cascade may reach its
-			// budget derivation before or after turn_end starts waiting.
-			turnEndCascadeSettleStart: () => runtime.getTurnEndCascadeSettleStart(),
-			// #348 phase 2: live reference so the deferred cascade can update the
-			// warm word index in place at the same seam as the graph rebuild.
-			// `runtime.wordIndex` is read fresh (not captured) via this closure-free
-			// property access being re-evaluated at object-literal construction
-			// time here — that's fine because runPipeline reads `ctx.wordIndex`
-			// synchronously into computeCascadeForFile's options before returning
-			// (the deferred part is the cascade's OWN execution, not this handoff).
-			wordIndex: runtime.wordIndex,
-			onWordIndexUpdated: (index) => {
-				scheduleWordIndexPersist(dispatchCwd, index, dbg);
-			},
-		},
-		{
-			biomeClient,
-			ruffClient,
-			metricsClient,
-			getFormatService,
-			fixedThisTurn: runtime.fixedThisTurn,
-		},
-	);
-	const pipelineTelemetry: InFlightPipeline = {
-		promise: pipelinePromise,
-		participantIds: [...new Set(participantIds)].slice(0, 100),
+	// #2464: the pipeline dispatch itself now lives in `dispatchPipelineAnalysis`
+	// (defined above `handleToolResult`), shared with the observed-mutation
+	// early return. This call site is otherwise unchanged — same arguments, same
+	// crash-then-return / success-then-continue shape as before the split.
+	const dispatchOutcome = await dispatchPipelineAnalysis({
+		deps,
+		runtime,
+		filePath,
+		dispatchCwd,
+		turnStateCwd,
+		autofixMode,
+		modifiedRanges,
+		writeIndex,
+		initialStateHash,
+		readGuardCorrelationId,
+		requestedEditIndexes,
+		requestedEditTotal,
+		isPartialApplyResult,
+		participantIds,
 		participantTotal,
-	};
-	let filePipelines = inFlightPipelines.get(filePath);
-	if (!filePipelines) {
-		filePipelines = new Map<string, InFlightPipeline>();
-		inFlightPipelines.set(filePath, filePipelines);
+		toolResultStart,
+	});
+	if (dispatchOutcome.crashed) {
+		return dispatchOutcome.response;
 	}
-	filePipelines.set(initialStateHash, pipelineTelemetry);
-	try {
-		result = await pipelinePromise;
-	} catch (pipelineErr) {
-		if (getFlag("lens-guard")) {
-			runtime.markGitGuardCacheUnknown("pipeline_crash");
-		}
-		dbg(`runPipeline crashed: ${pipelineErr}`);
-		logReadGuardEvent({
-			event: "edit_post_edit_pipeline_failed",
-			correlationId: readGuardCorrelationId,
-			filePath,
-			metadata: {
-				tool: event.toolName,
-				commitStatus: "committed",
-				reasonCode: "pipeline_failed",
-			},
-		});
-		logReadGuardEvent({
-			event: "edit_batch_summary",
-			correlationId: readGuardCorrelationId,
-			filePath,
-			metadata: {
-				tool: event.toolName,
-				editBatchSummary: createReadGuardEditBatchSummary({
-					requestedIndexes: requestedEditIndexes,
-					requestedTotal: requestedEditTotal,
-					resolvedIndexes: requestedEditIndexes,
-					resolvedTotal: requestedEditTotal,
-					appliedIndexes: requestedEditIndexes,
-					appliedTotal: requestedEditTotal,
-					participantIds: pipelineTelemetry.participantIds,
-					participantTotal: pipelineTelemetry.participantTotal,
-					commitStatus: "committed",
-					postEditStatus: "failed",
-					terminalStatus: "failed",
-					durationMs: Date.now() - toolResultStart,
-				}),
-			},
-		});
-		dbg(`runPipeline crash stack: ${(pipelineErr as Error).stack}`);
-		// The LSP fleet is process-wide, but a pipeline crash belongs to one
-		// evaluation. A registered primary owns the fleet; a known secondary
-		// must not tear it down. Keep the historical reset when no registration
-		// exists because synthetic callers and early startup have no role evidence.
-		const activePrimarySessionId = getActiveSessionId();
-		const crashBelongsToPrimary =
-			activePrimarySessionId === undefined ||
-			activePrimarySessionId === runtime.telemetrySessionId;
-		if (!getFlag("no-lsp") && crashBelongsToPrimary) {
-			resetLSPService({ fast: true, reason: "pipeline_crash" });
-		}
-
-		logLatency({
-			type: "tool_result",
-			toolName: event.toolName,
-			filePath,
-			durationMs: Date.now() - toolResultStart,
-			result: "pipeline_crash",
-		});
-
-		const notice = runtime.formatPipelineCrashNotice(filePath, pipelineErr);
-		return {
-			content: notice
-				? [...event.content, { type: "text", text: notice }]
-				: event.content,
-			isError: true,
-		};
-	} finally {
-		// Prune the per-file inner map once it's empty so a file touched once
-		// this session doesn't leave a permanent empty entry in the outer map.
-		filePipelines.delete(initialStateHash);
-		if (filePipelines.size === 0) {
-			inFlightPipelines.delete(filePath);
-		}
-	}
-
-	if (!isPartialApplyResult) {
-		const postEditStatus = result.isError ? "failed" : "succeeded";
-		if (result.isError) {
-			logReadGuardEvent({
-				event: "edit_post_edit_pipeline_failed",
-				correlationId: readGuardCorrelationId,
-				filePath,
-				metadata: {
-					tool: event.toolName,
-					commitStatus: "committed",
-					reasonCode: "pipeline_failed",
-				},
-			});
-		}
-		logReadGuardEvent({
-			event: "edit_batch_summary",
-			correlationId: readGuardCorrelationId,
-			filePath,
-			metadata: {
-				tool: event.toolName,
-				editBatchSummary: createReadGuardEditBatchSummary({
-					requestedIndexes: requestedEditIndexes,
-					requestedTotal: requestedEditTotal,
-					resolvedIndexes: requestedEditIndexes,
-					resolvedTotal: requestedEditTotal,
-					appliedIndexes: requestedEditIndexes,
-					appliedTotal: requestedEditTotal,
-					participantIds: pipelineTelemetry.participantIds,
-					participantTotal: pipelineTelemetry.participantTotal,
-					commitStatus: "committed",
-					postEditStatus,
-					terminalStatus: postEditStatus === "failed" ? "failed" : "success",
-					durationMs: Date.now() - toolResultStart,
-				}),
-			},
-		});
-	}
+	const result = dispatchOutcome.result;
 
 	const finalStateHash = getFileStateHash(filePath);
 	lastAnalyzedStateByFile.set(filePath, {
