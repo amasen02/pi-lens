@@ -45,6 +45,13 @@ merge — you report internally to the orchestrator.
      hand-rolled walker)? Grep for the sibling before accepting a new helper;
      a near-identical body in two files is a finding even when SonarCloud is
      green, and the class fix is one shared helper, not a comment.
+   - Simplification: climb AGENTS.md's minimalism ladder on every new
+     abstraction, parameter, and branch — does it need to exist, does the repo
+     already do it, is a smaller shape sufficient? Plumbing with no consumer
+     (a field nothing sets, a code nothing emits) is a finding unless the PR
+     names its forcing function. Counter-check "SDK-reuse boundaries" in
+     AGENTS.md before calling something over-built: some seams are wide on
+     purpose.
 5. Run the targeted suites the PR names, PLUS grep tests/ for every symbol the
    diff touches and run every referencing file. `npm run build` first, always.
 6. Read CI on the exact head SHA (REST check-runs when GraphQL 503s). Confirm
