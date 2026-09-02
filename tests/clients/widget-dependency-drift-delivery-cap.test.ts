@@ -133,6 +133,20 @@ function driveTurn(
 	return handleTurnEnd(makeTurnEndDeps(runtime, cacheManager, cwd));
 }
 
+/**
+ * Fix-round 3 (#2275 review F1): drive one more turn with NO modified files
+ * at all — the read-only-stretch case. Unlike `driveTurn`, this never
+ * touches `cacheManager.addModifiedRange`, so `turnState.files` stays empty
+ * and `handleTurnEnd` takes the `files.length === 0 && !hasCascadeRuns()`
+ * early-return branch (runtime-turn.ts). The widget-cap drain/charge loop
+ * must still run on this path — a quiet turn that repaints the footer and
+ * draws a demoted row is still a delivery.
+ */
+function driveQuietTurn(runtime: RuntimeCoordinator, cacheManager: CacheManager, cwd: string): Promise<void> {
+	runtime.beginTurn();
+	return handleTurnEnd(makeTurnEndDeps(runtime, cacheManager, cwd));
+}
+
 /** Record one widget-ONLY blocking LSP row and demote it on the drift axis. */
 function recordDemoted(filePath: string, message: string): void {
 	fs.writeFileSync(filePath, `export const x = "${message}";\n`);
@@ -309,6 +323,57 @@ describe("widget-footer dependency-drift delivery cap (#2275)", () => {
 			expect(entry?.footerRetired).toBeUndefined();
 			expect(entry?.staleDeliveryCount ?? 0).toBe(0);
 			expect(ledgerReasons()).toEqual([]);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	// Fix-round 3 (#2275 review F1): a read-only stretch (no modified files
+	// any turn) still repaints the footer and can draw a demoted row. Before
+	// the fix, the drain/charge loop sat below `handleTurnEnd`'s
+	// `files.length === 0` early return, so this sequence rendered the row
+	// every turn while the delivery count never advanced — 5 quiet turns, 5
+	// renders, `staleDeliveryCount` still `undefined`.
+	it(`advances the delivery count and retires after ${DEPENDENCY_DRIFT_MAX_DELIVERIES} quiet (no-file) turns`, async () => {
+		const env = setupTestEnvironment("pi-lens-2275-quiet-");
+		try {
+			const sessionId = "widget-cap-quiet";
+			const runtime = new RuntimeCoordinator();
+			runtime.setTelemetryIdentity({ sessionId });
+			runtime.beginTurn();
+			const cacheManager = new CacheManager(false);
+
+			const consumer = path.join(env.tmpDir, "quiet-consumer.ts");
+			recordDemoted(consumer, "type error demoted during a quiet stretch");
+
+			let renders = 0;
+			for (let turn = 1; turn <= MAX_TURNS; turn++) {
+				const footer = renderWidget(120, theme).join("\n");
+				if (footer.includes("type error demoted during a quiet stretch")) {
+					renders += 1;
+				}
+				await driveQuietTurn(runtime, cacheManager, env.tmpDir);
+				if (staleEntry(consumer)?.footerRetired === true) break;
+			}
+
+			// Retired after exactly `DEPENDENCY_DRIFT_MAX_DELIVERIES` RENDERS —
+			// on turns that touched NO file at all.
+			expect(renders).toBe(DEPENDENCY_DRIFT_MAX_DELIVERIES);
+
+			const entry = staleEntry(consumer);
+			expect(entry).toBeDefined();
+			expect(entry?.footerRetired).toBe(true);
+			expect(entry?.staleDeliveryCount).toBe(DEPENDENCY_DRIFT_MAX_DELIVERIES);
+			expect(renderWidget(120, theme).join("\n")).not.toContain(
+				"type error demoted during a quiet stretch",
+			);
+			expect(ledgerReasons()).toEqual(
+				expect.arrayContaining([
+					expect.stringContaining(
+						`capped after ${DEPENDENCY_DRIFT_MAX_DELIVERIES} deliveries`,
+					),
+				]),
+			);
 		} finally {
 			env.cleanup();
 		}

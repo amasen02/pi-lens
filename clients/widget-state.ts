@@ -366,10 +366,18 @@ function migrateEntryStamps(
 		// it counts is meaningless, and a resumed session re-evaluates
 		// dependency-drift from scratch (#1631 review F3) same as the `stale`
 		// bit itself. A restored footer has shown the row zero times.
+		// Fix-round 3 (#2275 review F2): `staleReason` left the round trip
+		// unstripped, so a resumed row could carry `staleReason:
+		// "dependency-drift"` with `stale` gone — `isDependencyDriftDemoted`
+		// reads `stale === true`, so that combination reads as clean today, but
+		// the stray reason is still a demotion label with no demotion behind
+		// it, the same "meaningless without the bit it counts" shape as the
+		// other three fields. Strip it alongside them.
 		const {
 			stale: _stale,
 			staleDeliveryCount: _staleDeliveryCount,
 			footerRetired: _footerRetired,
+			staleReason: _staleReason,
 			...rest
 		} = d;
 		return rest.observedAt == null
@@ -1320,6 +1328,15 @@ export function retireWidgetDependencyDriftBlockers(filePath: string): boolean {
 	if (!changed) return false;
 	// The record's severity tallies are unchanged by design (the finding is
 	// still an error, still non-blocking) — only what the footer draws moves.
+	// Fix-round 3 (#2275 review F1): this delete is live only for the
+	// multi-file drain re-render case — `drainRenderedDependencyDriftFilePaths`
+	// already clears the whole Set before this loop starts, so by the time a
+	// given `wPath` reaches this call its own entry is normally long gone. It
+	// only does something when a render for a DIFFERENT file interleaves
+	// between the drain and this retire (adding `rec.filePath` back to the
+	// Set mid-loop) or a render fires between retirement and the caller's next
+	// drain — either way, defensive: it keeps a just-retired file from being
+	// double-drained (and double-charged) on the next pass.
 	renderedDependencyDriftFiles.delete(rec.filePath);
 	requestRenderFn?.();
 	return true;

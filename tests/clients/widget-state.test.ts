@@ -809,6 +809,11 @@ describe("widget-state renderWidget", () => {
 		expect(restored[0]?.stale).toBeUndefined();
 		expect(restored[0]?.staleDeliveryCount).toBeUndefined();
 		expect(restored[0]?.footerRetired).toBeUndefined();
+		// Fix-round 3 (#2275 review F2): `staleReason` is the fourth field in
+		// this same "meaningless without the demotion it counts" set — a
+		// restored row must not carry `staleReason: "dependency-drift"` with
+		// `stale` gone.
+		expect(restored[0]?.staleReason).toBeUndefined();
 	});
 
 	// #1631 review F10: `isBlocking` answers false for a demoted finding by design
