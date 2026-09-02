@@ -20,7 +20,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createLensDiagnosticsTool } from "../../tools/lens-diagnostics.js";
 import {
 	clearWidgetState,
+	markWidgetFileBlockersStale,
 	recordDiagnostics,
+	retireWidgetDependencyDriftBlockers,
 } from "../../clients/widget-state.js";
 import { resetProjectLensConfigCache } from "../../clients/project-lens-config.js";
 
@@ -154,5 +156,60 @@ describe("lens_diagnostics mode=all dependency freshness (#1631 criterion 3)", (
 		expect(text).toContain("🔴");
 		expect(text).toContain("1 blocking");
 		expect(text).not.toContain("[stale — re-run to confirm]");
+	});
+
+	// #2275 review F2. The widget footer's delivery cap stops RENDERING a
+	// demoted row after N unconfirmed deliveries. It must not delete the
+	// record: `getFileDiagnosticSummaries` (this surface) and
+	// `lens_diagnostic_mark` read the same `allDiagnostics` list, so a spliced
+	// entry would make an unconfirmed LSP error read as CLEAN here. The file
+	// must still be listed, with its error tally intact and zero blocking, and
+	// the agent must be TOLD the footer stopped showing it.
+	it("still lists a footer-capped demotion, with an explicit capped note", async () => {
+		const dir = makeDir("pi-lens-modeall-capped-");
+		const consumer = path.join(dir, "capped.ts");
+		const dep = path.join(dir, "dep.ts");
+		fs.writeFileSync(dep, "export const x = 1;\n");
+		fs.writeFileSync(
+			consumer,
+			'import { x } from "./dep.js";\nexport const y = x;\n',
+		);
+
+		recordDiagnostics(
+			consumer,
+			[
+				{
+					severity: "error",
+					semantic: "blocking",
+					message: "No exported member 'gitEnv'",
+					tool: "lsp",
+					rule: "ts(2305)",
+					line: 1,
+				},
+			],
+			1,
+			Date.now(),
+		);
+		// Demote on the drift axis, then reach the footer delivery cap.
+		expect(markWidgetFileBlockersStale(consumer, "dependency-drift")).toBe(
+			true,
+		);
+		expect(retireWidgetDependencyDriftBlockers(consumer)).toBe(true);
+
+		const tool = makeTool(dir);
+		const result = (await runModeAll(tool, dir)) as {
+			content: Array<{ text: string }>;
+		};
+		const text = result.content.map((c) => c.text).join("\n");
+
+		// Not clean: the file is still listed with its error tally, demoted.
+		expect(text).toMatch(/capped\.ts\s+1E/);
+		expect(text).toContain("[stale — re-run to confirm]");
+		// Never re-asserted at full authority.
+		expect(text).not.toContain("🔴");
+		// And the agent is told the footer stopped showing it, and that a
+		// re-run can still confirm it.
+		expect(text).toContain("no longer shown in the pi-lens footer");
+		expect(text).toMatch(/1 demoted finding capped/);
 	});
 });
