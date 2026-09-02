@@ -7,6 +7,11 @@
  *
  * That is the one part of the fix a Windows development host cannot check, so
  * it is checked here against the REAL `ps`, on the real CI runner. No mocks.
+ *
+ * #2443 moved the argument vector and the etime parser into the shared
+ * process-table seam. This suite follows them: it now spawns the command the
+ * SEAM composes for the reaper's projection, rather than a copy of it, so a
+ * column the host's `ps` rejects reds here instead of in production.
  */
 
 import { spawn } from "node:child_process";
@@ -14,23 +19,21 @@ import { existsSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 import {
-	POSIX_PS_ARGS,
 	ageMsFromPosixEtime,
-} from "../../clients/instance-reaper.js";
+	buildProcessQuery,
+} from "../../scripts/lib/process-scan.mjs";
 
-const psPath = existsSync("/bin/ps")
-	? "/bin/ps"
-	: existsSync("/usr/bin/ps")
-		? "/usr/bin/ps"
-		: undefined;
+/** Exactly the projection `enumerateManagedProcesses` asks for. */
+const REAPER_FIELDS = ["pid", "ppid", "ageMs", "command"] as const;
 
 /** Probe the filesystem for `ps`, not `process.platform`: the question is
  *  whether this host HAS the binary the sweep spawns. */
-const hasPs = psPath !== undefined;
+const hasPs = existsSync("/bin/ps") || existsSync("/usr/bin/ps");
 
 function runPs(): Promise<{ stdout: string; code: number | null }> {
+	const query = buildProcessQuery(REAPER_FIELDS);
 	return new Promise((resolve) => {
-		const child = spawn(psPath as string, [...POSIX_PS_ARGS], {
+		const child = spawn(query.command, query.args, {
 			shell: false,
 			stdio: ["ignore", "pipe", "ignore"],
 		});
@@ -46,6 +49,15 @@ function runPs(): Promise<{ stdout: string; code: number | null }> {
 describe.skipIf(!hasPs)(
 	"#1857: the real ps accepts the etime column vector",
 	() => {
+		it("asks for the header-suppressed pid/ppid/etime/args projection", () => {
+			// Pinned so a seam change that silently dropped a column (which would
+			// put the command line where the age token belongs) fails here rather
+			// than by making every process look unknown-aged in production.
+			const query = buildProcessQuery(REAPER_FIELDS);
+			expect(query.args).toEqual(["-eo", "pid=,ppid=,etime=,args="]);
+			expect(query.tabSeparated).toBe(false);
+		});
+
 		it("exits zero and returns rows whose third column parses as an age", async () => {
 			const { stdout, code } = await runPs();
 

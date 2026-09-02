@@ -379,8 +379,9 @@ describe("tsconfig.dist.json", () => {
 	const dist = JSON.parse(
 		fs.readFileSync(path.join(root, "tsconfig.dist.json"), "utf8"),
 	) as {
-		compilerOptions?: { outDir?: string; types?: string[] };
+		compilerOptions?: { outDir?: string; types?: string[]; allowJs?: boolean };
 		exclude?: string[];
+		include?: string[];
 	};
 
 	it("emits to ./dist", () => {
@@ -397,5 +398,30 @@ describe("tsconfig.dist.json", () => {
 		// `prepare`. In that environment dev-only @types/node is absent, so the
 		// dist config must not inherit the base config's `types: ["node"]` entry.
 		expect(dist.compilerOptions?.types).toEqual([]);
+	});
+
+	it("compiles the shared process-table seam into dist so esbuild can inline it", () => {
+		// #2443: `clients/process-snapshot.ts` imports
+		// `../scripts/lib/process-scan.mjs` (the seam lives in scripts/ because
+		// the worktree-hygiene hooks run before anything is built — see that
+		// file's header). tsc resolves its TYPES from the sibling `.d.mts` and
+		// would emit no JS at all, leaving `dist/clients/process-snapshot.js`
+		// importing a file that is not there — and `bundle:dist` then dies with
+		// "Could not resolve". Naming the .mjs in `include` (with `allowJs`)
+		// puts it at `dist/scripts/lib/process-scan.mjs`, exactly where that
+		// relative specifier lands.
+		expect(dist.compilerOptions?.allowJs).toBe(true);
+		expect(dist.include ?? []).toContain("scripts/lib/process-scan.mjs");
+	});
+
+	it("keeps tsconfig.dist.json parseable as strict JSON", () => {
+		// This suite reads it with JSON.parse, and so does anything else that
+		// treats a tsconfig as data rather than handing it to tsc: a `//`
+		// comment here fails at read time, not at build time.
+		expect(() =>
+			JSON.parse(
+				fs.readFileSync(path.join(root, "tsconfig.dist.json"), "utf8"),
+			),
+		).not.toThrow();
 	});
 });
