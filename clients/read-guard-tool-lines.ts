@@ -16,7 +16,6 @@ import {
 } from "./partial-edit-apply.js";
 import {
 	boundedEditIndexes,
-	boundedIndexesForCount,
 	createReadGuardEditBatchSummary,
 	logReadGuardEvent,
 	type EditBatchRejection,

@@ -16,6 +16,7 @@ import { readChangesSince } from "../../clients/project-changes.js";
 import { handleAgentEnd } from "../../clients/runtime-agent-end.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { handleToolResult } from "../../clients/runtime-tool-result.js";
+import { assertNonEmptyScan } from "../support/sweep-kit.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
 vi.mock("../../clients/pipeline.js", async (importOriginal) => {
@@ -260,8 +261,9 @@ describe("#2423 acceptance 1 — a third-party edit reaches the bookkeeping chai
 				}),
 			);
 
-			expect(Object.keys(cacheManager.readTurnState(env.tmpDir).files ?? {}))
-				.toHaveLength(0);
+			expect(
+				Object.keys(cacheManager.readTurnState(env.tmpDir).files ?? {}),
+			).toHaveLength(0);
 			expect(runtime.pendingDeferredFormatCount).toBe(0);
 		} finally {
 			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
@@ -273,9 +275,8 @@ describe("#2423 acceptance 1 — a third-party edit reaches the bookkeeping chai
 
 describe("#2423 — classification contract", () => {
 	it("classifies pi's own tools from the built-in table", async () => {
-		const { classifyMutatingTool } = await import(
-			"../../clients/mutating-tool.js"
-		);
+		const { classifyMutatingTool } =
+			await import("../../clients/mutating-tool.js");
 		expect(
 			classifyMutatingTool({ toolName: "write", input: { path: "/a.ts" } }),
 		).toMatchObject({ kind: "write", provenance: "builtin", path: "/a.ts" });
@@ -300,9 +301,8 @@ describe("#2423 — classification contract", () => {
 	});
 
 	it("keeps the adapter order deterministic and first-match-wins", async () => {
-		const { MUTATION_SHAPE_ADAPTERS } = await import(
-			"../../clients/mutating-tool.js"
-		);
+		const { MUTATION_SHAPE_ADAPTERS } =
+			await import("../../clients/mutating-tool.js");
 		expect(MUTATION_SHAPE_ADAPTERS.map((a) => a.name)).toEqual([
 			"hashline-readmap",
 			"hashline-edit-pro",
@@ -312,9 +312,8 @@ describe("#2423 — classification contract", () => {
 	// Mutation proof for the registry: each adapter owns a case that goes red if
 	// its entry is deleted, because no other adapter recognizes that shape.
 	it("resolves the hashline-readmap shape (red if that adapter is removed)", async () => {
-		const { classifyMutatingTool } = await import(
-			"../../clients/mutating-tool.js"
-		);
+		const { classifyMutatingTool } =
+			await import("../../clients/mutating-tool.js");
 		expect(
 			classifyMutatingTool({
 				toolName: "hashline_edit",
@@ -332,9 +331,8 @@ describe("#2423 — classification contract", () => {
 	});
 
 	it("resolves the hashline-edit-pro shape (red if that adapter is removed)", async () => {
-		const { classifyMutatingTool } = await import(
-			"../../clients/mutating-tool.js"
-		);
+		const { classifyMutatingTool } =
+			await import("../../clients/mutating-tool.js");
 		expect(
 			classifyMutatingTool({
 				toolName: "replace",
@@ -349,9 +347,8 @@ describe("#2423 — classification contract", () => {
 	});
 
 	it("blocks rather than guesses when an adapter cannot resolve its anchors", async () => {
-		const { classifyMutatingTool } = await import(
-			"../../clients/mutating-tool.js"
-		);
+		const { classifyMutatingTool } =
+			await import("../../clients/mutating-tool.js");
 		const blocked = classifyMutatingTool({
 			toolName: "replace",
 			input: { path: "/a.ts", remove_from: "notaline", remove_to: "12" },
@@ -361,9 +358,8 @@ describe("#2423 — classification contract", () => {
 	});
 
 	it("has no dead `multiedit` entry left in the mutating-tool table", async () => {
-		const { getBuiltinMutatingToolNames, isMutatingToolName } = await import(
-			"../../clients/mutating-tool.js"
-		);
+		const { getBuiltinMutatingToolNames, isMutatingToolName } =
+			await import("../../clients/mutating-tool.js");
 		expect(getBuiltinMutatingToolNames().sort()).toEqual(["edit", "write"]);
 		expect(isMutatingToolName("multiedit")).toBe(false);
 	});
@@ -398,8 +394,9 @@ describe("#2423 grep guard — the seam is the only mutation decision point", ()
 	it("finds no tool-name literal comparison outside clients/mutating-tool.ts", () => {
 		const files = walkTypeScript(CLIENTS_DIR);
 		// Non-empty scan floor: a walker that silently found nothing would make
-		// this suite pass for the wrong reason.
-		expect(files.length).toBeGreaterThan(50);
+		// this suite pass for the wrong reason. `clients/` held well over 200
+		// TypeScript files when this floor was set on 2026-09-02.
+		assertNonEmptyScan("#2423 mutation-literal grep guard", files.length, 150);
 
 		const offenders: string[] = [];
 		for (const file of files) {

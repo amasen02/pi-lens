@@ -226,13 +226,15 @@ export function recordMutationThroughSeam(
 		// 2. Turn state: this is the insert that leaves `turn-state.json` `files`
 		//    non-empty for a mutation no `tool_result` described.
 		const changedRange = resolveChangedRange(classification, deps, filePath);
-		deps.getCacheManager().addModifiedRange?.(
-			filePath,
-			changedRange,
-			false,
-			projectRoot,
-			runtime.telemetrySessionId,
-		);
+		deps
+			.getCacheManager()
+			.addModifiedRange?.(
+				filePath,
+				changedRange,
+				false,
+				projectRoot,
+				runtime.telemetrySessionId,
+			);
 
 		// 3. Attributed change-log receipt. The source carries the producer's
 		//    identity instead of collapsing onto `agent-edit`, so a report can

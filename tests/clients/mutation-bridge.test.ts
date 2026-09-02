@@ -224,9 +224,9 @@ describe("mutation bridge bookkeeping", () => {
 			expect(() =>
 				recordMutationThroughSeam({ filePath, kind: "write" }, deps),
 			).not.toThrow();
-			expect(
-				recordMutationThroughSeam({ filePath, kind: "write" }, deps),
-			).toBe(false);
+			expect(recordMutationThroughSeam({ filePath, kind: "write" }, deps)).toBe(
+				false,
+			);
 		} finally {
 			env.cleanup();
 		}
@@ -249,9 +249,9 @@ describe("mutation bridge registration", () => {
 			});
 			const bridge = getMutationBridge();
 			expect(bridge?.version).toBe(1);
-			expect(
-				(globalThis as Record<symbol, unknown>)[MUTATION_BRIDGE_KEY],
-			).toBe(bridge);
+			expect((globalThis as Record<symbol, unknown>)[MUTATION_BRIDGE_KEY]).toBe(
+				bridge,
+			);
 
 			// A second registration is a no-op: the mounted bridge keeps its deps.
 			const second = vi.fn(() => true);

@@ -185,8 +185,38 @@ pi-lens writes to files **outside your own tool calls** (`docs/features.md`
 - **`write` then `edit` on the same file, same turn:** the write's autofix
   demotes to deferred too, so the file's mutation history stays coherent. This
   resets at the next turn.
+- **Any other tool that edits a file:** pi-lens recognizes it by the SHAPE of
+  its arguments rather than its name (`clients/mutating-tool.ts`), so a host or
+  extension tool called `replace` or `insert` gets the same chain `edit` gets:
+  the read-before-edit guard, a turn-state entry, a change-log receipt
+  attributed to that tool, and a *deferred* auto-fix. Deferred is the default
+  for every edit-shaped tool pi-lens cannot place, because formatting between
+  the steps of a multi-call rewrite fights the tool that is still writing.
 - The conservative actionable-warnings autofix (LSP quickfixes, hard-capped)
   is unchanged: it always runs at `agent_end`.
+
+**Extension authors: record your own writes.** If your extension writes files
+outside pi-lens's tool events — its own registered tool, a spawned rewriter —
+tell pi-lens through the in-process mutation bridge, the write-side sibling of
+the read bridge:
+
+```js
+const bridge = globalThis[Symbol.for("pi-lens:mutation-bridge")];
+if (bridge?.version === 1) {
+  bridge.recordMutation({
+    filePath,               // absolute path
+    kind: "edit",           // "write" replaces the whole file; "edit" is partial
+    editRanges: [[12, 18]], // optional, 1-based inclusive
+    consumer: "my-extension",
+  });
+}
+```
+
+Check `version` before calling; a version you do not recognize is unsupported.
+Calling when pi-lens is absent or the guard is disabled is safe — the bridge is
+missing or drops the call. `recordMutation` returns `true` when pi-lens took the
+record and `false` when it dropped it, so you can count your own drops. pi-lens's
+own `ast_grep_replace apply:true` records through this same bridge.
 
 Consequences for you:
 

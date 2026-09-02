@@ -53,6 +53,14 @@ so the final state is formatter-stable. A `write` immediately followed by an
 deferred too. See `clients/pipeline.ts`, `clients/runtime-tool-result.ts`, and
 `clients/runtime-agent-end.ts`.
 
+A tool pi-lens does not name is classified by the SHAPE of its arguments
+(`clients/mutating-tool.ts`). A host or extension edit tool called `replace` or
+`insert` therefore gets the read-before-edit guard, a turn-state entry, a
+change-log receipt attributed to the tool itself, and the deferred autofix and
+format pass — the same chain `edit` gets. Deferred is the default for any
+edit-shaped tool pi-lens cannot place, because formatting between the calls of a
+multi-step rewrite fights the tool that is still writing.
+
 **Bundled fallback lint configs stay conservative.** When a project ships no
 tool config, the package-owned fallback configs set the rules (`config/biome/core.jsonc`,
 `config/ruff/core.toml`, `config/markdownlint/core.json`). The biome fallback
