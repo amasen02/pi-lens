@@ -249,7 +249,10 @@ let softFail = 0;
 for (const r of results) {
 	const soft = (r.kind === "asset" || r.kind === "tool") && allowSoft;
 	const status = r.ok ? "PASS" : soft ? "WARN" : "FAIL";
-	if (!r.ok) soft ? softFail++ : hardFail++;
+	if (!r.ok) {
+		if (soft) softFail++;
+		else hardFail++;
+	}
 	console.log(
 		`  [${status}] ${r.name.padEnd(pad)} ${r.detail ? "— " + r.detail : ""}`,
 	);

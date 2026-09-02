@@ -351,7 +351,7 @@ async function analyzeLatency(files, state) {
 			} else if (entry.type === "phase") {
 				const phase = entry.phase ?? "unknown";
 				state.latency.phaseCounts.inc(phase);
-				if (/_timeout$/.test(phase)) state.latency.phaseTimeouts.inc(phase);
+				if (phase.endsWith("_timeout")) state.latency.phaseTimeouts.inc(phase);
 				if (
 					phase === "total" &&
 					(entry.durationMs ?? 0) >= thresholds.totalSlowMs
