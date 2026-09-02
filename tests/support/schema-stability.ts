@@ -97,6 +97,57 @@ export function assertSchemaStabilityTiers(schema: unknown): void {
 	}
 	const untiered: string[] = [];
 	const badTier: string[] = [];
+
+	walkSchemaProperties(schema, ({ name, node, pointer }) => {
+		void name;
+		if (node === undefined) {
+			untiered.push(pointer);
+			return;
+		}
+		const tier = node[STABILITY_TIER_KEY];
+		if (tier === undefined) untiered.push(pointer);
+		else if (!isStabilityTier(tier)) badTier.push(`${pointer} (${String(tier)})`);
+	});
+
+	const failures = [
+		untiered.length > 0
+			? `missing ${STABILITY_TIER_KEY}: ${untiered.join(", ")}`
+			: "",
+		badTier.length > 0
+			? `invalid ${STABILITY_TIER_KEY}: ${badTier.join(", ")}`
+			: "",
+	].filter(Boolean);
+	if (failures.length > 0) {
+		throw new Error(`schema stability tiers: ${failures.join("; ")}`);
+	}
+}
+
+/** One published property the walk found. */
+export interface SchemaProperty {
+	/** The property's own name, as a user writes it in a config file. */
+	readonly name: string;
+	/** JSON-pointer-ish path from the schema root. */
+	readonly pointer: string;
+	/** The subschema, or `undefined` when the schema put a non-object here. */
+	readonly node: JsonSchemaNode | undefined;
+}
+
+/**
+ * Visit every PUBLISHED property in a schema, wherever it hides.
+ *
+ * Extracted from `assertSchemaStabilityTiers` (#2427) rather than copied: the
+ * public-surface drift guard asks a different question of the SAME set of
+ * fields ("is it documented" instead of "is it tiered"), and a second walker
+ * would be a second answer to "what does this schema publish" — the
+ * single-source-of-truth defect, in the very harness that exists to catch
+ * drift. Both callers now inherit the same coverage of `$defs`, `oneOf`,
+ * `additionalProperties`, `if`/`then`/`else` and `contentSchema`.
+ */
+export function walkSchemaProperties(
+	schema: unknown,
+	visit: (property: SchemaProperty) => void,
+): void {
+	if (!isObject(schema)) return;
 	// Shared subschema objects (and `$ref`-free self-references built by hand)
 	// would otherwise recurse forever; the walk is a graph walk, not a tree walk.
 	const seen = new Set<JsonSchemaNode>();
@@ -112,13 +163,10 @@ export function assertSchemaStabilityTiers(schema: unknown): void {
 				const childPath = [...pathParts, name];
 				const pointer = `/${childPath.join("/")}`;
 				if (!isObject(child)) {
-					untiered.push(pointer);
+					visit({ name, pointer, node: undefined });
 					continue;
 				}
-				const tier = child[STABILITY_TIER_KEY];
-				if (tier === undefined) untiered.push(pointer);
-				else if (!isStabilityTier(tier))
-					badTier.push(`${pointer} (${String(tier)})`);
+				visit({ name, pointer, node: child });
 				walk(child, childPath);
 			}
 		}
@@ -153,18 +201,6 @@ export function assertSchemaStabilityTiers(schema: unknown): void {
 	};
 
 	walk(schema, []);
-
-	const failures = [
-		untiered.length > 0
-			? `missing ${STABILITY_TIER_KEY}: ${untiered.join(", ")}`
-			: "",
-		badTier.length > 0
-			? `invalid ${STABILITY_TIER_KEY}: ${badTier.join(", ")}`
-			: "",
-	].filter(Boolean);
-	if (failures.length > 0) {
-		throw new Error(`schema stability tiers: ${failures.join("; ")}`);
-	}
 }
 
 /**

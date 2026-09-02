@@ -38,6 +38,7 @@ import {
 	createWarmIpcLineReader,
 	createWarmIpcRequestQueue,
 	diagnosticStats,
+	effectiveConfig,
 	ensureLspConfig,
 	generatedSkipNotice,
 	ipcPathForCwd,
@@ -929,10 +930,36 @@ const ALL_TOOLS = [
 		name: "pilens_health",
 		description:
 			"pi-lens runtime health for THIS server: alive LSP servers, last dispatch " +
-			"summary, session diagnostic counts, and the total CPU/RAM footprint " +
-			"attributable to pi-lens across every process it owns (host + LSP " +
-			"children) machine-wide, from the shared instance registry.",
+			"summary, session diagnostic counts, how many resolved config leaves each " +
+			"source tier decided, and the total CPU/RAM footprint attributable to " +
+			"pi-lens across every process it owns (host + LSP children) machine-wide, " +
+			"from the shared instance registry.",
 		inputSchema: { type: "object", properties: {} },
+	},
+	{
+		name: "pilens_effective_config",
+		description:
+			"The resolved pi-lens configuration with the provenance of every " +
+			"decision: which file and source tier each setting came from, the trust " +
+			"decision that applied, and which config files contributed. Pass `file` " +
+			"to also get, for that path, its canonical language, EVERY LSP server " +
+			"with the reason it was selected or denied — including which tier's " +
+			"config denied it, which a nearer file cannot lift — and the lint/format " +
+			"runners that would dispatch. This is the answer to 'why is X running / " +
+			"why is X not running' without reading logs. Redacted by construction: " +
+			"it reports sources, never values — no environment values, no command " +
+			"arguments beyond the binary itself, and config paths are home-relative.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				cwd: { type: "string" },
+				file: {
+					type: "string",
+					description:
+						"Path to explain: adds the resolved language plus the per-server and per-runner selection decisions for it.",
+				},
+			},
+		},
 	},
 	{
 		name: "pilens_session_start",
@@ -1530,6 +1557,17 @@ async function callTool(
 		// hook records its outcome per workspace; this is where it becomes
 		// visible without `claude --debug` log spelunking.
 		const turnEnd = readTurnEndStatus(DEFAULT_CWD) ?? null;
+		// #2427: per-tier COUNTS only, never values — #2415's "provenance
+		// surfaces in health output without leaking values". Best-effort for the
+		// same reason the footprint below is: a config resolution failure must
+		// not take down the older, more load-bearing half of this report.
+		const configProvenance = await effectiveConfig({ cwd: DEFAULT_CWD })
+			.then((view) => ({
+				documents: view.documents.length,
+				tiers: view.provenanceCounts,
+				codes: view.recordCounts,
+			}))
+			.catch(() => null);
 		// #620: best-effort — a footprint read failure must never break the rest
 		// of pilens_health's (much older, more load-bearing) reporting.
 		const footprint = await resourceFootprint().catch(() => null);
@@ -1561,6 +1599,20 @@ async function callTool(
 					`${turnEnd.lastRunAt ? ` (last ran ${turnEnd.lastRunAt})` : ""}` +
 					`${turnEnd.lastSkipReason ? ` — last skip: ${turnEnd.lastSkipReason}${turnEnd.lastSkipAt ? ` at ${turnEnd.lastSkipAt}` : ""}` : ""}`
 				: "Stop-hook turn-end: no activity recorded (hook not installed, or no Stop yet)",
+			configProvenance
+				? `Config: ${configProvenance.documents} file(s) · ` +
+					`${Object.entries(configProvenance.tiers)
+						.filter(([, count]) => count > 0)
+						.map(([tier, count]) => `${tier} ${count}`)
+						.join(" · ")} leaf/leaves` +
+					`${
+						Object.keys(configProvenance.codes).length > 0
+							? ` · notices ${Object.entries(configProvenance.codes)
+									.map(([code, count]) => `${code}×${count}`)
+									.join(", ")}`
+							: ""
+					}`
+				: "Config: unavailable (resolution failed)",
 			footprint
 				? `Resource footprint: ${footprint.instanceCount} pi-lens instance(s) · ` +
 					`${(footprint.totalRssBytes / 1024 / 1024).toFixed(0)}MB RSS · ` +
@@ -1589,7 +1641,44 @@ async function callTool(
 			turnEnd,
 			resourceFootprint: footprint,
 			degradations,
+			configProvenance,
 		});
+	}
+
+	if (name === "pilens_effective_config") {
+		const cwd = typeof args.cwd === "string" ? args.cwd : DEFAULT_CWD;
+		const view = await effectiveConfig({
+			cwd,
+			...(typeof args.file === "string" ? { file: args.file } : {}),
+			redact: true,
+		});
+		const lines = [
+			`Config: ${view.documents.length} file(s) contributing, ${view.provenance.length} resolved leaf/leaves`,
+			...view.documents.map(
+				(document) =>
+					`  ${document.tier}: ${document.file}${document.legacy ? " (legacy location — scheduled for removal)" : ""}`,
+			),
+			...(view.file
+				? [
+						`File: ${view.file.path}${view.file.language ? ` — ${view.file.language}` : ""}${view.file.kind ? ` (kind ${view.file.kind})` : ""}`,
+						...view.file.servers
+							// Only the servers with something to say: every registry entry
+							// whose extension simply does not match this file would be ~40
+							// lines of "not applicable" ahead of the answer.
+							.filter((server) => server.reason !== "extension-mismatch")
+							.map(
+								(server) =>
+									`  ${server.selected ? "✓" : "✗"} ${server.id} — ${server.reason}` +
+									`${server.decidedBy ? ` (${server.decidedBy.tier}${server.decidedBy.file ? ` ${server.decidedBy.file}` : ""} → ${server.decidedBy.key})` : ""}`,
+							),
+						...view.file.tools.map(
+							(tool) =>
+								`  ${tool.selected ? "✓" : "✗"} ${tool.id} — ${tool.reason}`,
+						),
+					]
+				: []),
+		];
+		return toolText(lines.join("\n"), view);
 	}
 
 	if (name === "pilens_diagnostics") {
@@ -1725,6 +1814,10 @@ async function callTool(
 //   pilens_read_symbol, pilens_read_enclosing  — stateless file reads, but no
 //     existing fresh-fork path either; warn rather than silently answer with
 //     however this stale build's tree-sitter/read-symbol logic behaves.
+//   pilens_effective_config                    — reads the warm per-workspace
+//     LSP registry to say which servers a file selects, and the merge/deny
+//     semantics it explains are compiled code; a stale build would explain a
+//     resolution the running one no longer performs.
 //
 // `pilens_rebuild` is deliberately excluded: it doesn't answer with analysis
 // at all (it shells out to `npm run build`/`build:dist`), and it's the very
@@ -1745,6 +1838,7 @@ const WARN_ONLY_STALE_TOOLS = new Set([
 	"pilens_lsp_diagnostics",
 	"pilens_read_symbol",
 	"pilens_read_enclosing",
+	"pilens_effective_config",
 ]);
 
 /**

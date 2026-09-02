@@ -218,6 +218,7 @@ import {
 	createReadSymbolTool,
 } from "./tools/module-report.js";
 import { createProjectReportTool } from "./tools/project-report.js";
+import { createEffectiveConfigTool } from "./tools/effective-config.js";
 import { createSymbolSearchTool } from "./tools/symbol-search.js";
 import {
 	getLastLoggedPhase,
@@ -1612,6 +1613,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 			},
 		),
 		createSymbolSearchTool(() => runtime.projectRoot),
+		createEffectiveConfigTool(() => runtime.projectRoot),
 		createProjectReportTool(() => runtime.projectRoot),
 		createModuleReportTool(() => runtime.projectRoot),
 		createReadSymbolTool(

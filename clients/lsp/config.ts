@@ -369,20 +369,71 @@ export function isServerDisabled(serverId: string, filePath?: string): boolean {
 
 // --- Override getServersForFile to include custom servers
 
-export function getServersForFileWithConfig(filePath: string): LSPServerInfo[] {
+/**
+ * Why a server did or did not attach to a file. A closed union: it is public
+ * API the moment `pilens_effective_config` renders it, so a new member arrives
+ * through `docs/public-api-stability.md`.
+ */
+export type ServerSelectionReason =
+	| "selected"
+	| "disabled-by-config"
+	| "extension-mismatch"
+	| "path-filter";
+
+/** One server's selection decision for a file. */
+export interface ServerSelection {
+	readonly server: LSPServerInfo;
+	readonly selected: boolean;
+	readonly reason: ServerSelectionReason;
+}
+
+/**
+ * Evaluate every registered server against a file and say WHY each answer came
+ * out the way it did (#2427).
+ *
+ * This is the one evaluation; `getServersForFileWithConfig` is a projection of
+ * it. Answering "why is server X not running" used to mean re-implementing
+ * these three gates at the asking site — and a second copy of a filter is a
+ * copy that drifts, which is exactly what AGENTS.md's single-source-of-truth
+ * rule forbids. Deciding once and projecting twice makes the introspection
+ * answer and the dispatch answer the same computation by construction.
+ *
+ * Gate order is the ANSWER order, not just an implementation detail: a server
+ * the operator disabled reports `disabled-by-config` even when the file's
+ * extension would not have matched it anyway, because "you turned it off" is
+ * the fact the asker can act on.
+ */
+export function explainServersForFile(filePath: string): ServerSelection[] {
+	const config = getConfigForFile(filePath);
 	const ext = path.extname(filePath).toLowerCase();
 	const base = path.basename(filePath).toLowerCase();
-	return getAllServers(filePath).filter((server) => {
+	return [...LSP_SERVERS, ...config.customServers].map((server) => {
+		if (config.disabledServerIds.has(server.id)) {
+			return { server, selected: false, reason: "disabled-by-config" as const };
+		}
 		const extensions = server.extensions.map((value) => value.toLowerCase());
-		const extensionMatch =
-			extensions.includes(ext) || extensions.includes(base);
-		if (!extensionMatch) return false;
+		if (!extensions.includes(ext) && !extensions.includes(base)) {
+			return {
+				server,
+				selected: false,
+				reason: "extension-mismatch" as const,
+			};
+		}
 		// #636: a server's extension match can be intentionally broader than what
 		// it can usefully act on (zizmor attaches to "yaml" but only ever reports
 		// on GitHub Actions workflow/action/dependabot paths). `pathFilter`, when
 		// present, is an ADDITIONAL narrowing gate — never a widening one.
-		return server.pathFilter ? server.pathFilter(filePath) : true;
+		if (server.pathFilter && !server.pathFilter(filePath)) {
+			return { server, selected: false, reason: "path-filter" as const };
+		}
+		return { server, selected: true, reason: "selected" as const };
 	});
+}
+
+export function getServersForFileWithConfig(filePath: string): LSPServerInfo[] {
+	return explainServersForFile(filePath)
+		.filter((entry) => entry.selected)
+		.map((entry) => entry.server);
 }
 
 /**

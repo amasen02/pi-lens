@@ -73,7 +73,7 @@ describe("loadLSPConfig global configuration (#870)", () => {
 		});
 	});
 
-	it("merges maps by id and replaces project-owned array fields", async () => {
+	it("merges maps by id, replaces project-owned array fields, and unions denials", async () => {
 		const projectDir = tmpDir("pi-lens-lsp-project-");
 		const globalDir = tmpDir("pi-lens-lsp-global-");
 		process.env.PI_LENS_HOME = globalDir;
@@ -134,7 +134,15 @@ describe("loadLSPConfig global configuration (#870)", () => {
 		expect(config.serverOverrides?.rust.initializationOptions).toEqual({
 			check: { command: "clippy" },
 		});
-		expect(config.disabledServers).toEqual([]);
+		// `disabledServers` is the ONE array field that does NOT follow the
+		// project-replaces-global rule the rest of this case pins (#2427). It is a
+		// DENIAL, and `config-core/deny.ts` resolves it as the union of every
+		// tier's entries — so the project's `[]` above expresses nothing, and the
+		// operator's global denial survives. Before #2427 this assertion read
+		// `toEqual([])`, which is to say it pinned repository content silently
+		// re-enabling a server the operator had turned off; #2415 AC 3 forbids
+		// exactly that, and `docs/configuration.md` documents the exception.
+		expect(config.disabledServers).toEqual(["global-disabled"]);
 		expect(config.warmFiles).toEqual(["project.ts"]);
 	});
 
