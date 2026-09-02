@@ -22,6 +22,7 @@ import {
 	getDisposition,
 	type DispositionCandidate,
 } from "../clients/diagnostic-dispositions.js";
+import { DEPENDENCY_DRIFT_MAX_DELIVERIES } from "../clients/blocker-freshness.js";
 import { freshnessFromMtime } from "../clients/freshness.js";
 import { applyInlineSuppressions } from "../clients/dispatch/inline-suppressions.js";
 import { gateFindingsByPathFreshness } from "../clients/advisory-provenance.js";
@@ -2437,6 +2438,17 @@ function formatAllMode(
 	pathsScope?: PathsScope,
 	dependencyDemoted = 0,
 ): { content: [{ type: "text"; text: string }]; details: object } {
+	// #2275 review F2: the widget footer stops DRAWING a dependency-drift
+	// demotion once it hits `DEPENDENCY_DRIFT_MAX_DELIVERIES` unconfirmed
+	// deliveries, but the record stays here (dropping it would make an
+	// unconfirmed LSP error read as clean). Say so, through the same note
+	// channel as the demotion itself, so the agent knows why the footer went
+	// quiet and that a re-run can still confirm the finding.
+	const footerCapped = summaries.reduce(
+		(n, s) =>
+			n + (s.diagnostics ?? []).filter((d) => d.footerRetired === true).length,
+		0,
+	);
 	// Files changed/deleted since their diagnostics were recorded have already
 	// been dropped by reconcileStaleWidgetFiles; note them so the agent knows
 	// those aren't "clean", just un-rescanned (use mode=full to refresh).
@@ -2446,6 +2458,9 @@ function formatAllMode(
 			: "") +
 		(dependencyDemoted > 0
 			? ` (${dependencyDemoted} blocking finding${dependencyDemoted === 1 ? "" : "s"} demoted to [stale] — an imported file changed since; re-run to confirm)`
+			: "") +
+		(footerCapped > 0
+			? ` (${footerCapped} demoted finding${footerCapped === 1 ? "" : "s"} capped after ${DEPENDENCY_DRIFT_MAX_DELIVERIES} unconfirmed deliveries — no longer shown in the pi-lens footer, still listed here; re-run to confirm)`
 			: "");
 
 	// mode=full already actively scanned exactly the requested paths, so a zero

@@ -1112,7 +1112,7 @@ export const EXEMPT_SESSION_STATE_FILES: Readonly<Record<string, string>> = {
 	"recent-touches.ts":
 		"the recent-touch cursor, consumed and advanced per read",
 	"widget-state.ts":
-		"widget render state, rebuilt from the sources it displays",
+		"widget render state, rebuilt from the sources it displays. #2275 added `renderedDependencyDriftFiles`, the set of files whose dependency-drift demotions the footer has drawn since the last turn end: it is drained (emptied) by every turn end's delivery-cap step and cleared by clearWidgetState, so it is turn-scoped working state that cannot outlive a session even without its own reset",
 	"word-index.ts":
 		"word-index build guard, per build; asyncWordIndexOperations queue is keyed by WordIndex and self-deletes in finally, so it needs no reset",
 	"mcp/analyze.ts":
@@ -1294,7 +1294,9 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"test-runner-delivery.ts": 1,
 	"tui-fit.ts": 0,
 	"warm-attach.ts": 0,
-	"widget-state.ts": 2,
+	// #2275 added `renderedDependencyDriftFiles` (the drained per-turn footer
+	// delivery set) alongside the existing two.
+	"widget-state.ts": 3,
 	// #2068 added the per-index dirty-file set; it is process-local wire-cache
 	// state and is cleared by serialization, so it needs no session reset.
 	"word-index.ts": 4,
