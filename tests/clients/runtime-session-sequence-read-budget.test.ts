@@ -29,6 +29,7 @@
  * actually assert on.
  */
 
+import { withResidentBootstrap } from "../support/bootstrap-mock.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -81,7 +82,7 @@ function makeDeps(
 	runtime: RuntimeCoordinator,
 	overrides: Record<string, unknown> = {},
 ) {
-	return {
+	return withResidentBootstrap({
 		ctxCwd,
 		getFlag: () => false,
 		notify: vi.fn(),
@@ -127,7 +128,7 @@ function makeDeps(
 		resetDispatchBaselines: () => {},
 		resetLSPService: () => {},
 		...overrides,
-	} as any;
+	}) as any;
 }
 
 function makeProject(env: { tmpDir: string }): string {

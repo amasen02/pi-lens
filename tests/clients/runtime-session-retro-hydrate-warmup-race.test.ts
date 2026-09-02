@@ -24,6 +24,7 @@
  * invariant of the warmup's own code, not a timing bet).
  */
 
+import { withResidentBootstrap } from "../support/bootstrap-mock.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -88,7 +89,7 @@ vi.mock("../../clients/lsp/index.js", () => ({
 import { handleSessionStart } from "../../clients/runtime-session.js";
 
 function makeDeps(ctxCwd: string, runtime: RuntimeCoordinator) {
-	return {
+	return withResidentBootstrap({
 		ctxCwd,
 		getFlag: () => false,
 		notify: vi.fn(),
@@ -133,7 +134,7 @@ function makeDeps(ctxCwd: string, runtime: RuntimeCoordinator) {
 		cleanStaleTsBuildInfo: () => [],
 		resetDispatchBaselines: () => {},
 		resetLSPService: () => {},
-	} as any;
+	}) as any;
 }
 
 /** A deferred promise the test controls the settle timing of. */

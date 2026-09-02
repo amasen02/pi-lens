@@ -51,6 +51,8 @@ import {
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
 import {
+	_analyzerBootstrapFailureStrikes as analyzerBootstrapStrikes,
+	_armAnalyzerBootstrapLatchForTests as armAnalyzerBootstrapLatch,
 	isAnalyzerBootstrapShutdown,
 	markAnalyzerBootstrapShutdown,
 	resetAnalyzerBootstrapSessionState,
@@ -230,6 +232,20 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 		probe: {
 			arm: () => markAnalyzerBootstrapShutdown(),
 			isArmed: () => !isAnalyzerBootstrapShutdown(),
+			reset: () => resetAnalyzerBootstrapSessionState(),
+		},
+	},
+	{
+		id: "bootstrap:failure-latch",
+		module: "bootstrap.ts",
+		state: "bootstrapFailureStrikes",
+		policy: "session_start",
+		resetName: "resetAnalyzerBootstrapSessionState",
+		reason:
+			"#2467 review: after BOOTSTRAP_FAILURE_STRIKE_LIMIT consecutive failed builds the seam stops rebuilding, so a permanently unresolvable analyzer module no longer re-runs seventeen dynamic imports plus collectInstallDiagnostics on every tool call. That verdict is about an ENVIRONMENT, and an environment is repaired between sessions (a dependency installed, a package layout fixed) — held process-wide without a session_start reset it would write the analyzers off for the life of the process, which is defect shape 17 exactly.",
+		probe: {
+			arm: () => armAnalyzerBootstrapLatch(),
+			isArmed: () => analyzerBootstrapStrikes() === 0,
 			reset: () => resetAnalyzerBootstrapSessionState(),
 		},
 	},

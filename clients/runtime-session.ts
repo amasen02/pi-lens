@@ -1,19 +1,17 @@
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
 import type { AstGrepClient } from "./ast-grep-client.js";
-import type { BiomeClient } from "./biome-client.js";
 import { resetBoundedTelemetry } from "./bounded-telemetry.js";
 import { rotateMessageEndAttribution } from "./message-end-attribution.js";
 import type { CacheManager } from "./cache-manager.js";
 import { createDeadline, yieldIfOverBudget } from "./cooperative-budget.js";
-import type { DeadCodeClient, DeadCodeResult } from "./dead-code-client.js";
+import type { DeadCodeResult } from "./dead-code-client.js";
 import { deadCodeIssueCount } from "./dead-code-client.js";
 import { logDeadCodeScan } from "./dead-code-logger.js";
 import {
 	incrementDegradationCount,
 	resetDegradationLedger,
 } from "./degradation-ledger.js";
-import type { DependencyChecker } from "./dependency-checker.js";
 import { getDiagnosticTracker } from "./diagnostic-tracker.js";
 import { resetPsScriptAnalyzerAvailability } from "./dispatch/runners/psscriptanalyzer.js";
 import { resetInstallRetryLatches } from "./dispatch/runners/utils/availability-policy.js";
@@ -29,14 +27,13 @@ import {
 	getProjectDataDir,
 } from "./file-utils.js";
 import { GitleaksClient, type GitleaksResult } from "./gitleaks-client.js";
-import type { GoClient } from "./go-client.js";
 import {
 	GovulncheckClient,
 	type GovulncheckResult,
 } from "./govulncheck-client.js";
 import { sweepAtomicWriteStages } from "./instance-reaper.js";
 import type { JscpdClient } from "./jscpd-client.js";
-import type { KnipClient, KnipResult } from "./knip-client.js";
+import type { KnipResult } from "./knip-client.js";
 import { canRunStartupHeavyScans } from "./language-policy.js";
 import {
 	detectProjectLanguageProfile,
@@ -53,8 +50,7 @@ import {
 	resetLSPCaseSensitivityState,
 } from "./lsp/server.js";
 import { loadLspService } from "./lsp-lazy.js";
-import type { MetricsClient } from "./metrics-client.js";
-import type { OpengrepClient, OpengrepResult } from "./opengrep-client.js";
+import type { OpengrepResult } from "./opengrep-client.js";
 import { resetManagedToolRefreshSession } from "./installer/managed-tool-refresh-session.js";
 import { resetResolvedPathCache } from "./installer/index.js";
 import { _resetPackageManagerCache } from "./package-manager.js";
@@ -82,14 +78,9 @@ import {
 	readProjectSnapshotMeta,
 	saveRuntimeProjectSnapshot,
 } from "./project-snapshot.js";
-import type { RuffClient } from "./ruff-client.js";
 import { scanProjectRules } from "./rules-scanner.js";
 import type { RuntimeCoordinator } from "./runtime-coordinator.js";
-import type { RustClient } from "./rust-client.js";
-import {
-	getAmbientAbortSignal,
-	resetSafeSpawnWindowsCommandCache,
-} from "./safe-spawn.js";
+import { resetSafeSpawnWindowsCommandCache } from "./safe-spawn.js";
 import {
 	type BootstrapClients,
 	resetAnalyzerBootstrapSessionState,
@@ -117,8 +108,6 @@ import {
 	isSubagentSession,
 	subagentLightModeNotice,
 } from "./subagent-mode.js";
-import type { TestRunnerClient } from "./test-runner-client.js";
-import type { TodoScanner } from "./todo-scanner.js";
 import { TrivyClient, type TrivyResult } from "./trivy-client.js";
 import { isWarmAttached } from "./warm-attach.js";
 import { setSessionLanguages } from "./widget-state.js";
@@ -183,90 +172,44 @@ interface SessionStartDeps {
 	cacheManager: CacheManager;
 	astGrepClient: AstGrepClient;
 	/**
-	 * #2467: the on-demand analyzer-bootstrap seam. When present it SUPERSEDES
-	 * the fifteen client fields below — production passes only this, so the
-	 * analyzer graph is never loaded before a consumer proves it needs it.
+	 * #2467: the ONE way this handler reaches the analyzer clients.
 	 *
-	 * The client fields stay for callers that already hold concrete instances
-	 * (every test fixture, and `clients/mcp/session.ts`, which builds a whole
-	 * session context up front because an MCP call has nothing to defer to).
-	 * Exactly one of the two shapes is supplied; `resolveBootstrap` reads
-	 * whichever it finds.
+	 * It used to take fifteen already-constructed clients — i.e. an awaited
+	 * seventeen-module load on the interactive path. The first attempt at
+	 * lazifying it made those fifteen fields optional and added this seam
+	 * beside them, with "exactly one of the two shapes is supplied" stated in
+	 * prose; that admitted a third shape the compiler was happy with and the
+	 * handler was not — drop `metricsClient` and every startup scan silently
+	 * stopped running. One required field, one shape. A caller that already
+	 * holds concrete clients (`clients/mcp/session.ts`) wraps them with
+	 * `residentBootstrapAccess`.
 	 */
-	bootstrap?: SessionBootstrapAccess;
-	metricsClient?: MetricsClient;
-	todoScanner?: TodoScanner;
-	biomeClient?: BiomeClient;
-	ruffClient?: RuffClient;
-	knipClient?: KnipClient;
-	jscpdClient?: JscpdClient;
-	deadCodeClients?: DeadCodeClient[];
-	govulncheckClient?: GovulncheckClient;
-	gitleaksClient?: GitleaksClient;
-	trivyClient?: TrivyClient;
-	opengrepClient?: OpengrepClient;
-	depChecker?: DependencyChecker;
-	testRunnerClient?: TestRunnerClient;
-	goClient?: GoClient;
-	rustClient?: RustClient;
+	bootstrap: SessionBootstrapAccess;
 	ensureTool: (name: string) => Promise<string | null | undefined>;
 	cleanStaleTsBuildInfo: (cwd: string) => string[];
 	resetDispatchBaselines: (cwd?: string) => void;
 	resetLSPService: (options?: LSPShutdownOptions) => void;
 }
 
-/** The analyzer clients as they are RIGHT NOW, without loading anything.
- *
- * Session start's two client resets (`metricsClient.reset()`,
- * `knipClient.resetSessionState()`) re-arm state that only exists once a
- * client has been constructed, so "nothing is loaded" and "nothing to
- * reset" are the same answer — loading seventeen modules to reset nothing
- * is exactly the cost #2467 removes. */
-function residentBootstrap(deps: SessionStartDeps): Partial<BootstrapClients> {
-	if (!deps.bootstrap) return deps as Partial<BootstrapClients>;
-	return deps.bootstrap.peek() ?? {};
-}
-
-/** The analyzer clients, loading them on demand and failing OPEN.
- *
- * An empty result means the caller proceeds without those analyzers; the
- * bounded record and the `analyzer-bootstrap-unavailable` ledger kind name
- * the demand, so a skipped scan is never mistaken for a clean one. The
- * ambient turn abort signal is folded in so Escape unblocks a demand that
- * is waiting on a slow load, alongside the loader's own wall-clock
- * ceiling (AGENTS.md's both-bounds rule). */
-async function demandBootstrap(
-	deps: SessionStartDeps,
-	reason: string,
-): Promise<Partial<BootstrapClients>> {
-	if (!deps.bootstrap) return deps as Partial<BootstrapClients>;
-	return (await deps.bootstrap.request(reason, getAmbientAbortSignal())) ?? {};
-}
-
-/** The `SessionStartDeps` fields the analyzer bootstrap supplies (#2467). */
-type BootstrapDepField = keyof BootstrapClients & keyof SessionStartDeps;
-
-/** `SessionStartDeps` whose analyzer client fields are proven present. */
-type BootstrapResolvedDeps = SessionStartDeps &
-	Required<Pick<SessionStartDeps, BootstrapDepField>>;
+/** `SessionStartDeps` with the analyzer clients merged in. */
+type BootstrapResolvedDeps = SessionStartDeps & BootstrapClients;
 
 /**
  * `deps` with resolved analyzer clients merged in, or `null` when the
  * bootstrap could not be served and the caller must proceed without them.
  *
- * The assertion is sound by construction: `buildBootstrapClients` returns
- * all seventeen fields or the demand returns nothing at all — a per-client
- * failure substitutes a degraded no-op stub rather than omitting the key —
- * so one probe answers for the whole set. A partially populated result is
- * not a shape this seam can produce.
+ * No cast and no "is one representative field present?" probe: the seam
+ * answers with all seventeen clients or with `null`, so the two outcomes are
+ * the two branches. A skipped consumer is already counted in the ledger under
+ * `analyzer-bootstrap-unavailable`, so it is never mistaken for a clean one.
  */
 async function demandBootstrapDeps(
 	deps: SessionStartDeps,
 	reason: string,
 ): Promise<BootstrapResolvedDeps | null> {
-	const clients = await demandBootstrap(deps, reason);
-	if (!clients.metricsClient) return null;
-	return { ...deps, ...clients } as BootstrapResolvedDeps;
+	const clients = await deps.bootstrap.request(reason);
+	if (!clients) return null;
+	return { ...deps, ...clients };
 }
 
 type StartupMode = "full" | "minimal" | "quick";
@@ -2271,7 +2214,7 @@ export async function handleSessionStart(
 	// holds no per-session state to re-arm, so the reset is vacuous — and
 	// loading the analyzer graph in order to reset nothing is the interactive-
 	// path cost this issue removes.
-	residentBootstrap(deps).metricsClient?.reset();
+	deps.bootstrap.peek()?.metricsClient.reset();
 	getDiagnosticTracker().reset();
 	clearFileTimeSessions();
 	runtime.complexityBaselines.clear();
@@ -2380,7 +2323,7 @@ export async function handleSessionStart(
 	// its absence must not make session_start fail.
 	// #2467: `peek` for the same reason as `metricsClient.reset()` above —
 	// an unloaded knip client has no session state to clear.
-	residentBootstrap(deps).knipClient?.resetSessionState?.();
+	deps.bootstrap.peek()?.knipClient.resetSessionState?.();
 	// #1910: the tier-3 cascade outstanding-touch registry and its
 	// sweep-scoped expired/evicted counters (clients/lsp/cascade-tier.ts) are
 	// a per-SESSION claim about touches THIS session fired. #1899 bounded the
@@ -2917,14 +2860,14 @@ export async function handleSessionStart(
 	// process's first session, the one the user is waiting on — returns above
 	// and never reaches here. Fail open: an unavailable bootstrap drops these
 	// three entries from the "Active tools" line rather than failing the start.
-	const summaryClients = await demandBootstrap(deps, "session-start-tools");
+	const summaryClients = await deps.bootstrap.request("session-start-tools");
 	const detectedRunner =
-		summaryClients.testRunnerClient?.detectRunner(analysisRoot);
+		summaryClients?.testRunnerClient.detectRunner(analysisRoot);
 	phase("test-runner-detect");
 	if (detectedRunner) tools.push(`Test runner (${detectedRunner.runner})`);
-	if (await summaryClients.goClient?.isGoAvailableAsync())
+	if (await summaryClients?.goClient.isGoAvailableAsync())
 		tools.push("Go (go vet)");
-	if (await summaryClients.rustClient?.isAvailableAsync())
+	if (await summaryClients?.rustClient.isAvailableAsync())
 		tools.push("Rust (cargo)");
 	log(`Active tools: ${tools.join(", ")}`);
 	dbg(`session_start tools: ${tools.join(", ")}`);

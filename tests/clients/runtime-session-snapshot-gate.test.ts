@@ -17,6 +17,7 @@
  *   - the full-mode path carries the same gate + record flag.
  */
 
+import { withResidentBootstrap } from "../support/bootstrap-mock.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -64,7 +65,7 @@ vi.mock("../../clients/lsp/index.js", () => ({
 import { handleSessionStart } from "../../clients/runtime-session.js";
 
 function makeDeps(ctxCwd: string, dbg: (msg: string) => void = () => {}) {
-	return {
+	return withResidentBootstrap({
 		ctxCwd,
 		getFlag: () => false,
 		notify: vi.fn(),
@@ -109,7 +110,7 @@ function makeDeps(ctxCwd: string, dbg: (msg: string) => void = () => {}) {
 		cleanStaleTsBuildInfo: () => [],
 		resetDispatchBaselines: () => {},
 		resetLSPService: () => {},
-	} as any;
+	}) as any;
 }
 
 function makeProject(env: { tmpDir: string }): string {

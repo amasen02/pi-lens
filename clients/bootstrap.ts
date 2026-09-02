@@ -39,6 +39,7 @@ import { logExtension } from "./extension-log.js";
 import { combineAbortSignals } from "./deadline-utils.js";
 import { logLatency } from "./latency-logger.js";
 import { emitBounded } from "./bounded-telemetry.js";
+import { recordDegradationOnce } from "./degradation-ledger.js";
 import { createSingleFlight } from "./single-flight.js";
 import type { AgentBehaviorClient } from "./agent-behavior-client.js";
 import type { BiomeClient } from "./biome-client.js";
@@ -104,6 +105,27 @@ let residentClients: BootstrapClients | null = null;
 let bootstrapShutdown = false;
 
 /**
+ * The abort signal every BOUNDED demand races, aborted by
+ * {@link markAnalyzerBootstrapShutdown} and replaced at `session_start`.
+ *
+ * #2467 review: the two session-start schedulers must NOT bind the ambient
+ * TURN signal — a `session_start` that lands mid-turn (sequential
+ * replacement, `/new`) would otherwise cancel every startup scan with no
+ * retry, which is #1394's exact lesson. They are not turn-scoped work. But
+ * "no abort at all" is not the answer either: AGENTS.md's both-bounds rule
+ * wants a wall-clock ceiling AND an abort race, and the bound that is
+ * genuinely theirs is the SESSION's own teardown. So the seam supplies it,
+ * for every caller, rather than each caller inventing one.
+ */
+let bootstrapShutdownController = new AbortController();
+
+/**
+ * Consecutive BUILD failures, reset by a successful build and by
+ * `session_start`. See {@link BOOTSTRAP_FAILURE_STRIKE_LIMIT}.
+ */
+let bootstrapFailureStrikes = 0;
+
+/**
  * How many BUILDS have been started this process (not how many demands were
  * made — concurrent demands share one build). Stamped into the
  * `bootstrap_clients_load` record as `attempt`, which is the discrimination
@@ -138,6 +160,22 @@ const bootstrapFlight = createSingleFlight<BootstrapClients>();
  * a wedged module evaluation cannot park a `tool_call` handler forever.
  */
 export const BOOTSTRAP_LOAD_TIMEOUT_MS = 10_000;
+
+/**
+ * How many consecutive failed builds before the seam stops rebuilding.
+ *
+ * Retry-after-failure is right for a TRANSIENT fault, which is the case the
+ * flight's identity-guarded release was written for. It is wrong for a
+ * PERMANENT one: an analyzer module that cannot resolve under the host's
+ * package layout (#285/#335) fails identically every time, and without a
+ * latch every later demand re-ran seventeen dynamic imports plus
+ * `collectInstallDiagnostics` — on the tool-call hot path — for an answer
+ * that could not change. Three strikes distinguishes "the filesystem
+ * hiccuped" from "this environment cannot load these analyzers"; after that
+ * the demand fails OPEN immediately, and `session_start` re-arms the latch so
+ * a repaired environment is never locked out for the life of the process.
+ */
+export const BOOTSTRAP_FAILURE_STRIKE_LIMIT = 3;
 
 /**
  * A stand-in for an analysis client whose module failed to load (an unresolved
@@ -350,7 +388,9 @@ async function buildBootstrapClients(): Promise<BootstrapClients> {
  * Why a demand could not be served: `shutdown` (the primary session already
  * tore down, so no new load may start), `timeout` (the caller's wall-clock
  * ceiling elapsed), `aborted` (the caller's own signal fired — Escape, turn
- * abort), or `failed` (the load itself rejected). A `null` from
+ * abort), `failed` (the load itself rejected), or `latched`
+ * ({@link BOOTSTRAP_FAILURE_STRIKE_LIMIT} consecutive builds failed, so the
+ * seam stopped rebuilding). A `null` from
  * {@link requestBootstrapClients} never says which on its own, so the reason
  * travels in the bounded record and the ledger entry instead.
  */
@@ -359,6 +399,7 @@ export const BOOTSTRAP_UNAVAILABLE_REASONS = [
 	"timeout",
 	"aborted",
 	"failed",
+	"latched",
 ] as const;
 
 /** One of {@link BOOTSTRAP_UNAVAILABLE_REASONS}. */
@@ -402,11 +443,39 @@ export function peekBootstrapClients(): BootstrapClients | null {
 export interface SessionBootstrapAccess {
 	/** Resident clients only; never starts a load. */
 	peek(): BootstrapClients | null;
-	/** Bounded, fail-open demand. `null` means proceed without them. */
-	request(
-		reason: string,
-		signal?: AbortSignal,
-	): Promise<BootstrapClients | null>;
+	/**
+	 * Bounded, fail-open demand. `null` means proceed without them.
+	 *
+	 * Deliberately takes NO abort signal. Session start is not turn-scoped
+	 * work: a `session_start` can land mid-turn (sequential replacement,
+	 * `/new`), and binding the ambient turn signal there cancelled every
+	 * startup scan with no retry — #1394's lesson, found in review. Both
+	 * bounds still hold, because {@link requestBootstrapClients} races the
+	 * wall-clock ceiling against the seam's own session-teardown signal, which
+	 * IS the bound that belongs to this work. Leaving the parameter off means
+	 * no future call site can quietly rebind the wrong one.
+	 */
+	request(reason: string): Promise<BootstrapClients | null>;
+}
+
+/**
+ * A {@link SessionBootstrapAccess} over clients that are ALREADY loaded.
+ *
+ * `clients/mcp/session.ts` builds its whole session context up front — an MCP
+ * call has nothing to defer to — so it holds the seventeen clients before it
+ * ever calls `handleSessionStart`. This is the two-line adapter that lets the
+ * handler take ONE shape instead of admitting a second, untyped one in which
+ * fifteen individually-optional client fields stood in for the seam ("exactly
+ * one of the two is supplied" was prose, not a type; a dropped
+ * `metricsClient` compiled and silently skipped every startup scan).
+ */
+export function residentBootstrapAccess(
+	clients: BootstrapClients,
+): SessionBootstrapAccess {
+	return {
+		peek: () => clients,
+		request: async () => clients,
+	};
 }
 
 /**
@@ -439,10 +508,33 @@ export function loadBootstrapClients(): Promise<BootstrapClients> {
 			),
 		);
 	}
+	// Same `!has()` shape as the shutdown gate above, for the same reason: a
+	// flight that is already running is JOINED, never refused. Only a build
+	// this call would have to START is what the strike latch declines.
+	if (
+		bootstrapFailureStrikes >= BOOTSTRAP_FAILURE_STRIKE_LIMIT &&
+		!bootstrapFlight.has(BOOTSTRAP_FLIGHT_KEY)
+	) {
+		return Promise.reject(
+			new BootstrapUnavailableError(
+				"latched",
+				`analyzer bootstrap declined: ${bootstrapFailureStrikes} consecutive load failures`,
+			),
+		);
+	}
 	return bootstrapFlight.run(BOOTSTRAP_FLIGHT_KEY, async () => {
 		const attempt = (bootstrapLoadAttempts += 1);
 		const startedAt = Date.now();
-		const clients = await buildBootstrapClients();
+		let clients: BootstrapClients;
+		try {
+			clients = await buildBootstrapClients();
+		} catch (err) {
+			noteBootstrapBuildFailure(err);
+			throw err;
+		}
+		// A SUCCESS is what makes the strikes consecutive rather than a running
+		// total, so one bad build in a healthy process never edges the latch shut.
+		bootstrapFailureStrikes = 0;
 		residentClients = clients;
 		// The one timing record #2467's observability section keeps. It used to
 		// be emitted by `handleSessionStart` from timestamps `index.ts` took
@@ -459,6 +551,26 @@ export function loadBootstrapClients(): Promise<BootstrapClients> {
 			metadata: { attempt },
 		});
 		return clients;
+	});
+}
+
+/**
+ * Count a failed build and, on the transition that closes the latch, write the
+ * ONE durable row saying this environment has stopped being retried.
+ *
+ * `recordDegradationOnce` is the repo's own once-per-kind/subject recorder, so
+ * the latch needs no parallel "have I logged this yet" boolean beside the one
+ * the ledger already keeps.
+ */
+function noteBootstrapBuildFailure(err: unknown): void {
+	bootstrapFailureStrikes += 1;
+	if (bootstrapFailureStrikes !== BOOTSTRAP_FAILURE_STRIKE_LIMIT) return;
+	recordDegradationOnce({
+		kind: "analyzer-bootstrap-latched",
+		subject: BOOTSTRAP_FLIGHT_KEY,
+		reason: `${BOOTSTRAP_FAILURE_STRIKE_LIMIT} consecutive load failures; no further builds this session: ${
+			(err as Error)?.message ?? String(err)
+		}`,
 	});
 }
 
@@ -481,11 +593,17 @@ export async function requestBootstrapClients(options: {
 	timeoutMs?: number;
 }): Promise<BootstrapClients | null> {
 	if (residentClients) return residentClients;
+	// The seam's own session-teardown bound travels with EVERY demand, so a
+	// caller whose work is not turn-scoped (the two session-start schedulers)
+	// still satisfies AGENTS.md's both-bounds rule without binding a turn
+	// signal that would cancel it for the wrong reason.
+	const shutdownSignal = bootstrapShutdownController.signal;
 	try {
 		return await awaitWithinBounds(
 			loadBootstrapClients(),
 			options.timeoutMs ?? BOOTSTRAP_LOAD_TIMEOUT_MS,
 			options.signal,
+			shutdownSignal,
 		);
 	} catch (err) {
 		const unavailableReason =
@@ -526,28 +644,30 @@ export async function requestBootstrapClients(options: {
 async function awaitWithinBounds<T>(
 	work: Promise<T>,
 	timeoutMs: number,
-	signal?: AbortSignal,
+	signal: AbortSignal | undefined,
+	shutdownSignal: AbortSignal,
 ): Promise<T> {
 	const bound = combineAbortSignals(
 		signal,
+		shutdownSignal,
 		timeoutMs > 0 ? AbortSignal.timeout(timeoutMs) : AbortSignal.abort(),
 	);
 	// Unreachable — a signal is always supplied above — but the declared type
 	// admits `undefined` and an unbounded await is the one outcome this
 	// function exists to prevent, so it fails closed rather than silently
 	// dropping both bounds.
-	if (!bound) throw abandonedError(signal, timeoutMs);
+	if (!bound) throw abandonedError(signal, shutdownSignal, timeoutMs);
 	// The loser leg must not surface as an unhandled rejection when a bound
 	// wins the race; the flight's own callers still see the rejection.
 	void work.catch(() => {});
-	if (bound.aborted) throw abandonedError(signal, timeoutMs);
+	if (bound.aborted) throw abandonedError(signal, shutdownSignal, timeoutMs);
 	let onAbort: (() => void) | undefined;
 	try {
 		return await Promise.race([
 			work,
 			new Promise<never>((_resolve, reject) => {
 				onAbort = () => {
-					reject(abandonedError(signal, timeoutMs));
+					reject(abandonedError(signal, shutdownSignal, timeoutMs));
 				};
 				bound.addEventListener("abort", onAbort, { once: true });
 			}),
@@ -560,17 +680,25 @@ async function awaitWithinBounds<T>(
 /** Which bound won, read off the caller's own signal rather than guessed. */
 function abandonedError(
 	signal: AbortSignal | undefined,
+	shutdownSignal: AbortSignal,
 	timeoutMs: number,
 ): BootstrapUnavailableError {
-	return signal?.aborted
-		? new BootstrapUnavailableError(
-				"aborted",
-				"analyzer bootstrap wait abandoned: caller aborted",
-			)
-		: new BootstrapUnavailableError(
-				"timeout",
-				`analyzer bootstrap wait abandoned after ${timeoutMs}ms`,
-			);
+	if (signal?.aborted) {
+		return new BootstrapUnavailableError(
+			"aborted",
+			"analyzer bootstrap wait abandoned: caller aborted",
+		);
+	}
+	if (shutdownSignal.aborted) {
+		return new BootstrapUnavailableError(
+			"shutdown",
+			"analyzer bootstrap wait abandoned: primary session is shutting down",
+		);
+	}
+	return new BootstrapUnavailableError(
+		"timeout",
+		`analyzer bootstrap wait abandoned after ${timeoutMs}ms`,
+	);
 }
 
 /**
@@ -584,6 +712,9 @@ function abandonedError(
  */
 export function markAnalyzerBootstrapShutdown(): void {
 	bootstrapShutdown = true;
+	// Unparks any bounded demand still waiting on a load rather than leaving it
+	// to burn the full wall-clock ceiling for clients its session will never use.
+	bootstrapShutdownController.abort();
 }
 
 /**
@@ -598,6 +729,11 @@ export function markAnalyzerBootstrapShutdown(): void {
  */
 export function resetAnalyzerBootstrapSessionState(): void {
 	bootstrapShutdown = false;
+	bootstrapShutdownController = new AbortController();
+	// The strike latch is a per-SESSION claim too: an environment repaired
+	// between sessions (a dependency installed, a package layout fixed) must be
+	// retried, not written off for the life of the process.
+	bootstrapFailureStrikes = 0;
 }
 
 /**
@@ -611,10 +747,25 @@ export function isAnalyzerBootstrapShutdown(): boolean {
 	return bootstrapShutdown;
 }
 
+/**
+ * How many consecutive builds have failed — the session-state registry's probe
+ * for the strike latch, which cannot be read off {@link isAnalyzerBootstrapShutdown}.
+ */
+export function _analyzerBootstrapFailureStrikes(): number {
+	return bootstrapFailureStrikes;
+}
+
+/** Test-only: close the strike latch without paying three real failed builds. */
+export function _armAnalyzerBootstrapLatchForTests(): void {
+	bootstrapFailureStrikes = BOOTSTRAP_FAILURE_STRIKE_LIMIT;
+}
+
 /** Test-only: drop the resident clients, the flight, and the gate. */
 export function _resetAnalyzerBootstrapForTests(): void {
 	residentClients = null;
 	bootstrapShutdown = false;
+	bootstrapShutdownController = new AbortController();
+	bootstrapFailureStrikes = 0;
 	bootstrapLoadAttempts = 0;
 	bootstrapFlight.clear();
 }

@@ -10,6 +10,7 @@
  * actually ran.
  */
 
+import { withResidentBootstrap } from "../support/bootstrap-mock.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -47,7 +48,7 @@ function setStartupMode(mode: "full" | "quick"): () => void {
 }
 
 function makeDeps(ctxCwd: string, overrides: Record<string, unknown> = {}) {
-	return {
+	return withResidentBootstrap({
 		ctxCwd,
 		getFlag: () => false,
 		notify: () => {},
@@ -93,7 +94,7 @@ function makeDeps(ctxCwd: string, overrides: Record<string, unknown> = {}) {
 		resetDispatchBaselines: () => {},
 		resetLSPService: () => {},
 		...overrides,
-	} as any;
+	}) as any;
 }
 
 type SessionStartTotalMetadata = {

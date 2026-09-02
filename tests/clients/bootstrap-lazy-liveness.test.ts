@@ -22,6 +22,16 @@ import { removeTempDirSync } from "./test-utils.js";
 /** Every demand made on the bootstrap seam, in order, with its stated reason. */
 const demands: string[] = [];
 
+/**
+ * The demands that were actually SERVED with clients.
+ *
+ * A demand that answers `null` still appears in `demands` — the caller asked
+ * — but the analyzers behind it never ran. Distinguishing the two is the
+ * whole point of #1394's lesson: "the scan was requested" and "the scan
+ * happened" are different facts, and only the second one is liveness.
+ */
+const served: string[] = [];
+
 /** Stub clients that answer "nothing available" for every analyzer. */
 function stubClients(): Record<string, unknown> {
 	return {
@@ -73,6 +83,7 @@ async function activateWithSpiedBootstrap(): Promise<
 > {
 	vi.resetModules();
 	demands.length = 0;
+	served.length = 0;
 	vi.doMock("../../clients/bootstrap.js", async () => {
 		const { bootstrapSeamMock } = await import("../support/bootstrap-mock.js");
 		const seam = bootstrapSeamMock(async () => stubClients());
@@ -82,9 +93,20 @@ async function activateWithSpiedBootstrap(): Promise<
 				demands.push("load");
 				return seam.loadBootstrapClients();
 			},
-			requestBootstrapClients: (options?: { reason?: string }) => {
-				demands.push(`request:${options?.reason ?? "?"}`);
-				return seam.requestBootstrapClients(options);
+			requestBootstrapClients: async (options?: {
+				reason?: string;
+				signal?: AbortSignal;
+			}) => {
+				const reason = options?.reason ?? "?";
+				demands.push(`request:${reason}`);
+				// The double honours the signal exactly as production does, so a
+				// caller that binds the wrong one is visible HERE rather than
+				// only in production.
+				const clients = await seam.requestBootstrapClients(
+					options as { reason: string; signal?: AbortSignal },
+				);
+				if (clients) served.push(reason);
+				return clients;
 			},
 		};
 	});
@@ -150,6 +172,35 @@ describe("#2467 — session start pays only for what it uses", () => {
 	}, 60_000);
 });
 
+describe("#2467 — session-start demands are not turn-scoped", () => {
+	it("a leftover aborted turn signal does not cancel the startup scans", async () => {
+		process.env.PI_LENS_STARTUP_MODE = "full";
+		const pi = await activateWithSpiedBootstrap();
+		// A `session_start` can land mid-turn (sequential replacement, /new), so
+		// the ambient signal of the turn that is being torn down is still
+		// installed when the handler runs. Binding it to the deferred scans
+		// meant the whole session silently ran with no todo/dead-code/knip/jscpd
+		// scan and no retry — #1394's exact lesson.
+		const { setAmbientAbortSignal } =
+			await import("../../clients/safe-spawn.js");
+		const stale = new AbortController();
+		stale.abort();
+		setAmbientAbortSignal(stale.signal);
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-2467-stale-"));
+		fs.writeFileSync(path.join(cwd, "index.ts"), "export const a = 1;\n");
+		try {
+			await pi.emit("session_start", {}, makeCtx({ cwd }));
+			// Not merely "the demand was made" — it was SERVED, so the scan
+			// bodies behind it actually ran.
+			expect(served).toContain("session-start-scans");
+			expect(served).toContain("session-start-tool-probes");
+		} finally {
+			setAmbientAbortSignal(undefined);
+			removeTempDirSync(cwd);
+		}
+	}, 60_000);
+});
+
 describe("#2467 — tool_call loads only for a branch that needs it", () => {
 	it("an irrelevant tool call neither loads nor awaits the graph", async () => {
 		process.env.PI_LENS_STARTUP_MODE = "quick";
@@ -186,6 +237,40 @@ describe("#2467 — tool_call loads only for a branch that needs it", () => {
 			await pi.emit("session_start", {}, makeCtx({ cwd }));
 			await pi.emit("turn_start", {}, makeCtx({ cwd }));
 			demands.length = 0;
+			await pi.emit(
+				"tool_call",
+				{ toolName: "read", input: { path: filePath } },
+				makeCtx({ cwd }),
+			);
+			expect(demands).toEqual([]);
+		} finally {
+			removeTempDirSync(cwd);
+		}
+	}, 30_000);
+
+	it("a read of an unsupported file type never demands the graph", async () => {
+		process.env.PI_LENS_STARTUP_MODE = "quick";
+		const pi = await activateWithSpiedBootstrap();
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-2467-md-"));
+		// A markdown read resolves to a real, in-project, non-vendored path, so
+		// every cheap guard admits it — and then the complexity client answers
+		// "unsupported" and no baseline is ever produced. Because a baseline is
+		// what memoizes the file, the demand fires again on EVERY later read of
+		// it. Docs, JSON, YAML, CSS, Java, shell: the whole non-analyzed
+		// majority of a repo used to pay the seventeen-module load per read.
+		const filePath = path.join(cwd, "README.md");
+		fs.writeFileSync(filePath, "# readme\n");
+		try {
+			await pi.emit("session_start", {}, makeCtx({ cwd }));
+			await pi.emit("turn_start", {}, makeCtx({ cwd }));
+			demands.length = 0;
+			await pi.emit(
+				"tool_call",
+				{ toolName: "read", input: { path: filePath } },
+				makeCtx({ cwd }),
+			);
+			// Twice, because the never-cached half of the defect only shows on
+			// the second read.
 			await pi.emit(
 				"tool_call",
 				{ toolName: "read", input: { path: filePath } },

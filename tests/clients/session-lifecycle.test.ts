@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { withResidentBootstrap } from "../support/bootstrap-mock.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { handleSessionStart } from "../../clients/runtime-session.js";
 import {
@@ -404,7 +405,7 @@ async function runGuardedSessionStart(
 	if (!decision.runFullSessionStart) {
 		return decision;
 	}
-	await handleSessionStart({
+	await handleSessionStart(withResidentBootstrap({
 		ctxCwd: tmpDir,
 		getFlag: () => false,
 		notify: () => {},
@@ -430,7 +431,7 @@ async function runGuardedSessionStart(
 		cleanStaleTsBuildInfo: () => [],
 		resetDispatchBaselines: () => {},
 		resetLSPService,
-	} as any);
+	}) as any);
 	return decision;
 }
 

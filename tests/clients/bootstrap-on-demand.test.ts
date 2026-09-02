@@ -87,6 +87,36 @@ function faultFirstBuild(): void {
 	});
 }
 
+/**
+ * Make the first `limit` builds reject, and every build after that succeed.
+ *
+ * Same seam as {@link faultFirstBuild} — one client fails to construct and the
+ * failure logger that then runs throws — but counted, so a test can watch the
+ * strike latch close and then watch a repaired environment reload.
+ */
+function faultBuildsUntil(limit: number): void {
+	vi.doMock("../../clients/rust-client.js", () => ({
+		RustClient: class {
+			constructor() {
+				throw new Error("rust-client unresolved");
+			}
+		},
+	}));
+	let builds = 0;
+	vi.doMock("../../clients/extension-log.js", async (importOriginal) => {
+		const actual =
+			await importOriginal<typeof import("../../clients/extension-log.js")>();
+		return {
+			...actual,
+			logExtension: (entry: { subsystem?: string }) => {
+				if (entry?.subsystem !== "bootstrap") return;
+				builds += 1;
+				if (builds <= limit) throw new Error("extension log sink down");
+			},
+		};
+	});
+}
+
 beforeEach(() => {
 	vi.resetModules();
 	vi.doUnmock("../../clients/ruff-client.js");
@@ -306,6 +336,29 @@ describe("#2467 — the primary-shutdown gate", () => {
 		).rejects.toThrow(/shutting down/);
 	}, 30_000);
 
+	it("admits a NEW demand that arrives while a flight is still live", async () => {
+		const { bootstrap } = await freshSeam();
+		const gate = gateOneClientImport();
+
+		// Caller A opens the flight; shutdown lands with it still in the air.
+		const opener = bootstrap.loadBootstrapClients();
+		bootstrap.markAnalyzerBootstrapShutdown();
+
+		// Caller B is an entirely NEW demand, made after the gate closed — it
+		// holds no pre-shutdown promise of its own, which is what separates
+		// this from the waiter case above. The gate refuses only a load it
+		// would have to START, so B joins the running flight. Drop the
+		// `!bootstrapFlight.has(KEY)` half of the guard and this call rejects
+		// with "shutting down" instead.
+		const joiner = bootstrap.loadBootstrapClients();
+
+		gate.release();
+		const [a, b] = await Promise.all([opener, joiner]);
+		expect(b).toBe(a);
+		expect(b.biomeClient).toBeDefined();
+		expect(bootstrap._analyzerBootstrapLoadAttempts()).toBe(1);
+	}, 30_000);
+
 	it("session_start re-arms the gate so a replacement session can load", async () => {
 		const { bootstrap } = await freshSeam();
 		bootstrap.markAnalyzerBootstrapShutdown();
@@ -317,4 +370,53 @@ describe("#2467 — the primary-shutdown gate", () => {
 		const clients = await bootstrap.loadBootstrapClients();
 		expect(clients.biomeClient).toBeDefined();
 	}, 30_000);
+});
+
+describe("#2467 — a load that cannot succeed latches after N strikes", () => {
+	it("stops rebuilding after three failures and fails open immediately", async () => {
+		faultBuildsUntil(Number.POSITIVE_INFINITY);
+		const { bootstrap, ledger } = await freshSeam();
+
+		for (let i = 0; i < 8; i++) {
+			expect(
+				await bootstrap.requestBootstrapClients({
+					reason: "tool-call-complexity-baseline",
+				}),
+			).toBeNull();
+		}
+		// Three BUILDS, not eight. Retry-after-failure is right for a TRANSIENT
+		// fault; a permanently unresolvable analyzer module made every single
+		// tool call re-run seventeen dynamic imports and
+		// `collectInstallDiagnostics` for an answer that could not change.
+		expect(bootstrap._analyzerBootstrapLoadAttempts()).toBe(3);
+
+		const latched = ledger
+			.getDegradationSummary()
+			.find((entry) => entry.kind === "analyzer-bootstrap-latched");
+		expect(latched?.count).toBe(1);
+		expect(latched?.latestReasons).toHaveLength(1);
+	}, 60_000);
+
+	it("session_start re-arms the latch so a repaired environment reloads", async () => {
+		faultBuildsUntil(3);
+		const { bootstrap } = await freshSeam();
+
+		for (let i = 0; i < 5; i++) {
+			expect(
+				await bootstrap.requestBootstrapClients({ reason: "session-start-scans" }),
+			).toBeNull();
+		}
+		expect(bootstrap._analyzerBootstrapLoadAttempts()).toBe(3);
+
+		// The latch is a per-SESSION claim held in process-lived storage
+		// (defect shape 17): without this reset a replacement session in a
+		// repaired environment would find the analyzers refused for the rest
+		// of the process.
+		bootstrap.resetAnalyzerBootstrapSessionState();
+		const clients = await bootstrap.requestBootstrapClients({
+			reason: "session-start-scans",
+		});
+		expect(clients?.biomeClient).toBeDefined();
+		expect(bootstrap._analyzerBootstrapLoadAttempts()).toBe(4);
+	}, 60_000);
 });

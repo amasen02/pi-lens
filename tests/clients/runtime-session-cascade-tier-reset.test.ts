@@ -15,6 +15,7 @@
  * index.ts) does not.
  */
 
+import { withResidentBootstrap } from "../support/bootstrap-mock.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { removeTempDirSync, setupTestEnvironment } from "./test-utils.js";
 
@@ -79,7 +80,7 @@ function makeDefaultRuntime() {
 }
 
 function makeDeps(ctxCwd: string) {
-	return {
+	return withResidentBootstrap({
 		ctxCwd,
 		getFlag: () => false,
 		notify: vi.fn(),
@@ -125,7 +126,7 @@ function makeDeps(ctxCwd: string) {
 		resetDispatchBaselines: () => {},
 		resetLSPService: () => {},
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	} as any;
+	}) as any;
 }
 
 /** Mirrors `MAX_OUTSTANDING_TOUCHES` in clients/lsp/cascade-tier.ts. */

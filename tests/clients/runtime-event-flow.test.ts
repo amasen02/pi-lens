@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import { withResidentBootstrap } from "../support/bootstrap-mock.js";
 import * as path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { CacheManager } from "../../clients/cache-manager.js";
@@ -210,7 +211,7 @@ describe("runtime event flow", () => {
 			fs.mkdirSync(path.dirname(filePath), { recursive: true });
 			fs.writeFileSync(filePath, "export const value = 1;\n");
 
-			await handleSessionStart({
+			await handleSessionStart(withResidentBootstrap({
 				ctxCwd: env.tmpDir,
 				getFlag: () => false,
 				notify,
@@ -254,7 +255,7 @@ describe("runtime event flow", () => {
 				cleanStaleTsBuildInfo: () => [],
 				resetDispatchBaselines: () => {},
 				resetLSPService: () => {},
-			} as any);
+			}) as any);
 
 			await handleToolResult({
 				event: {

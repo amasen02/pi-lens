@@ -8,6 +8,7 @@
  * (decision 2: fold into the existing warmup, not a new mechanism).
  */
 
+import { withResidentBootstrap } from "../support/bootstrap-mock.js";
 import * as fs from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -92,7 +93,7 @@ async function waitForPersistedSnapshot(cwd: string): Promise<void> {
 }
 
 function makeDeps(tmpDir: string, runtime: RuntimeCoordinator, dbg = vi.fn()) {
-	return {
+	return withResidentBootstrap({
 		ctxCwd: tmpDir,
 		getFlag: () => false,
 		notify: vi.fn(),
@@ -161,7 +162,7 @@ function makeDeps(tmpDir: string, runtime: RuntimeCoordinator, dbg = vi.fn()) {
 		cleanStaleTsBuildInfo: () => [],
 		resetDispatchBaselines: () => {},
 		resetLSPService: () => {},
-	} as any;
+	}) as any;
 }
 
 afterEach(() => {

@@ -602,6 +602,16 @@ export type DegradationKind =
 	 * analyzer finding nothing read identically (AGENTS.md shape 10).
 	 */
 	| "analyzer-bootstrap-unavailable"
+	/**
+	 * The analyzer bootstrap stopped rebuilding after
+	 * `BOOTSTRAP_FAILURE_STRIKE_LIMIT` consecutive failed loads (#2467 review).
+	 * Recorded ONCE per session, because that is exactly what it reports: a
+	 * state change, not a rate. The per-demand degradations that follow keep
+	 * arriving under `analyzer-bootstrap-unavailable` with
+	 * `unavailableReason: "latched"`, so the ledger still answers both "how
+	 * often did a consumer degrade" and "why did it stop even trying".
+	 */
+	| "analyzer-bootstrap-latched"
 	| "config-ignored";
 
 export interface DegradationRecord {

@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { withResidentBootstrap } from "../support/bootstrap-mock.js";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { getGlobalPiLensDir } from "../../clients/file-utils.js";
@@ -145,7 +146,7 @@ async function runSessionStart(
 	mockTouchFile.mockClear();
 
 	try {
-		await handleSessionStart({
+		await handleSessionStart(withResidentBootstrap({
 			ctxCwd: env.tmpDir,
 			getFlag: (name: string) => {
 				if (name === "lens-lsp") return true;
@@ -220,7 +221,7 @@ async function runSessionStart(
 			cleanStaleTsBuildInfo: () => ["tsconfig.tsbuildinfo"],
 			resetDispatchBaselines: () => {},
 			resetLSPService,
-		} as any);
+		}) as any);
 
 		// The returned `cleanup` waits for the tmpDir-touching background scans
 		// to settle (see the #810 comment above `inFlightScans`) before deleting
@@ -341,7 +342,7 @@ describe(
 					},
 				});
 
-				await handleSessionStart({
+				await handleSessionStart(withResidentBootstrap({
 					ctxCwd: env.tmpDir,
 					getFlag: (name: string) => name === "no-lsp",
 					notify: () => {},
@@ -364,7 +365,7 @@ describe(
 					cleanStaleTsBuildInfo: () => [],
 					resetDispatchBaselines: () => {},
 					resetLSPService: () => {},
-				} as any);
+				}) as any);
 
 				expect(runtime.cachedExports.get("fromSnapshot")).toBe(
 					path.join(env.tmpDir, "src/a.ts"),
@@ -412,7 +413,7 @@ describe(
 					projectRulesScan: { hasCustomRules: true, rules: [] },
 				});
 
-				await handleSessionStart({
+				await handleSessionStart(withResidentBootstrap({
 					ctxCwd: nestedCwd,
 					getFlag: (name: string) => name === "no-lsp",
 					notify: () => {},
@@ -435,7 +436,7 @@ describe(
 					cleanStaleTsBuildInfo: () => [],
 					resetDispatchBaselines: () => {},
 					resetLSPService: () => {},
-				} as any);
+				}) as any);
 
 				expect(runtime.cachedExports.get("nestedSnapshot")).toBe(nestedFile);
 				expect(runtime.projectRulesScan.hasCustomRules).toBe(true);
@@ -703,7 +704,7 @@ describe(
 			delete process.env.PI_LENS_STARTUP_MODE;
 			const dbg = vi.fn();
 			try {
-				await handleSessionStart({
+				await handleSessionStart(withResidentBootstrap({
 					ctxCwd: env.tmpDir,
 					startupModeOverride: "full",
 					getFlag: (name: string) => name === "no-lsp",
@@ -772,7 +773,7 @@ describe(
 					cleanStaleTsBuildInfo: () => [],
 					resetDispatchBaselines: () => {},
 					resetLSPService: () => {},
-				} as any);
+				}) as any);
 				// dbg records the resolved startup mode synchronously
 				expect(
 					dbg.mock.calls.some(([msg]) =>
@@ -806,7 +807,7 @@ describe(
 			delete process.env.PI_LENS_STARTUP_MODE;
 			const dbg = vi.fn();
 			try {
-				await handleSessionStart({
+				await handleSessionStart(withResidentBootstrap({
 					ctxCwd: env.tmpDir,
 					// no startupModeOverride → TUI heuristic applies → quick
 					getFlag: (name: string) => name === "no-lsp",
@@ -875,7 +876,7 @@ describe(
 					cleanStaleTsBuildInfo: () => [],
 					resetDispatchBaselines: () => {},
 					resetLSPService: () => {},
-				} as any);
+				}) as any);
 				expect(
 					dbg.mock.calls.some(([msg]) =>
 						String(msg).includes("startup mode: quick"),
@@ -908,7 +909,7 @@ describe(
 			process.env.PI_LENS_STARTUP_MODE = "quick";
 			const dbg = vi.fn();
 			try {
-				await handleSessionStart({
+				await handleSessionStart(withResidentBootstrap({
 					ctxCwd: env.tmpDir,
 					startupModeOverride: "full", // would normally force full for MCP host…
 					getFlag: (name: string) => name === "no-lsp",
@@ -977,7 +978,7 @@ describe(
 					cleanStaleTsBuildInfo: () => [],
 					resetDispatchBaselines: () => {},
 					resetLSPService: () => {},
-				} as any);
+				}) as any);
 				// PI_LENS_STARTUP_MODE=quick wins → resolveStartupMode() returns "quick"
 				// before the heuristic even runs (env var check skips the override branch)
 				expect(

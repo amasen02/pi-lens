@@ -19,6 +19,7 @@
  * usually means something synchronous crept onto the hot path.
  */
 
+import { withResidentBootstrap } from "../support/bootstrap-mock.js";
 import * as os from "node:os";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { handleSessionStart } from "../../clients/runtime-session.js";
@@ -61,7 +62,7 @@ function setStartupMode(mode: "full" | "quick"): () => void {
 }
 
 function makeDeps(ctxCwd: string, dbg: (msg: string) => void = () => {}) {
-	return {
+	return withResidentBootstrap({
 		ctxCwd,
 		getFlag: (_name: string) => false,
 		notify: () => {},
@@ -120,7 +121,7 @@ function makeDeps(ctxCwd: string, dbg: (msg: string) => void = () => {}) {
 		cleanStaleTsBuildInfo: () => [],
 		resetDispatchBaselines: () => {},
 		resetLSPService: () => {},
-	} as any;
+	}) as any;
 }
 
 afterEach(() => {

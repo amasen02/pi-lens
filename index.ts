@@ -201,10 +201,7 @@ import {
 	registerQuietWindowTask,
 	runQuietWindow,
 } from "./clients/quiet-window.js";
-import {
-	getAmbientAbortSignal,
-	setAmbientAbortSignal,
-} from "./clients/safe-spawn.js";
+import { setAmbientAbortSignal } from "./clients/safe-spawn.js";
 import { initI18n, t } from "./i18n.js";
 import { createAstGrepDumpTool } from "./tools/ast-dump.js";
 import {
@@ -302,17 +299,19 @@ let loadedDispatchIntegration: DispatchIntegration | undefined;
  * Activation binds this and nothing more: no `import()` of the seventeen
  * analyzer modules runs until a consumer asks. `peek` serves the two
  * session-start resets, which are vacuous when nothing is loaded;
- * `request` serves the deferred scans and probes, folding the ambient turn
- * abort signal in beside the loader's own wall-clock ceiling so Escape
- * unblocks a wait on a slow load.
+ * `request` serves the deferred scans and probes.
+ *
+ * No abort signal is bound here. Session start is not turn-scoped work, and a
+ * `session_start` that lands mid-turn (sequential replacement, `/new`) would
+ * arrive with the OUTGOING turn's ambient signal still installed — folding it
+ * in cancelled every startup scan, with no retry, for the whole session
+ * (#1394's lesson, found in review). Both bounds still hold inside
+ * `requestBootstrapClients`, which races its wall-clock ceiling against the
+ * seam's own session-teardown signal.
  */
 const sessionBootstrapAccess: SessionBootstrapAccess = {
 	peek: () => peekBootstrapClients(),
-	request: (reason, signal) =>
-		requestBootstrapClients({
-			reason,
-			signal: signal ?? getAmbientAbortSignal(),
-		}),
+	request: (reason) => requestBootstrapClients({ reason }),
 };
 
 function warmDispatchAtSessionStart(): void {
