@@ -23,6 +23,7 @@ import {
 	lookupLearnedMutatingTool,
 	noteObservedClean,
 	noteObservedMutation,
+	noteObservedUnverifiable,
 	primePersistedMutationAttribution,
 	resetMutationAttribution,
 	shouldArmObservationForTool,
@@ -138,9 +139,38 @@ describe("#2430 item 2 — the arming predicate", () => {
 		noteObservedClean("coincidence");
 		expect(lookupLearnedMutatingTool("coincidence")).toBeUndefined();
 		expect(isProvisionalLearnedAttribution("coincidence")).toBe(false);
-		// The clean counter is NOT reset by the withdrawal, so the tool does not
-		// go straight back to being armed on every call.
+		// #2449 review round 3, S4: the withdrawal resets BOTH counters, so the
+		// tool is back exactly where an unseen tool starts — watchable, and
+		// re-learnable from a real disk diff. Leaving `clean` at three made the
+		// withdrawal terminal: never armed again, therefore never re-learned.
+		expect(shouldArmObservationForTool("coincidence")).toBe(true);
+		// Bounded, not unbounded: the ordinary arm latch takes over from here.
+		noteObservedClean("coincidence");
+		noteObservedClean("coincidence");
 		expect(shouldArmObservationForTool("coincidence")).toBe(false);
+		// And it is still unattributed — two cleans do not re-attribute anything.
+		expect(lookupLearnedMutatingTool("coincidence")).toBeUndefined();
+	});
+
+	it("does not count an UNVERIFIABLE observation toward either latch", () => {
+		// #2449 review round 3, S3/S4. An observation the net could not complete
+		// is not evidence the tool is clean. It must not spend the arm latch (a
+		// truncated directory watch would otherwise stop pi-lens watching a real
+		// codemod), and it must break the de-attribution run rather than voting
+		// in it.
+		noteObservedMutation("wide_codemod", undefined);
+		noteObservedClean("wide_codemod");
+		noteObservedClean("wide_codemod");
+		noteObservedUnverifiable("wide_codemod");
+		noteObservedClean("wide_codemod");
+		// Three cleans have happened, but not three in a ROW.
+		expect(lookupLearnedMutatingTool("wide_codemod")).toBe("session");
+
+		// And on an UNATTRIBUTED tool the unverifiable observations never latch
+		// the watching off, however many there are.
+		for (let index = 0; index < 10; index += 1)
+			noteObservedUnverifiable("never_watchable");
+		expect(shouldArmObservationForTool("never_watchable")).toBe(true);
 	});
 
 	it("never withdraws an attribution that already reached disk", () => {

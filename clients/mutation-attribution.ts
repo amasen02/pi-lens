@@ -79,6 +79,12 @@ export const CLEAN_OBSERVATION_ARM_LIMIT = 2;
  * formatter, another agent — and the tool goes back to unattributed rather
  * than staying mislabelled for the rest of the session.
  *
+ * CONSECUTIVE is literal, and it is the run tracked by `ToolObservation.cleanRun`
+ * rather than the lifetime `clean` total (#2449 review round 3, S4): an
+ * observation the net could not COMPLETE — a truncated directory watch, a cut
+ * capture — is not evidence of cleanliness, so it breaks the run instead of
+ * voting in it.
+ *
  * Higher than {@link CLEAN_OBSERVATION_ARM_LIMIT} on purpose: forgetting is
  * the more consequential direction, so it takes strictly more evidence than
  * merely deciding to stop watching. It applies only BEFORE persistence — an
@@ -96,8 +102,22 @@ export type LearnedMutationSource = "session" | "persisted";
 interface ToolObservation {
 	/** Times a mutation was actually observed after this tool ran. */
 	mutating: number;
-	/** Times an armed observation found nothing changed. */
+	/**
+	 * Consecutive clean observations, for the ARM latch. Reset by a mutation
+	 * and by a de-attribution; an observation the net could not complete does
+	 * not advance it, because it is not evidence the tool is clean.
+	 */
 	clean: number;
+	/**
+	 * Consecutive clean observations for the DE-ATTRIBUTION latch. Separate
+	 * from `clean` because the two runs break on different events: an
+	 * unverifiable observation breaks this one (it is not three-in-a-row any
+	 * more) while leaving the arm latch exactly where it was, so a tool the net
+	 * keeps failing to watch is neither un-learned nor watched forever.
+	 */
+	cleanRun: number;
+	/** Armed observations the net could not complete. Diagnostic, and bounded. */
+	unverifiable: number;
 	/** Whether the persisted file already carries this tool. */
 	persisted: boolean;
 }
@@ -144,7 +164,13 @@ function put(
 function observationFor(toolName: string): ToolObservation {
 	const current = state().session.get(toolName);
 	if (current) return current;
-	const created: ToolObservation = { mutating: 0, clean: 0, persisted: false };
+	const created: ToolObservation = {
+		mutating: 0,
+		clean: 0,
+		cleanRun: 0,
+		unverifiable: 0,
+		persisted: false,
+	};
 	put(state().session, toolName, created);
 	return created;
 }
@@ -298,6 +324,7 @@ export function noteObservedMutation(
 	const observation = observationFor(toolName);
 	observation.mutating += 1;
 	observation.clean = 0;
+	observation.cleanRun = 0;
 	recordDegradationOnce({
 		kind: "unclassified-mutating-tool",
 		subject: toolName,
@@ -324,22 +351,54 @@ export function noteObservedMutation(
  * one observation behind it was a coincidence, and leaving it standing would
  * keep a read-shaped tool labelled as mutating for the rest of the session.
  *
- * The counter is deliberately NOT reset when the attribution is withdrawn.
- * Zeroing it would put the tool straight back into the armed-and-unattributed
- * state and re-arm it forever; leaving it at or above
- * {@link CLEAN_OBSERVATION_ARM_LIMIT} means "not attributed, and not worth
- * watching either", which is the truth the observations support.
+ * Withdrawing resets BOTH counters (#2449 review round 3, S4). The first cut
+ * zeroed `mutating` and left `clean` at three, which is a state no evidence
+ * can leave: `shouldArmObservationForTool` reads three cleans as "not worth
+ * watching", so the tool was never armed again and therefore could never be
+ * RE-learned — a terminal verdict reached from three no-ops, dressed up as a
+ * revisable one. Zeroing both puts the tool back exactly where it started, and
+ * that is bounded, not unbounded: two more cleans latch the watching off again
+ * through the ordinary {@link CLEAN_OBSERVATION_ARM_LIMIT} path, and only a
+ * real disk diff re-attributes it.
  */
 export function noteObservedClean(toolName: string): void {
 	const observation = observationFor(toolName);
 	observation.clean += 1;
+	observation.cleanRun += 1;
 	if (
 		observation.mutating > 0 &&
 		!observation.persisted &&
-		observation.clean >= DEATTRIBUTE_AFTER_CLEAN_OBSERVATIONS
+		observation.cleanRun >= DEATTRIBUTE_AFTER_CLEAN_OBSERVATIONS
 	) {
 		observation.mutating = 0;
+		observation.clean = 0;
+		observation.cleanRun = 0;
 	}
+}
+
+/**
+ * Record that an armed observation could not be COMPLETED (#2449 review round
+ * 3, S3/S4): the tool named a directory wider than the net may watch, or a
+ * bound cut the capture short.
+ *
+ * This is deliberately neither a clean nor a mutating observation. It does not
+ * advance {@link CLEAN_OBSERVATION_ARM_LIMIT}, because "we stopped looking" is
+ * not evidence the tool changes nothing — scoring it as clean is exactly how a
+ * real codemod over an 84-entry directory de-attributed itself. And it BREAKS
+ * the de-attribution run, because three-in-a-row means three, not two plus a
+ * shrug.
+ *
+ * The cost that buys: a tool whose target is permanently too wide stays armed
+ * for the session. That is bounded per call (one `readdir` plus at most
+ * {@link MUTATION_ATTRIBUTION_MAX_TOOLS}-independent
+ * `OBSERVED_TARGET_DIR_MAX_ENTRIES` stat/hash pairs) and bounded per turn by
+ * the net's own wall-clock budget, and it is the direction that loses a little
+ * time rather than a real mutation.
+ */
+export function noteObservedUnverifiable(toolName: string): void {
+	const observation = observationFor(toolName);
+	observation.unverifiable += 1;
+	observation.cleanRun = 0;
 }
 
 function persistAttribution(

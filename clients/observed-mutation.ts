@@ -47,6 +47,13 @@
  * file it never named is the settled sweep's business, not the armed
  * observation's, and the sweep says so honestly rather than guessing.
  *
+ * When that cap BITES the observation is truncated, and a truncated
+ * observation is `unverifiable` — never clean (#2449 review round 3, S3). The
+ * first cut broke out of the readdir loop silently, so a codemod that rewrote
+ * the 84th entry of an 84-entry directory produced an empty diff, the empty
+ * diff advanced the clean latch, and two of those stopped pi-lens watching a
+ * tool that mutates on every call.
+ *
  * ## What layer 3 cannot see, stated rather than hidden
  *
  * The sweep compares against a ledger seeded from files pi-lens has ALREADY
@@ -72,31 +79,41 @@
  * `observed_mutation_budget_exhausted` record and a degradation-ledger tally —
  * it is never a silent skip (catalog shape 10).
  *
- * The SETTLE is deliberately synchronous and deliberately NOT budget-gated.
- * `handleToolResult` may not yield before it dispatches the pipeline (#1086,
- * asserted by `tests/clients/runtime-tool-result-debounce.test.ts`), and a
- * settle clamped to a spent budget silently dropped real mutations (round-2
- * findings F1 and F5). The snapshot already exists and the post-capture is one
- * path, so it always completes for the target; a directory target's remaining
- * entries are the only part a deadline can cut, and a cut capture says so.
+ * The SETTLE is ASYNC and deliberately NOT budget-gated. Round 2 made it
+ * synchronous to keep `handleToolResult` from yielding before it dispatches
+ * the pipeline (#1086); round 3 (T4) removed the sync filesystem work from the
+ * tool_result path instead and made the ORDER explicit at the call site: the
+ * classified chain reads everything it derives from the post-result bytes
+ * BEFORE the settle's yield, so a racing tool_result for the same path cannot
+ * make this call register under the other call's state hash. Only the
+ * pending-baseline PROBE (`hasPendingObservation`) stays synchronous, which is
+ * what keeps the cost on the overwhelmingly common no-baseline path at one map
+ * lookup.
+ *
+ * A settle clamped to a spent budget silently dropped real mutations (round-2
+ * findings F1 and F5), so the settle has its own deadline rather than the
+ * arm's leftovers. The snapshot already exists and the post-capture always
+ * runs its first entry, so it completes for the target path whatever the clock
+ * says; a directory target's remaining entries are the only part a deadline
+ * can cut, and a cut capture says so rather than scoring itself clean.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { createHash } from "node:crypto";
 
 import { emitBounded } from "./bounded-telemetry.js";
+import { freshnessFromMtime } from "./freshness.js";
 import { logLatency } from "./latency-logger.js";
 import {
 	noteObservedClean,
 	noteObservedMutation,
+	noteObservedUnverifiable,
 	shouldArmObservationForTool,
 } from "./mutation-attribution.js";
 import {
 	captureFileStatsForPaths,
-	captureFileStatsForPathsSync,
 	diffFileStats,
 	type FileStatsSnapshot,
-	OPAQUE_MTIME_TOLERANCE_MS,
 } from "./opaque-mutation-scan.js";
 import { normalizeMapKey } from "./path-utils.js";
 import { getProcessSingleton } from "./process-singletons.js";
@@ -121,19 +138,19 @@ export const OBSERVED_CAPTURE_BUDGET_MS = 200;
 export const OBSERVED_TURN_BUDGET_MS = 600;
 
 /**
- * Wall-clock ceiling for the SYNCHRONOUS settle capture.
+ * Per-entry deadline for the settle's re-capture.
  *
- * Tighter than {@link OBSERVED_CAPTURE_BUDGET_MS} because this one blocks the
- * event loop: the settle cannot yield without breaking #1086's ordering
- * contract (see {@link settleObservedMutation}), so its bound is a stall
- * budget, not a latency budget. Measured on this repo: a file target settles in
- * ~0.35ms and a full 42-entry DIRECTORY target in ~13ms, so this clears the
- * realistic worst case with room and only bites on a filesystem far slower than
- * the one it was measured on.
+ * Tighter than {@link OBSERVED_CAPTURE_BUDGET_MS} because the settle sits on
+ * the `tool_result` path, between a tool finishing and pi-lens dispatching its
+ * pipeline: every millisecond here is latency the agent waits through. Measured
+ * on this repo: a file target settles in ~1.4ms and a full 42-entry DIRECTORY
+ * target in ~20ms, so this clears the realistic worst case and only bites on a
+ * filesystem far slower than the one it was measured on.
  *
- * It can never cut the TARGET itself — `captureFileStatsForPathsSync` always
- * runs its first entry — so F5's "the settle always completes for the target
- * path" holds regardless of the clock.
+ * It can never cut the TARGET itself — `captureFileStatsForPaths` always runs
+ * its first entry — so F5's "the settle always completes for the target path"
+ * holds regardless of the clock. What it CAN cut is a directory target's tail,
+ * and that is reported as `stoppedEarly` rather than scored as clean.
  */
 export const OBSERVED_SETTLE_DEADLINE_MS = 50;
 
@@ -149,6 +166,40 @@ export const OBSERVED_TARGET_DIR_MAX_ENTRIES = 64;
 
 /** Tracked files (read-guard + widget + open LSP docs) the sweep may hold. */
 export const OBSERVED_TRACKED_MAX_FILES = 400;
+
+/**
+ * How long a file must have been QUIET before its ledger entry may be trusted
+ * for the sweep's stat short-circuit.
+ *
+ * Its own constant, not `OPAQUE_MTIME_TOLERANCE_MS` (#2449 review round 3,
+ * S1). That one answers "how far before a recorded start may an earlier write
+ * still be attributed to this call" — an attribution window. This one answers
+ * "was the file still being written when we took its baseline" — a settling
+ * window. They happen to share a number today; a change to either for its own
+ * reasons must not move the other.
+ *
+ * ## The direction it does NOT close, stated
+ *
+ * On a filesystem whose mtime granularity is COARSER than this window (FAT's
+ * two seconds, HFS+'s one), a baseline recorded 150ms or more into a tick and
+ * a same-size rewrite later in that SAME tick still short-circuit: the entry
+ * looks settled because the mtime it carries is old, and the rewrite does not
+ * move it. That residual window is the price of the short-circuit that makes
+ * the sweep affordable at all. The settled sweep's next pass over the file
+ * closes it as soon as anything moves the size or the tick, and the armed
+ * observation (which hashes the target unconditionally) never depended on it.
+ */
+export const OBSERVED_LEDGER_SETTLE_MS = 150;
+
+/**
+ * Path keys the "pi-lens already recorded this" set may hold.
+ *
+ * The set is normally cleared once per settle by
+ * {@link refreshObservedMutationLedger}. Since round 3 (S5) that clear is
+ * conditional on the refresh actually completing, so the set needs a bound of
+ * its own for the case where it keeps not completing.
+ */
+export const OBSERVED_HANDLED_MAX = 1000;
 
 /**
  * Files the settled sweep STATS in one turn before parking its cursor.
@@ -205,6 +256,14 @@ interface PendingObservation {
 	stats: FileStatsSnapshot;
 	targetKey: string;
 	targetLineHashes: Map<number, string> | undefined;
+	/**
+	 * The target was a directory with more entries than
+	 * {@link OBSERVED_TARGET_DIR_MAX_ENTRIES}, so the universe below is a
+	 * TRUNCATION of what the tool named. Carried to the settle because that is
+	 * where an empty diff has to be read as `unverifiable` rather than clean
+	 * (#2449 review round 3, S3).
+	 */
+	targetDirCapped: boolean;
 }
 
 /**
@@ -234,7 +293,12 @@ interface LedgerEntry {
 	 * time against the file's mtime closes it: an entry recorded while the
 	 * file's mtime was still fresh cannot be trusted to short-circuit, so the
 	 * next pass verifies it by content. Once the file stops being written the
-	 * gap widens past the tolerance and the reads stop.
+	 * gap widens past {@link OBSERVED_LEDGER_SETTLE_MS} and the reads stop.
+	 *
+	 * The comparison itself goes through `clients/freshness.ts` (#1739's
+	 * kernel), not a hand-rolled `>`: this is a mtime-against-a-recorded-
+	 * instant question, which is exactly the population that kernel exists to
+	 * keep in one place (#2449 review round 3, S1).
 	 */
 	seenAtMs: number;
 }
@@ -310,7 +374,17 @@ export function _observedMutationStateForTests(): {
  */
 export function noteMutationHandled(filePath: string): void {
 	try {
-		state().handled.add(normalizeMapKey(path.resolve(filePath)));
+		const handled = state().handled;
+		const key = normalizeMapKey(path.resolve(filePath));
+		if (!handled.has(key) && handled.size >= OBSERVED_HANDLED_MAX) {
+			// FIFO: a Set iterates in insertion order, so the first key is the
+			// oldest. Dropping it costs one duplicate sweep report at worst.
+			// Hand-rolled like this module's other two evictions, and an adoption
+			// site for #2442's bounded-FIFO primitive when it lands.
+			const oldest = handled.keys().next().value;
+			if (oldest !== undefined) handled.delete(oldest);
+		}
+		handled.add(key);
 	} catch {
 		// A path that cannot be resolved cannot collide with a ledger key either.
 	}
@@ -422,18 +496,18 @@ export interface LineHashReadBudget {
 	remainingBytes: number;
 }
 
-function captureLineHashes(
+async function captureLineHashes(
 	filePath: string,
 	budget?: LineHashReadBudget,
-): Map<number, string> | undefined {
+): Promise<Map<number, string> | undefined> {
 	try {
-		const size = fs.statSync(filePath).size;
+		const size = (await fs.promises.stat(filePath)).size;
 		if (size > OBSERVED_LINE_HASH_MAX_BYTES) return undefined;
 		if (budget) {
 			if (budget.remainingBytes < size) return undefined;
 			budget.remainingBytes -= size;
 		}
-		const lines = splitLines(fs.readFileSync(filePath, "utf-8"));
+		const lines = splitLines(await fs.promises.readFile(filePath, "utf-8"));
 		const hashes = new Map<number, string>();
 		for (let index = 0; index < lines.length; index += 1) {
 			hashes.set(index + 1, lineContentHash(lines[index] ?? ""));
@@ -496,14 +570,14 @@ function denseLineBaseline(
  * then over-approximates to the whole file rather than naming lines that were
  * never touched.
  */
-export function deriveObservedEditRanges(
+export async function deriveObservedEditRanges(
 	filePath: string,
 	before: Map<number, string> | Record<number, string> | undefined,
 	budget?: LineHashReadBudget,
-): [number, number][] | undefined {
+): Promise<[number, number][] | undefined> {
 	const baseline = denseLineBaseline(before);
 	if (baseline === undefined) return undefined;
-	const after = captureLineHashes(filePath, budget);
+	const after = await captureLineHashes(filePath, budget);
 	if (after === undefined) return undefined;
 	if (after.size !== baseline.length) return undefined;
 	const changed: number[] = [];
@@ -640,12 +714,16 @@ export async function armObservedMutation(
 	const timeoutMs = Math.min(remaining, OBSERVED_CAPTURE_BUDGET_MS);
 	const outcome = await withBounds(
 		async () => {
-			const paths = await collectObservationUniverse(args.targetPath);
-			const stats = await captureFileStatsForPaths(paths, {
+			const universe = await collectObservationUniverse(args.targetPath);
+			const captured = await captureFileStatsForPaths(universe.paths, {
 				withHashes: true,
 				hashBudgetBytes: OBSERVED_HASH_BUDGET_BYTES,
 			});
-			return { paths, stats };
+			return {
+				paths: universe.paths,
+				capped: universe.capped,
+				stats: captured.snapshot,
+			};
 		},
 		timeoutMs,
 		args.signal,
@@ -672,6 +750,25 @@ export async function armObservedMutation(
 
 	const targetKey = normalizeMapKey(path.resolve(args.targetPath));
 	seedLedger(outcome.value.stats);
+	if (outcome.value.capped) {
+		// A truncated universe is a real coverage gap and it is named here, at
+		// the moment it happens, so it is counted even for a call whose settle
+		// never arrives (catalog shape 10).
+		emitBounded(
+			"observed_target_dir_capped",
+			args.toolName,
+			{
+				filePath: args.targetPath,
+				durationMs: Date.now() - started,
+				result: `entries:${OBSERVED_TARGET_DIR_MAX_ENTRIES}`,
+			},
+			{
+				ledgerKind: "observed-mutation-dir-cap",
+				reason: `directory target has more than ${OBSERVED_TARGET_DIR_MAX_ENTRIES} entries; the observation covers only the first ${OBSERVED_TARGET_DIR_MAX_ENTRIES}`,
+				capPerTurn: { limit: 2, turnIndex: args.turnIndex },
+			},
+		);
+	}
 	putPending(args.toolCallId, {
 		toolName: args.toolName,
 		startedAt: started,
@@ -680,7 +777,8 @@ export async function armObservedMutation(
 		paths: outcome.value.paths,
 		stats: outcome.value.stats,
 		targetKey,
-		targetLineHashes: captureLineHashes(args.targetPath),
+		targetLineHashes: await captureLineHashes(args.targetPath),
+		targetDirCapped: outcome.value.capped,
 	});
 	const durationMs = Date.now() - started;
 	logLatency({
@@ -702,12 +800,17 @@ export async function armObservedMutation(
  * directory as its working set. A path that does not exist yet is still
  * watched as itself, so a call that CREATES it is observed.
  *
+ * `capped` is the load-bearing half of the return (#2449 review round 3, S3):
+ * when the cap bites, the list below is a TRUNCATION of what the tool named,
+ * and the settle must not read an empty diff over it as evidence the tool
+ * changed nothing.
+ *
  * See the module header for why the sibling walk and the tracked-set fold this
  * replaces were both wrong.
  */
 async function collectObservationUniverse(
 	targetPath: string,
-): Promise<string[]> {
+): Promise<{ paths: string[]; capped: boolean }> {
 	const target = path.resolve(targetPath);
 	try {
 		const stat = await fs.promises.stat(target);
@@ -716,17 +819,21 @@ async function collectObservationUniverse(
 				withFileTypes: true,
 			});
 			const files: string[] = [];
+			let capped = false;
 			for (const entry of entries) {
-				if (files.length >= OBSERVED_TARGET_DIR_MAX_ENTRIES) break;
+				if (files.length >= OBSERVED_TARGET_DIR_MAX_ENTRIES) {
+					capped = true;
+					break;
+				}
 				if (entry.isFile()) files.push(path.join(target, entry.name));
 			}
-			return files;
+			return { paths: files, capped };
 		}
 	} catch {
 		// Does not exist yet, or is unreadable. Watching the path itself is the
 		// right answer for both: a call that creates it shows up as an addition.
 	}
-	return [target];
+	return { paths: [target], capped: false };
 }
 
 export interface SettleObservationArgs {
@@ -750,7 +857,15 @@ export interface SettleObservationResult {
 	replayed: number;
 	/** Entries actually re-captured. Short of the baseline means a cut capture. */
 	scanned: number;
-	/** Present whenever `settled` is false, or the capture was cut short. */
+	/**
+	 * `true` when the observation did not cover everything the tool named — the
+	 * directory target was wider than {@link OBSERVED_TARGET_DIR_MAX_ENTRIES},
+	 * or a bound cut the re-capture. An empty `changedPaths` alongside this is
+	 * "we stopped looking", NOT "nothing changed", and it never advances the
+	 * tool's clean-observation latch (#2449 review round 3, S3).
+	 */
+	stoppedEarly: boolean;
+	/** Present whenever `settled` is false, or the observation was truncated. */
 	reason?: string;
 }
 
@@ -761,12 +876,15 @@ export interface SettleObservationResult {
  * asks for: the tool is unknown, so nothing downstream would have recorded the
  * file, and this replay is what puts it in `turn-state.json`.
  *
- * SYNCHRONOUS by contract. `handleToolResult` may not yield before dispatching
- * the pipeline (#1086); an `await` here — even on the map-miss path, which is
- * almost every call — reordered the debounce and in-flight registration and
- * reds `tests/clients/runtime-tool-result-debounce.test.ts` (#2449 round 2,
- * F1). Callers gate on {@link hasPendingObservation} first, so reaching this
- * function at all already means there is real work to do.
+ * ASYNC since round 3 (T4). Round 2 made it synchronous because
+ * `handleToolResult` may not yield before dispatching the pipeline (#1086) —
+ * but the fix for that is to keep the PROBE synchronous ({@link
+ * hasPendingObservation}, which every call pays and almost every call fails)
+ * and to have the caller read what it derives from the post-result bytes
+ * BEFORE this yield. Blocking the event loop on a directory's worth of
+ * `readFileSync` to buy an ordering property the call site can state directly
+ * was the wrong trade. Reaching this function at all already means there is
+ * real work to do.
  *
  * NOT budget-gated. The previous cut clamped the post-capture to whatever was
  * left of the per-turn arm budget, which on a busy turn is 1ms — long enough to
@@ -774,9 +892,9 @@ export interface SettleObservationResult {
  * measured (round 2, F5). The baseline exists; re-capturing the target it was
  * taken for is not optional.
  */
-export function settleObservedMutation(
+export async function settleObservedMutation(
 	args: SettleObservationArgs,
-): SettleObservationResult {
+): Promise<SettleObservationResult> {
 	const key = args.toolCallId;
 	if (!key)
 		return {
@@ -784,6 +902,7 @@ export function settleObservedMutation(
 			changedPaths: [],
 			replayed: 0,
 			scanned: 0,
+			stoppedEarly: false,
 			reason: "no-tool-call-id",
 		};
 	const pending = state().pending.get(key);
@@ -796,6 +915,7 @@ export function settleObservedMutation(
 			changedPaths: [],
 			replayed: 0,
 			scanned: 0,
+			stoppedEarly: false,
 			reason: "no-pending-baseline",
 		};
 	}
@@ -809,6 +929,7 @@ export function settleObservedMutation(
 			changedPaths: [],
 			replayed: 0,
 			scanned: 0,
+			stoppedEarly: false,
 			reason: "session-generation-advanced",
 		};
 	}
@@ -816,30 +937,64 @@ export function settleObservedMutation(
 	const started = Date.now();
 	// The target is `paths[0]` for a file target and the whole (already capped)
 	// entry list for a directory one. The deadline can only ever cut a directory
-	// target's tail — `captureFileStatsForPathsSync` always runs its first entry.
-	const captured = captureFileStatsForPathsSync(pending.paths, {
-		withHashes: true,
-		hashBudgetBytes: OBSERVED_HASH_BUDGET_BYTES,
-		deadlineMs: started + OBSERVED_SETTLE_DEADLINE_MS,
-		signal: args.signal,
-	});
+	// target's tail — `captureFileStatsForPaths` always runs its first entry.
+	// The outer race exists only to bound a single wedged `stat`, so its budget
+	// is deliberately slack compared with the per-entry deadline that does the
+	// real work.
+	const capture = await withBounds(
+		() =>
+			captureFileStatsForPaths(pending.paths, {
+				withHashes: true,
+				hashBudgetBytes: OBSERVED_HASH_BUDGET_BYTES,
+				deadlineMs: started + OBSERVED_SETTLE_DEADLINE_MS,
+				signal: args.signal,
+			}),
+		OBSERVED_SETTLE_DEADLINE_MS * 4,
+		args.signal,
+	);
 	chargeTurnBudget(args.turnIndex, Date.now() - started);
+	if (!capture.ok) {
+		// A wedged filesystem call. There is no diff to report and, critically,
+		// no evidence the tool was clean — so the clean latch is not advanced.
+		noteObservedUnverifiable(args.toolName);
+		return {
+			settled: false,
+			changedPaths: [],
+			replayed: 0,
+			scanned: 0,
+			stoppedEarly: true,
+			reason: capture.reason,
+		};
+	}
+	const captured = capture.value;
 
 	seedLedger(captured.snapshot);
 	const changed = diffFileStats(pending.stats, captured.snapshot).filter(
 		(candidate) => args.isRecordable?.(candidate) !== false,
 	);
-	const cutReason = captured.stoppedEarly ? "capture-cut-short" : undefined;
+	// Two different ways the observation can fall short of what the tool named:
+	// the ARM already truncated a wide directory (#2449 round 3, S3), or the
+	// re-capture's own deadline cut its tail. Both mean the same thing to the
+	// verdict below.
+	const truncated = pending.targetDirCapped || captured.stoppedEarly;
+	const cutReason = pending.targetDirCapped
+		? "target-dir-cap-exceeded"
+		: captured.stoppedEarly
+			? "capture-cut-short"
+			: undefined;
 	if (changed.length === 0) {
-		// A CUT capture is not evidence of cleanliness — it is evidence we
-		// stopped looking. Advancing the clean latch on it would teach pi-lens
-		// to stop watching a tool it never finished watching.
-		if (!captured.stoppedEarly) noteObservedClean(args.toolName);
+		// An INCOMPLETE observation is not evidence of cleanliness — it is
+		// evidence we stopped looking. Advancing the clean latch on it would
+		// teach pi-lens to stop watching a tool it never finished watching, and
+		// with a directory wider than the cap that is every single call.
+		if (truncated) noteObservedUnverifiable(args.toolName);
+		else noteObservedClean(args.toolName);
 		return {
 			settled: true,
 			changedPaths: [],
 			replayed: 0,
 			scanned: captured.snapshot.size,
+			stoppedEarly: truncated,
 			reason: cutReason,
 		};
 	}
@@ -853,7 +1008,7 @@ export function settleObservedMutation(
 			filePath === pending.targetKey
 				? pending.targetLineHashes
 				: args.getStoredLineHashes?.(filePath);
-		const editRanges = deriveObservedEditRanges(
+		const editRanges = await deriveObservedEditRanges(
 			filePath,
 			baseline,
 			rangeBudget,
@@ -904,6 +1059,7 @@ export function settleObservedMutation(
 		changedPaths: changed,
 		replayed,
 		scanned: captured.snapshot.size,
+		stoppedEarly: truncated,
 		reason: cutReason,
 	};
 }
@@ -923,8 +1079,14 @@ export interface SettledSweepArgs {
 export interface SettledSweepResult {
 	/** Files stat'ed this pass. */
 	scanned: number;
-	/** Tracked files this pass did NOT reach; the cursor resumes there. */
-	remaining: number;
+	/**
+	 * Tracked files this pass did NOT reach, because the stat window or the
+	 * deadline ended the pass first. NOT a backlog and not a queue depth: the
+	 * cursor resumes at exactly this many files on the next settle, and a
+	 * steady state where every turn leaves some unreached is the normal shape
+	 * of a rotation over a set larger than one window.
+	 */
+	notReachedThisPass: number;
 	/** Where the next pass resumes. */
 	cursor: number;
 	drifted: string[];
@@ -1072,10 +1234,21 @@ async function scanTrackedIncrementally(
 		// The stat short-circuit — the reason this pass is affordable — but only
 		// when the baseline is old enough to be trusted. See `LedgerEntry.seenAtMs`
 		// for the same-tick same-size rewrite it would otherwise bake in forever.
+		//
+		// The reference instant is OBSERVED_LEDGER_SETTLE_MS *before* the entry
+		// was recorded: a file whose mtime is later than that was still in
+		// flight when we looked at it, so its stat cannot stand in for its
+		// bytes. `fresh` therefore means "already settled when recorded".
+		const baselineSettled =
+			freshnessFromMtime({
+				mtimeMs: stat.mtimeMs,
+				referenceMs: previous.seenAtMs - OBSERVED_LEDGER_SETTLE_MS,
+				toleranceMs: 0,
+			}).verdict === "fresh";
 		if (
 			previous.size === stat.size &&
 			previous.mtimeMs === stat.mtimeMs &&
-			previous.seenAtMs - stat.mtimeMs > OPAQUE_MTIME_TOLERANCE_MS
+			baselineSettled
 		) {
 			putLedger(key, next);
 			continue;
@@ -1164,7 +1337,7 @@ export async function runObservedSettledSweep(
 		);
 		return {
 			scanned: 0,
-			remaining: 0,
+			notReachedThisPass: 0,
 			cursor: state().sweepCursor,
 			drifted: [],
 			unverifiable: [],
@@ -1180,7 +1353,7 @@ export async function runObservedSettledSweep(
 	let replayed = 0;
 	for (const filePath of scan.drifted) {
 		if (args.signal?.aborted === true) break;
-		const editRanges = deriveObservedEditRanges(
+		const editRanges = await deriveObservedEditRanges(
 			filePath,
 			args.getStoredLineHashes?.(filePath),
 			rangeBudget,
@@ -1195,7 +1368,7 @@ export async function runObservedSettledSweep(
 		});
 		if (accepted) replayed += 1;
 	}
-	const remaining = Math.max(0, scan.tracked - scan.scanned);
+	const notReachedThisPass = Math.max(0, scan.tracked - scan.scanned);
 	if (scan.drifted.length > 0 || scan.unverifiable.length > 0) {
 		logLatency({
 			type: "phase",
@@ -1227,7 +1400,7 @@ export async function runObservedSettledSweep(
 	}
 	return {
 		scanned: scan.scanned,
-		remaining,
+		notReachedThisPass,
 		cursor: scan.cursor,
 		drifted: scan.drifted,
 		unverifiable: scan.unverifiable,
@@ -1248,12 +1421,21 @@ export async function runObservedSettledSweep(
  * Clearing `handled` is this function's job and not the sweep's — the sweep
  * runs BEFORE the drain, so a set cleared there would not cover the drain's own
  * writes.
+ *
+ * And the clear is CONDITIONAL on the re-baseline having actually happened
+ * (#2449 review round 3, S5). The first cut cleared unconditionally, including
+ * when the refresh aborted or timed out: the ledger then still held the
+ * PRE-drain bytes while the only record that those bytes were pi-lens's own had
+ * just been thrown away, so the next settled sweep reported pi-lens's own
+ * formatter output as third-party drift and queued it for another format. A
+ * kept `handled` set costs at most one skipped report of a file we did write;
+ * a cleared one costs a fabricated mutation every turn.
  */
 export async function refreshObservedMutationLedger(
 	args: Pick<
 		SettledSweepArgs,
 		"getTrackedPaths" | "signal" | "getStoredLineHashes"
-	>,
+	> & { turnIndex?: number },
 ): Promise<number> {
 	const started = Date.now();
 	const outcome = await withBounds(
@@ -1265,6 +1447,27 @@ export async function refreshObservedMutationLedger(
 		OBSERVED_CAPTURE_BUDGET_MS * 2,
 		args.signal,
 	);
-	state().handled.clear();
+	// `stoppedEarly` matters as much as `ok`: a pass that parked at its deadline
+	// re-baselined a PREFIX of the tracked set, and the drain's writes may be in
+	// the tail it never reached.
+	const complete = outcome.ok && !outcome.value.stoppedEarly;
+	if (complete) {
+		state().handled.clear();
+		return outcome.value.scanned;
+	}
+	emitBounded(
+		"observed_refresh_incomplete",
+		"post-drain-refresh",
+		{
+			durationMs: Date.now() - started,
+			result: outcome.ok ? "window-parked" : outcome.reason,
+		},
+		{
+			ledgerKind: "observed-mutation-budget",
+			reason:
+				"post-drain ledger refresh did not cover the tracked set; the already-recorded set was kept rather than cleared",
+			capPerTurn: { limit: 2, turnIndex: args.turnIndex ?? 0 },
+		},
+	);
 	return outcome.ok ? outcome.value.scanned : 0;
 }

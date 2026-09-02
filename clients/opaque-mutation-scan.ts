@@ -112,6 +112,17 @@ export interface CaptureOptions {
 	withHashes?: boolean;
 }
 
+/** What a bounded capture returns: the snapshot, and whether it was cut. */
+export interface PathCaptureResult {
+	snapshot: FileStatsSnapshot;
+	/**
+	 * `true` when a bound stopped the capture before every path was reached.
+	 * A partial snapshot must never be read as a complete one: absence from a
+	 * cut capture means "not looked at", not "unchanged".
+	 */
+	stoppedEarly: boolean;
+}
+
 /**
  * Stat (and optionally hash) an EXPLICIT file list into a snapshot.
  *
@@ -124,15 +135,48 @@ export interface CaptureOptions {
  * `hashBudgetBytes` defaults to {@link OPAQUE_HASH_BUDGET_BYTES}. A file past
  * the budget simply carries no hash, and its comparison degrades to
  * mtime+size — the same documented limitation the walking capture has.
+ *
+ * `deadlineMs` (an absolute epoch stamp) and `signal` are both checked
+ * BETWEEN files, so a multi-path capture cannot outrun either bound. The FIRST
+ * entry always runs: the observational net's settle (#2430) guarantees the
+ * target path it took a baseline for is re-captured no matter what the clock
+ * says (#2449 review round 2, F5), and a bound that could cut the one path the
+ * caller actually asked about would drop a mutation already measured.
+ *
+ * There was a synchronous twin of this function until #2449 review round 3
+ * (T4). It existed only so `handleToolResult` could settle an observation
+ * without yielding; the settle is an ordinary async step now, and blocking the
+ * event loop on a directory's worth of `readFileSync` was never worth the
+ * ordering shortcut it bought.
  */
 export async function captureFileStatsForPaths(
 	files: Iterable<string>,
-	options: CaptureOptions & { hashBudgetBytes?: number } = {},
-): Promise<FileStatsSnapshot> {
+	options: CaptureOptions & {
+		hashBudgetBytes?: number;
+		deadlineMs?: number;
+		signal?: AbortSignal;
+	} = {},
+): Promise<PathCaptureResult> {
 	const hashBudget = options.hashBudgetBytes ?? OPAQUE_HASH_BUDGET_BYTES;
 	const snapshot: FileStatsSnapshot = new Map();
 	let hashBytesSpent = 0;
+	let stoppedEarly = false;
+	let first = true;
 	for (const file of files) {
+		if (!first) {
+			if (options.signal?.aborted === true) {
+				stoppedEarly = true;
+				break;
+			}
+			if (
+				options.deadlineMs !== undefined &&
+				Date.now() >= options.deadlineMs
+			) {
+				stoppedEarly = true;
+				break;
+			}
+		}
+		first = false;
 		try {
 			const stat = await fs.promises.stat(file);
 			if (!stat.isFile()) continue;
@@ -149,79 +193,6 @@ export async function captureFileStatsForPaths(
 			snapshot.set(normalizeMapKey(path.resolve(file)), entry);
 		} catch {
 			// Vanished mid-walk: absent from both snapshots = unchanged-by-absence.
-		}
-	}
-	return snapshot;
-}
-
-/**
- * The SYNCHRONOUS twin of {@link captureFileStatsForPaths}.
- *
- * It exists for exactly one caller: the observational net's `tool_result`
- * settle (#2430). `handleToolResult` carries a hard invariant — no intervening
- * `await` before the pipeline is dispatched (#1086), asserted by
- * `tests/clients/runtime-tool-result-debounce.test.ts` — so the settle cannot
- * yield. Since #2449 review round 2 collapsed the observation universe to the
- * TARGET PATH alone (one file, or one non-recursive directory capped at
- * `OBSERVED_TARGET_DIR_MAX_ENTRIES`), the post-capture is small enough to do
- * without yielding at all, which removes the ordering hazard structurally
- * rather than by re-ordering statements.
- *
- * Deliberately adjacent to its async twin and sharing {@link FileStatEntry},
- * `normalizeMapKey` and the same sha256 over the same bytes, so
- * {@link diffFileStats} cannot mean two different things depending on which one
- * produced the snapshot. `deadlineMs` is an absolute epoch stamp: sync code
- * cannot race an `AbortSignal`, so the honest equivalent is a check BETWEEN
- * files plus the caller's own file cap. `stoppedEarly` reports when either
- * bound cut the capture short, so a partial snapshot is never read as a
- * complete one.
- */
-export function captureFileStatsForPathsSync(
-	files: Iterable<string>,
-	options: CaptureOptions & {
-		hashBudgetBytes?: number;
-		deadlineMs?: number;
-		signal?: AbortSignal;
-	} = {},
-): { snapshot: FileStatsSnapshot; stoppedEarly: boolean } {
-	const hashBudget = options.hashBudgetBytes ?? OPAQUE_HASH_BUDGET_BYTES;
-	const snapshot: FileStatsSnapshot = new Map();
-	let hashBytesSpent = 0;
-	let stoppedEarly = false;
-	let first = true;
-	for (const file of files) {
-		// The FIRST entry always runs: the settle's contract is that the target
-		// path is captured even with no budget left (#2449 review round 2, F5).
-		if (!first) {
-			if (options.signal?.aborted === true) {
-				stoppedEarly = true;
-				break;
-			}
-			if (
-				options.deadlineMs !== undefined &&
-				Date.now() >= options.deadlineMs
-			) {
-				stoppedEarly = true;
-				break;
-			}
-		}
-		first = false;
-		try {
-			const stat = fs.statSync(file);
-			if (!stat.isFile()) continue;
-			const entry: FileStatEntry = {
-				mtimeMs: stat.mtimeMs,
-				size: stat.size,
-			};
-			if (options.withHashes && hashBytesSpent + stat.size <= hashBudget) {
-				entry.hash = createHash("sha256")
-					.update(fs.readFileSync(file))
-					.digest("hex");
-				hashBytesSpent += stat.size;
-			}
-			snapshot.set(normalizeMapKey(path.resolve(file)), entry);
-		} catch {
-			// Vanished mid-capture: absent from both snapshots = unchanged-by-absence.
 		}
 	}
 	return { snapshot, stoppedEarly };
@@ -248,7 +219,7 @@ export async function captureFileStats(
 				scannedCount: files.length,
 			};
 		}
-		const snapshot = await captureFileStatsForPaths(files, options);
+		const { snapshot } = await captureFileStatsForPaths(files, options);
 		return { snapshot, scannedCount: snapshot.size };
 	} catch {
 		return { unknownReason: "walk-failed", scannedCount: 0 };

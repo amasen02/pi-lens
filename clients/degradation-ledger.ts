@@ -37,6 +37,16 @@ export type DegradationKind =
 	 * visible rather than read as "nothing changed" (catalog shape 10).
 	 */
 	| "observed-mutation-budget"
+	/**
+	 * #2430: an armed observation's universe was TRUNCATED — the tool named a
+	 * directory with more entries than {@link
+	 * clients/observed-mutation.ts#OBSERVED_TARGET_DIR_MAX_ENTRIES}, so the
+	 * entries past the cap were never watched. Subject is the tool name. This
+	 * is deliberately NOT `observed-mutation-budget`: no clock and no byte
+	 * budget was exceeded, and a reader tuning a timeout would be chasing a
+	 * structural cap that no amount of time changes (#2449 review round 3).
+	 */
+	| "observed-mutation-dir-cap"
 	| "trust-refusal"
 	| "mode-suppression"
 	| "ts-idle-eviction"

@@ -2568,7 +2568,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 			if (result.drifted.length > 0 || result.unverifiable.length > 0) {
 				dbg(
 					`observed_settled_sweep: ${result.drifted.length} drifted file(s), ${result.replayed} replayed, ` +
-						`${result.unverifiable.length} unverifiable; scanned ${result.scanned}, ${result.remaining} left for the next turn (cursor ${result.cursor})`,
+						`${result.unverifiable.length} unverifiable; scanned ${result.scanned}, ${result.notReachedThisPass} not reached this pass (cursor ${result.cursor})`,
 				);
 			}
 		} catch (sweepErr) {
@@ -2584,6 +2584,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 		const cwd = ctx.cwd ?? runtime.projectRoot;
 		try {
 			await refreshObservedMutationLedger({
+				turnIndex: runtime.turnIndex,
 				getTrackedPaths: () =>
 					collectTrackedPaths({
 						readGuard: runtime.readGuard,

@@ -14,6 +14,7 @@ import {
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
 import {
+	CLEAN_OBSERVATION_ARM_LIMIT,
 	DEATTRIBUTE_AFTER_CLEAN_OBSERVATIONS,
 	lookupLearnedMutatingTool,
 	noteObservedMutation,
@@ -30,6 +31,7 @@ import {
 	type ObservedReplayEntry,
 	OBSERVED_SWEEP_HASH_BUDGET_BYTES,
 	OBSERVED_SWEEP_STAT_WINDOW,
+	OBSERVED_TARGET_DIR_MAX_ENTRIES,
 	OBSERVED_TRACKED_MAX_FILES,
 	OBSERVED_TURN_BUDGET_MS,
 	refreshObservedMutationLedger,
@@ -132,7 +134,7 @@ describe("#2430 item 1 — arm, diff, replay", () => {
 
 			await armObservedMutation(armArgs(filePath, env.tmpDir));
 			fs.writeFileSync(filePath, `${SOURCE}const d = 4;\n`);
-			settleObservedMutation({
+			await settleObservedMutation({
 				toolCallId: "call-observed-1",
 				toolName: "patch_file",
 				sessionGeneration: 1,
@@ -147,7 +149,7 @@ describe("#2430 item 1 — arm, diff, replay", () => {
 			);
 			expect(second).toMatchObject({ armed: true });
 			fs.writeFileSync(filePath, `${SOURCE}const d = 4;\nconst e = 5;\n`);
-			settleObservedMutation({
+			await settleObservedMutation({
 				toolCallId: "call-observed-2",
 				toolName: "patch_file",
 				sessionGeneration: 1,
@@ -447,7 +449,7 @@ describe("#2430 item 3 — the agent_settled sweep", () => {
 			// window, not the set, and the rest is reported as `remaining`
 			// rather than silently skipped.
 			expect(swept.scanned).toBe(OBSERVED_SWEEP_STAT_WINDOW);
-			expect(swept.remaining).toBe(
+			expect(swept.notReachedThisPass).toBe(
 				OBSERVED_TRACKED_MAX_FILES - OBSERVED_SWEEP_STAT_WINDOW,
 			);
 			expect(swept.cursor).toBe(OBSERVED_SWEEP_STAT_WINDOW);
@@ -460,7 +462,7 @@ describe("#2430 item 3 — the agent_settled sweep", () => {
 });
 
 describe("#2430 — range derivation from stored line hashes", () => {
-	it("names the changed lines, not the whole file", () => {
+	it("names the changed lines, not the whole file", async () => {
 		const env = setupTestEnvironment("pi-lens-2430-ranges-");
 		try {
 			const filePath = path.join(env.tmpDir, "ranged.ts");
@@ -474,7 +476,7 @@ describe("#2430 — range derivation from stored line hashes", () => {
 			before[lines.length + 1] = lineContentHash("");
 
 			fs.writeFileSync(filePath, `${["a", "B", "c", "D", "e"].join("\n")}\n`);
-			expect(deriveObservedEditRanges(filePath, before)).toEqual([
+			expect(await deriveObservedEditRanges(filePath, before)).toEqual([
 				[2, 2],
 				[4, 4],
 			]);
@@ -483,10 +485,10 @@ describe("#2430 — range derivation from stored line hashes", () => {
 		}
 	});
 
-	it("returns undefined with no baseline, so the caller over-approximates safely", () => {
-		expect(deriveObservedEditRanges("/nonexistent/file.ts", undefined)).toBe(
-			undefined,
-		);
+	it("returns undefined with no baseline, so the caller over-approximates safely", async () => {
+		expect(
+			await deriveObservedEditRanges("/nonexistent/file.ts", undefined),
+		).toBe(undefined);
 	});
 });
 
@@ -566,7 +568,7 @@ describe("#2449 review round 2 — the observation universe is the target path",
 			fs.writeFileSync(sibling, `${SOURCE}const intruder = 1;\n`);
 
 			const sink = recorder();
-			const settled = settleObservedMutation({
+			const settled = await settleObservedMutation({
 				toolCallId: "call-observed-1",
 				toolName: "sniff_file",
 				sessionGeneration: 1,
@@ -607,7 +609,7 @@ describe("#2449 review round 2 — the observation universe is the target path",
 			);
 
 			const sink = recorder();
-			const settled = settleObservedMutation({
+			const settled = await settleObservedMutation({
 				toolCallId: "call-observed-1",
 				toolName: "codemod_dir",
 				sessionGeneration: 1,
@@ -634,7 +636,7 @@ describe("#2449 review round 2 — the observation universe is the target path",
 				armArgs(filePath, env.tmpDir, { toolName: "maybe_writes" }),
 			);
 			fs.writeFileSync(filePath, `${SOURCE}const d = 4;\n`);
-			settleObservedMutation({
+			await settleObservedMutation({
 				toolCallId: "call-observed-1",
 				toolName: "maybe_writes",
 				sessionGeneration: 1,
@@ -656,7 +658,7 @@ describe("#2449 review round 2 — the observation universe is the target path",
 					}),
 				);
 				expect(armed).toMatchObject({ armed: true });
-				settleObservedMutation({
+				await settleObservedMutation({
 					toolCallId: callId,
 					toolName: "maybe_writes",
 					sessionGeneration: 1,
@@ -666,9 +668,159 @@ describe("#2449 review round 2 — the observation universe is the target path",
 			}
 
 			expect(lookupLearnedMutatingTool("maybe_writes")).toBeUndefined();
-			// And it is not re-armed forever either: the clean counter is what
-			// stops the watching, so it is deliberately NOT reset.
-			expect(shouldArmObservationForTool("maybe_writes")).toBe(false);
+			// Round 3, S4: forgetting resets BOTH counters. Leaving `clean` at
+			// three while zeroing `mutating` put the tool in a state no evidence
+			// could ever leave — `shouldArmObservationForTool` was false forever,
+			// so the tool was never watched again and could never be RE-learned.
+			// A de-attribution that cannot be undone is not a revision, it is a
+			// terminal verdict reached from three no-ops.
+			expect(shouldArmObservationForTool("maybe_writes")).toBe(true);
+
+			// And a later REAL mutation re-learns it, end to end.
+			await armObservedMutation(
+				armArgs(filePath, env.tmpDir, {
+					toolName: "maybe_writes",
+					toolCallId: "call-relearn",
+				}),
+			);
+			fs.writeFileSync(filePath, `${SOURCE}const relearned = 1;\n`);
+			await settleObservedMutation({
+				toolCallId: "call-relearn",
+				toolName: "maybe_writes",
+				sessionGeneration: 1,
+				turnIndex: 1,
+				record: recorder().record,
+			});
+			expect(lookupLearnedMutatingTool("maybe_writes")).toBe("session");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("does not forget on a clean run that an UNVERIFIABLE observation broke", async () => {
+		// Round 3, S4's second half. De-attribution takes three CONSECUTIVE
+		// clean observations. An observation the net could not complete is not a
+		// clean one, so it breaks the run rather than counting toward it —
+		// otherwise a truncated directory watch silently votes to un-learn a
+		// tool it never actually watched.
+		const env = setupTestEnvironment("pi-lens-2449-deattrib-gap-");
+		try {
+			const filePath = path.join(env.tmpDir, "mixed.ts");
+			fs.writeFileSync(filePath, SOURCE);
+			const wide = path.join(env.tmpDir, "wide");
+			fs.mkdirSync(wide);
+			for (
+				let index = 0;
+				index < OBSERVED_TARGET_DIR_MAX_ENTRIES + 20;
+				index += 1
+			) {
+				fs.writeFileSync(
+					path.join(wide, `f${String(index).padStart(3, "0")}.ts`),
+					SOURCE,
+				);
+			}
+
+			const cycle = async (callId: string, target: string): Promise<void> => {
+				await armObservedMutation(
+					armArgs(target, env.tmpDir, {
+						toolName: "mixed_tool",
+						toolCallId: callId,
+					}),
+				);
+				await settleObservedMutation({
+					toolCallId: callId,
+					toolName: "mixed_tool",
+					sessionGeneration: 1,
+					turnIndex: 1,
+					record: recorder().record,
+				});
+			};
+
+			// One real mutation attributes the tool.
+			await armObservedMutation(
+				armArgs(filePath, env.tmpDir, {
+					toolName: "mixed_tool",
+					toolCallId: "call-mixed-seed",
+				}),
+			);
+			fs.writeFileSync(filePath, `${SOURCE}const seeded = 1;\n`);
+			await settleObservedMutation({
+				toolCallId: "call-mixed-seed",
+				toolName: "mixed_tool",
+				sessionGeneration: 1,
+				turnIndex: 1,
+				record: recorder().record,
+			});
+			expect(lookupLearnedMutatingTool("mixed_tool")).toBe("session");
+
+			// Two clean observations, then one the net could not complete
+			// (a directory wider than it may watch), then one more clean.
+			await cycle("call-mixed-clean-0", filePath);
+			await cycle("call-mixed-clean-1", filePath);
+			await cycle("call-mixed-capped", wide);
+			await cycle("call-mixed-clean-2", filePath);
+
+			// Three cleans have now happened in total, but not three in a ROW.
+			expect(lookupLearnedMutatingTool("mixed_tool")).toBe("session");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("says so when a DIRECTORY target has more entries than it may watch", async () => {
+		// Round 3, S3. Past OBSERVED_TARGET_DIR_MAX_ENTRIES the universe is a
+		// TRUNCATION, and the first cut broke out of the loop silently: a codemod
+		// that rewrote the 84th entry produced an empty diff, the empty diff was
+		// scored as a CLEAN observation, and two of those latched the watching
+		// off for the rest of the session — de-attributing a real codemod on
+		// evidence the net never collected (catalog shape 10).
+		const env = setupTestEnvironment("pi-lens-2449-dircap-");
+		try {
+			const dir = path.join(env.tmpDir, "wide");
+			fs.mkdirSync(dir);
+			const names = Array.from(
+				{ length: OBSERVED_TARGET_DIR_MAX_ENTRIES + 20 },
+				(_unused, index) => `f${String(index).padStart(3, "0")}.ts`,
+			);
+			for (const name of names) fs.writeFileSync(path.join(dir, name), SOURCE);
+			const beyondCap = path.join(dir, names[names.length - 1]);
+
+			for (let cycle = 0; cycle < CLEAN_OBSERVATION_ARM_LIMIT; cycle += 1) {
+				const callId = `call-dircap-${cycle}`;
+				const armed = await armObservedMutation(
+					armArgs(dir, env.tmpDir, {
+						toolName: "wide_codemod",
+						toolCallId: callId,
+					}),
+				);
+				expect(armed).toMatchObject({
+					armed: true,
+					scannedCount: OBSERVED_TARGET_DIR_MAX_ENTRIES,
+				});
+
+				// The change lands on an entry the truncated universe never saw.
+				fs.writeFileSync(beyondCap, `${SOURCE}const cycle = ${cycle};\n`);
+
+				const settled = await settleObservedMutation({
+					toolCallId: callId,
+					toolName: "wide_codemod",
+					sessionGeneration: 1,
+					turnIndex: 1,
+					record: recorder().record,
+				});
+				expect(settled.changedPaths).toEqual([]);
+				expect(settled.stoppedEarly).toBe(true);
+				expect(settled.reason).toBe("target-dir-cap-exceeded");
+			}
+
+			expect(
+				getDegradationSummary().some(
+					(group) => group.kind === "observed-mutation-dir-cap",
+				),
+			).toBe(true);
+			// An empty diff over a truncated universe is UNVERIFIABLE, so it must
+			// not spend the tool's clean-observation budget.
+			expect(shouldArmObservationForTool("wide_codemod")).toBe(true);
 		} finally {
 			env.cleanup();
 		}
@@ -676,45 +828,83 @@ describe("#2449 review round 2 — the observation universe is the target path",
 });
 
 describe("#2449 review round 2 — the settle is not budget-gated", () => {
-	it("completes for the target path with the per-turn budget already spent", async () => {
+	it("completes for EVERY watched entry with the per-turn budget already spent", async () => {
 		// F5. The first cut clamped the post-capture to whatever was left of the
 		// arm budget (`Math.min(Math.max(remaining, 1), ...)`), so a busy turn
 		// gave the settle 1ms, it reported a timeout, and a mutation that had
 		// already been measured was dropped on the floor.
+		//
+		// Round 3, T2: the previous cut of this case watched ONE file, and the
+		// capture always runs its FIRST entry by contract — so restoring the
+		// clamp changed nothing and the case was vacuous. The target is now a
+		// DIRECTORY whose entries all change, and the clock is a monotonic
+		// 2ms-per-read stub so the clamped deadline (`max(remaining, 1)` = 1ms)
+		// and the real one (50ms) separate deterministically instead of racing
+		// the host's disk speed.
 		const env = setupTestEnvironment("pi-lens-2449-settle-budget-");
+		const realNow = Date.now.bind(Date);
 		try {
-			const filePath = path.join(env.tmpDir, "late.ts");
-			fs.writeFileSync(filePath, SOURCE);
-			await armObservedMutation(armArgs(filePath, env.tmpDir));
+			const dir = path.join(env.tmpDir, "late");
+			fs.mkdirSync(dir);
+			const names = ["a1.ts", "a2.ts", "a3.ts", "a4.ts", "a5.ts"];
+			for (const name of names) fs.writeFileSync(path.join(dir, name), SOURCE);
+
+			await armObservedMutation(
+				armArgs(dir, env.tmpDir, { toolName: "codemod_dir" }),
+			);
 
 			// The rest of the turn burns the whole observational budget.
 			_setObservedTurnBudgetForTests(1, OBSERVED_TURN_BUDGET_MS);
 
-			fs.writeFileSync(
-				filePath,
-				["const a = 1;", "const b = 42;", "const c = 3;", ""].join("\n"),
-			);
+			for (const name of names) {
+				fs.writeFileSync(
+					path.join(dir, name),
+					["const a = 1;", "const b = 42;", "const c = 3;", ""].join("\n"),
+				);
+			}
+
+			let tick = realNow();
+			vi.spyOn(Date, "now").mockImplementation(() => {
+				tick += 2;
+				return tick;
+			});
 			const sink = recorder();
-			const settled = settleObservedMutation({
+			const settled = await settleObservedMutation({
 				toolCallId: "call-observed-1",
-				toolName: "patch_file",
+				toolName: "codemod_dir",
 				sessionGeneration: 1,
 				turnIndex: 1,
 				record: sink.record,
 			});
+			vi.restoreAllMocks();
 
-			expect(settled).toMatchObject({ settled: true, replayed: 1, scanned: 1 });
+			expect(settled).toMatchObject({
+				settled: true,
+				replayed: names.length,
+				scanned: names.length,
+			});
 			expect(settled.reason).toBeUndefined();
-			expect(sink.entries[0]).toMatchObject({ touchedLines: [2, 2] });
+			expect(sink.entries).toHaveLength(names.length);
+			// Every watched entry, not just the one the capture's first-entry rule
+			// guarantees. A clamped settle replays exactly one of these.
+			expect(
+				sink.entries.every(
+					(entry) =>
+						entry.kind === "edit" &&
+						entry.consumer === "codemod_dir" &&
+						entry.provenance === "observed",
+				),
+			).toBe(true);
 		} finally {
+			vi.restoreAllMocks();
 			env.cleanup();
 		}
 	});
 
-	it("names a missing baseline instead of reporting a silent no-op", () => {
+	it("names a missing baseline instead of reporting a silent no-op", async () => {
 		// F5's second half: "nothing changed" and "nothing was watched" are
 		// different answers, and the record has to say which (catalog shape 10).
-		const settled = settleObservedMutation({
+		const settled = await settleObservedMutation({
 			toolCallId: "call-that-never-armed",
 			toolName: "patch_file",
 			sessionGeneration: 1,
@@ -730,7 +920,7 @@ describe("#2449 review round 2 — the settle is not budget-gated", () => {
 });
 
 describe("#2449 review round 2 — ranges are measured, never fabricated", () => {
-	it("returns no ranges for a WINDOWED read-guard baseline", () => {
+	it("returns no ranges for a WINDOWED read-guard baseline", async () => {
 		// F6. A partial read stores hashes for the lines it showed. The first cut
 		// compared those by line number against the whole file: a real change at
 		// line 3 fell below the window and was DROPPED, and every line past the
@@ -744,23 +934,34 @@ describe("#2449 review round 2 — ranges are measured, never fabricated", () =>
 			);
 			fs.writeFileSync(filePath, `${lines.join("\n")}\n`);
 
-			// A windowed baseline: only lines 60..100 were ever shown.
+			// A windowed baseline: only lines 61..101 were ever shown.
+			//
+			// Round 3, T3: the previous window (60..100) had 41 keys against a
+			// 101-line split, so a coverage-BLIND implementation produced a
+			// 100-long array and `deriveObservedEditRanges`' own size check
+			// rejected it — the coverage check was never the thing under test and
+			// gutting it left the case green. This window ends on the file's LAST
+			// line, so the blind array is exactly 101 long, the size check passes,
+			// and only the key-range check stands between the caller and a
+			// fabricated 1..60 range over the window's own holes.
 			const windowed: Record<number, string> = {};
-			for (let line = 60; line <= 100; line += 1) {
-				windowed[line] = lineContentHash(lines[line - 1]);
+			for (let line = 61; line <= 101; line += 1) {
+				windowed[line] = lineContentHash(line === 101 ? "" : lines[line - 1]);
 			}
 
 			// The tool changes line 3 — inside the file, outside the window.
 			lines[2] = "const v2 = 999;";
 			fs.writeFileSync(filePath, `${lines.join("\n")}\n`);
 
-			expect(deriveObservedEditRanges(filePath, windowed)).toBeUndefined();
+			expect(
+				await deriveObservedEditRanges(filePath, windowed),
+			).toBeUndefined();
 		} finally {
 			env.cleanup();
 		}
 	});
 
-	it("returns no ranges when the line COUNT changed", () => {
+	it("returns no ranges when the line COUNT changed", async () => {
 		// F6's other half: an insert shifts every following line, so a
 		// by-line-number diff reports the shift rather than the edit. The safe
 		// answer is no ranges at all, which over-approximates to the whole file.
@@ -778,13 +979,15 @@ describe("#2449 review round 2 — ranges are measured, never fabricated", () =>
 				filePath,
 				["const zero = 0;", ...SOURCE.split("\n")].join("\n"),
 			);
-			expect(deriveObservedEditRanges(filePath, baseline)).toBeUndefined();
+			expect(
+				await deriveObservedEditRanges(filePath, baseline),
+			).toBeUndefined();
 		} finally {
 			env.cleanup();
 		}
 	});
 
-	it("returns no ranges once the cumulative read budget is spent", () => {
+	it("returns no ranges once the cumulative read budget is spent", async () => {
 		// F8. Range derivation reads whole files; on the sweep that is once per
 		// drifted file, which without a cumulative cap is unbounded read volume
 		// at a turn boundary.
@@ -805,13 +1008,13 @@ describe("#2449 review round 2 — ranges are measured, never fabricated", () =>
 
 			const spent: LineHashReadBudget = { remainingBytes: 0 };
 			expect(
-				deriveObservedEditRanges(filePath, baseline, spent),
+				await deriveObservedEditRanges(filePath, baseline, spent),
 			).toBeUndefined();
 
 			const funded: LineHashReadBudget = { remainingBytes: 1024 * 1024 };
-			expect(deriveObservedEditRanges(filePath, baseline, funded)).toEqual([
-				[2, 2],
-			]);
+			expect(
+				await deriveObservedEditRanges(filePath, baseline, funded),
+			).toEqual([[2, 2]]);
 			// The budget is actually DRAWN from, not merely consulted.
 			expect(funded.remainingBytes).toBeLessThan(1024 * 1024);
 		} finally {
@@ -850,7 +1053,7 @@ describe("#2449 review round 2 — the settled sweep is incremental and honest",
 				// partial pass can never be read as a complete one.
 				expect(swept.reason).toBeUndefined();
 				expect(swept.scanned).toBe(OBSERVED_SWEEP_STAT_WINDOW);
-				expect(swept.scanned + swept.remaining).toBe(
+				expect(swept.scanned + swept.notReachedThisPass).toBe(
 					OBSERVED_TRACKED_MAX_FILES,
 				);
 				expect(swept.cursor).toBeLessThan(OBSERVED_TRACKED_MAX_FILES);
@@ -957,6 +1160,12 @@ describe("#2449 review round 2 — the settled sweep is incremental and honest",
 			const filePath = path.join(env.tmpDir, "same-size.ts");
 			fs.writeFileSync(filePath, SOURCE);
 			const tracked = [filePath];
+			// Pin the file's mtime to a whole millisecond BEFORE the baseline is
+			// taken. `utimesSync` only carries millisecond precision, so without
+			// this the restore below cannot reproduce a stat the ledger recorded
+			// and the case silently stops testing the short-circuit (round 3, T1).
+			const pinned = Math.floor(Date.now());
+			fs.utimesSync(filePath, new Date(pinned), new Date(pinned));
 
 			await runObservedSettledSweep({
 				turnIndex: 0,
@@ -974,12 +1183,15 @@ describe("#2449 review round 2 — the settled sweep is incremental and honest",
 			].join("\n");
 			expect(rewritten.length).toBe(SOURCE.length);
 			fs.writeFileSync(filePath, rewritten);
-			const seeded = fs.statSync(filePath);
-			fs.utimesSync(
-				filePath,
-				new Date(seeded.mtimeMs),
-				new Date(seeded.mtimeMs),
-			);
+			// Force the rewrite back onto the exact tick the LEDGER recorded. The
+			// previous cut restored `statSync(file).mtimeMs` — the value the file
+			// already had AFTER the rewrite — so `previous.mtimeMs !==
+			// stat.mtimeMs`, the short-circuit was never reached, and deleting
+			// the `seenAtMs` guard left this case green.
+			fs.utimesSync(filePath, new Date(pinned), new Date(pinned));
+			const restored = fs.statSync(filePath);
+			expect(restored.size).toBe(SOURCE.length);
+			expect(restored.mtimeMs).toBe(pinned);
 
 			const sink = recorder();
 			const swept = await runObservedSettledSweep({
@@ -989,6 +1201,62 @@ describe("#2449 review round 2 — the settled sweep is incremental and honest",
 			});
 			expect(swept.drifted).toHaveLength(1);
 			expect(sink.entries).toHaveLength(1);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("keeps the handled set when the post-drain refresh could not finish", async () => {
+		// Round 3, S5. `handled` is what stops pi-lens's OWN drain output from
+		// being read as third-party drift on the next turn. The first cut cleared
+		// it unconditionally, including on a refresh that aborted or timed out —
+		// so the ledger still held the PRE-drain bytes while the only record that
+		// those bytes were ours had just been thrown away, and the next settled
+		// sweep replayed pi-lens's own formatter output as a third-party
+		// mutation.
+		const env = setupTestEnvironment("pi-lens-2449-refresh-abort-");
+		try {
+			const filePath = path.join(env.tmpDir, "own.ts");
+			fs.writeFileSync(filePath, SOURCE);
+			const tracked = [filePath];
+
+			await runObservedSettledSweep({
+				turnIndex: 0,
+				getTrackedPaths: () => tracked,
+				record: recorder().record,
+			});
+
+			// The deferred drain formats the file — pi-lens's own bytes.
+			noteMutationHandled(filePath);
+			fs.writeFileSync(filePath, `${SOURCE}const formatted = 1;\n`);
+
+			const controller = new AbortController();
+			controller.abort();
+			await refreshObservedMutationLedger({
+				turnIndex: 1,
+				getTrackedPaths: () => tracked,
+				signal: controller.signal,
+			});
+
+			const sink = recorder();
+			const swept = await runObservedSettledSweep({
+				turnIndex: 1,
+				getTrackedPaths: () => tracked,
+				record: sink.record,
+			});
+			expect(swept.drifted).toEqual([]);
+			expect(sink.entries).toEqual([]);
+			// And the incomplete refresh says so rather than looking like a
+			// successful one (catalog shape 10).
+			expect(
+				getDegradationSummary().some(
+					(group) =>
+						group.kind === "observed-mutation-budget" &&
+						group.latestReasons.some(
+							(entry) => entry.subject === "post-drain-refresh",
+						),
+				),
+			).toBe(true);
 		} finally {
 			env.cleanup();
 		}

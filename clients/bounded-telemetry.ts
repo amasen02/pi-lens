@@ -146,6 +146,21 @@ export const BOUNDED_TELEMETRY_PHASES = [
 	 * per turn: one settle can find many such files at once.
 	 */
 	"observed_sweep_unverifiable",
+	/**
+	 * #2430: an armed observation's universe was TRUNCATED because the tool
+	 * named a directory with more entries than the net may watch. Bounded per
+	 * turn with the ledger holding the exact count, and the identity is the
+	 * tool name so the record answers WHICH tool is being watched partially
+	 * (#2449 review round 3).
+	 */
+	"observed_target_dir_capped",
+	/**
+	 * #2430: the post-drain ledger refresh did not finish, so the "pi-lens
+	 * wrote these bytes itself" set was deliberately NOT cleared. At most once
+	 * per settle; capped for the same reason as the sweep's own record
+	 * (#2449 review round 3).
+	 */
+	"observed_refresh_incomplete",
 ] as const;
 
 export type BoundedPhase = (typeof BOUNDED_TELEMETRY_PHASES)[number];

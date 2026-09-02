@@ -25,7 +25,10 @@ import {
 	resetMutationAttribution,
 	shouldArmObservationForTool,
 } from "../../clients/mutation-attribution.js";
-import { resetObservedMutationNet } from "../../clients/observed-mutation.js";
+import {
+	armObservedMutation,
+	resetObservedMutationNet,
+} from "../../clients/observed-mutation.js";
 import { readChangesSince } from "../../clients/project-changes.js";
 import { countFileLines } from "../../clients/read-guard-tool-lines.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
@@ -308,6 +311,133 @@ describe("#2430 acceptance 2 — persistence is reachable on the PRODUCTION path
 		} finally {
 			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
 			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+});
+
+describe("#2449 review round 3 — one receipt per physical edit", () => {
+	it("records a provisionally-learned tool once, not once per half", async () => {
+		// S2. A tool learned from ONE observation is classified by NAME from the
+		// next call on, and is STILL armed — that second property is what makes
+		// `PERSIST_AFTER_OBSERVATIONS = 2` reachable at all (round 2, F2). Both
+		// halves then recorded the same edit: the settle replayed it through the
+		// mutation bridge with measured ranges, and the classification chain
+		// below recorded it AGAIN as a whole-file change. Three real edits
+		// produced four change-log receipts, and the middle one was reported
+		// twice with two different ranges.
+		const env = setupTestEnvironment("pi-lens-2449-double-record-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		try {
+			const filePath = path.join(env.tmpDir, "thrice.ts");
+			fs.writeFileSync(filePath, SOURCE);
+			const { runtime, cacheManager } = newSession(env.tmpDir);
+
+			for (const [index, body] of [
+				`${SOURCE}const d = 4;\n`,
+				`${SOURCE}const d = 4;\nconst e = 5;\n`,
+				`${SOURCE}const d = 4;\nconst e = 5;\nconst f = 6;\n`,
+			].entries()) {
+				const event = patchEvent(filePath, `call-2449-double-${index}`);
+				await handleToolCall(
+					toolCallDeps({ event, cwd: env.tmpDir, runtime, cacheManager }),
+				);
+				fs.writeFileSync(filePath, body);
+				await handleToolResult(
+					toolResultDeps({ event, runtime, cacheManager }),
+				);
+			}
+
+			// One physical edit, one receipt. Not one per bookkeeping path that
+			// happened to be reachable.
+			expect(
+				readChangesSince(env.tmpDir, 0).map((change) => change.source),
+			).toEqual([
+				"agent-tool:patch_file",
+				"agent-tool:patch_file",
+				"agent-tool:patch_file",
+			]);
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+});
+
+describe("#2449 review round 3 — the async settle never reorders registration", () => {
+	it("keeps two same-path tool_results with different content as distinct pipelines", async () => {
+		// T4. The settle stopped being synchronous (no sync filesystem work on
+		// the tool_result path), so `handleToolResult` now YIELDS on a call that
+		// has an armed observation. Everything the classified chain derives from
+		// the file's post-result bytes therefore has to be read BEFORE that
+		// yield: a racing tool_result for the same path rewrites the file while
+		// the first call is awaiting, and the first call then registers under the
+		// SECOND call's state hash — collapsing two distinct pipeline runs into
+		// one (#1086's composite key, and the dedupe that rides on it).
+		const env = setupTestEnvironment("pi-lens-2449-settle-order-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		const previousDebounce = process.env.PI_LENS_TOOL_RESULT_DEBOUNCE_MS;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		// Route through inFlightPipelines rather than the debounce coalescer.
+		delete process.env.PI_LENS_TOOL_RESULT_DEBOUNCE_MS;
+		try {
+			const filePath = path.join(env.tmpDir, "race.ts");
+			fs.writeFileSync(filePath, "export const z = 1;\n");
+			// The armed observation watches an UNRELATED path that never moves,
+			// so the settle finds nothing, replays nothing, and the classified
+			// chain below still runs — which is what puts the ordering under
+			// test rather than the skip.
+			const watched = path.join(env.tmpDir, "watched.ts");
+			fs.writeFileSync(watched, SOURCE);
+			const { runtime, cacheManager } = newSession(env.tmpDir);
+
+			const { runPipeline } = await import("../../clients/pipeline.js");
+			vi.mocked(runPipeline).mockClear();
+
+			await armObservedMutation({
+				toolCallId: "call-race-a",
+				toolName: "edit",
+				targetPath: watched,
+				cwd: env.tmpDir,
+				sessionGeneration: runtime.sessionGeneration,
+				turnIndex: runtime.turnIndex,
+			});
+
+			const editEvent = (toolCallId: string): Record<string, unknown> => ({
+				toolName: "edit",
+				toolCallId,
+				input: { path: filePath },
+				content: [{ type: "text", text: "edited" }],
+			});
+
+			const first = handleToolResult(
+				toolResultDeps({
+					event: editEvent("call-race-a"),
+					runtime,
+					cacheManager,
+				}),
+			);
+			// Synchronously, before the first call can resume from its settle.
+			fs.writeFileSync(filePath, "export const z = 2;\n");
+			const second = handleToolResult(
+				toolResultDeps({
+					event: editEvent("call-race-b"),
+					runtime,
+					cacheManager,
+				}),
+			);
+			await Promise.all([first, second]);
+
+			// Two distinct post-result states, two pipeline runs.
+			expect(vi.mocked(runPipeline)).toHaveBeenCalledTimes(2);
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			if (previousDebounce === undefined)
+				delete process.env.PI_LENS_TOOL_RESULT_DEBOUNCE_MS;
+			else process.env.PI_LENS_TOOL_RESULT_DEBOUNCE_MS = previousDebounce;
 			env.cleanup();
 		}
 	});

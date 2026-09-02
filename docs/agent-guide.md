@@ -204,7 +204,11 @@ pi-lens writes to files **outside your own tool calls** (`docs/features.md`
   and the tool is then remembered as mutating: for this session on the first
   sighting, persisted under the project's data directory on the second, so a
   later session classifies it by name with no snapshot at all. Three quiet
-  observations in a row withdraw a session attribution again. A call that names
+  observations in a row withdraw a session attribution again, and a withdrawn
+  tool can be learned back from a later real edit. An observation pi-lens could
+  not finish — a directory with more entries than it watches — counts as
+  neither, so a wide codemod is never written off on a look it never took. A
+  call that names
   no file is caught at `agent_settled` by an incremental content check over the
   files pi-lens has already read, written, diagnosed or opened on a language
   server — a rotating window per turn, reading only what actually moved; a file

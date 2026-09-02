@@ -942,20 +942,29 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	// the file in `turn-state.json`, and it replays through the mutation bridge
 	// to get the identical bookkeeping a `write` gets.
 	//
-	// Two properties of this block are load-bearing, both from #2449 review
-	// round 2 (F1). It must not YIELD: `handleToolResult` has no `await` before
+	// The PROBE is synchronous and is the first thing asked, so the
+	// overwhelmingly common call — no baseline armed — pays one map lookup and
+	// nothing else (#2449 round 2, F1).
+	//
+	// The SETTLE is async (#2449 round 3, T4: no synchronous filesystem work on
+	// this path), so it yields. `handleToolResult` has no other `await` before
 	// it registers with `debouncedPipelines`/`inFlightPipelines`, and
-	// `tests/clients/runtime-tool-result-debounce.test.ts` asserts exactly that
-	// (a microtask here lets a racing second tool_result miss the first's
-	// entry). And it must do NOTHING on the overwhelmingly common path where no
-	// baseline was armed. So: a synchronous map probe first, and a synchronous
-	// settle — the universe is one path, so there is nothing here worth
-	// yielding for.
-	if (
+	// `tests/clients/runtime-tool-result-debounce.test.ts` asserts that a
+	// racing second tool_result for the same path cannot miss the first's
+	// entry — so everything the chain below derives from the file's POST-RESULT
+	// bytes is read HERE, before the yield. Otherwise the racing call rewrites
+	// the file while this one is awaiting and this one registers under the
+	// OTHER call's state hash, collapsing two distinct pipelines into one.
+	const observationPending =
 		!getFlag("no-read-guard") &&
-		hasPendingObservation(resolveToolCallCorrelationId(event))
-	) {
-		const observed = settleObservedMutation({
+		hasPendingObservation(resolveToolCallCorrelationId(event));
+	const preSettleStateHash =
+		observationPending && mutation !== undefined && filePath
+			? getFileStateHash(filePath)
+			: undefined;
+	let observedReplayed = 0;
+	if (observationPending) {
+		const observed = await settleObservedMutation({
 			toolCallId: resolveToolCallCorrelationId(event),
 			toolName: event.toolName,
 			sessionGeneration: runtime.sessionGeneration,
@@ -969,6 +978,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 				!isPathIgnoredByProject(candidate, workspaceRoot, false),
 			dbg,
 		});
+		observedReplayed = observed.replayed;
 		if (observed.replayed > 0) {
 			dbg(
 				`tool_result: observed ${observed.replayed} mutation(s) from tool "${event.toolName}"`,
@@ -998,6 +1008,27 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			`tool_result: skipped pipeline - file outside project root or in node_modules: ${filePath}`,
 		);
 		return;
+	}
+	// #2449 review round 3 (S2). A tool learned from ONE observation is
+	// classified by NAME from here on AND is still armed — that second property
+	// is what makes a second observation, and therefore persistence, reachable
+	// at all (round 2, F2). Both halves then recorded the same physical edit:
+	// the settle above replayed it through the mutation bridge with measured
+	// ranges, and the chain below recorded it AGAIN as a whole-file change, so
+	// a three-edit session produced four change-log receipts.
+	//
+	// The settle wins, deliberately. It ran the disk diff, so it knows which
+	// LINES moved; the chain, reached through `recognizeOnly`, has no ranges for
+	// an unknown tool and over-approximates to the file. Skipping the arm
+	// instead would be the other way to fix this, and it is the wrong one — it
+	// makes PERSIST_AFTER_OBSERVATIONS unreachable again.
+	if (observedReplayed > 0) {
+		dbg(
+			`tool_result: skipping turn tracking - the observational settle already recorded ${observedReplayed} mutation(s) for "${event.toolName}"`,
+		);
+		return syntheticWriteContent.length > 0
+			? { content: [...event.content, ...syntheticWriteContent] }
+			: undefined;
 	}
 	// #2430: a classified mutation is accounted for by the chain below, so the
 	// `agent_settled` sweep must re-baseline this file rather than report the
@@ -1047,7 +1078,12 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	// for the pipeline dedup key (`initialStateHash`) further down (finding 3):
 	// nothing between here and that point rewrites the file, so a second read
 	// would only re-derive the same digest.
-	const postWriteStateHash = getFileStateHash(filePath);
+	//
+	// `preSettleStateHash` is that same digest taken BEFORE the observational
+	// settle's yield, on the only path that has one (#2449 round 3, T4). Reusing
+	// it is not an optimization: re-reading here would read whatever a racing
+	// tool_result wrote while this call was awaiting.
+	const postWriteStateHash = preSettleStateHash ?? getFileStateHash(filePath);
 
 	// #2402: a fully-applied native edit is also an applied record, so an
 	// identical retry is recognized as already-applied instead of escalating

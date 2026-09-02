@@ -2563,16 +2563,27 @@ file, or, when it is a directory, that directory's own entries non-recursively
 and capped. Never siblings, never the tracked set: watching the neighbourhood
 attributed a background write to whatever tool happened to be running, so a
 `read`-shaped tool got learned as an editor from one coincidence. The tracked
-set is the SETTLED SWEEP's domain, and only its.
+set is the SETTLED SWEEP's domain, and only its. When the directory cap BITES
+the universe is a TRUNCATION, so an empty diff over it is `unverifiable` and
+never clean — scoring the truncation as clean de-attributed a real codemod that
+rewrote the 84th entry of an 84-entry directory.
 
 `clients/mutation-attribution.ts` remembers the tool: `provenance: "learned"`
 for the session on the first observation, persisted under
 `getProjectDataDir(cwd)` on the second — and a session-learned tool STAYS armed
 until that second observation lands, because nothing else can produce it (latch
-off at observation one and the persist threshold is unreachable). Three
-consecutive clean observations withdraw a provisional attribution again; a
-persisted one is never withdrawn. One `unclassified-mutating-tool` degradation
-per tool keeps the registry gap visible.
+off at observation one and the persist threshold is unreachable). A
+still-armed-and-already-classified tool is recorded by exactly ONE of the two
+paths: **when the settle replayed, the classification chain skips**, or the same
+physical edit lands in the change log twice (once with measured ranges, once
+whole-file). Three CONSECUTIVE clean observations withdraw a provisional
+attribution again, and withdrawing resets BOTH counters — leaving the clean
+count at three made the withdrawal terminal, so the tool was never armed again
+and could never be re-learned. An observation the net could not COMPLETE is
+`unverifiable`: it neither spends the arm latch nor votes in the
+de-attribution run. One `unclassified-mutating-tool` degradation per tool keeps
+the registry gap visible; a truncated directory watch adds an
+`observed-mutation-dir-cap` tally naming the tool.
 
 A tool that names no file is caught by the `agent_settled` sweep, which runs
 BEFORE the deferred drain and re-baselines after it so pi-lens's own formatter
@@ -2580,13 +2591,18 @@ output is never read as third-party drift. The sweep is INCREMENTAL and
 **stat-first**: it stats a bounded window of the tracked set per turn from a
 carried cursor and reads a file only when its size or mtime moved, so coverage
 of a large tracked set accumulates across turns instead of timing out in one,
-and the record reports its own `scanned`/`remaining`/`cursor`. Two rules there
+and the record reports its own `scanned`/`notReachedThisPass`/`cursor`. Two rules there
 are not negotiable — **never replay on size+mtime alone** (a `touch` moves mtime
 without moving a byte, so a candidate is confirmed by content hash or named in
 `unverifiable`), and **never trust the stat short-circuit against a baseline
-recorded while the file's mtime was still fresh** (`LedgerEntry.seenAtMs`, the
-same-tick same-size rewrite of catalog shape 6). A file pi-lens has never seen
-has no baseline and is not covered, by design.
+recorded while the file's mtime was still fresh** (`LedgerEntry.seenAtMs`
+against `OBSERVED_LEDGER_SETTLE_MS`, the same-tick same-size rewrite of catalog
+shape 6). That comparison goes through `clients/freshness.ts`, like every other
+mtime-against-a-recorded-instant question in `clients/` (#1739). A file pi-lens
+has never seen has no baseline and is not covered, by design. The post-drain
+re-baseline clears the "pi-lens wrote these bytes" set only when it actually
+finished: clearing it after an aborted refresh replayed pi-lens's own formatter
+output as third-party drift on the next turn.
 
 `deriveObservedEditRanges` reports ranges only when it can MEASURE them: a
 windowed read-guard baseline, a changed line count, an unreadable file or a
@@ -2594,16 +2610,21 @@ spent read budget all return `undefined` so the bridge over-approximates to the
 whole file. Naming lines that were never touched is worse than naming none.
 
 Do not add a second scanner: the snapshot and diff primitives are
-`captureFileStatsForPaths` / `captureFileStatsForPathsSync` / `diffFileStats` in
+`captureFileStatsForPaths` / `diffFileStats` in
 `clients/opaque-mutation-scan.ts`, shared with the #2000 bash recovery so the
-paths cannot disagree about what "changed" means. Every ASYNC capture carries a
-timeout AND an abort race, a file cap, a hash-byte budget and a per-turn
-wall-clock budget; exceeding any of them writes a bounded
-`observed_mutation_budget_exhausted` record and an `observed-mutation-budget`
-ledger tally, never a silent skip. The SETTLE is the deliberate exception on
-both counts: it is synchronous, because `handleToolResult` may not yield before
-it dispatches the pipeline (#1086), and it is not budget-gated, because a
-settle clamped to a spent budget drops a mutation that was already measured.
+paths cannot disagree about what "changed" means. There is no synchronous twin
+any more, and adding one back is not the answer to an ordering problem. Every
+capture carries a timeout AND an abort race, a file cap, a hash-byte budget and
+a per-turn wall-clock budget; exceeding any of them writes a bounded record and
+a degradation-ledger tally, never a silent skip. The SETTLE is the deliberate
+exception to the BUDGET only: it has its own deadline rather than the arm's
+leftovers, because a settle clamped to a spent budget drops a mutation that was
+already measured. It is ASYNC, and the #1086 ordering contract is met at the
+CALL SITE instead: the pending-baseline probe (`hasPendingObservation`) is
+synchronous, and `handleToolResult` reads everything it derives from the
+post-result bytes — the state hash the in-flight composite key is built from —
+BEFORE the settle's yield. Move that read after the yield and a racing
+tool_result for the same path collapses two distinct pipelines into one.
 Steady-state cost is zero for a classified `write`/`edit` (the net is gated on
 `classifyMutatingTool` having returned `undefined` or the attribution still
 being provisional) and ~1.3ms for one armed observation of a file target, paid
