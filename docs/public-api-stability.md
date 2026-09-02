@@ -1,0 +1,205 @@
+# Public API stability and versioning policy
+
+**Status:** normative. Landed by #2418; gates #2416.
+**Enforced by:** `clients/config-diagnostic-codes.ts` (the data),
+`tests/support/schema-stability.ts`, `tests/config/schema-stability-tiers.test.ts`,
+`tests/clients/config-diagnostic-codes.test.ts`,
+`tests/clients/config-deprecation-registry.test.ts` (the tests).
+
+pi-lens ships to roughly 28k installs a month. A config field, a warning a user
+greps for, or a tool id becomes a compatibility obligation the moment it ships —
+whether or not anyone wrote that obligation down. This document writes it down,
+and every clause below is backed by a test rather than by convention, because a
+policy nobody can fail is not a policy.
+
+Scope: the unified config schema (#2415/#2416/#2383/#195), the capability
+facades, the MCP tool mirror, and the versioned `PiLensApi` (#1358). It does not
+define any catalog schema; it constrains how those schemas evolve.
+
+## 1. Field stability tiers
+
+Every property in a published pi-lens schema carries an `x-stability`
+annotation, whose value is one of a closed vocabulary:
+
+| Tier | Meaning |
+| --- | --- |
+| `experimental` | May change shape, semantics, or disappear in a **minor** release. Not covered by the compatibility guarantee. |
+| `stable` | Covered by the guarantee. Shape and semantics change only in a **major**, through the checklist in section 4. |
+
+Rules:
+
+- **New fields default to `experimental`.** Shipping a field straight to
+  `stable` is a deliberate act, not a default.
+- **Promotion `experimental` → `stable` is changelogged** under `Changed`,
+  naming the field. Demotion `stable` → `experimental` is a breaking change and
+  follows section 4.
+- **A property with no tier fails CI.** `assertSchemaStabilityTiers` walks the
+  whole schema — `properties`, `patternProperties`, `items`, `prefixItems`,
+  `additionalProperties`, `oneOf`/`anyOf`/`allOf`, `not`, `if`/`then`/`else`,
+  `$defs`/`definitions` — so a field cannot hide from the tier requirement by
+  living inside a composition keyword.
+- The **root schema** is not itself a property and carries no tier. Entries
+  under `$defs`/`definitions` are reusable subschemas, not published fields;
+  they need no tier, but every property *inside* them does.
+
+The vocabulary lives in `STABILITY_TIERS` and the annotation key in
+`STABILITY_TIER_KEY` (`clients/config-diagnostic-codes.ts`). #2416's first real
+catalog schema asserts itself with the same two exported functions rather than
+writing a second walker.
+
+## 2. Stable config diagnostic codes
+
+Every user-facing config validation or migration warning carries a code from a
+closed, **append-only** namespace, `PILENS_CFG_NNNN`, registered once in
+`CONFIG_DIAGNOSTIC_CODES`.
+
+- **The prose is not API; the code is.** Message text may be rewritten in any
+  release. A code is never renumbered, never removed, and a retired number is
+  never reused — a retired code keeps its registry entry with an amended
+  description.
+- The code is threaded through the one durable choke point
+  (`recordDegradationOnce` / `incrementDegradationCount` in
+  `clients/degradation-ledger.ts`) and through `notifyUserDegradation`, so the
+  same code appears in the user-visible message, in `extension.log`, and in the
+  durable `latency.log` degradation row.
+- The durable row writes `code` **after** the bounded caller metadata, so the
+  ledger's `MAX_METADATA_KEYS` cap can never evict the one field a user greps
+  on.
+- A new `notifyUserDegradation` call from any `clients/**/*config*.ts` file
+  without a registered code fails CI
+  (`tests/clients/config-diagnostic-codes.test.ts` scans for it; it does not
+  keep a hand-maintained list of call sites).
+
+### How a user matches or suppresses a warning
+
+**The match key is the bracketed suffix, not the prose.** Every coded warning is
+rendered as:
+
+```
+pi-lens: ignoring invalid LSP config .pi-lens/lsp.json: Unexpected token } [PILENS_CFG_0001]
+```
+
+The trailing ` [PILENS_CFG_NNNN]` marker is appended by
+`withConfigDiagnosticCode`, is idempotent, and is always last. Match on it:
+
+```sh
+# every ignored-config warning this session, from the durable degradation log
+grep 'PILENS_CFG_0001' ~/.pi-lens/latency.log
+
+# suppress one code while keeping every other pi-lens warning
+pi ... 2>&1 | grep -v 'PILENS_CFG_0001'
+```
+
+The extraction pattern is exported as `CONFIG_DIAGNOSTIC_MARKER_PATTERN`
+(capture group 1 is the code) so tooling need not re-derive it. Anything that
+filters on the prose instead — `"ignoring invalid"` — is filtering on a string
+this policy explicitly reserves the right to change.
+
+### Registered codes
+
+| Code | Meaning | Emitter |
+| --- | --- | --- |
+| `PILENS_CFG_0001` | A config file exists but could not be read or parsed, so it is ignored. | `warnIgnoredConfigOnce` (`clients/config-warn.ts`), the single choke point behind the LSP, global, and project config loaders. |
+| `PILENS_CFG_0002` | A deprecated config **key** was accepted inside its deprecation window. | Reserved. No emitter yet; #2416 slice 1 wires it when the migration path lands. |
+| `PILENS_CFG_0003` | A deprecated config **file location** was read inside its window. | Reserved. No emitter yet; same slice. |
+
+A reserved code is registered and referenced by the deprecation registry, but
+nothing emits it today. That is deliberate: the number must be pinned before the
+migration warning ships, because append-only means the number cannot be chosen
+later.
+
+## 3. Config-envelope identity anchor
+
+The unified config format reserves a `$schema` URL from its first published
+version. Both halves are pinned in `clients/config-diagnostic-codes.ts`:
+
+- `CONFIG_SCHEMA_ID` — the canonical schema URL. The published schema's own
+  `$id` must equal it.
+- `CONFIG_SCHEMA_ANCHOR_KEY` (`"$schema"`) — the key a user's config file uses
+  to name the schema it was written against.
+
+`assertSchemaIdentityAnchor` checks all three facts: the schema's `$id` matches,
+the schema declares a meta-schema, and the root declares a `$schema` **instance**
+property so a user's file can carry the anchor. Pinning the URL in one module is
+what stops it drifting between the schema, the validator, and the docs.
+
+## 4. Deprecation window and removal checklist
+
+### The maintainer stance
+
+**A legacy source is read for exactly one deprecation window, and then it is
+actually removed.** pi-lens does not carry legacy config surfaces forever, and
+it does not silently drop them either. Both failure modes are ruled out by the
+same rule: while a surface is inside its window it is read and honored exactly
+as before, with a bounded coded warning; at the next major it is removed through
+the checklist below, announced in `Removed`. Nothing is ever dropped without an
+announced window that preceded it.
+
+### The data
+
+Every deprecated key or file location is a row in `DEPRECATED_CONFIG_SURFACES`
+carrying `surface`, `kind`, `code`, `deprecatedSince`, `removeNotBefore`, and a
+`reason`. The registry test enforces:
+
+- `deprecatedSince` names the release that **announces** the deprecation — for a
+  row announced only in an unreleased `.changelog/` fragment, that must be a
+  version later than the newest release in `CHANGELOG.md` (you cannot back-date
+  a deprecation into a version that already shipped without it);
+- `removeNotBefore` is a **later major**, `X.0.0` — removal never happens in a
+  minor;
+- the row's code is registered, and matches its kind;
+- the surface is announced in a Changelog `Deprecated` section as a delimited
+  token (`` `pi-lens.json` ``), so a substring of a longer filename does not
+  count as an announcement;
+- FILE rows name a location a loader actually reads, and KEY rows name a key the
+  `LSPConfig` interface actually declares — both checked against the exported
+  constants and the real interface body, never a hand-copied list.
+
+Note that a canonical file is not deprecated because some of its keys are.
+`.pi-lens.json` is a canonical location (#2426); the deprecated surfaces are the
+legacy top-level LSP keys read from it, which are `kind: "key"` rows.
+
+### The removal checklist
+
+This is the checklist #2372 slice 5's "separately approved breaking-change plan"
+instantiates. It does not invent a second process; slice 5 is one execution of
+this list.
+
+1. **Window elapsed.** The current version is at or past the row's
+   `removeNotBefore`, and that version is a major.
+2. **Announced.** The surface has been in a shipped `Deprecated` changelog
+   section since `deprecatedSince`, continuously.
+3. **Warned in-product.** The migration warning has been emitting its stable
+   code for the whole window — the user has had a coded, greppable signal, not
+   only a release note.
+4. **Migration path documented and reachable.** The replacement surface exists,
+   is `stable`, and the `reason` field names it.
+5. **Canonical-wins collision behavior verified.** For the whole window, a
+   config setting both the legacy and the canonical surface resolved to the
+   canonical one, with the coded warning naming the ignored legacy value.
+6. **Removal PR does all four:** deletes the reader, deletes the registry row,
+   adds a `Removed` changelog entry naming the surface and the replacement, and
+   keeps the diagnostic code registered (codes outlive the surfaces they
+   described).
+7. **Approved as a breaking change.** A major-version bump plus explicit
+   maintainer approval on the plan; a removal never rides in on an unrelated PR.
+
+Removing a row from `DEPRECATED_CONFIG_SURFACES` while the reader still exists,
+or removing the reader while the row still exists, fails the registry test. The
+two move together or not at all.
+
+## Where each policy point is enforced
+
+| Policy point | Data | Test |
+| --- | --- | --- |
+| 1. `x-stability` on every published field | `STABILITY_TIER_KEY`, `STABILITY_TIERS` | `tests/config/schema-stability-tiers.test.ts` via `assertSchemaStabilityTiers` |
+| 2. Append-only `PILENS_CFG_*` codes | `CONFIG_DIAGNOSTIC_CODES` | `tests/clients/config-diagnostic-codes.test.ts` |
+| 3. Reserved `$schema` identity anchor | `CONFIG_SCHEMA_ID`, `CONFIG_SCHEMA_ANCHOR_KEY` | `assertSchemaIdentityAnchor` |
+| 4. Deprecation window + removal checklist | `DEPRECATED_CONFIG_SURFACES` | `tests/clients/config-deprecation-registry.test.ts` |
+
+## Related
+
+#2415 (shared config core), #2416/#2372 (catalog schema and its compat
+template), #2383, #195 (selector semantics), #1358 (facade versioning — a
+separate version axis this policy only has to compose with), #2426 (canonical
+config locations).

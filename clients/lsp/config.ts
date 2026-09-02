@@ -47,8 +47,10 @@
  * clients/lsp/server.ts (e.g. "rust", "nix", "bash", "python", "go", "ts").
  */
 
-import { logExtension } from "../extension-log.js";
-import { notifyUserDegradation } from "../user-notify.js";
+import {
+	resetIgnoredConfigWarnCache,
+	warnIgnoredConfigOnce,
+} from "../config-warn.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { BoundedLruCache } from "../bounded-cache.js";
@@ -110,19 +112,44 @@ interface RegisteredLSPConfig {
 
 // --- Config Loading ---
 
-const CONFIG_PATHS = [".pi-lens/lsp.json", ".pi-lens.json", "pi-lsp.json"];
+/**
+ * Project-relative LSP config locations, in precedence order. Exported so the
+ * deprecation-window registry test (#2418) can check every deprecated FILE row
+ * against the paths actually read, rather than a hand-copied list.
+ */
+export const LSP_CONFIG_PATHS = [
+	".pi-lens/lsp.json",
+	".pi-lens.json",
+	"pi-lsp.json",
+] as const;
+
+/** Basename of the machine-global LSP config inside `~/.pi-lens/`. */
+export const GLOBAL_LSP_CONFIG_BASENAME = "lsp.json";
+
+const CONFIG_PATHS = LSP_CONFIG_PATHS;
 
 function warnInvalidLSPConfig(configPath: string, error: unknown): void {
-	const reason = error instanceof Error ? error.message : String(error);
-	const message = `ignoring invalid LSP config ${configPath}: ${reason}`;
-	logExtension({
+	// One shared seam for all three config loaders (#2418): it owns the
+	// warn-once latch, the extension.log line, the durable `config-ignored`
+	// ledger row, and the stable-coded user notification. The rendered prose is
+	// unchanged — `ignoring invalid LSP config <path>: <reason>`.
+	warnIgnoredConfigOnce({
 		subsystem: "lsp-config",
-		level: "warn",
-		message,
-		metadata: { configPath, reason },
+		file: configPath,
+		reason: error instanceof Error ? error.message : String(error),
 	});
-	// HUMAN-audience too: the user's own lsp.json is being ignored (#1333).
-	notifyUserDegradation(`pi-lens: ${message}`);
+}
+
+/**
+ * For tests that need to force the warn-once cache to reset between cases —
+ * the LSP loader's counterpart to `resetGlobalConfigWarnCache` in
+ * lens-config.ts and to the clear folded into `resetProjectLensConfigCache`
+ * (#2418 review round 3, S3). Without it, this loader's cases had to lean on
+ * every fixture landing in a fresh temp path to stay unlatched, which is a
+ * property of the fixture rather than of the test.
+ */
+export function resetLSPConfigWarnCache(): void {
+	resetIgnoredConfigWarnCache("lsp-config");
 }
 
 async function readLSPConfig(
@@ -202,7 +229,9 @@ export async function loadLSPConfig(cwd: string): Promise<LSPConfig> {
 	}
 
 	const globalConfig =
-		(await readLSPConfig(path.join(getGlobalPiLensDir(), "lsp.json"))) ?? {};
+		(await readLSPConfig(
+			path.join(getGlobalPiLensDir(), GLOBAL_LSP_CONFIG_BASENAME),
+		)) ?? {};
 	return mergeLSPConfigs(globalConfig, projectConfig ?? {});
 }
 
@@ -416,6 +445,9 @@ export function resetLSPConfigStateForTests(): void {
 	// Reset both together: a cleared config store beside a live session-root
 	// registry would decline files for roots nothing can serve any more.
 	resetSessionRootsForTests();
+	// The warn latch is loader state too: a test that re-reads the same broken
+	// path after this reset must see the warning again, not a latched silence.
+	resetLSPConfigWarnCache();
 }
 
 /**

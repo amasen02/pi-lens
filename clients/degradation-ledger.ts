@@ -1,5 +1,6 @@
 /** Bounded, process-local telemetry for behavior degraded during one session. */
 
+import type { ConfigDiagnosticCode } from "./config-diagnostic-codes.js";
 import { logExtension } from "./extension-log.js";
 import { LEDGER_FIELD_MAX, truncateForLedger } from "./ledger-bounds.js";
 import { logLatency } from "./latency-logger.js";
@@ -545,13 +546,35 @@ export type DegradationKind =
 	 * nothing for the file, silently prior to this kind. Once per file per
 	 * session; subject is the file path.
 	 */
-	| "ast-grep-napi-html-script-scan-failed";
+	| "ast-grep-napi-html-script-scan-failed"
+	/**
+	 * A config file the user wrote — or one key inside it — was rejected and
+	 * IGNORED, so pi-lens ran on defaults instead of on what the user asked for
+	 * (#2418). Written only through `warnIgnoredConfigOnce`
+	 * (`clients/config-warn.ts`), the single seam behind all three config
+	 * loaders. Before this kind the rejection existed only as a log line and a
+	 * one-shot notification: nothing counted it, so a session could silently run
+	 * the whole time on defaults with no durable trace. Subject is
+	 * `<file>\0<key>` (empty key = the whole file was unreadable), so a per-key
+	 * rejection and a whole-file rejection stay distinct rows for the same path;
+	 * `metadata.subsystem` says which loader. Once per subject per session — a
+	 * config is re-read on many paths and the count of re-reads is not the
+	 * observability question, the fact of the ignore is. This is the only kind
+	 * that carries a `code` (`PILENS_CFG_0001`) into the durable row.
+	 */
+	| "config-ignored";
 
 export interface DegradationRecord {
 	kind: unknown;
 	subject: unknown;
 	reason: unknown;
 	metadata?: Record<string, unknown>;
+	/**
+	 * Optional STABLE config diagnostic code (#2418). Reserved row field: it is
+	 * written into the durable row AFTER the bounded caller metadata, so the
+	 * `MAX_METADATA_KEYS` cap can never evict the one field a user greps on.
+	 */
+	code?: ConfigDiagnosticCode;
 }
 
 export interface DegradationGroup {
@@ -620,7 +643,7 @@ export function recordDegradationOnce(record: DegradationRecord): void {
 		if (onceKeys.has(key)) return;
 		onceKeys.add(key);
 		if (recordDegradation({ kind, subject, reason: record.reason })) {
-			logDurableDegradation(kind, subject, 1, record.metadata);
+			logDurableDegradation(kind, subject, 1, record.metadata, record.code);
 		}
 	} catch (error) {
 		debugLedgerFailure("record-once", error);
@@ -669,7 +692,7 @@ export function incrementDegradationCount(record: DegradationRecord): boolean {
 		// Durable rows use the summary's admission and emit the first event and
 		// power-of-two milestones only, keeping the sink bounded.
 		if (admitted && isPowerOfTwo(count)) {
-			logDurableDegradation(kind, subject, count, record.metadata);
+			logDurableDegradation(kind, subject, count, record.metadata, record.code);
 		}
 		return count === 1;
 	} catch (error) {
@@ -690,6 +713,7 @@ function logDurableDegradation(
 	subject: string,
 	count: number,
 	metadata?: Record<string, unknown>,
+	code?: ConfigDiagnosticCode,
 ): void {
 	const boundedMetadata = boundLedgerMetadata(metadata);
 	logLatency({
@@ -703,6 +727,9 @@ function logDurableDegradation(
 			subject,
 			count,
 			ledgerGeneration,
+			// Reserved row field, written AFTER the bounded caller metadata so the
+			// `MAX_METADATA_KEYS` cap cannot evict the stable code (#2418).
+			...(code ? { code } : {}),
 		},
 	});
 }
