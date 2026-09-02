@@ -8,7 +8,9 @@
 // --- Constants ---
 
 // ANSI escape codes for colors and formatting
+// oxlint-disable-next-line no-control-regex -- ESC (\x1b) is the literal ANSI escape-sequence lead byte this pattern strips, not accidental input.
 const ANSI_ESCAPE = /\x1b\[[0-9;]*m/g;
+// oxlint-disable-next-line no-control-regex -- ESC (\x1b) is the literal ANSI escape-sequence lead byte this pattern strips, not accidental input.
 const ANSI_ESCAPE_EXTENDED = /\x1b\[[0-9;]*[A-Za-z]/g;
 
 // Common error patterns from different tools

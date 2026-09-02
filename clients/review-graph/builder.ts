@@ -3401,7 +3401,7 @@ export function _readReviewGraphCheckpointForTests(cwd: string): {
 
 /** Test hook: force any pending debounced persist to write immediately. */
 export function flushReviewGraphPersistsForTests(): void {
-	for (const key of [..._pendingPersist.keys()]) {
+	for (const key of _pendingPersist.keys()) {
 		const pending = _pendingPersist.get(key);
 		if (!pending) continue;
 		_pendingPersist.delete(key);
@@ -3489,7 +3489,7 @@ export function flushReviewGraphPersist(
 	let pending = _pendingPersist.get(key);
 	const removedWorkerRequests: PendingPersist[] = [];
 	let selectedWorkerRequest: PendingPersist | undefined;
-	for (const [id, request] of [..._workerRequests]) {
+	for (const [id, request] of _workerRequests) {
 		if (request.key !== key) continue;
 		_workerRequests.delete(id);
 		removedWorkerRequests.push(request.pending);

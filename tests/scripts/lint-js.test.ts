@@ -138,3 +138,50 @@ describe("lint:js (#2439 — oxlint wired over .mjs/.cjs)", () => {
 		expect(result.status, result.stdout + result.stderr).toBe(0);
 	});
 });
+
+describe("lint:js — TS lane (#2454 — clients/tools/mcp/index.ts scanned for warning-tier hits)", () => {
+	it("does not ignore .ts/.tsx (the **/*.ts blanket ignore-pattern is gone)", () => {
+		// The #2439 baseline shipped with a blanket `**/*.ts`/`**/*.tsx`
+		// ignore-pattern (the TS tree had 30+ un-triaged warning-tier hits at
+		// the time). #2454 drove those to zero and dropped the blanket ignore
+		// — a regression that puts it back (even accidentally, e.g. copy-pasting
+		// the old flag list) would silently stop linting clients/tools/mcp/
+		// index.ts TypeScript again, so assert directly against the argv string
+		// rather than only re-deriving pass/fail from a clean tree.
+		const pkg = JSON.parse(
+			fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf8"),
+		);
+		const lintJs: string = pkg.scripts["lint:js"];
+		expect(lintJs).not.toMatch(/--ignore-pattern\s+"?\*\*\/\*\.tsx?"?/);
+	});
+
+	it("mutation proof: a planted warning-tier hit in clients/ fails the real `npm run lint`", () => {
+		// This is the #2454 acceptance criterion's literal mutation proof,
+		// codified as a regression test rather than only a one-off manual run:
+		// a real hit inside the real clients/ tree, through the real npm
+		// script chain (tsc && lint:js), must fail — proving the TS lane is
+		// genuinely wired into the gate other contributors run, not just this
+		// test file's own direct oxlint invocations above.
+		const probePath = path.join(
+			REPO_ROOT,
+			"clients",
+			"__lint2454_mutation_probe.ts",
+		);
+		expect(fs.existsSync(probePath)).toBe(false);
+		fs.writeFileSync(
+			probePath,
+			"export function __lint2454MutationProbe(n: number): number[] {\n\treturn new Array(n);\n}\n",
+		);
+		try {
+			const result = spawnSync(NPM, ["run", "lint"], {
+				encoding: "utf8",
+				cwd: REPO_ROOT,
+				shell: IS_WIN,
+			});
+			expect(result.status).not.toBe(0);
+			expect(result.stdout + result.stderr).toContain("no-new-array");
+		} finally {
+			fs.rmSync(probePath, { force: true });
+		}
+	});
+});

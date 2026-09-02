@@ -527,7 +527,9 @@ export async function handleAgentEnd({
 			error?: string;
 			missing?: boolean;
 		};
-		const work = new Array<FormatWork | undefined>(formatRecords.length);
+		const work: (FormatWork | undefined)[] = Array.from({
+			length: formatRecords.length,
+		});
 		const started = new Set<number>();
 		let nextIndex = 0;
 		const worker = async (): Promise<void> => {

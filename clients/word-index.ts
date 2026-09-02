@@ -1241,9 +1241,10 @@ export async function refreshWordIndexIncrementally(
 		Number.isFinite(requestedConcurrency) && requestedConcurrency > 0
 			? Math.max(1, Math.floor(requestedConcurrency))
 			: WORD_INDEX_STAT_CONCURRENCY;
-	const statResults = new Array<
-		{ path: string; mtimeMs: number; size: number } | undefined
-	>(walked.length);
+	const statResults: (
+		| { path: string; mtimeMs: number; size: number }
+		| undefined
+	)[] = Array.from({ length: walked.length });
 	let cursor = 0;
 	let superseded = false;
 	const worker = async (): Promise<void> => {

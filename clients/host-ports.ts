@@ -103,7 +103,7 @@ export function createDefaultHostPorts(
 	return Object.fromEntries(
 		Object.entries(defaults).map(([group, value]) => [
 			group,
-			{ ...value, ...(overrides[group as keyof HostPorts] ?? {}) },
+			{ ...value, ...overrides[group as keyof HostPorts] },
 		]),
 	) as unknown as HostPorts;
 }

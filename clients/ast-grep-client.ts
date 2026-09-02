@@ -770,7 +770,7 @@ message: found
 		}
 
 		return Array.from(grouped.entries())
-			.filter(([_, functions]) => functions.length > 1)
+			.filter(([, functions]) => functions.length > 1)
 			.map(([pattern, functions]) => ({ pattern, functions }));
 	}
 

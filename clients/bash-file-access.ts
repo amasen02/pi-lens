@@ -41,6 +41,7 @@ function stripQuotes(token: string): string {
 }
 
 function stripAnsi(value: string): string {
+	// oxlint-disable-next-line no-control-regex -- ESC (\x1b) is the literal ANSI escape-sequence lead byte this pattern strips, not accidental input.
 	return value.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
 }
 

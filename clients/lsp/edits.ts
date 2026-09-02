@@ -796,6 +796,10 @@ function planWorkspaceEdit(
 	};
 	const flushSubtree = (uri: string): void => {
 		const key = indexKey(uri);
+		// #2454: this file is under concurrent edit for the applyWorkspaceEdit
+		// mutation-bridge work (refs #2450); left as-is rather than risking a
+		// collision, deferred here.
+		// oxlint-disable-next-line no-useless-spread
 		for (const candidate of [...(descendants.get(key) ?? [])]) {
 			const item = pending.get(candidate);
 			if (item) flushUri(item.uri);
@@ -842,6 +846,10 @@ function planWorkspaceEdit(
 		} else flushSubtree(resource.uri);
 		ops.push(resource);
 	}
+	// #2454: this file is under concurrent edit for the applyWorkspaceEdit
+	// mutation-bridge work (refs #2450); left as-is rather than risking a
+	// collision, deferred here.
+	// oxlint-disable-next-line no-useless-spread
 	for (const item of [...pending.values()]) flushUri(item.uri);
 	return ops;
 }

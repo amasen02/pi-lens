@@ -53,7 +53,10 @@ export function createLineParser(config: LineParserConfig) {
 
 		// Optionally strip ANSI codes (for tools that output colored text)
 		const clean =
-			config.stripAnsi !== false ? raw.replace(/\x1b\[[0-9;]*m/g, "") : raw;
+			config.stripAnsi !== false
+				? // oxlint-disable-next-line no-control-regex -- ESC (\x1b) is the literal ANSI escape-sequence lead byte this pattern strips, not accidental input.
+					raw.replace(/\x1b\[[0-9;]*m/g, "")
+				: raw;
 
 		const lines = clean.split("\n").filter((l) => l.trim());
 

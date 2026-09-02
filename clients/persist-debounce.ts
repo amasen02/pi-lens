@@ -54,7 +54,7 @@ export function createDebounceScheduler<T>(args: {
 	}
 
 	function flushAll(): void {
-		for (const key of [...pending.keys()]) flush(key);
+		for (const key of pending.keys()) flush(key);
 	}
 
 	function schedule(key: string, payload: T): void {
