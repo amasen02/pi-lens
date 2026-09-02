@@ -391,6 +391,72 @@ describe("lsp_diagnostics tool", () => {
 		}
 	});
 
+	it("scans a mixed .ts + .py directory as typescript, unchanged by the #2434 registry fold", async () => {
+		const tool = createLspDiagnosticsTool();
+		const tmpDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-diag-mixed-"),
+		);
+		fs.writeFileSync(path.join(tmpDir, "a.ts"), "const value = 1;\n");
+		fs.writeFileSync(path.join(tmpDir, "b.py"), "value = 1\n");
+
+		try {
+			const result = (await tool.execute(
+				"diag-dir-mixed",
+				{ path: tmpDir, severity: "all", concurrency: 2 },
+				new AbortController().signal,
+				null,
+				{ cwd: "." },
+			)) as any;
+
+			expect(result.isError).toBeUndefined();
+			expect(result.details?.mode).toBe("directory");
+			// typescript sits before python in SCAN_LANGUAGE_PRIORITY (same
+			// relative order LANG_EXTENSIONS's ".ts" key had before ".py"), so the
+			// directory scans as typescript and the python file is not opened.
+			expect(result.details?.filesScanned).toBe(1);
+			const openFile = (
+				mocked.service as { openFile: ReturnType<typeof vi.fn> }
+			).openFile;
+			const opened = openFile.mock.calls.map(([filePath]) =>
+				path.relative(tmpDir, String(filePath)).replace(/\\/g, "/"),
+			);
+			expect(opened).toEqual(["a.ts"]);
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
+	});
+
+	it("scans a .ru-only directory as ruby (#2434 Changed: widened from the old LANG_EXTENSIONS table, which never named .ru)", async () => {
+		const tool = createLspDiagnosticsTool();
+		const tmpDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-diag-ru-"),
+		);
+		fs.writeFileSync(path.join(tmpDir, "config.ru"), "run MyApp\n");
+
+		try {
+			const result = (await tool.execute(
+				"diag-dir-ru",
+				{ path: tmpDir, severity: "all", concurrency: 2 },
+				new AbortController().signal,
+				null,
+				{ cwd: "." },
+			)) as any;
+
+			expect(result.isError).toBeUndefined();
+			expect(result.details?.mode).toBe("directory");
+			expect(result.details?.filesScanned).toBe(1);
+			const openFile = (
+				mocked.service as { openFile: ReturnType<typeof vi.fn> }
+			).openFile;
+			const opened = openFile.mock.calls.map(([filePath]) =>
+				path.relative(tmpDir, String(filePath)).replace(/\\/g, "/"),
+			);
+			expect(opened).toEqual(["config.ru"]);
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
+	});
+
 	it("honors .pi-lens.json ignore patterns during directory scans (#243)", async () => {
 		const tool = createLspDiagnosticsTool();
 		const tmpDir = fs.mkdtempSync(
