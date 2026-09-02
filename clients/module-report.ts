@@ -1375,7 +1375,7 @@ const pythonCallbackRules: CallbackLanguageRules = {
 				include: true,
 			};
 		}
-		if (/\.add_done_callback$/.test(callName)) {
+		if (callName.endsWith(".add_done_callback")) {
 			return {
 				kind: "future_callback",
 				flags: withFlag(base.flags, "future completion"),
@@ -1534,7 +1534,7 @@ const javaCallbackRules: CallbackLanguageRules = {
 			3,
 		);
 		const created = obj?.children?.find((c) => c.type === "type_identifier");
-		if (created && /Thread$/.test(created.text)) {
+		if (created && created.text.endsWith("Thread")) {
 			return {
 				kind: "task",
 				flags: withFlag(base.flags, "thread"),
@@ -2413,8 +2413,10 @@ function levenshteinDistance(a: string, b: string): number {
 	const bl = b.length;
 	if (al === 0) return bl;
 	if (bl === 0) return al;
-	let prev = new Array<number>(bl + 1);
-	let curr = new Array<number>(bl + 1);
+	let prev: number[] = [];
+	prev.length = bl + 1;
+	let curr: number[] = [];
+	curr.length = bl + 1;
 	for (let j = 0; j <= bl; j++) prev[j] = j;
 	for (let i = 1; i <= al; i++) {
 		curr[0] = i;

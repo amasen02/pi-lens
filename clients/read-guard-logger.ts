@@ -350,7 +350,7 @@ export function logReadGuardEvent(entry: ReadGuardLogEntry): void {
 		return;
 	}
 	const rawMetadata = entry.correlationId
-		? { ...(entry.metadata ?? {}), correlationId: entry.correlationId }
+		? { ...entry.metadata, correlationId: entry.correlationId }
 		: entry.metadata;
 	const bounded = boundTelemetryValue(rawMetadata, "metadata", 0);
 	const metadata: Record<string, unknown> | undefined =

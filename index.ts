@@ -55,6 +55,16 @@ import {
 import { selectLspStatus } from "./clients/lsp-status.js";
 import type { PersistedReadGuardState } from "./clients/read-guard.js";
 import { registerMutationBridge } from "./clients/mutation-bridge.js";
+import {
+	OBSERVED_TRACKED_MAX_FILES,
+	refreshObservedMutationLedger,
+	runObservedSettledSweep,
+} from "./clients/observed-mutation.js";
+import {
+	collectTrackedPaths,
+	replayThroughMutationBridge,
+	storedLineHashesFor,
+} from "./clients/observed-mutation-sources.js";
 import { classifyMutatingTool } from "./clients/mutating-tool.js";
 import { resolveLanguageRootForFile } from "./clients/language-profile.js";
 import { countFileLines } from "./clients/read-guard-tool-lines.js";
@@ -2164,7 +2174,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 						resetDispatchBaselines,
 						resetLSPService,
 					});
-					ctx.ui && updateLspStatus(ctx.ui.setStatus, ctx.ui.theme);
+					if (ctx.ui) updateLspStatus(ctx.ui.setStatus, ctx.ui.theme);
 
 					// Pin the stable identity + reason AFTER handleSessionStart (which ran
 					// resetForSession → a fresh random id); the stable id now wins (#190).
@@ -2518,6 +2528,77 @@ function activateExtension(hostPi: ExtensionAPI) {
 		};
 	};
 
+	/**
+	 * #2430 item 3. Kept separate from `runDeferredMutationDrain` so a throw
+	 * here can never take the drain with it: the sweep is a last-resort net for
+	 * changes nothing else saw, and the drain is the pipeline's contract.
+	 */
+	async function runObservedSettledSweepSafely(
+		ctx: DeferredDrainCtx,
+	): Promise<void> {
+		if (getLensFlag("no-read-guard")) return;
+		const cwd = ctx.cwd ?? runtime.projectRoot;
+		try {
+			const result = await runObservedSettledSweep({
+				turnIndex: runtime.turnIndex,
+				getTrackedPaths: () =>
+					collectTrackedPaths({
+						readGuard: runtime.readGuard,
+						cwd,
+						limit: OBSERVED_TRACKED_MAX_FILES,
+					}),
+				record: replayThroughMutationBridge,
+				getStoredLineHashes: (candidate) =>
+					storedLineHashesFor(runtime.readGuard, candidate),
+				// Merge of #2449 into #2450: #2449 wrote this gate as the
+				// hand-spelled `isPathIgnoredByProject` + `isExternalOrVendorFile`
+				// pair, which is the duplication #2450's review round 2 (F4)
+				// consolidated into `isRecordableProjectPath`. Routed through the
+				// helper so the settled sweep, the read bridge, the mutation
+				// bridge and the direct LSP path all ask ONE question.
+				isRecordable: (candidate) =>
+					isRecordableProjectPath(candidate, runtime.projectRoot),
+				signal: ctx?.signal,
+				dbg,
+			});
+			if (result.drifted.length > 0 || result.unverifiable.length > 0) {
+				dbg(
+					`observed_settled_sweep: ${result.drifted.length} drifted file(s), ${result.replayed} replayed, ` +
+						`${result.unverifiable.length} unverifiable; scanned ${result.scanned}, ${result.notReachedThisPass} not reached this pass (cursor ${result.cursor})`,
+				);
+			}
+		} catch (sweepErr) {
+			dbg(`observed_settled_sweep crashed: ${sweepErr}`);
+		}
+	}
+
+	/**
+	 * Post-drain re-baseline; see the call site for why it exists.
+	 *
+	 * No `getTrackedPaths` here on purpose (#2449 review round 5, F2): the
+	 * refresh's traversal is the `handled` set — the files THIS run's pipeline
+	 * or drain actually wrote — not the tracked set, so it needs no path
+	 * collection of its own.
+	 */
+	async function refreshObservedLedgerSafely(
+		ctx: DeferredDrainCtx,
+	): Promise<void> {
+		if (getLensFlag("no-read-guard")) return;
+		try {
+			await refreshObservedMutationLedger({
+				turnIndex: runtime.turnIndex,
+				// Same seeding shortcut the sweep uses: a file first seen here
+				// gets its baseline from the read-guard's stored per-line hashes
+				// rather than a read (#2449 review round 2, F3).
+				getStoredLineHashes: (candidate) =>
+					storedLineHashesFor(runtime.readGuard, candidate),
+				signal: ctx?.signal,
+			});
+		} catch (refreshErr) {
+			dbg(`observed_ledger_refresh crashed: ${refreshErr}`);
+		}
+	}
+
 	async function runDeferredMutationDrain(
 		ctx: DeferredDrainCtx,
 	): Promise<void> {
@@ -2587,7 +2668,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 			// `agent_settled` below, since — unlike this flush — running it here
 			// can fire mid-run, between auto-retries).
 			await flushDebouncedToolResults();
-			ctx.ui && updateLspStatus(ctx.ui.setStatus, ctx.ui.theme);
+			if (ctx.ui) updateLspStatus(ctx.ui.setStatus, ctx.ui.theme);
 		} catch (agentEndErr) {
 			// The stale-ctx class has ONE classifier and one record, in
 			// clients/session-event-guard.ts. Rethrow so the wrapper around this
@@ -3046,7 +3127,20 @@ function activateExtension(hostPi: ExtensionAPI) {
 		try {
 			setAmbientAbortSignal(ctx?.signal);
 			try {
+				// #2430 item 3: the turn-boundary net runs BEFORE the drain, so a
+				// file a path-less third-party tool changed is queued in time to be
+				// formatted in this same settle rather than a run later. It
+				// hash-checks the tracked-file set only — read-guard reads/writes,
+				// widget diagnostic files, open LSP documents — and never walks the
+				// workspace. Bounded on both axes (timeout + this ctx's abort) and
+				// wrapped, because an advisory sweep must never cost the drain.
+				await runObservedSettledSweepSafely(ctx);
 				await runDeferredMutationDrain(ctx);
+				// The drain just wrote formatted/autofixed bytes to files pi-lens
+				// itself owns. Re-baseline them, or the NEXT settle reads our own
+				// formatter output as unexplained third-party drift and requeues the
+				// same files forever.
+				await refreshObservedLedgerSafely(ctx);
 			} catch (drainErr) {
 				// #1924 classified the stale-ctx case inline here. #1925 moved the
 				// classifier and its record to clients/session-event-guard.ts, so

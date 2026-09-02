@@ -63,7 +63,20 @@ the mutation is recorded whole-file with lines unknown, and the
 read-before-edit guard takes its no-line-info arm rather than guessing.
 Deferred is the default for any edit-shaped tool pi-lens cannot place, because
 formatting between the calls of a multi-step rewrite fights the tool that is
-still writing.
+still writing. A tool whose SHAPE is unrecognized too is caught by observation:
+pi-lens takes a bounded snapshot of the path that call names — and only that
+path, so a change to a neighbouring file is never blamed on it — replays
+whatever actually changed through the same chain, then remembers that tool as
+mutating for the session, and on disk under the project's data directory once a
+second observation confirms it, so later sessions classify it by name with no
+snapshot at all. A tool that names no file is caught at `agent_settled` by an
+incremental content check over the files pi-lens has already read, written,
+diagnosed or opened on a language server: a rotating window of the set each
+turn, reading only the files whose size or timestamp actually moved, so the
+check stays affordable as the set grows. A file it has never seen has no
+baseline and is therefore not covered, and a file it cannot verify is named
+rather than reformatted on a timestamp alone
+(`clients/observed-mutation.ts`).
 
 **Bundled fallback lint configs stay conservative.** When a project ships no
 tool config, the package-owned fallback configs set the rules (`config/biome/core.jsonc`,

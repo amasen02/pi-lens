@@ -112,6 +112,92 @@ export interface CaptureOptions {
 	withHashes?: boolean;
 }
 
+/** What a bounded capture returns: the snapshot, and whether it was cut. */
+export interface PathCaptureResult {
+	snapshot: FileStatsSnapshot;
+	/**
+	 * `true` when a bound stopped the capture before every path was reached.
+	 * A partial snapshot must never be read as a complete one: absence from a
+	 * cut capture means "not looked at", not "unchanged".
+	 */
+	stoppedEarly: boolean;
+}
+
+/**
+ * Stat (and optionally hash) an EXPLICIT file list into a snapshot.
+ *
+ * Extracted from `captureFileStats` so the observational net (#2430) reuses
+ * exactly this identity function — same key form, same hash algorithm, same
+ * byte budget — instead of hand-rolling a second scanner whose diff could
+ * disagree with `diffFileStats`. The walk-and-cap half stays in
+ * `captureFileStats`; a caller that already knows its file set skips it.
+ *
+ * `hashBudgetBytes` defaults to {@link OPAQUE_HASH_BUDGET_BYTES}. A file past
+ * the budget simply carries no hash, and its comparison degrades to
+ * mtime+size — the same documented limitation the walking capture has.
+ *
+ * `deadlineMs` (an absolute epoch stamp) and `signal` are both checked
+ * BETWEEN files, so a multi-path capture cannot outrun either bound. The FIRST
+ * entry always runs: the observational net's settle (#2430) guarantees the
+ * target path it took a baseline for is re-captured no matter what the clock
+ * says (#2449 review round 2, F5), and a bound that could cut the one path the
+ * caller actually asked about would drop a mutation already measured.
+ *
+ * There was a synchronous twin of this function until #2449 review round 3
+ * (T4). It existed only so `handleToolResult` could settle an observation
+ * without yielding; the settle is an ordinary async step now, and blocking the
+ * event loop on a directory's worth of `readFileSync` was never worth the
+ * ordering shortcut it bought.
+ */
+export async function captureFileStatsForPaths(
+	files: Iterable<string>,
+	options: CaptureOptions & {
+		hashBudgetBytes?: number;
+		deadlineMs?: number;
+		signal?: AbortSignal;
+	} = {},
+): Promise<PathCaptureResult> {
+	const hashBudget = options.hashBudgetBytes ?? OPAQUE_HASH_BUDGET_BYTES;
+	const snapshot: FileStatsSnapshot = new Map();
+	let hashBytesSpent = 0;
+	let stoppedEarly = false;
+	let first = true;
+	for (const file of files) {
+		if (!first) {
+			if (options.signal?.aborted === true) {
+				stoppedEarly = true;
+				break;
+			}
+			if (
+				options.deadlineMs !== undefined &&
+				Date.now() >= options.deadlineMs
+			) {
+				stoppedEarly = true;
+				break;
+			}
+		}
+		first = false;
+		try {
+			const stat = await fs.promises.stat(file);
+			if (!stat.isFile()) continue;
+			const entry: FileStatEntry = {
+				mtimeMs: stat.mtimeMs,
+				size: stat.size,
+			};
+			if (options.withHashes && hashBytesSpent + stat.size <= hashBudget) {
+				entry.hash = createHash("sha256")
+					.update(await fs.promises.readFile(file))
+					.digest("hex");
+				hashBytesSpent += stat.size;
+			}
+			snapshot.set(normalizeMapKey(path.resolve(file)), entry);
+		} catch {
+			// Vanished mid-walk: absent from both snapshots = unchanged-by-absence.
+		}
+	}
+	return { snapshot, stoppedEarly };
+}
+
 export async function captureFileStats(
 	root: string,
 	options: CaptureOptions = {},
@@ -133,29 +219,7 @@ export async function captureFileStats(
 				scannedCount: files.length,
 			};
 		}
-		const snapshot: FileStatsSnapshot = new Map();
-		let hashBytesSpent = 0;
-		for (const file of files) {
-			try {
-				const stat = await fs.promises.stat(file);
-				const entry: FileStatEntry = {
-					mtimeMs: stat.mtimeMs,
-					size: stat.size,
-				};
-				if (
-					options.withHashes &&
-					hashBytesSpent + stat.size <= OPAQUE_HASH_BUDGET_BYTES
-				) {
-					entry.hash = createHash("sha256")
-						.update(await fs.promises.readFile(file))
-						.digest("hex");
-					hashBytesSpent += stat.size;
-				}
-				snapshot.set(normalizeMapKey(path.resolve(file)), entry);
-			} catch {
-				// Vanished mid-walk: absent from both snapshots = unchanged-by-absence.
-			}
-		}
+		const { snapshot } = await captureFileStatsForPaths(files, options);
 		return { snapshot, scannedCount: snapshot.size };
 	} catch {
 		return { unknownReason: "walk-failed", scannedCount: 0 };

@@ -111,7 +111,7 @@ function paramNamesFromSignature(
 		.map((raw) => {
 			let name = raw;
 			// Rest/spread params forward as themselves textually (`...args`).
-			const isRest = /^\.\.\./.test(name);
+			const isRest = name.startsWith("...");
 			name = name.replace(/^\.\.\./, "");
 			name = name.split("=")[0].trim(); // strip default value
 			name = name.split(":")[0].trim(); // strip type annotation

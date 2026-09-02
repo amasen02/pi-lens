@@ -12,6 +12,7 @@ import {
 import type { AppliedWorkspaceEdit } from "./lsp/edits.js";
 import { normalizeMapKey } from "./path-utils.js";
 import { getMutationBridge } from "./mutation-bridge.js";
+import { noteMutationHandled } from "./observed-mutation.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
 
 // #2450 fix round 3 (minor): gates the "bridge unavailable" dbg line to fire
@@ -394,6 +395,16 @@ function bookkeepLspMutation(
 					);
 				}
 			}
+			// #2465: the bridge-fallback branch above gets this for free —
+			// `recordMutationThroughSeam` calls `noteMutationHandled` for every
+			// entry it takes. The DIRECT branch bypasses the bridge entirely, so
+			// it has to say so itself, or the #2430 `agent_settled` sweep finds
+			// bytes on disk it has no baseline for and reports every
+			// `lsp_navigation` rename as drift no tool call explains. Placed
+			// after `addModifiedRange` and OUTSIDE its `try`: the mark is about
+			// "pi-lens wrote this file", which is true whether or not the
+			// turn-state insert threw.
+			noteMutationHandled(filePath);
 		}
 		// #2450 review round 2 (Partial-deps): its own surface, independent of
 		// whether the receipt/turn-state used the direct path or the bridge

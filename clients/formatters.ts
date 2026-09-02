@@ -17,6 +17,7 @@ import { BoundedLruCache } from "./bounded-cache.js";
 import { createGenerationSource } from "./generation-guard.js";
 import { normalizeMapKey } from "./path-utils.js";
 import { TERRAGRUNT_FILENAMES } from "./file-kinds.js";
+import { stripAnsi } from "./sanitize.js";
 import {
 	detectIndentation,
 	hasDetectableIndentation,
@@ -2092,11 +2093,6 @@ export function clearFormatterRuntimeState(): void {
 	// is `session_start`'s block in runtime-session.ts.
 }
 
-// ESC is built via fromCharCode so no raw control byte sits in the source.
-const ANSI_ESCAPE = new RegExp(
-	`${String.fromCharCode(27)}\\[[0-9;]*[A-Za-z]`,
-	"g",
-);
 const BOX_DRAWING_GLOBAL = /[\u2500-\u257F]/g;
 const HAS_BOX_DRAWING = /[\u2500-\u257F]/;
 
@@ -2116,7 +2112,7 @@ export function firstDiagnosticLine(
 	text: string | undefined,
 ): string | undefined {
 	for (const raw of (text ?? "").split("\n")) {
-		const line = raw.replace(ANSI_ESCAPE, "").trimEnd();
+		const line = stripAnsi(raw).trimEnd();
 		const stripped = line.replace(BOX_DRAWING_GLOBAL, "").trim();
 		if (!stripped) continue;
 		// "format ━━━━━━━━" is a section banner, not a diagnostic. Require a rule

@@ -116,6 +116,11 @@ import { isWarmAttached } from "./warm-attach.js";
 import { setSessionLanguages } from "./widget-state.js";
 import { logWordIndex } from "./word-index-logger.js";
 import { resetOpaqueMutationState } from "./opaque-mutation-scan.js";
+import {
+	primePersistedMutationAttribution,
+	resetMutationAttribution,
+} from "./mutation-attribution.js";
+import { resetObservedMutationNet } from "./observed-mutation.js";
 import { resetPendingAuxiliaryCoverage } from "./lsp/pending-aux-coverage.js";
 import { resetWorkspaceTopology } from "./workspace-topology.js";
 import { resetZizmorTokenAvailability } from "./zizmor-config.js";
@@ -2161,6 +2166,14 @@ export async function handleSessionStart(
 	// after reset) and the git-worktree memo must re-probe after a session
 	// that may have seen a non-git dir become one.
 	resetOpaqueMutationState();
+	// #2430: the observational net's pending baselines are keyed by tool-call
+	// id and its content ledger describes the previous session's files; both
+	// mis-answer forever without this. The learned attribution map is cleared
+	// and then RE-PRIMED from this project's persisted file, so a tool an
+	// earlier session observed is classified by name with no snapshot at all.
+	resetObservedMutationNet();
+	resetMutationAttribution();
+	primePersistedMutationAttribution(ctxCwd);
 	// #2026: pending auxiliary baselines are unreachable after generation bump.
 	resetPendingAuxiliaryCoverage();
 	// #817/#1199: Windows command resolution is cached per (command, canonical

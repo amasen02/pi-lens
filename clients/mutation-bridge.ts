@@ -56,6 +56,7 @@ import {
 	type BridgeMutationEntry,
 	type MutatingToolClassification,
 } from "./mutating-tool.js";
+import { noteMutationHandled } from "./observed-mutation.js";
 import type { ProjectChangeSource } from "./project-changes.js";
 
 /** Stable Symbol key — identical across module reloads in the same process. */
@@ -175,6 +176,17 @@ export function isValidMutationEntry(
 	if (e["deferAutofix"] !== undefined && typeof e["deferAutofix"] !== "boolean")
 		return false;
 
+	// #2430: only the observational net's two values are accepted. An unknown
+	// string is rejected rather than silently downgraded, so a producer that
+	// invents a provenance learns about it instead of publishing a wrong one.
+	const provenance = e["provenance"];
+	if (
+		provenance !== undefined &&
+		provenance !== "observed" &&
+		provenance !== "settled-sweep"
+	)
+		return false;
+
 	return true;
 }
 
@@ -260,6 +272,20 @@ export function recordMutationThroughSeam(
 			onAppendError: (err) =>
 				deps.dbg?.(`mutation_bridge: change log append failed: ${err}`),
 		});
+
+		// #2430: this file is now accounted for this run, so the `agent_settled`
+		// sweep re-baselines it instead of reporting the same bytes as drift no
+		// tool call explains. Every in-process producer passes through here, so
+		// this is the one place that has to say so.
+		//
+		// It sits OUTSIDE the `deferAutofix` guard below and must stay there
+		// (#2465). "pi-lens accounted for this write" and "pi-lens will also
+		// format this file later" are different questions: the LSP
+		// mutation-bridge fallback passes `deferAutofix: false` precisely
+		// because an LSP-applied edit is not this seam's to format, and it is
+		// still a write pi-lens recorded. Move this inside the guard and every
+		// such write is re-read by the settled sweep as unattributed drift.
+		noteMutationHandled(filePath);
 
 		// 4. Deferred autofix and format at `agent_settled` — never immediate.
 		//    Skippable per entry (`deferAutofix: false`, #2450 review round 2 F3):
