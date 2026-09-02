@@ -78,6 +78,34 @@ describe("blocker freshness — forward-import resolution (#1631)", () => {
 		fs.writeFileSync(file, "not code\n");
 		expect(await extractForwardImportPaths(dir, file)).toEqual([]);
 	});
+
+	/**
+	 * #2424 disclosed behavior change. This sweep resolves its language through
+	 * `resolveTreeSitterLanguage`, which before #2424 answered only the twelve
+	 * grammars `tree-sitter-shared.ts` hand-listed. `.java` was not one of them,
+	 * so a Java blocker's forward imports were ALWAYS `[]` and only the blocker
+	 * file's own drift could demote it — even though the java grammar, its
+	 * `IMPORT_QUERIES` entry and `resolveJava` in import-resolvers.ts all
+	 * shipped. Projecting the map from the registry's grammar column reconnects
+	 * them, so cross-file demotion now works for the widened languages
+	 * (.java/.kt/.kts/.swift/.dart/.lua/.zig/.ml/.mli/.ex/.exs/.sh/.bash).
+	 *
+	 * Red on pre-#2424 `clients/`: `expected [] to contain '<dir>/app/Helper.java'`.
+	 */
+	it("resolves a .java blocker's forward imports (#2424 ext->grammar widening)", async () => {
+		const dir = makeDir("pi-lens-fresh-java-");
+		fs.mkdirSync(path.join(dir, "app"));
+		const dep = path.join(dir, "app", "Helper.java");
+		fs.writeFileSync(dep, "package app;\nclass Helper { }\n");
+		const consumer = path.join(dir, "Main.java");
+		fs.writeFileSync(
+			consumer,
+			"import app.Helper;\nclass Main { Helper h; }\n",
+		);
+
+		const imports = await extractForwardImportPaths(dir, consumer);
+		expect(imports.map((p) => path.resolve(p))).toContain(path.resolve(dep));
+	});
 });
 
 describe("blocker freshness sweep — drift demotion (#1631)", () => {

@@ -54,4 +54,10 @@ changes must extend exact-key pins (`BASELINE_KEYS`-style), never loosen them.
   passes and the regression test was red first.
 - `closes` vs `refs` follows delivery, not optimism; leftovers get an issue
   comment before anything closes.
+- After merging a `refs #N` PR, VERIFY the issue: read `gh issue view N
+  --comments` and confirm a comment names the remainder. If the PR in fact
+  satisfied every acceptance criterion, close N crediting the PR; if a
+  remainder exists but is unnamed, post it. A `refs` PR with no remainder
+  comment is how #1968 and #2355 sat open for weeks after their fixes
+  landed (found 2026-09-02).
 - Report what ran, what was skipped, and what CI must still confirm.
