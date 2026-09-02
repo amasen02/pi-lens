@@ -3132,10 +3132,11 @@ describe("per-path diagnostics versions (#1531)", () => {
 // `cwd` plus a directly-threaded `runtime`/`cacheManager`, and
 // `readTurnState`/`appendProjectChange` are cwd-scoped, so a wrong owner does
 // not merely mislabel a receipt — it can route a live edit's bookkeeping into
-// ANOTHER project's change log. The remedy is ownership, not depth: only the
-// frame that takes the depth to 1 owns the slot, and a non-owner restores
-// what it saved ONLY while that owner is still live.
-describe("runServerCommand mutation-context ownership across overlapping frames (#2479 round 2)", () => {
+// ANOTHER project's change log. The remedy is neither a stack nor a
+// liveness flag but a DERIVED slot: the context of the frame that took the
+// depth to 1, exposed only while that frame is the sole one in flight, and
+// recomputed on every entry and unwind (round 3).
+describe("runServerCommand mutation-context ownership across overlapping frames (#2479 rounds 2/3)", () => {
 	const OVERLAP_CONTEXT_BASE = {
 		tool: "lsp_navigation:executeCommand",
 		source: "lsp-execute-command" as const,
@@ -3324,5 +3325,202 @@ describe("runServerCommand mutation-context ownership across overlapping frames 
 		expect(state.activeMutationDepth).toBe(0);
 		expect(state.serverEditsAllowed).toBe(0);
 		expect(state.activeMutationContext).toBeUndefined();
+	});
+
+	// #2479 review round 3 (P1). The round-2 owner-live flag proves that an
+	// owner is LIVE — not that the slot's context belongs to the frame whose
+	// window an incoming edit is arriving in. Those are different claims the
+	// moment the MIDDLE frame settles first, with the owner still running:
+	//
+	//   A (owner, 0→1) → B (1→2) → C (2→3) → B settles (3→2) → C settles (2→1)
+	//
+	// A per-frame save/restore hands B's saved predecessor — A's context —
+	// back while A is live but only C's window is the innermost one open, so
+	// every edit C solicits is bookkept through A's readGuard/runtime/
+	// cacheManager/cwd and consumes A's one-shot `summaryEmitted` latch (a
+	// NEW mis-attribution: pre-#2479 that read `undefined`). C's own unwind
+	// then puts back the `undefined` IT saved while A, the owner, is STILL in
+	// flight — so A's remaining applyEdits take the fallback receipt and
+	// #2479 itself is resurrected. The slot is not a stack and not a
+	// liveness flag: it is DERIVED from the current frame set — the owner's
+	// context while exactly one frame is in flight, nothing otherwise. One
+	// case per half.
+	function stageMiddleSettlesFirst(
+		state: LSPClientState,
+		contexts: {
+			a: LspMutationContext;
+			b: LspMutationContext;
+			c: LspMutationContext;
+		},
+	) {
+		const gateA = gatedPromise<unknown>();
+		const gateB = gatedPromise<unknown>();
+		const gateC = gatedPromise<unknown>();
+		gateExecuteCommands(state, {
+			"cmd.a": gateA,
+			"cmd.b": gateB,
+			"cmd.c": gateC,
+		});
+		// Every frame is established synchronously: the depth bump and the
+		// slot write both run before the first `await` in `runServerCommand`.
+		const promiseA = runServerCommand(state, "cmd.a", [], 5000, contexts.a);
+		const promiseB = runServerCommand(state, "cmd.b", [], 5000, contexts.b);
+		const promiseC = runServerCommand(state, "cmd.c", [], 5000, contexts.c);
+		return { gateA, gateB, gateC, promiseA, promiseB, promiseC };
+	}
+
+	// The REAL `workspace/applyEdit` handler, driven against a real on-disk
+	// file exactly as a server soliciting an edit inside an open window does.
+	function applyEditSolicitorFor(
+		state: LSPClientState,
+	): (filePath: string, newText: string) => Promise<{ applied: boolean }> {
+		setupIncomingHandlers(state, {});
+		const applyEditHandler = (
+			vi.mocked(state.connection.onRequest).mock.calls as unknown as Array<
+				[string, (...args: unknown[]) => unknown]
+			>
+		).find((call) => call[0] === "workspace/applyEdit")?.[1];
+		expect(applyEditHandler).toBeDefined();
+		return (filePath, newText) =>
+			applyEditHandler!({
+				edit: {
+					changes: {
+						[pathToFileURL(filePath).href]: [
+							{
+								range: {
+									start: { line: 0, character: 6 },
+									end: { line: 0, character: 9 },
+								},
+								newText,
+							},
+						],
+					},
+				},
+			}) as Promise<{ applied: boolean }>;
+	}
+
+	function overlapContext(
+		root: string,
+		name: string,
+		readGuard?: LspMutationContext["readGuard"],
+	): LspMutationContext {
+		return {
+			...OVERLAP_CONTEXT_BASE,
+			cwd: path.join(root, `project-${name}`),
+			correlationId: `middle-first-${name}`,
+			...(readGuard ? { readGuard } : {}),
+		};
+	}
+
+	it("does not lend the owner's context to a deeper frame's window when the middle frame settles first (#2479 P1a)", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-2479-p1a-"));
+		const filePath = path.join(root, "app.ts");
+		fs.writeFileSync(filePath, "const old = 1;\n", "utf8");
+		try {
+			const state = createMockState({
+				root,
+				advertisedCommands: new Set(["cmd.a", "cmd.b", "cmd.c"]),
+				// Mirror the real initial values of `createLSPClientState`.
+				activeMutationDepth: 0,
+				activeMutationContext: undefined,
+			});
+			// A carries the `readGuard`, so "which context did the handler
+			// actually bookkeep through" is observed at the receipt, not
+			// inferred from the slot.
+			const writtenThroughA: string[] = [];
+			const contextA = overlapContext(root, "a", {
+				recordWritten: (file) => writtenThroughA.push(file),
+			});
+			const frames = stageMiddleSettlesFirst(state, {
+				a: contextA,
+				b: overlapContext(root, "b"),
+				c: overlapContext(root, "c"),
+			});
+			expect(state.activeMutationDepth).toBe(3);
+			expect(state.activeMutationContext).toBeUndefined();
+
+			// B — the MIDDLE frame — settles first (3 → 2). A (the owner) and C
+			// are BOTH still in flight, so no single frame owns the window and
+			// the slot must name none of them.
+			frames.gateB.resolve({ ok: true });
+			await frames.promiseB;
+			expect(state.activeMutationDepth).toBe(2);
+			expect(state.serverEditsAllowed).toBe(2);
+
+			// An edit solicited now belongs to C's window, not A's. It must
+			// take the handler's honest fallback receipt: nothing stamped
+			// through A's read guard, and A's one-shot summary latch not
+			// consumed by another frame's edit.
+			const solicit = applyEditSolicitorFor(state);
+			await expect(solicit(filePath, "mid")).resolves.toMatchObject({
+				applied: true,
+			});
+			expect(fs.readFileSync(filePath, "utf8")).toBe("const mid = 1;\n");
+			expect(writtenThroughA).toEqual([]);
+			expect(contextA.summaryEmitted).toBeUndefined();
+			expect(contextA.summaryCount).toBeUndefined();
+			expect(state.activeMutationContext).toBeUndefined();
+
+			frames.gateC.resolve({ ok: true });
+			await frames.promiseC;
+			frames.gateA.resolve({ ok: true });
+			await frames.promiseA;
+			expect(state.activeMutationDepth).toBe(0);
+			expect(state.serverEditsAllowed).toBe(0);
+			expect(state.activeMutationContext).toBeUndefined();
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("gives the slot back to the still-live owner once the deeper frames unwind (#2479 P1b)", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-2479-p1b-"));
+		const filePath = path.join(root, "app.ts");
+		fs.writeFileSync(filePath, "const old = 1;\n", "utf8");
+		try {
+			const state = createMockState({
+				root,
+				advertisedCommands: new Set(["cmd.a", "cmd.b", "cmd.c"]),
+				activeMutationDepth: 0,
+				activeMutationContext: undefined,
+			});
+			const writtenThroughA: string[] = [];
+			const contextA = overlapContext(root, "a", {
+				recordWritten: (file) => writtenThroughA.push(file),
+			});
+			const frames = stageMiddleSettlesFirst(state, {
+				a: contextA,
+				b: overlapContext(root, "b"),
+				c: overlapContext(root, "c"),
+			});
+
+			// B settles (3 → 2), then C (2 → 1). A — the owner — never stopped
+			// running, and it is the only frame left, so its window is whole
+			// again: this is exactly the #2479 report (a deeper frame
+			// unwinding must not cost the outer call its own context for the
+			// rest of its life).
+			frames.gateB.resolve({ ok: true });
+			await frames.promiseB;
+			frames.gateC.resolve({ ok: true });
+			await frames.promiseC;
+			expect(state.activeMutationDepth).toBe(1);
+			expect(state.serverEditsAllowed).toBe(1);
+
+			const solicit = applyEditSolicitorFor(state);
+			await expect(solicit(filePath, "own")).resolves.toMatchObject({
+				applied: true,
+			});
+			expect(writtenThroughA).toEqual([path.resolve(filePath)]);
+			expect(contextA.summaryEmitted).toBe(true);
+			expect(state.activeMutationContext).toBe(contextA);
+
+			frames.gateA.resolve({ ok: true });
+			await frames.promiseA;
+			expect(state.activeMutationDepth).toBe(0);
+			expect(state.serverEditsAllowed).toBe(0);
+			expect(state.activeMutationContext).toBeUndefined();
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
 	});
 });

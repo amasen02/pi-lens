@@ -1111,22 +1111,26 @@ export interface LSPClientState {
 	 * disk whenever it likes — only as the direct effect of an opted-in command).
 	 */
 	serverEditsAllowed: number;
-	/** One active command context is safe to associate with a nested applyEdit.
+	/**
+	 * One active command context is safe to associate with a nested applyEdit.
 	 * Concurrent commands deliberately clear this rather than cross-correlate.
-	 * OWNED by the `runServerCommand` frame that took `activeMutationDepth` to
-	 * 1 (#2479): that frame installs the context and clears it on unwind, while
-	 * a deeper frame borrows the slot for its own lifetime only and hands the
-	 * owner back when it unwinds — but only while that owner is still live
-	 * (`activeMutationContextOwnerLive`). Frames overlap without nesting and
-	 * settle out of order, so "restore whatever I saved" alone would re-install
-	 * the context of a call that has already returned. */
+	 * DERIVED, never a stack: assigned only by `syncMutationContextSlot`
+	 * (below in this file), which holds `mutationContextOwner` here while
+	 * exactly one frame is in flight (`activeMutationDepth === 1`) and empties
+	 * it otherwise. Frames OVERLAP without nesting and settle in any order, so
+	 * no per-frame history — neither "put back what I saved" nor "put it back
+	 * while some owner is live" — can decide this: whose window an incoming
+	 * edit belongs to is a function of the CURRENT frame set, not of any one
+	 * frame's bookkeeping (#2479 review rounds 2/3).
+	 */
 	activeMutationContext?: LspMutationContext;
-	/** True while the frame that owns `activeMutationContext` is still in
-	 * flight. A non-owner frame hands its saved predecessor back ONLY while
-	 * this is set; once the owner has settled there is nothing live to hand
-	 * back, so the slot stays empty and `workspace/applyEdit` takes its honest
-	 * fallback receipt rather than a stale owner (#2479 review round 2, F1). */
-	activeMutationContextOwnerLive?: boolean;
+	/**
+	 * The context of the frame that took `activeMutationDepth` 0 -> 1, held
+	 * for that frame's whole lifetime — including while deeper or overlapping
+	 * frames are open. Written only by that frame (set on entry, cleared on
+	 * unwind); `activeMutationContext` is derived from it and the depth.
+	 */
+	mutationContextOwner?: LspMutationContext;
 	activeMutationDepth?: number;
 	readonly serverId: string;
 	/** See `LSPServerInfo.spawn`'s `launchVariant` (server.ts). Undefined =
@@ -2536,21 +2540,19 @@ export function setupIncomingHandlers(
 			if (state.serverEditsAllowed <= 0 || !params?.edit) {
 				return { applied: false, failureReason: "edit not solicited" };
 			}
-			// #2450 fix round 3 (F3): no `depth === 1` re-check here — dead code.
-			// `state.activeMutationContext` is set ONLY by `runServerCommand`
-			// (below in this file), which already enforces exactly that
-			// invariant: the slot is OWNED by the frame that took
-			// `activeMutationDepth` to 1, deeper frames clear it for their own
-			// lifetime, and every frame that unwinds either clears the slot or
-			// hands the still-LIVE owner back. By the time this handler reads
-			// it, `state.activeMutationContext` can therefore only ever be a
-			// live outermost call's context or `undefined` — re-testing the
-			// depth here was redundant with that invariant, not an independent
-			// gate. #2479: the hand-back is what keeps the outer call's own
-			// context for the WHOLE of its window (a nested call unwinding to
-			// depth 1 no longer leaves the slot cleared), and the owner-live
-			// flag is what keeps an already-SETTLED call from being handed back
-			// when overlapping frames unwind out of order (review round 2, F1).
+			// #2450 fix round 3 (F3) removed a `depth === 1` re-check here as
+			// dead code. It is not dead — it moved to the WRITE side, where it
+			// is the live invariant: `state.activeMutationContext` is assigned
+			// only by `syncMutationContextSlot` (below in this file), which
+			// populates it exactly when `activeMutationDepth === 1` and
+			// empties it on every other frame transition. The depth test
+			// therefore still runs, on each entry and each unwind; repeating
+			// it here would be a second copy of the same predicate, not an
+			// independent gate. What this handler reads is consequently either
+			// the context of the single frame currently in flight or
+			// `undefined` — never a settled frame's context, and never a
+			// context belonging to some other window that is still open
+			// (#2479 review rounds 2/3).
 			const context = state.activeMutationContext;
 			// `workspace/applyEdit` is only ever honored inside the
 			// `serverEditsAllowed` window this handler just checked, which is
@@ -4823,6 +4825,36 @@ async function clientPingLiveness(
 	return isClientAlive(state);
 }
 
+// #2479: `activeMutationContext` is DERIVED state, not a stack. The frame that
+// takes `activeMutationDepth` 0 -> 1 owns the context for its whole lifetime
+// (`mutationContextOwner`); the slot merely exposes that owner while it is the
+// ONLY frame in flight. Deeper or overlapping frames therefore empty the slot
+// for as long as they are open — concurrent and nested commands deliberately
+// do not cross-correlate — and it refills by itself when they unwind, with no
+// frame having to remember anything.
+//
+// Recomputing beats saving and restoring because these frames do not nest:
+// `LSPClient.executeCommand` and `LSPService.executeCommand` fan out with no
+// mutex, parallel `lsp_navigation` calls with `apply: true` overlap, and #449
+// light mode shares one client across agents. With A (the owner), B and C
+// overlapping and the MIDDLE one settling first, a per-frame restore hands A's
+// context back while C's window is the open one — and `LspMutationContext`
+// carries a cwd plus a directly-threaded runtime/cacheManager, with
+// `readTurnState` / `appendProjectChange` cwd-scoped, so that routes a live
+// edit's bookkeeping into another project's change log (strictly worse than
+// the honest fallback the pre-#2479 code gave). An owner-liveness flag does
+// not fix it either: it answers "is an owner live", not "does the slot belong
+// to the window this edit is in" — and C's own unwind then puts back the
+// `undefined` it saved while the owner is still running, resurrecting #2479
+// (review round 3). Deriving answers the second question by construction, and
+// "no command in flight == no context" — the invariant the
+// `serverEditsAllowed` gate on `workspace/applyEdit` is paired with — falls
+// out of it with no depth-0 special case.
+function syncMutationContextSlot(state: LSPClientState): void {
+	state.activeMutationContext =
+		state.activeMutationDepth === 1 ? state.mutationContextOwner : undefined;
+}
+
 // Run an advertised server command via workspace/executeCommand, with the
 // generous EXECUTE_COMMAND_TIMEOUT_MS anti-deadlock backstop. Preserves the
 // hardening invariants: allowlist-by-advertisement (only commands the server
@@ -4847,38 +4879,20 @@ export async function runServerCommand(
 	}
 	state.serverEditsAllowed += 1;
 	state.activeMutationDepth = (state.activeMutationDepth ?? 0) + 1;
-	// #2479: OWNERSHIP, not a stack. The frame that takes the depth to 1 owns
-	// the slot; a deeper frame borrows it (cleared — concurrent and nested
-	// commands deliberately do not cross-correlate) and hands the owner back
-	// when it unwinds. The old shape only ever CLEARED the slot, and only once
-	// depth returned to 0, so a nested `executeCommand` unwinding from depth 2
-	// back to depth 1 left the OUTER call without its own context for the rest
-	// of its window: every server-initiated `applyEdit` it still solicited read
+	// #2479: the frame that takes the depth to 1 owns the context; the slot is
+	// derived from that owner (see `syncMutationContextSlot` above). The
+	// pre-#2479 shape only ever CLEARED the slot, and only once the depth
+	// returned to 0, so a nested `executeCommand` unwinding from depth 2 back
+	// to 1 left the OUTER call without its own context for the rest of its
+	// window: every server-initiated `applyEdit` it still solicited read
 	// `undefined`, fell to the mutation bridge, and carried the generic
 	// `agent-tool:lsp-workspace-applyEdit` receipt instead of the outer
 	// operation's own (`lsp-rename` / `lsp-execute-command`).
-	//
-	// A plain save/restore stack is NOT enough (review round 2, F1): these
-	// frames are not guaranteed to nest. `LSPClient.executeCommand` and
-	// `LSPService.executeCommand` fan out with no mutex, parallel
-	// `lsp_navigation` calls with `apply: true` overlap, and #449 light mode
-	// shares one client across agents. With three OVERLAPPING frames A, B, C,
-	// A can settle before B — and B putting back "what it saved" would
-	// re-install the context of A, a call that has already RETURNED, while
-	// only C is in flight. `LspMutationContext` carries a cwd and a
-	// directly-threaded runtime/cacheManager, and `readTurnState` /
-	// `appendProjectChange` are cwd-scoped, so that misroutes a live edit's
-	// bookkeeping into another project's change log — strictly worse than the
-	// honest fallback the pre-#2479 code gave. Hence the owner-live flag: a
-	// non-owner hands back only while the owner it saved is still running.
 	const isMutationContextOwner = state.activeMutationDepth === 1;
-	const previousMutationContext = state.activeMutationContext;
 	if (isMutationContextOwner) {
-		state.activeMutationContext = mutationContext;
-		state.activeMutationContextOwnerLive = true;
-	} else {
-		state.activeMutationContext = undefined;
+		state.mutationContextOwner = mutationContext;
 	}
+	syncMutationContextSlot(state);
 	try {
 		let result: unknown;
 		try {
@@ -4909,22 +4923,15 @@ export async function runServerCommand(
 			0,
 			(state.activeMutationDepth ?? 0) - 1,
 		);
-		// The owner tears its own context down and marks itself gone; a
-		// non-owner hands back what it saved only while that owner is still
-		// live, and otherwise leaves the slot empty. "No command in flight ==
-		// no context" — the invariant the `serverEditsAllowed` gate on
-		// `workspace/applyEdit` is paired with — therefore falls OUT of the
-		// ownership rule instead of needing its own depth-0 special case: the
-		// owner cannot settle without clearing, and any non-owner unwinding
-		// after it clears too (#2479 review round 2, F1/F2).
+		// The owner drops its context; every frame then resyncs. Both the
+		// hand-back to a still-live owner once the deeper frames unwind and
+		// the empty slot while more than one frame is open are consequences of
+		// the derivation, not separate rules each frame has to get right
+		// (#2479 review rounds 2/3).
 		if (isMutationContextOwner) {
-			state.activeMutationContext = undefined;
-			state.activeMutationContextOwnerLive = false;
-		} else {
-			state.activeMutationContext = state.activeMutationContextOwnerLive
-				? previousMutationContext
-				: undefined;
+			state.mutationContextOwner = undefined;
 		}
+		syncMutationContextSlot(state);
 	}
 }
 
@@ -5325,7 +5332,6 @@ export async function createLSPClient(options: {
 		advertisedCommands: new Set(),
 		serverEditsAllowed: 0,
 		activeMutationDepth: 0,
-		activeMutationContextOwnerLive: false,
 		serverId,
 		launchVariant,
 		root,
