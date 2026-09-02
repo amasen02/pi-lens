@@ -5,7 +5,7 @@
  * Usage: node scripts/scan-tree-sitter-rules.mjs [dir]  (default: clients/)
  */
 
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readdirSync } from "node:fs";
 import { join, resolve, relative, extname } from "node:path";
 import { fileURLToPath } from "node:url";
 

@@ -19,6 +19,7 @@
  * both wrap every line in. Every pattern below matches against the stripped
  * text -- matching raw escape-coded text is what makes log heuristics
  * brittle across reporter versions. */
+// oxlint-disable-next-line no-control-regex -- ESC (\x1b) is the literal ANSI escape-sequence lead byte this pattern strips, not accidental input.
 const ANSI_PATTERN = /\x1b\[[0-9;]*m/g;
 export function stripAnsi(text) {
 	return text.replace(ANSI_PATTERN, "");
