@@ -2,7 +2,11 @@
 
 import type { ConfigDiagnosticCode } from "./config-diagnostic-codes.js";
 import { logExtension } from "./extension-log.js";
-import { LEDGER_FIELD_MAX, truncateForLedger } from "./ledger-bounds.js";
+import {
+	DEGRADATION_ENTRIES_PER_KIND,
+	LEDGER_FIELD_MAX,
+	truncateForLedger,
+} from "./ledger-bounds.js";
 import { logLatency } from "./latency-logger.js";
 import {
 	getSinkWriteFailures,
@@ -598,7 +602,7 @@ export interface DegradationGroup {
 	latestReasons: Array<{ subject: string; reason: string }>;
 }
 
-const ENTRIES_PER_KIND = 20;
+const ENTRIES_PER_KIND = DEGRADATION_ENTRIES_PER_KIND;
 const MAX_DISTINCT_KINDS = 32;
 const OVERFLOW_KIND = "other";
 const groups = new Map<
@@ -885,5 +889,9 @@ export function resetDegradationLedger(): void {
 	// life. Deliberate exception to catalog shape 17, not an oversight.
 }
 
-export const DEGRADATION_ENTRIES_PER_KIND = ENTRIES_PER_KIND;
+// Re-exported so every existing importer keeps its specifier. The value now
+// lives in the `ledger-bounds.js` leaf (#2426), so a producer that only needs
+// the BOUND does not have to import the ledger — and cannot be broken by a test
+// that mocks it wholesale.
+export { DEGRADATION_ENTRIES_PER_KIND };
 export const DEGRADATION_MAX_DISTINCT_KINDS = MAX_DISTINCT_KINDS;

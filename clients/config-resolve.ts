@@ -49,17 +49,24 @@ import {
 	PROJECT_CONFIG_LOCATIONS,
 	configSearchDirs,
 } from "./config-locations.js";
+// The core's halves are imported directly rather than through
+// `config-core/index.js` (#2426). The barrel re-exports the whole vocabulary
+// including `process-spec.js`, which reaches `project-trust.js` and the
+// degradation ledger; a module that only resolves a config has no use for that
+// and, sitting downstream of `file-utils.ts` as every config loader does, would
+// close three import cycles by importing it. `resolveConfig` is still the one
+// supported way into the pipeline — `merge()` is deliberately not imported here.
+import { type RawConfigSource, resolveConfig } from "./config-core/resolve.js";
 import {
 	type MigrationRecord,
-	type Provenance,
-	type RawConfigSource,
-	type SourceTier,
 	migrationSubject,
-	reportMigrationRecords,
-	resolveConfig,
-} from "./config-core/index.js";
+} from "./config-core/records.js";
+import type { Provenance, SourceTier } from "./config-core/provenance.js";
 import { PI_LENS_CONFIG_SCHEMA } from "./config-schema.js";
-import type { IgnoredConfigSubsystem } from "./config-warn.js";
+import {
+	type IgnoredConfigSubsystem,
+	warnIgnoredConfigOnce,
+} from "./config-warn.js";
 import { homeRelativePath } from "./path-utils.js";
 
 /** What reading one candidate path produced. */
@@ -392,12 +399,35 @@ function record(input: {
 	};
 }
 
-/** Thread a resolution's records to the shared warn seam under one subsystem. */
+/**
+ * Thread a resolution's records to the ONE config warning seam (#2418).
+ *
+ * The subsystem is the CALLER'S, not this module's: `warnIgnoredConfigOnce`
+ * keys its latch and its `extension.log` line on the loader that is reporting,
+ * and this module is shared by all three.
+ *
+ * It lives here rather than in `config-core/records.ts`, where #2425 first put
+ * it (#2426). Putting the sink call inside the library contradicted the
+ * library's own stated purity — `config-core` is documented as "no state, no
+ * I/O, no ledger writes" — and the import it needed
+ * (`records.ts` -> `config-warn.js` -> `degradation-ledger.js`) closed seven
+ * cycles the moment a loader resolved through the core, because every config
+ * loader sits downstream of `file-utils.ts`. Reporting is a loader decision;
+ * this is the loaders' shared module.
+ */
 export function reportPiLensConfigRecords(
 	records: readonly MigrationRecord[],
 	subsystem: IgnoredConfigSubsystem,
 ): void {
-	reportMigrationRecords(records, subsystem);
+	for (const record of records) {
+		warnIgnoredConfigOnce({
+			subsystem,
+			file: record.file,
+			key: record.key.length > 0 ? record.key : undefined,
+			reason: record.reason,
+			code: record.code,
+		});
+	}
 }
 
 /**

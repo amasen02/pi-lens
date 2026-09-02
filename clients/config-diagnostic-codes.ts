@@ -86,7 +86,7 @@ export const CONFIG_DIAGNOSTIC_CODES = {
 	 * EMITTED since #2426, by `deprecationRecords` (`clients/config-resolve.ts`)
 	 * for every `kind: "key"` row below that appears at the ROOT of a canonical
 	 * file — one record per `(file, key)` — and delivered through
-	 * `reportMigrationRecords` -> `warnIgnoredConfigOnce`, which renders it as
+	 * `reportPiLensConfigRecords` -> `warnIgnoredConfigOnce`, which renders it as
 	 * `deprecated <label> key in <file>: …` and records a `config-deprecated`
 	 * ledger row rather than a `config-ignored` one. The setting still APPLIES;
 	 * the code says only that the spelling is on a removal schedule.
@@ -110,7 +110,7 @@ export const CONFIG_DIAGNOSTIC_CODES = {
 	 * PRODUCED by `validate()` (`clients/config-core/normalize.ts`), which is
 	 * the one place the unknown-field policy in `docs/public-api-stability.md`
 	 * is implemented: warn and drop, never throw. It reaches a user through
-	 * `reportMigrationRecords` -> `warnIgnoredConfigOnce`, which #2426 wires
+	 * `reportPiLensConfigRecords` -> `warnIgnoredConfigOnce`, which #2426 wires
 	 * when the loaders adopt the core. Registered now because the resolution
 	 * pipeline already stamps records with it, and a record carrying an
 	 * unregistered code is exactly what the #2418 drift test forbids.

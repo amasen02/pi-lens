@@ -21,11 +21,7 @@
  */
 
 import type { ConfigDiagnosticCode } from "../config-diagnostic-codes.js";
-import {
-	type IgnoredConfigSubsystem,
-	warnIgnoredConfigOnce,
-} from "../config-warn.js";
-import { DEGRADATION_ENTRIES_PER_KIND } from "../degradation-ledger.js";
+import { DEGRADATION_ENTRIES_PER_KIND } from "../ledger-bounds.js";
 import { redactSecrets } from "../redact/secrets.js";
 
 /**
@@ -150,29 +146,5 @@ export class MigrationRecordCollector {
 	/** Total produced: retained plus dropped. */
 	get totalCount(): number {
 		return this.kept.length + this.dropped;
-	}
-}
-
-/**
- * Thread collected records to the ONE config warning seam (#2418).
- *
- * The subsystem is the caller's, not this module's: `warnIgnoredConfigOnce`
- * keys its latch and its `extension.log` line on the loader that is ignoring
- * the config, and config-core is a library every loader calls rather than a
- * loader of its own. #2426 is the forcing function — it is the slice that gives
- * each of the three loaders a call to this function.
- */
-export function reportMigrationRecords(
-	records: readonly MigrationRecord[],
-	subsystem: IgnoredConfigSubsystem,
-): void {
-	for (const record of records) {
-		warnIgnoredConfigOnce({
-			subsystem,
-			file: record.file,
-			key: record.key.length > 0 ? record.key : undefined,
-			reason: record.reason,
-			code: record.code,
-		});
 	}
 }

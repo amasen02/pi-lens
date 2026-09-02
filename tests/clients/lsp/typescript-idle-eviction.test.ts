@@ -1,18 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { suspendAt } from "../interleaving-kit.js";
 const recordDegradation = vi.hoisted(() => vi.fn());
-// Partial mock, not a replacement (#2426): this suite reaches
-// clients/lsp/config.ts, which now resolves config through the config core,
-// and config-core/records.ts reads DEGRADATION_ENTRIES_PER_KIND from this
-// module at import time. A whole-module stub removes that export and the suite
-// fails to LOAD rather than failing an assertion.
-vi.mock("../../../clients/degradation-ledger.js", async (importOriginal) => {
-	const actual =
-		await importOriginal<
-			typeof import("../../../clients/degradation-ledger.js")
-		>();
-	return { ...actual, recordDegradation };
-});
+vi.mock("../../../clients/degradation-ledger.js", () => ({
+	recordDegradation,
+}));
 
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();

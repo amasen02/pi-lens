@@ -43,7 +43,10 @@ import {
 	type StabilityTier,
 } from "./config-diagnostic-codes.js";
 import { LEGACY_ROOT_LSP_KEYS, LSP_NAMESPACE_KEY } from "./config-locations.js";
-import type { ConfigSchemaNode } from "./config-core/index.js";
+// From the owning module, not the barrel — same reason as `config-resolve.ts`:
+// the barrel's width would drag `process-spec.js` -> `project-trust.js` into
+// every config loader's import graph for one type alias.
+import type { ConfigSchemaNode } from "./config-core/schema.js";
 import {
 	flagConfigSectionKeys,
 	GLOBAL_NON_FLAG_CONFIG_SECTIONS,

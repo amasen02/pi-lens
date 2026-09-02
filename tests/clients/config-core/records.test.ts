@@ -5,10 +5,13 @@ import {
 	resetDegradationLedger,
 } from "../../../clients/degradation-ledger.js";
 import { validate } from "../../../clients/config-core/normalize.js";
-import {
-	MigrationRecordCollector,
-	reportMigrationRecords,
-} from "../../../clients/config-core/records.js";
+import { MigrationRecordCollector } from "../../../clients/config-core/records.js";
+// The reporting step moved OUT of config-core in #2426, to the module that owns
+// the loaders' subsystem vocabulary — a "pure, no-I/O" library must not import
+// the warn seam. The cases below still belong here: what they pin is that a
+// record PRODUCED by `validate()` reaches the ledger correctly, and `validate`
+// is this directory's subject.
+import { reportPiLensConfigRecords as reportMigrationRecords } from "../../../clients/config-resolve.js";
 import { DEMO_CONFIG_SCHEMA } from "../../support/config-core-fixtures.js";
 
 const NUL = String.fromCharCode(0);
