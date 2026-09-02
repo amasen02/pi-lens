@@ -1400,4 +1400,100 @@ describe("lsp_navigation tool", () => {
 			removeTempDirSync(tmpDir);
 		}
 	});
+
+	// #2450 review round 2 (F4). Before this round, the direct (deps-threaded)
+	// path had NO recordability gate at all — only the mutation-bridge
+	// fallback applied `no-read-guard`/ignored/vendor filtering internally.
+	// Reconciled: the SAME gate (`isRecordableProjectPath`, shared with
+	// `index.ts`'s bridge registrations) now applies to the direct path too,
+	// via `LspMutationContext.isRecordable`, threaded here.
+	it("#2450 review round 2 (F4): a rename touching a vendor-directory file records only the non-vendor file", async () => {
+		const tmpDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-nav-2450-vendor-"),
+		);
+		const fileA = path.join(tmpDir, "a.ts");
+		const vendorDir = path.join(tmpDir, "node_modules", "some-pkg");
+		fs.mkdirSync(vendorDir, { recursive: true });
+		const fileVendor = path.join(vendorDir, "vendored.ts");
+		const filler = "// filler line\n".repeat(5);
+		fs.writeFileSync(fileA, `${filler}const oldName = 1;\n`);
+		fs.writeFileSync(fileVendor, `${filler}const oldName = 2;\n`);
+
+		const runtime = new RuntimeCoordinator();
+		runtime.projectRoot = tmpDir;
+		runtime.setTelemetryIdentity({ sessionId: "s-2450-vendor-gate" });
+		runtime.beginTurn();
+		const cacheManager = new CacheManager(false);
+
+		const tool = createLspNavigationTool((flag) => flag === "lens-lsp", {
+			runtime: runtime as never,
+			cacheManager,
+			readGuard: { recordWritten: () => {} },
+			dbg: () => {},
+		});
+
+		(mocked.service as { rename: ReturnType<typeof vi.fn> }).rename = vi
+			.fn()
+			.mockResolvedValue({
+				changes: {
+					[pathToFileURL(fileA).href]: [
+						{
+							range: {
+								start: { line: 5, character: 6 },
+								end: { line: 5, character: 13 },
+							},
+							newText: "newName",
+						},
+					],
+					[pathToFileURL(fileVendor).href]: [
+						{
+							range: {
+								start: { line: 5, character: 6 },
+								end: { line: 5, character: 13 },
+							},
+							newText: "newName",
+						},
+					],
+				},
+			});
+
+		try {
+			const result = await tool.execute(
+				"rename-skips-vendor",
+				{
+					operation: "rename",
+					path: fileA,
+					line: 6,
+					character: 7,
+					newName: "newName",
+					apply: true,
+				},
+				new AbortController().signal,
+				null,
+				{ cwd: tmpDir },
+			);
+
+			expect(result.isError).toBeUndefined();
+			// The write itself still lands on disk for both files — the gate is a
+			// BOOKKEEPING filter, not an edit-application one.
+			expect(fs.readFileSync(fileA, "utf-8")).toBe(
+				`${filler}const newName = 1;\n`,
+			);
+			expect(fs.readFileSync(fileVendor, "utf-8")).toBe(
+				`${filler}const newName = 2;\n`,
+			);
+
+			const turnFiles = cacheManager.readTurnState(tmpDir).files ?? {};
+			const keys = Object.keys(turnFiles);
+			expect(keys).toHaveLength(1);
+			expect(keys[0]).toContain("a.ts");
+			expect(keys.some((k) => k.includes("vendored.ts"))).toBe(false);
+
+			const changes = readChangesSince(tmpDir, 0);
+			expect(changes).toHaveLength(1);
+			expect(changes[0].filePath).toBe(path.resolve(fileA));
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
+	});
 });
