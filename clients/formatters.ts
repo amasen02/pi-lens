@@ -18,6 +18,7 @@ import { createGenerationSource } from "./generation-guard.js";
 import { normalizeMapKey } from "./path-utils.js";
 import { resolveCargoPackageEdition } from "./cargo-manifest.js";
 import { resolveKtfmtGradleStyle } from "./gradle-ktfmt-style.js";
+import { resolvePhpCsFixerConfig } from "./php-cs-fixer-config.js";
 import { TERRAGRUNT_FILENAMES } from "./file-kinds.js";
 import { stripAnsi } from "./sanitize.js";
 import {
@@ -1386,16 +1387,42 @@ export const phpCsFixerFormatter: FormatterInfo = {
 	name: "php-cs-fixer",
 	command: ["php-cs-fixer", "fix", "$FILE"],
 	extensions: [".php"],
+	// #2472: php-cs-fixer does NOT walk up parent directories looking for its
+	// own config the way prettier/biome/eslint do (verified against upstream
+	// `computeConfigFiles()` — see `resolvePhpCsFixerConfig`'s doc comment),
+	// and `formatFile` spawns with cwd = the FILE's own directory, which is
+	// not necessarily where the ancestor config `detect()` found actually
+	// lives. Always resolve the binary explicitly here (vendor/bin first,
+	// then global) rather than falling through to the static `command` above
+	// — that static command can never carry `--config`, so a config found at
+	// an ancestor would silently be dropped whenever the vendor lookup here
+	// missed but a global binary still resolved. `--config` is attached
+	// whenever a config resolves, even when it sits in the file's own
+	// directory (AC3): unlike the pre-#2472 code, correctness no longer
+	// depends on php-cs-fixer's own (nonexistent) upward search.
 	async resolveCommand(filePath, cwd) {
-		const vendor = await findInVendorBin("php-cs-fixer", cwd);
-		if (vendor) return [vendor, "fix", filePath];
-		return null;
+		const configPath = resolvePhpCsFixerConfig(filePath);
+		const binary =
+			(await findInVendorBin("php-cs-fixer", cwd)) ??
+			(await which("php-cs-fixer"));
+		if (!binary) return null;
+		return configPath
+			? [binary, "fix", "--config", configPath, filePath]
+			: [binary, "fix", filePath];
 	},
 	async detect(cwd: string) {
 		const vendorBin = await findInVendorBin("php-cs-fixer", cwd);
 		const globalBin = await which("php-cs-fixer");
 		if (!vendorBin && !globalBin) return false;
-		// Only run if project has explicit config
+		// Only run if project has explicit config. This is a presence-only
+		// climb from the project `cwd` (not necessarily the formatted file's
+		// own directory) via this file's own `findUp` — deliberately NOT
+		// merged with `resolvePhpCsFixerConfig` above (#2472 AC4): that
+		// resolver climbs from the FILE's directory and needs the exact
+		// winning path for `--config`, while this only needs a yes/no answer
+		// from whatever `cwd` the caller passed. `rustfmtFormatter.detect`
+		// keeps the same non-merged shape against `resolveCargoPackageEdition`
+		// for the identical reason.
 		const configs = [".php-cs-fixer.php", ".php-cs-fixer.dist.php"];
 		const found = await findUp(configs, cwd);
 		return found.length > 0;
