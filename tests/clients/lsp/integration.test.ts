@@ -929,29 +929,57 @@ describe("LSP Client Integration — batched watched-files (#271)", () => {
 });
 
 describe("LSP Client Integration — mutation-bridge fallback for server-initiated edits (#2450)", () => {
-	// `executeCommand(command, args)` — the 2-arg form, no `mutationContext` — is
-	// a real production shape (clients/lsp/tsserver-sync.ts calls it that way),
-	// and the fake server's "fake.applyEdit" command still solicits a real
-	// `workspace/applyEdit` for it. Before #2450, `workspace/applyEdit`'s
-	// fallback `LspMutationContext` (clients/lsp/client.ts) carried no
-	// `runtime`/`cacheManager`, so `bookkeepLspMutation` skipped every
-	// bookkeeping step for a write that reached disk — no read-guard stamp,
-	// no turn-state entry, no change-log receipt. This proves the mutation
-	// bridge fallback (clients/lsp-mutation.ts `bookkeepLspMutation`) closes
-	// that gap using the SAME seam every other LSP-applied edit bookkeeps
-	// through, not a parallel one.
+	// `workspace/applyEdit`'s fallback `LspMutationContext` (clients/lsp/client.ts)
+	// is reached whenever `state.activeMutationDepth !== 1` at request time —
+	// review round 2 (F5) corrected the round-1 citation, which claimed
+	// `clients/lsp/tsserver-sync.ts` was the production caller reaching this
+	// path. It is not: both of that module's `executeCommand` calls request
+	// `TSSERVER_REQUEST_COMMAND`, a read-only diagnostics pull, never a
+	// mutating command. `tools/lsp-navigation.ts` — the one production caller
+	// that solicits a MUTATING `executeCommand` — always threads a real
+	// `mutationContext`. The actually-reachable no-context shape is nested/
+	// re-entrant `executeCommand`: `runServerCommand` (clients/lsp/client.ts)
+	// clears `state.activeMutationContext` to `undefined` for the ENTIRE
+	// duration any call is not the outermost one (`activeMutationDepth !== 1`),
+	// even though the outer call's own context is still live. Before #2450,
+	// `bookkeepLspMutation` skipped every bookkeeping step for a write that
+	// reached disk this way — no read-guard stamp, no turn-state entry, no
+	// change-log receipt. This proves the mutation bridge fallback
+	// (clients/lsp-mutation.ts `bookkeepLspMutation`) closes that gap using the
+	// SAME seam every other LSP-applied edit bookkeeps through, not a parallel
+	// one. The dedicated nested-case test below pins the corrected shape; the
+	// first test here pins the simpler "no mutationContext argument at all"
+	// client-level contract (still a real, if narrower, way to reach the same
+	// fallback).
 	let proc: Awaited<ReturnType<typeof launchLSP>> | undefined;
 	let client: Awaited<ReturnType<typeof createLSPClient>> | undefined;
 	let tmpDir: string;
 	let filePath: string;
 	let prevDataDir: string | undefined;
 
+	// #2450 review round 2 (F2): 8 lines, with the edit target on line 7
+	// (1-based) — never line 1 — so the real recorded range ({7,7}) cannot
+	// collide with the {1,1} resource-op/whole-file-fallback default. A test
+	// that edits line 1 stays green even if every range-plumbing step between
+	// the fake server's response and the turn-state entry is neutered.
+	const FIXTURE_LINES = [
+		"const a = 1;",
+		"const b = 2;",
+		"const c = 3;",
+		"const d = 4;",
+		"const e = 5;",
+		"const f = 6;",
+		"hello world;",
+		"const h = 8;",
+	];
+	const EDIT_LINE_0BASED = 6; // "hello world;" — 1-based line 7.
+
 	beforeEach(async () => {
 		tmpDir = fs.mkdtempSync(
 			path.join(os.tmpdir(), "pi-lens-lsp-bridge-fallback-"),
 		);
 		filePath = path.join(tmpDir, "target.ts");
-		fs.writeFileSync(filePath, "hello world", "utf-8");
+		fs.writeFileSync(filePath, `${FIXTURE_LINES.join("\n")}\n`, "utf-8");
 		prevDataDir = process.env.PILENS_DATA_DIR;
 		process.env.PILENS_DATA_DIR = path.join(tmpDir, "data");
 		proc = await spawnFakeLspServer({ cwd: tmpDir });
@@ -997,12 +1025,19 @@ describe("LSP Client Integration — mutation-bridge fallback for server-initiat
 		});
 
 		// Same call shape as "applies a server-initiated edit solicited during
-		// executeCommand" above: no mutationContext argument.
+		// executeCommand" above: no mutationContext argument. The edit lands on
+		// line 7 (1-based), not line 1, so the recorded range can't collide with
+		// the {1,1} default (#2450 review round 2, F2).
 		const res = await client!.executeCommand("fake.applyEdit", [
 			pathToFileURL(filePath).href,
+			{ line: EDIT_LINE_0BASED, startCharacter: 0, endCharacter: 5 },
 		]);
 		expect(res.executed).toBe(true);
-		expect(fs.readFileSync(filePath, "utf-8")).toBe("EDITED world");
+		const expectedLines = [...FIXTURE_LINES];
+		expectedLines[EDIT_LINE_0BASED] = "EDITED world;";
+		expect(fs.readFileSync(filePath, "utf-8")).toBe(
+			`${expectedLines.join("\n")}\n`,
+		);
 
 		const receipts = runtime.getMutationsSince(0);
 		expect(receipts.map((r) => r.filePath)).toEqual([
@@ -1013,15 +1048,131 @@ describe("LSP Client Integration — mutation-bridge fallback for server-initiat
 		expect(receipts[0].source).toBe("agent-tool:lsp-workspace-applyEdit");
 
 		// The durable change-log entry carries the REAL range the edit touched
-		// (line 0 → 1-based {1,1}), not a synthetic whole-file default.
+		// (line 7, 1-based), not the {1,1} resource-op/whole-file default.
 		const changes = readChangesSince(tmpDir, 0);
 		expect(changes).toHaveLength(1);
 		expect(changes[0].source).toBe("agent-tool:lsp-workspace-applyEdit");
-		expect(changes[0].changedRange).toEqual({ start: 1, end: 1 });
+		expect(changes[0].changedRange).toEqual({ start: 7, end: 7 });
 
 		const turnFiles = cacheManager.readTurnState(tmpDir).files ?? {};
 		const keys = Object.keys(turnFiles);
 		expect(keys).toHaveLength(1);
 		expect(keys[0]).toContain("target.ts");
+		expect(turnFiles[keys[0]].modifiedRanges).toEqual([{ start: 7, end: 7 }]);
+	});
+
+	// #2450 review round 2 (F5). The reachable production shape is nested
+	// executeCommand, not "a caller that never threads a context" — see the
+	// describe-level comment above. Two `executeCommand` calls fire back to
+	// back with NO `await` between them, so both calls' synchronous prefix
+	// (the `activeMutationDepth` bump in `runServerCommand`, before its first
+	// `await`) runs before either awaits a server round-trip: the outer call
+	// bumps depth 0→1 and stores ITS OWN (fully-threaded) mutation context;
+	// the inner call then bumps depth 1→2, which — per `runServerCommand` —
+	// clears `activeMutationContext` to `undefined` for the window, even
+	// though the outer call's context object is still very much alive. The
+	// inner call's own `workspace/applyEdit` therefore lands with NO context,
+	// exactly like the un-nested test above, and must fall back to the bridge
+	// — proving the fallback triggers on `activeMutationDepth !== 1`, not
+	// merely on "nobody ever passed a context".
+	it("falls back to the mutation bridge for a nested executeCommand's server-initiated edit, without touching the outer call's own context", async () => {
+		// A SEPARATE cwd for the outer call's own bookkeeping, deliberately
+		// distinct from `tmpDir` (the real edit target's directory, and the
+		// bridge's `getProjectRoot`). `cacheManager.addModifiedRange`/
+		// `readTurnState` and `readChangesSince` are FILE-scoped by `cwd` — any
+		// two `CacheManager`/`readChangesSince` calls sharing the same `cwd`
+		// observe the SAME on-disk store regardless of which JS instance made
+		// them. Using the same `tmpDir` for both `outerContext` and the bridge
+		// would make the outer call's turn-state/change-log indistinguishable
+		// from the bridge's, defeating the "never touched the outer call's own
+		// context" assertion below.
+		const outerCwd = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-bridge-fallback-outer-"),
+		);
+		try {
+			const outerRuntime = new RuntimeCoordinator();
+			outerRuntime.projectRoot = outerCwd;
+			outerRuntime.setTelemetryIdentity({ sessionId: "s-2450-outer" });
+			outerRuntime.beginTurn();
+			const outerCacheManager = new CacheManager(false);
+
+			const bridgeRuntime = new RuntimeCoordinator();
+			bridgeRuntime.projectRoot = tmpDir;
+			bridgeRuntime.setTelemetryIdentity({
+				sessionId: "s-2450-nested-fallback",
+			});
+			bridgeRuntime.beginTurn();
+			const bridgeCacheManager = new CacheManager(false);
+			registerMutationBridge({
+				getRuntime: () => bridgeRuntime as never,
+				getCacheManager: () => bridgeCacheManager,
+				getProjectRoot: () => tmpDir,
+				getDispatchCwd: () => tmpDir,
+				countFileLines,
+				isRecordable: () => true,
+				dbg: () => {},
+			});
+
+			const outerContext = {
+				cwd: outerCwd,
+				correlationId: "nested-outer",
+				tool: "lsp_navigation:executeCommand",
+				source: "lsp-execute-command" as const,
+				runtime: outerRuntime as never,
+				cacheManager: outerCacheManager,
+				emitSummary: false,
+			};
+
+			// Fired back to back, deliberately not awaited individually — see the
+			// comment above for why this ordering is what makes depth 1→2 happen
+			// before either request round-trips.
+			const outerPromise = client!.executeCommand(
+				"fake.doThing",
+				undefined,
+				outerContext,
+			);
+			const innerPromise = client!.executeCommand("fake.applyEdit", [
+				pathToFileURL(filePath).href,
+				{ line: EDIT_LINE_0BASED, startCharacter: 0, endCharacter: 5 },
+			]);
+
+			const [outerRes, innerRes] = await Promise.all([
+				outerPromise,
+				innerPromise,
+			]);
+
+			expect(outerRes.executed).toBe(true);
+			expect(innerRes.executed).toBe(true);
+			const expectedLines = [...FIXTURE_LINES];
+			expectedLines[EDIT_LINE_0BASED] = "EDITED world;";
+			expect(fs.readFileSync(filePath, "utf-8")).toBe(
+				`${expectedLines.join("\n")}\n`,
+			);
+
+			// The inner write landed through the bridge fallback, not the outer
+			// call's directly-threaded runtime/cacheManager.
+			const bridgeChanges = readChangesSince(tmpDir, 0);
+			expect(bridgeChanges).toHaveLength(1);
+			expect(bridgeChanges[0].source).toBe(
+				"agent-tool:lsp-workspace-applyEdit",
+			);
+			expect(bridgeChanges[0].changedRange).toEqual({ start: 7, end: 7 });
+			const bridgeTurnFiles =
+				bridgeCacheManager.readTurnState(tmpDir).files ?? {};
+			expect(Object.keys(bridgeTurnFiles)).toHaveLength(1);
+
+			// The outer call's OWN context (and its own, differently-scoped
+			// turn-state/change-log/receipt store) was never used for the inner
+			// write — proof the fallback fired because nesting cleared the
+			// active context, not because no context existed anywhere in the
+			// process.
+			expect(
+				Object.keys(outerCacheManager.readTurnState(outerCwd).files ?? {}),
+			).toHaveLength(0);
+			expect(readChangesSince(outerCwd, 0)).toEqual([]);
+			expect(outerRuntime.getMutationsSince(0)).toEqual([]);
+		} finally {
+			removeTempDirSync(outerCwd);
+		}
 	});
 });

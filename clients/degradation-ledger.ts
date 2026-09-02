@@ -60,6 +60,17 @@ export type DegradationKind =
 	| "lsp-warm-client-missing"
 	| "lsp-capability-skip"
 	/**
+	 * A server-initiated `workspace/applyEdit` fell back to the mutation
+	 * bridge (`clients/lsp-mutation.ts`, #2450) because its `LspMutationContext`
+	 * carried no `runtime`/`cacheManager`, and no bridge is mounted in this
+	 * process (`registerMutationBridge` only runs inside pi's own in-process
+	 * extension activation — the standalone MCP server, `mcp/server.ts`,
+	 * never calls it). The write still lands on disk; only its bookkeeping
+	 * (read-guard stamp, turn-state entry, change-log receipt) is lost.
+	 * Subject is the soliciting tool name.
+	 */
+	| "lsp-mutation-bridge-unmounted"
+	/**
 	 * #2007: a worktree-mutating git command was declined because a live peer
 	 * session shares this dirty checkout. The subject is the checkout root, so
 	 * the ledger says WHICH shared directory is contended.

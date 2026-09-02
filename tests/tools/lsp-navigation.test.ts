@@ -1295,8 +1295,15 @@ describe("lsp_navigation tool", () => {
 		);
 		const fileA = path.join(tmpDir, "a.ts");
 		const fileB = path.join(tmpDir, "b.ts");
-		fs.writeFileSync(fileA, "const oldName = 1;\n");
-		fs.writeFileSync(fileB, "import { oldName } from './a';\n");
+		// #2450 review round 2 (F2): the renamed identifier sits on line 6
+		// (1-based) in both files, not line 1 — a line-1 edit's real 1-based
+		// range ({1,1}) is indistinguishable from the {1,1} resource-op/
+		// whole-file-fallback default, so a test asserting {1,1} stays green
+		// even with every range-plumbing step between the mocked WorkspaceEdit
+		// and the turn-state entry neutered.
+		const filler = "// filler line\n".repeat(5);
+		fs.writeFileSync(fileA, `${filler}const oldName = 1;\n`);
+		fs.writeFileSync(fileB, `${filler}import { oldName } from './a';\n`);
 
 		const runtime = new RuntimeCoordinator();
 		runtime.projectRoot = tmpDir;
@@ -1318,8 +1325,8 @@ describe("lsp_navigation tool", () => {
 					[pathToFileURL(fileA).href]: [
 						{
 							range: {
-								start: { line: 0, character: 6 },
-								end: { line: 0, character: 13 },
+								start: { line: 5, character: 6 },
+								end: { line: 5, character: 13 },
 							},
 							newText: "newName",
 						},
@@ -1327,8 +1334,8 @@ describe("lsp_navigation tool", () => {
 					[pathToFileURL(fileB).href]: [
 						{
 							range: {
-								start: { line: 0, character: 9 },
-								end: { line: 0, character: 16 },
+								start: { line: 5, character: 9 },
+								end: { line: 5, character: 16 },
 							},
 							newText: "newName",
 						},
@@ -1342,7 +1349,7 @@ describe("lsp_navigation tool", () => {
 				{
 					operation: "rename",
 					path: fileA,
-					line: 1,
+					line: 6,
 					character: 7,
 					newName: "newName",
 					apply: true,
@@ -1353,9 +1360,11 @@ describe("lsp_navigation tool", () => {
 			);
 
 			expect(result.isError).toBeUndefined();
-			expect(fs.readFileSync(fileA, "utf-8")).toBe("const newName = 1;\n");
+			expect(fs.readFileSync(fileA, "utf-8")).toBe(
+				`${filler}const newName = 1;\n`,
+			);
 			expect(fs.readFileSync(fileB, "utf-8")).toBe(
-				"import { newName } from './a';\n",
+				`${filler}import { newName } from './a';\n`,
 			);
 
 			// Both files land in turn-state.json — not just whichever one the
@@ -1370,9 +1379,10 @@ describe("lsp_navigation tool", () => {
 				);
 				expect(key, `expected a turn-state entry for ${file}`).toBeDefined();
 				const entry = turnFiles[key as string];
-				// Real ranges from the computed fileDetails — never the {1,1}
-				// resource-op default a text edit should never fall back to.
-				expect(entry.modifiedRanges).toEqual([{ start: 1, end: 1 }]);
+				// Real ranges from the computed fileDetails (line 6, 1-based) —
+				// never the {1,1} resource-op default a text edit should never
+				// fall back to.
+				expect(entry.modifiedRanges).toEqual([{ start: 6, end: 6 }]);
 			}
 
 			// The receipt names the LSP operation — "lsp-rename" — instead of the

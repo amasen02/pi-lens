@@ -59,11 +59,8 @@ import { classifyMutatingTool } from "./clients/mutating-tool.js";
 import { resolveLanguageRootForFile } from "./clients/language-profile.js";
 import { countFileLines } from "./clients/read-guard-tool-lines.js";
 import { registerReadBridge } from "./clients/read-bridge.js";
-import {
-	isExternalOrVendorFile,
-	normalizeFilePath,
-} from "./clients/path-utils.js";
-import { isPathIgnoredByProject } from "./clients/file-utils.js";
+import { normalizeFilePath } from "./clients/path-utils.js";
+import { isRecordableProjectPath } from "./clients/file-utils.js";
 import {
 	dropStaleFiles,
 	loadSessionState,
@@ -860,10 +857,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 			peekWriteIndex: () => runtime.peekWriteIndex(),
 			isRecordable(filePath: string): boolean {
 				if (_readBridgeGetFlag?.("no-read-guard")) return false;
-				if (isPathIgnoredByProject(filePath, runtime.projectRoot, false))
-					return false;
-				if (isExternalOrVendorFile(filePath, runtime.projectRoot)) return false;
-				return true;
+				return isRecordableProjectPath(filePath, runtime.projectRoot);
 			},
 		});
 	}
@@ -886,10 +880,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 			countFileLines,
 			isRecordable(filePath: string): boolean {
 				if (_mutationBridgeGetFlag?.("no-read-guard")) return false;
-				if (isPathIgnoredByProject(filePath, runtime.projectRoot, false))
-					return false;
-				if (isExternalOrVendorFile(filePath, runtime.projectRoot)) return false;
-				return true;
+				return isRecordableProjectPath(filePath, runtime.projectRoot);
 			},
 			dbg,
 		});

@@ -16,6 +16,7 @@ import {
 } from "../clients/lsp-mutation.js";
 import type { LSPCallHierarchyItem } from "../clients/lsp/client.js";
 import { uriToPath } from "../clients/path-utils.js";
+import { isRecordableProjectPath } from "../clients/file-utils.js";
 import { compactRenderResult } from "./render-compact.js";
 import {
 	applyWorkspaceEdit,
@@ -1107,6 +1108,17 @@ export function createLspNavigationTool(
 					readGuard: getFlag("no-read-guard", cwd)
 						? undefined
 						: mutationDeps?.readGuard,
+					// #2450 review round 2 (F4): the SAME gate
+					// `registerMutationBridge` applies internally in `index.ts`, so
+					// this directly-threaded path and the bridge fallback
+					// (`clients/lsp-mutation.ts`, reached when `mutationDeps` is
+					// absent/partial — e.g. the MCP server) agree on which files
+					// count as project source, rather than the direct path
+					// recording an ignored/vendor write the fallback would drop.
+					isRecordable: (filePath: string): boolean => {
+						if (getFlag("no-read-guard", cwd)) return false;
+						return isRecordableProjectPath(filePath, cwd);
+					},
 				};
 			}
 

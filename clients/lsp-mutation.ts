@@ -12,6 +12,7 @@ import {
 import type { AppliedWorkspaceEdit } from "./lsp/edits.js";
 import { normalizeMapKey } from "./path-utils.js";
 import { getMutationBridge } from "./mutation-bridge.js";
+import { recordDegradationOnce } from "./degradation-ledger.js";
 
 export interface LspMutationRuntime {
 	bumpFileSeq?: (filePath: string) => { projectSeq: number; fileSeq: number };
@@ -66,6 +67,20 @@ export interface LspMutationContext {
 	summaryOverflowed?: boolean;
 	/** Bounded per-batch dedupe for the existing turn-summary autofix publisher. */
 	autofixRecordedPaths?: Set<string>;
+	/**
+	 * Same recordability gate `clients/mutation-bridge.ts` applies internally
+	 * (`no-read-guard` / ignored / vendor) — optional so every existing caller
+	 * that never threaded one keeps its exact prior behavior (always
+	 * recordable). `tools/lsp-navigation.ts` sets this on the contexts it
+	 * builds for `rename`/`rename_file`/`executeCommand` so the direct
+	 * (deps-threaded) path applies the SAME gate the bridge fallback already
+	 * enforces internally — before #2450 review round 2 (F4) the direct path
+	 * had no such gate at all, so an LSP-issued write to an ignored/vendor
+	 * path (or with `no-read-guard` set) was recorded on the direct path but
+	 * silently dropped on the fallback path, an inequivalence between the two
+	 * branches for the exact same kind of write.
+	 */
+	isRecordable?: (filePath: string) => boolean;
 }
 
 export interface LspMutationSummaryOptions {
@@ -237,6 +252,17 @@ function bookkeepLspMutation(
 	const useBridgeFallback = !context.runtime || !context.cacheManager;
 	for (const detail of details) {
 		const filePath = path.resolve(detail.filePath);
+		// #2450 review round 2 (F4): the SAME recordability gate the bridge
+		// fallback below already applies internally (`isRecordable`, mounted in
+		// index.ts). Applied here too so the direct (deps-threaded) branch
+		// cannot record a write the fallback branch would have silently
+		// dropped for the exact same reason (`no-read-guard` / ignored /
+		// vendor) — the two branches must agree on which files count as
+		// project source, not just on how they bookkeep the ones that do.
+		if (context.isRecordable && !context.isRecordable(filePath)) {
+			context.dbg?.(`lsp mutation not recordable, skipping ${filePath}`);
+			continue;
+		}
 		if (context.readGuard) {
 			try {
 				context.readGuard.recordWritten(filePath);
@@ -248,50 +274,95 @@ function bookkeepLspMutation(
 		}
 		if (useBridgeFallback) {
 			const bridge = getMutationBridge();
-			try {
-				bridge?.recordMutation({
-					filePath,
-					kind: "edit",
-					editRanges: detail.range
-						? [[detail.range.start, detail.range.end]]
-						: undefined,
-					consumer: context.tool,
+			if (!bridge) {
+				// #2450 review round 2 (F4): the MCP server process
+				// (`mcp/server.ts`) builds `lsp_navigation` with no
+				// `mutationDeps` AND never mounts the bridge (that only happens
+				// inside pi's own in-process extension activation, `index.ts`) —
+				// every LSP-applied edit in that process is unrecorded. Once per
+				// session (not once per file — a rename can touch many files in
+				// one call), not once per process lifetime silently.
+				recordDegradationOnce({
+					kind: "lsp-mutation-bridge-unmounted",
+					subject: context.tool,
+					reason:
+						"workspace/applyEdit bookkeeping fell back to the mutation " +
+						"bridge, but no bridge is mounted in this process (e.g. the " +
+						"MCP server, which never runs pi's extension activation) — " +
+						"the write is unrecorded (no read-guard stamp, no turn-state " +
+						"entry, no change-log receipt).",
 				});
-			} catch (err) {
 				context.dbg?.(
-					`lsp mutation bridge fallback failed for ${filePath}: ${err}`,
+					`lsp mutation bridge unavailable, dropping bookkeeping for ${filePath}`,
 				);
+			} else {
+				try {
+					const recorded = bridge.recordMutation({
+						filePath,
+						kind: "edit",
+						editRanges: detail.range
+							? [[detail.range.start, detail.range.end]]
+							: undefined,
+						consumer: context.tool,
+						// Real value threaded through, not the bridge's own
+						// historical `false` default (#2450 review round 2, F1) —
+						// the tsserver organize-imports/add-import case is exactly
+						// the import-changing one.
+						importsChanged: detail.importsChanged ?? true,
+						// Equivalence with the direct branch below, which never
+						// enqueues a deferred autofix/format pass for an LSP-applied
+						// edit (#2450 review round 2, F3).
+						deferAutofix: false,
+					});
+					if (!recorded) {
+						context.dbg?.(
+							`lsp mutation bridge dropped ${filePath} (recordMutation() ` +
+								"returned false — see the mutation_bridge debug output " +
+								"for the reason: malformed entry, out-of-scope path, or " +
+								"a bookkeeping error)",
+						);
+					}
+				} catch (err) {
+					context.dbg?.(
+						`lsp mutation bridge fallback failed for ${filePath}: ${err}`,
+					);
+				}
 			}
-			continue;
-		}
-		const runtime = context.runtime;
-		// One mutation seam (#2000 phase 1): bump + receipt + change-log live in
-		// RuntimeCoordinator.recordProjectMutation.
-		runtime?.recordProjectMutation?.({
-			filePath,
-			source: context.source as ProjectChangeSource,
-			cwd: context.cwd,
-			changedRange: detail.range,
-			onAppendError: (err) =>
-				context.dbg?.(
-					`lsp mutation project change append failed for ${filePath}: ${err}`,
-				),
-		});
-		if (context.cacheManager) {
-			try {
-				context.cacheManager.addModifiedRange(
-					filePath,
-					detail.range ?? { start: 1, end: 1 },
-					detail.importsChanged ?? true,
-					context.cwd,
-					runtime?.telemetrySessionId,
-				);
-			} catch (err) {
-				context.dbg?.(
-					`lsp mutation modified-range tracking failed for ${filePath}: ${err}`,
-				);
+		} else {
+			const runtime = context.runtime;
+			// One mutation seam (#2000 phase 1): bump + receipt + change-log live in
+			// RuntimeCoordinator.recordProjectMutation.
+			runtime?.recordProjectMutation?.({
+				filePath,
+				source: context.source as ProjectChangeSource,
+				cwd: context.cwd,
+				changedRange: detail.range,
+				onAppendError: (err) =>
+					context.dbg?.(
+						`lsp mutation project change append failed for ${filePath}: ${err}`,
+					),
+			});
+			if (context.cacheManager) {
+				try {
+					context.cacheManager.addModifiedRange(
+						filePath,
+						detail.range ?? { start: 1, end: 1 },
+						detail.importsChanged ?? true,
+						context.cwd,
+						runtime?.telemetrySessionId,
+					);
+				} catch (err) {
+					context.dbg?.(
+						`lsp mutation modified-range tracking failed for ${filePath}: ${err}`,
+					);
+				}
 			}
 		}
+		// #2450 review round 2 (Partial-deps): its own surface, independent of
+		// whether the receipt/turn-state used the direct path or the bridge
+		// fallback above — a half-threaded caller (one that provides
+		// `recordAutofix` but not `runtime`/`cacheManager`) must not lose its
+		// turn-summary publisher just because SOME other surface fell back.
 		if (context.recordAutofix && context.source === "autofix") {
 			const key = normalizeMapKey(filePath);
 			const seen = context.autofixRecordedPaths ?? new Set<string>();

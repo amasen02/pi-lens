@@ -784,6 +784,29 @@ export interface BridgeMutationEntry {
 	editRanges?: [number, number][];
 	/** Producer identity, surfaced as the tool name on the classification. */
 	consumer?: string;
+	/**
+	 * Whether this write changed the file's import/require statements —
+	 * gates `cache-manager.ts`'s madge re-scan filter (#2450 review round 2,
+	 * F1). Omitted defaults to `false`, matching every bridge producer's
+	 * behavior before this field existed (e.g. `ast_grep_replace`, which does
+	 * not compute this and should not change behavior by omission). A
+	 * producer that DOES know the real value (the LSP mutation-bridge
+	 * fallback, `clients/lsp-mutation.ts`, threads the same
+	 * `AppliedWorkspaceEdit.fileDetails[].importsChanged` its direct path
+	 * uses) should pass it explicitly.
+	 */
+	importsChanged?: boolean;
+	/**
+	 * Whether this write should queue a deferred autofix/format pass at
+	 * `agent_settled` (#2450 review round 2, F3). Omitted defaults to `true`
+	 * — every existing bridge producer (`ast_grep_replace`, a third-party
+	 * extension) still gets the deferred pass it always has. The LSP
+	 * mutation-bridge fallback passes `false`: `bookkeepLspMutation`'s direct
+	 * path never enqueues a deferred pass for an LSP-applied edit (that is
+	 * not this seam's job), so the fallback must not either — the two
+	 * branches have to be behaviorally equivalent for the same write.
+	 */
+	deferAutofix?: boolean;
 }
 
 /**
