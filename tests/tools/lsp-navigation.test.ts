@@ -325,6 +325,67 @@ describe("lsp_navigation tool", () => {
 		});
 	});
 
+	// #2450 fix round 5 (F1): pin the PRODUCTION `isRecordable` closure built
+	// at tools/lsp-navigation.ts:1126-1131 — not a hand-mirrored stand-in.
+	// `runtime.projectRoot` is the parent of the request `cwd` (a sub-package),
+	// so a sibling package's file must still judge as recordable against the
+	// project root rather than the narrower request `cwd`. Plain `cwd` (the
+	// round-4 regression this guards) makes the sibling path read as outside
+	// the (sub-package) root and `isRecordable` wrongly returns false.
+	it("#2450 fix round 5 (F1): the production isRecordable closure judges a sibling-package path against runtime.projectRoot, not the sub-package ctx.cwd", async () => {
+		const tmpDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-nav-2450-f1-"),
+		);
+		const subPackageDir = path.join(tmpDir, "packages", "sub");
+		const siblingDir = path.join(tmpDir, "packages", "sibling");
+		fs.mkdirSync(subPackageDir, { recursive: true });
+		fs.mkdirSync(siblingDir, { recursive: true });
+		const siblingPath = path.join(siblingDir, "foo.ts");
+		fs.writeFileSync(siblingPath, "export const foo = 1;\n");
+
+		const runtime = new RuntimeCoordinator();
+		runtime.projectRoot = tmpDir;
+		runtime.setTelemetryIdentity({ sessionId: "s-2450-f1-root" });
+		runtime.beginTurn();
+		const cacheManager = new CacheManager(false);
+
+		const tool = createLspNavigationTool((flag) => flag === "lens-lsp", {
+			runtime: runtime as never,
+			cacheManager,
+			readGuard: { recordWritten: () => {} },
+			dbg: () => {},
+		});
+
+		try {
+			const result = await tool.execute(
+				"exec-apply-f1-root",
+				{
+					operation: "executeCommand",
+					command: "_typescript.organizeImports",
+					commandArguments: ["file:///x.ts"],
+					apply: true,
+				},
+				new AbortController().signal,
+				null,
+				{ cwd: subPackageDir },
+			);
+
+			expect(result.isError).toBeUndefined();
+			const executeCall = (
+				mocked.service as { executeCommand: ReturnType<typeof vi.fn> }
+			).executeCommand.mock.calls[0];
+			expect(
+				(
+					executeCall?.[3] as {
+						isRecordable: (filePath: string) => boolean;
+					}
+				).isRecordable(siblingPath),
+			).toBe(true);
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
+	});
+
 	it("executeCommand refuses a command the server did not advertise", async () => {
 		const tool = createLspNavigationTool((flag) => flag === "lens-lsp");
 
