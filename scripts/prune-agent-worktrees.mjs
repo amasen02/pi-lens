@@ -30,11 +30,21 @@
  *   - kills are always by pid after a command-line/cwd match, never
  *     `taskkill`-by-name.
  *
+ * WHO REMOVES WHAT (PR #2438 review S1 -- see resolveHookPolicy):
+ *   `--hook subagent-stop` NEVER removes a worktree. Resume-by-SendMessage
+ *   happens after SubagentStop, and .claude/skills/merge-train/SKILL.md keeps
+ *   a fixer's worktree until its PR merges -- removing it there would break
+ *   the fix round. It runs the orphan-fixture sweep SCOPED to that agent's
+ *   tree, and with no usable `agent_id` it does nothing but say so.
+ *   Removal belongs to `--hook session-start` (default --min-age, clean +
+ *   pushed rails, never --only, at most ONE tree per run) and to a manual
+ *   `npm run hygiene` (same rails, --min-age overridable, uncapped).
+ *
  * Usage:
  *   node scripts/prune-agent-worktrees.mjs [--dry-run] [--min-age 30m]
  *        [--only <path>]... [--json] [--quiet]
  *   node scripts/prune-agent-worktrees.mjs --hook subagent-stop   (reads the
- *        hook JSON payload on stdin and derives --only from `agent_id`)
+ *        hook JSON payload on stdin and scopes the orphan sweep by `agent_id`)
  *   node scripts/prune-agent-worktrees.mjs --hook session-start
  *
  * Exit code is ALWAYS 0. This is a hygiene sweep wired to Claude Code hooks
@@ -55,6 +65,7 @@ import { fileURLToPath } from "node:url";
 import {
 	DEFAULT_LOG_MAX_LINES,
 	DEFAULT_MIN_AGE_MS,
+	capRemovals,
 	collectAncestorPids,
 	formatKillRecord,
 	formatScanRecord,
@@ -65,11 +76,11 @@ import {
 	parseDuration,
 	parseLockPid,
 	parseWorktreeList,
+	planBranchDeletions,
+	planOrphanSweep,
 	planWorktreePrune,
 	pruneLogLines,
-	selectOrphanFixtureProcesses,
 	selectProcessesUnderPath,
-	selectStaleBranches,
 } from "./lib/worktree-hygiene.mjs";
 
 const isWindows = process.platform === "win32";
@@ -127,8 +138,11 @@ const USAGE = `Usage: node scripts/prune-agent-worktrees.mjs [options]
                         Overrides --min-age and the live-lock rail for the
                         named tree — never the dirty/unpushed rails.
   --hook <event>        subagent-stop | session-start. Reads the hook JSON
-                        payload on stdin; subagent-stop derives --only from
-                        the payload's agent_id when that worktree exists.
+                        payload on stdin. subagent-stop NEVER removes a
+                        worktree: it reaps orphaned test-fixture helpers under
+                        the tree named by the payload's agent_id, and does
+                        nothing at all without one. session-start removes at
+                        most ONE tree (the oldest eligible) per run.
   --no-orphan-sweep     Skip the fixture-orphan sweep.
   --json                Emit the plan as one JSON object instead of text.
   --quiet               Only print lines about work actually done.
@@ -226,6 +240,48 @@ export function parseArgs(argv) {
 }
 
 /**
+ * What each invocation mode is ALLOWED to do. One table, consulted once, so
+ * "SubagentStop must not remove worktrees" is a value a test can read rather
+ * than a branch buried in main() (PR #2438 review S1/S8).
+ *
+ * `maxRemovals`: null = uncapped (a human ran it and is watching); 1 = one
+ * tree per SessionStart, because `git worktree remove` is bounded at
+ * REMOVE_TIMEOUT_MS and more than one cannot fit inside the hook's own
+ * timeout; 0 = never, for SubagentStop.
+ */
+export const HOOK_POLICIES = Object.freeze({
+	"subagent-stop": Object.freeze({
+		removeWorktrees: false,
+		deleteBranches: false,
+		orphanSweep: true,
+		scopedToAgentTree: true,
+		maxRemovals: 0,
+	}),
+	"session-start": Object.freeze({
+		removeWorktrees: true,
+		deleteBranches: true,
+		orphanSweep: true,
+		scopedToAgentTree: false,
+		maxRemovals: 1,
+	}),
+	manual: Object.freeze({
+		removeWorktrees: true,
+		deleteBranches: true,
+		orphanSweep: true,
+		scopedToAgentTree: false,
+		maxRemovals: null,
+	}),
+});
+
+/**
+ * @param {string|null|undefined} hook
+ * @returns {(typeof HOOK_POLICIES)["manual"]}
+ */
+export function resolveHookPolicy(hook) {
+	return HOOK_POLICIES[hook ?? "manual"] ?? HOOK_POLICIES.manual;
+}
+
+/**
  * Derive the worktree a SubagentStop payload refers to. Claude Code names an
  * agent worktree `.claude/worktrees/agent-<agent_id>`, so the payload's
  * `agent_id` maps to a path — but the mapping is a NAMING CONVENTION, not a
@@ -298,6 +354,28 @@ function git(args, cwd, timeoutMs = DEFAULT_GIT_TIMEOUT_MS) {
 	} catch {
 		return null;
 	}
+}
+
+/**
+ * The MAIN checkout's root, which is where `.claude/worktrees/` actually
+ * lives. `REPO_ROOT` is derived from this script's own location, so a sweep
+ * invoked from inside an agent worktree would otherwise look for
+ * `<worktree>/.claude/worktrees/agent-<id>` and find nothing. Asked of git
+ * rather than reconstructed by string surgery: `--git-common-dir` is the
+ * shared `.git` of the whole worktree set.
+ *
+ * @param {number} timeoutMs
+ * @returns {string|null}
+ */
+function mainCheckoutRoot(timeoutMs) {
+	const out = git(
+		["rev-parse", "--path-format=absolute", "--git-common-dir"],
+		REPO_ROOT,
+		timeoutMs,
+	);
+	const commonDir = (out ?? "").trim();
+	if (!commonDir) return null;
+	return path.basename(commonDir) === ".git" ? path.dirname(commonDir) : null;
 }
 
 /**
@@ -436,12 +514,14 @@ function windowsExe(name) {
  * `tasklist` exposes no parent pid and no command line, and `wmic` is gone
  * from Windows 11. POSIX uses `ps -eo pid,ppid,args`.
  *
- * Never rejects: a scan that fails or times out yields an EMPTY table, which
- * degrades every downstream selector to "kill nothing". Bounded by
- * `timeoutMs` so a hook can never hang a session on a wedged WMI service.
+ * Never rejects. Returns `{ rows, ok }`: `ok` is false when the listing
+ * failed, timed out, never spawned, or EXITED NON-ZERO -- the last of which
+ * used to be ignored (PR #2438 review S5), so a `ps` that printed a partial
+ * table and then died read as a complete one. Bounded by `timeoutMs` so a
+ * hook can never hang a session on a wedged WMI service.
  *
  * @param {number} timeoutMs
- * @returns {Promise<import("./lib/worktree-hygiene.mjs").ProcRow[]>}
+ * @returns {Promise<{ rows: import("./lib/worktree-hygiene.mjs").ProcRow[], ok: boolean }>}
  */
 function snapshotProcesses(timeoutMs) {
 	const command = isWindows
@@ -459,11 +539,11 @@ function snapshotProcesses(timeoutMs) {
 
 	return new Promise((resolve) => {
 		let settled = false;
-		const finish = (rows) => {
+		const finish = (rows, ok) => {
 			if (settled) return;
 			settled = true;
 			clearTimeout(timer);
-			resolve(rows);
+			resolve({ rows, ok });
 		};
 		let child;
 		const timer = setTimeout(() => {
@@ -472,7 +552,7 @@ function snapshotProcesses(timeoutMs) {
 			} catch {
 				/* already gone */
 			}
-			finish([]);
+			finish([], false);
 		}, timeoutMs);
 		try {
 			child = spawn(command, args, {
@@ -481,15 +561,20 @@ function snapshotProcesses(timeoutMs) {
 				stdio: ["ignore", "pipe", "ignore"],
 			});
 		} catch {
-			finish([]);
+			finish([], false);
 			return;
 		}
 		let out = "";
 		child.stdout.on("data", (chunk) => {
 			out += chunk.toString();
 		});
-		child.once("error", () => finish([]));
-		child.once("close", () => finish(parseProcessTable(out, isWindows)));
+		child.once("error", () => finish([], false));
+		// A non-zero exit (or a signal) means the listing is PARTIAL at best.
+		// Whatever it printed is not evidence of what is NOT running, which is
+		// exactly the question the orphan predicate asks of it.
+		child.once("close", (code, signal) =>
+			finish(parseProcessTable(out, isWindows), code === 0 && !signal),
+		);
 	});
 }
 
@@ -700,6 +785,183 @@ const SELF_FILE = fileURLToPath(import.meta.url);
 const SCRIPT_DIR = path.dirname(SELF_FILE);
 const REPO_ROOT = path.resolve(SCRIPT_DIR, "..");
 
+/**
+ * Take the bounded process snapshot, enrich it with cwd where the platform
+ * allows, and report whether the LISTING itself succeeded. Any degradation is
+ * returned as a ledger record rather than only printed: the hooks run
+ * `--quiet`, so an unrecorded degradation makes a sweep that ran blind look
+ * exactly like a sweep that found nothing (defect shape 10).
+ *
+ * @param {{ budgetMs: number, budgetLeft: () => number }} options
+ */
+async function readProcessTable({ budgetMs, budgetLeft }) {
+	const scanBudgetMs = Math.min(DEFAULT_SCAN_TIMEOUT_MS, budgetLeft());
+	// Skipping loudly beats scanning with a stub timeout it cannot meet.
+	if (scanBudgetMs < MIN_SCAN_BUDGET_MS) {
+		console.error(
+			`[hygiene] process scan skipped: only ${budgetLeft()}ms of the ` +
+				`${budgetMs}ms budget left (needs ${MIN_SCAN_BUDGET_MS}ms); ` +
+				`no orphan sweep this run`,
+		);
+		return {
+			table: [],
+			listingOk: false,
+			scanBudgetMs,
+			records: [
+				formatScanRecord({
+					reason: "skipped",
+					budgetMs,
+					remainingMs: budgetLeft(),
+					rows: 0,
+				}),
+			],
+		};
+	}
+	const { rows, ok } = await snapshotProcesses(scanBudgetMs);
+	const table = enrichCwd(rows);
+	const records = [];
+	if (!ok) {
+		console.error(
+			`[hygiene] process listing failed, timed out or exited non-zero ` +
+				`within ${scanBudgetMs}ms; no orphan sweep this run`,
+		);
+		records.push(
+			formatScanRecord({
+				reason: "listing-failed",
+				budgetMs,
+				remainingMs: scanBudgetMs,
+				rows: table.length,
+			}),
+		);
+	} else if (table.length === 0) {
+		console.error(
+			`[hygiene] process scan returned no rows within ${scanBudgetMs}ms; ` +
+				`no orphan sweep this run`,
+		);
+		records.push(
+			formatScanRecord({
+				reason: "empty",
+				budgetMs,
+				remainingMs: scanBudgetMs,
+				rows: 0,
+			}),
+		);
+	}
+	return { table, listingOk: ok, scanBudgetMs, records };
+}
+
+/**
+ * The SubagentStop hook: reap this agent's own orphaned fixture helpers, and
+ * NOTHING else. It never removes a worktree (see the file header / review S1)
+ * and never touches a sibling agent's tree.
+ *
+ * @param {{ options: ReturnType<typeof parseArgs>, worktreePath: string, budgetMs: number, budgetLeft: () => number, say: (m: string) => void, startedAt: number, nowIso: string }} context
+ */
+async function runScopedOrphanSweep({
+	options,
+	worktreePath,
+	budgetMs,
+	budgetLeft,
+	say,
+	startedAt,
+	nowIso,
+}) {
+	const scan = await readProcessTable({ budgetMs, budgetLeft });
+	const records = [...scan.records];
+	const protectedPids = collectAncestorPids(scan.table, process.pid);
+	protectedPids.add(process.pid);
+
+	const { orphans, degraded } = planOrphanSweep({
+		rows: scan.table,
+		selfPid: process.pid,
+		protectedPids,
+		restrictToPath: worktreePath,
+		listingOk: scan.listingOk,
+		isPidAlive,
+	});
+	// "listing-failed" and the empty case were already reported by
+	// readProcessTable; a TRUNCATED listing is a distinct degradation and is
+	// reported here.
+	if (degraded && degraded.reason !== "listing-failed") {
+		console.error(
+			`[hygiene] process snapshot could not be verified ` +
+				`(${degraded.reason}); no orphan sweep this run`,
+		);
+		records.push(
+			formatScanRecord({
+				reason: degraded.reason,
+				budgetMs,
+				remainingMs: scan.scanBudgetMs,
+				rows: scan.table.length,
+			}),
+		);
+	}
+
+	for (const { row, reason } of orphans) {
+		say(
+			`${options.dryRun ? "WOULD KILL  " : "kill    "} pid ${row.pid}  ${reason}  ${row.command}`,
+		);
+	}
+	for (const { row, reason } of orphans) {
+		if (options.dryRun) {
+			records.push(
+				formatKillRecord({
+					pid: row.pid,
+					command: row.command,
+					reason,
+					worktree: worktreePath,
+					dryRun: true,
+					nowIso,
+				}),
+			);
+			continue;
+		}
+		const { killed, error } = await terminatePid(row.pid);
+		records.push(
+			formatKillRecord({
+				pid: row.pid,
+				command: row.command,
+				reason,
+				worktree: worktreePath,
+				killed,
+				error,
+				nowIso,
+			}),
+		);
+	}
+	appendLedger(records);
+
+	if (options.json) {
+		console.log(
+			JSON.stringify(
+				{
+					hook: "subagent-stop",
+					worktree: worktreePath,
+					dryRun: options.dryRun,
+					remove: [],
+					keep: [],
+					orphans: orphans.map(({ row, reason }) => ({
+						pid: row.pid,
+						ppid: row.ppid,
+						reason,
+						command: row.command,
+					})),
+					processTableRows: scan.table.length,
+				},
+				null,
+				2,
+			),
+		);
+	} else {
+		say(
+			`${options.dryRun ? "dry-run: " : ""}subagent-stop: ` +
+				`${orphans.length} orphan process(es) under ${worktreePath} ` +
+				`(worktrees are never removed here), ` +
+				`${scan.table.length} process rows, ${Date.now() - startedAt}ms`,
+		);
+	}
+}
+
 async function main(argv) {
 	const options = parseArgs(argv);
 	if (options.help) {
@@ -710,29 +972,63 @@ async function main(argv) {
 	if (options.errors.length > 0) return;
 
 	const startedAt = Date.now();
+	const nowIso = new Date().toISOString();
 	const say = (message) => {
 		if (!options.quiet && !options.json) console.log(`[hygiene] ${message}`);
 	};
-
-	let only = options.only;
-	let minAgeMs = options.minAgeMs;
-
-	if (options.hook === "subagent-stop") {
-		const derived = worktreePathFromHookPayload(readHookPayload(), REPO_ROOT);
-		if (derived && fs.existsSync(derived)) {
-			only = [derived];
-			minAgeMs = 0;
-		}
-		// No usable agent_id (or the derived tree is already gone): fall
-		// through to the default sweep rather than guessing.
-	} else if (options.hook === "session-start") {
-		readHookPayload();
-	}
-
+	const policy = resolveHookPolicy(options.hook);
 	const budgetMs =
 		options.budgetMs ??
 		(options.hook ? DEFAULT_HOOK_BUDGET_MS : DEFAULT_MANUAL_BUDGET_MS);
 	const budgetLeft = () => Math.max(0, budgetMs - (Date.now() - startedAt));
+
+	if (policy.scopedToAgentTree) {
+		const worktreesBase =
+			mainCheckoutRoot(
+				Math.min(
+					DEFAULT_GIT_TIMEOUT_MS,
+					Math.max(MIN_GIT_TIMEOUT_MS, budgetLeft()),
+				),
+			) ?? REPO_ROOT;
+		const derived = worktreePathFromHookPayload(
+			readHookPayload(),
+			worktreesBase,
+		);
+		if (!derived || !fs.existsSync(derived)) {
+			// Deliberately does NOT fall back to the ordinary sweep: this hook
+			// has a mandate over exactly one agent's tree, and with no usable
+			// agent_id it has no mandate at all.
+			console.error(
+				"[hygiene] subagent-stop: no usable agent_id on stdin; nothing to do",
+			);
+			return;
+		}
+		await runScopedOrphanSweep({
+			options,
+			worktreePath: derived,
+			budgetMs,
+			budgetLeft,
+			say,
+			startedAt,
+			nowIso,
+		});
+		return;
+	}
+
+	if (options.hook === "session-start") {
+		readHookPayload();
+		if (options.only) {
+			console.error(
+				"[hygiene] session-start: ignoring --only; the session sweep never " +
+					"narrows to a single tree",
+			);
+		}
+	}
+	// `--only` belongs to a human at a terminal. The session sweep runs the
+	// ordinary rails over every tree (review S1).
+	const only = options.hook === "session-start" ? null : options.only;
+	const minAgeMs = options.minAgeMs;
+
 	// Every git call is bounded by whatever is LEFT of the sweep's budget, not
 	// by a fixed constant: the budget is only enforceable if no single call can
 	// outlast it (a `git status` on this box hit 100s+ under five-agent load).
@@ -758,8 +1054,8 @@ async function main(argv) {
 	const listed = parseWorktreeList(porcelain);
 	const nowMs = Date.now();
 
-	// Trees named by --only are inspected FIRST, so a SubagentStop hook never
-	// loses its 2s budget to unrelated siblings (orderBySelection, tested).
+	// Trees named by --only are inspected FIRST, so a narrowed manual run never
+	// loses its budget to unrelated siblings (orderBySelection, tested).
 	const ordered = orderBySelection(listed, only);
 
 	let evaluated = 0;
@@ -804,64 +1100,64 @@ async function main(argv) {
 		minAgeMs,
 		only,
 		// Both spellings of "where this sweep lives": its own file, and the
-		// directory it was invoked from. Either may sit in a worktree.
+		// directory it was invoked from. planWorktreePrune maps each to the
+		// agent worktree that CONTAINS it (review S4) — neither is ever a
+		// worktree root, so equality never fired.
 		selfPath: [SCRIPT_DIR, process.cwd()],
 		isPidAlive,
 	});
 
-	const wantProcessScan = plan.remove.length > 0 || options.orphanSweep;
-	// Skipping loudly beats scanning with a stub timeout: an empty process
-	// table silently disables BOTH the orphan sweep and the
-	// kill-what-holds-the-tree step, and a silent no-op is the failure mode
-	// this repo's defect catalog keeps flagging.
-	const scanBudgetMs = Math.min(DEFAULT_SCAN_TIMEOUT_MS, budgetLeft());
-	const scanSkipped = wantProcessScan && scanBudgetMs < MIN_SCAN_BUDGET_MS;
-	const table =
-		wantProcessScan && !scanSkipped
-			? enrichCwd(await snapshotProcesses(scanBudgetMs))
-			: [];
-	/** @type {string[]} */
-	const degradations = [];
-	if (scanSkipped) {
-		console.error(
-			`[hygiene] process scan skipped: only ${budgetLeft()}ms of the ` +
-				`${budgetMs}ms budget left (needs ${MIN_SCAN_BUDGET_MS}ms); ` +
-				`no orphan sweep this run`,
-		);
-		degradations.push(
-			formatScanRecord({
-				reason: "skipped",
-				budgetMs,
-				remainingMs: budgetLeft(),
-				rows: 0,
-			}),
-		);
-	} else if (wantProcessScan && table.length === 0) {
-		console.error(
-			`[hygiene] process scan returned no rows within ${scanBudgetMs}ms; ` +
-				`no orphan sweep this run`,
-		);
-		degradations.push(
-			formatScanRecord({
-				reason: "empty",
-				budgetMs,
-				remainingMs: scanBudgetMs,
-				rows: 0,
-			}),
-		);
-	}
+	// At most one removal per SessionStart run: `git worktree remove` is
+	// bounded at REMOVE_TIMEOUT_MS and a SIGKILLed removal leaves a
+	// half-removed tree, so the hook's timeout has to cover the removal it
+	// starts (review S8). A manual run is uncapped.
+	const removals = policy.removeWorktrees
+		? capRemovals(plan.remove, policy.maxRemovals)
+		: [];
+	const removalKeys = new Set(removals.map((removal) => removal.path));
+	const deferred = plan.remove.filter(
+		(removal) => !removalKeys.has(removal.path),
+	);
+
+	const wantProcessScan =
+		removals.length > 0 || (options.orphanSweep && policy.orphanSweep);
+	const scan = wantProcessScan
+		? await readProcessTable({ budgetMs, budgetLeft })
+		: { table: [], listingOk: false, scanBudgetMs: 0, records: [] };
+	const degradations = [...scan.records];
+	const table = scan.table;
+
 	const protectedPids = collectAncestorPids(table, process.pid);
 	protectedPids.add(process.pid);
 
-	const orphans = options.orphanSweep
-		? selectOrphanFixtureProcesses(table, {
-				selfPid: process.pid,
-				protectedPids,
-			})
-		: [];
+	const orphanPlan =
+		options.orphanSweep && policy.orphanSweep
+			? planOrphanSweep({
+					rows: table,
+					selfPid: process.pid,
+					protectedPids,
+					listingOk: scan.listingOk,
+					isPidAlive,
+				})
+			: { orphans: [], degraded: null };
+	const orphans = orphanPlan.orphans;
+	if (orphanPlan.degraded && orphanPlan.degraded.reason !== "listing-failed") {
+		console.error(
+			`[hygiene] process snapshot could not be verified ` +
+				`(${orphanPlan.degraded.reason}); no orphan sweep this run`,
+		);
+		degradations.push(
+			formatScanRecord({
+				reason: orphanPlan.degraded.reason,
+				budgetMs,
+				remainingMs: scan.scanBudgetMs,
+				rows: table.length,
+			}),
+		);
+	}
 
 	const perTreeProcesses = new Map();
-	for (const removal of plan.remove) {
+	for (const removal of removals) {
 		perTreeProcesses.set(
 			removal.path,
 			selectProcessesUnderPath(table, removal.path, { protectedPids }),
@@ -875,12 +1171,13 @@ async function main(argv) {
 					dryRun: options.dryRun,
 					minAgeMs,
 					only,
-					remove: plan.remove.map((removal) => ({
+					remove: removals.map((removal) => ({
 						...removal,
 						processes: (perTreeProcesses.get(removal.path) ?? []).map(
 							(row) => ({ pid: row.pid, command: row.command }),
 						),
 					})),
+					deferred: deferred.map((removal) => removal.path),
 					keep: plan.keep,
 					orphans: orphans.map(({ row, reason }) => ({
 						pid: row.pid,
@@ -901,7 +1198,13 @@ async function main(argv) {
 				`keep    ${entry.path}  (${entry.reason}${entry.detail ? `: ${entry.detail}` : ""})`,
 			);
 		}
-		for (const removal of plan.remove) {
+		for (const removal of deferred) {
+			say(
+				`defer   ${removal.path}  (removal cap ${policy.maxRemovals} per run; ` +
+					`the next sweep takes it)`,
+			);
+		}
+		for (const removal of removals) {
 			const procs = perTreeProcesses.get(removal.path) ?? [];
 			say(
 				`${options.dryRun ? "WOULD REMOVE" : "remove "} ${removal.path}` +
@@ -918,10 +1221,11 @@ async function main(argv) {
 	}
 
 	const records = [...degradations];
-	const nowIso = new Date().toISOString();
+	/** Full refs of the worktrees this run actually removed (review S10). */
+	const removedBranchRefs = [];
 
 	if (!options.dryRun) {
-		for (const removal of plan.remove) {
+		for (const removal of removals) {
 			for (const row of perTreeProcesses.get(removal.path) ?? []) {
 				const { killed, error } = await terminatePid(row.pid);
 				records.push(
@@ -943,7 +1247,8 @@ async function main(argv) {
 			// Deliberately NOT budget-bound: this is the actual work, and
 			// SIGKILLing git partway through a recursive delete leaves a
 			// half-removed worktree plus a stale admin directory. The sweep's
-			// budget gates whether removal STARTS, never whether it finishes.
+			// budget gates whether removal STARTS, never whether it finishes —
+			// and the hook timeout is sized to cover one of these (review S8).
 			const removed = git(
 				["worktree", "remove", "--force", "--force", removal.path],
 				REPO_ROOT,
@@ -951,6 +1256,8 @@ async function main(argv) {
 			);
 			if (removed === null) {
 				console.error(`[hygiene] could not remove ${removal.path}`);
+			} else if (removal.branch) {
+				removedBranchRefs.push(removal.branch);
 			}
 			records.push(
 				formatWorktreeRecord({
@@ -963,7 +1270,7 @@ async function main(argv) {
 				}),
 			);
 		}
-		if (plan.remove.length > 0)
+		if (removals.length > 0)
 			git(["worktree", "prune"], REPO_ROOT, REMOVE_TIMEOUT_MS);
 
 		for (const { row, reason } of orphans) {
@@ -981,10 +1288,15 @@ async function main(argv) {
 			);
 		}
 
-		const deleted = deleteStaleBranches(gitBudget);
-		for (const branch of deleted) say(`deleted branch ${branch}`);
+		// Only after a removal, and only for the branch that removal orphaned
+		// (review S10). A sweep that removed nothing deletes nothing.
+		if (policy.deleteBranches && removedBranchRefs.length > 0) {
+			for (const branch of deleteStaleBranches(gitBudget, removedBranchRefs)) {
+				say(`deleted branch ${branch}`);
+			}
+		}
 	} else {
-		for (const removal of plan.remove) {
+		for (const removal of removals) {
 			for (const row of perTreeProcesses.get(removal.path) ?? []) {
 				records.push(
 					formatKillRecord({
@@ -1024,8 +1336,9 @@ async function main(argv) {
 
 	if (!options.json) {
 		say(
-			`${options.dryRun ? "dry-run: " : ""}${plan.remove.length} worktree(s), ` +
+			`${options.dryRun ? "dry-run: " : ""}${removals.length} worktree(s), ` +
 				`${orphans.length} orphan process(es)` +
+				`${deferred.length > 0 ? `, ${deferred.length} deferred to the next sweep` : ""}` +
 				`${skippedForBudget > 0 ? `, ${skippedForBudget} not evaluated (budget ${budgetMs}ms)` : ""}` +
 				`, ${table.length} process rows, ${Date.now() - startedAt}ms`,
 		);
@@ -1033,12 +1346,17 @@ async function main(argv) {
 }
 
 /**
- * Delete agent-session branches left behind by removed worktrees. Runs after
- * removal so `checkedOut` reflects the post-removal reality.
+ * Delete the agent-session branches left behind by the worktrees this run
+ * just removed. Runs after removal so `checkedOut` reflects the post-removal
+ * reality, and is never called with an empty `removedBranchRefs` — the whole
+ * candidate set is scoped to those refs (review S10), so a sweep can no
+ * longer reach a live agent's branch just because its shape matches.
  *
+ * @param {() => number} gitBudget
+ * @param {string[]} removedBranchRefs
  * @returns {string[]}
  */
-function deleteStaleBranches(gitBudget) {
+function deleteStaleBranches(gitBudget, removedBranchRefs) {
 	const out = git(
 		[
 			"for-each-ref",
@@ -1057,15 +1375,19 @@ function deleteStaleBranches(gitBudget) {
 			.filter(Boolean)
 			.map((ref) => String(ref).replace(/^refs\/heads\//, "")),
 	);
-	// Two passes on purpose: the cheap shape/upstream/checked-out filter first
-	// (one for-each-ref line each, no subprocess), then the containment query
-	// ONLY for survivors. A repo with dozens of local branches would otherwise
-	// pay a revwalk per branch to answer a question that is already "no".
+	const wanted = new Set(
+		removedBranchRefs
+			.filter((ref) => typeof ref === "string" && ref !== "")
+			.map((ref) => ref.replace(/^refs\/heads\//, "")),
+	);
+	// Three passes on purpose: scope to the branches this run orphaned, then
+	// the cheap shape/upstream/checked-out filter (one for-each-ref line each,
+	// no subprocess), then the containment revwalk ONLY for survivors.
 	const candidates = [];
 	for (const line of out.split(/\r?\n/)) {
 		if (!line.trim()) continue;
 		const [name, upstream, track] = line.split("\t");
-		if (!name) continue;
+		if (!name || !wanted.has(name)) continue;
 		const branch = {
 			name,
 			hasUpstream: Boolean(upstream),
@@ -1079,7 +1401,7 @@ function deleteStaleBranches(gitBudget) {
 		containedInOrigin: isContainedInOrigin(branch.name, REPO_ROOT, gitBudget()),
 	}));
 	const deleted = [];
-	for (const name of selectStaleBranches(branches)) {
+	for (const name of planBranchDeletions({ branches, removedBranchRefs })) {
 		if (git(["branch", "-D", name], REPO_ROOT, gitBudget()) !== null) {
 			deleted.push(name);
 		}

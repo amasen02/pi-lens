@@ -7,7 +7,7 @@
 					{
 						"type": "command",
 						"command": "node scripts/prune-agent-worktrees.mjs --hook session-start --quiet",
-						"timeout": 15
+						"timeout": 90
 					}
 				]
 			}

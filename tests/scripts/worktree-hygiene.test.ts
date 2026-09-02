@@ -19,7 +19,9 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+	capRemovals,
 	collectAncestorPids,
+	enclosingAgentWorktree,
 	formatKillRecord,
 	formatScanRecord,
 	formatWorktreeRecord,
@@ -30,12 +32,15 @@ import {
 	parseDuration,
 	parseLockPid,
 	parseWorktreeList,
+	planBranchDeletions,
+	planOrphanSweep,
 	planWorktreePrune,
 	pruneLogLines,
 	selectOrphanFixtureProcesses,
 	selectProcessesUnderPath,
 	selectStaleBranches,
 	toComparablePath,
+	verifySnapshotIntegrity,
 	MAX_RECORDED_COMMAND_CHARS,
 } from "../../scripts/lib/worktree-hygiene.mjs";
 
@@ -728,5 +733,326 @@ describe("toComparablePath", () => {
 		// path.resolve("") is the cwd — an empty key must never become a
 		// needle that matches every process on the box.
 		expect(toComparablePath("")).toBe("");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// PR #2438 review round 1 (S4, S5, S7, S8, S10)
+// ---------------------------------------------------------------------------
+
+describe("enclosingAgentWorktree (review S4)", () => {
+	it("maps a subdirectory of an agent worktree to the worktree root", () => {
+		expect(enclosingAgentWorktree(`${wt("agent-abc")}/tests`)).toBe(
+			toComparablePath(wt("agent-abc")),
+		);
+	});
+
+	it("maps the worktree root to itself", () => {
+		expect(enclosingAgentWorktree(wt("agent-abc"))).toBe(
+			toComparablePath(wt("agent-abc")),
+		);
+	});
+
+	it("maps a deeply nested path to the worktree root", () => {
+		expect(enclosingAgentWorktree(`${wt("agent-abc")}/a/b/c/d.ts`)).toBe(
+			toComparablePath(wt("agent-abc")),
+		);
+	});
+
+	it("returns null for a path outside every agent worktree", () => {
+		expect(enclosingAgentWorktree(`${ROOT}/scripts`)).toBeNull();
+		expect(enclosingAgentWorktree(ROOT)).toBeNull();
+	});
+
+	it("does not fold a sibling whose name merely extends another's", () => {
+		expect(enclosingAgentWorktree(`${wt("agent-abc2")}/x`)).toBe(
+			toComparablePath(wt("agent-abc2")),
+		);
+	});
+});
+
+describe("planWorktreePrune — the self rail is containment, not equality (review S4)", () => {
+	it("keeps the tree the sweep's cwd is nested inside", () => {
+		// The real caller passes [SCRIPT_DIR, process.cwd()]. SCRIPT_DIR is
+		// `<worktree>/scripts` and cwd is wherever the agent invoked from —
+		// neither is ever exactly the worktree root, so exact equality left the
+		// sweep able to delete the tree it was running in.
+		const plan = planWorktreePrune({
+			worktrees: [candidate({ mtimeMs: OLD })],
+			nowMs: NOW,
+			selfPath: [`${wt("agent-aaa")}/scripts`, `${wt("agent-aaa")}/tests`],
+		});
+		expect(plan.remove).toEqual([]);
+		expect(plan.keep[0]).toMatchObject({
+			path: wt("agent-aaa"),
+			reason: "self",
+		});
+	});
+
+	it("still removes a tree when the sweep lives outside every worktree", () => {
+		const plan = planWorktreePrune({
+			worktrees: [candidate({ mtimeMs: OLD })],
+			nowMs: NOW,
+			selfPath: [`${ROOT}/scripts`, ROOT],
+		});
+		expect(plan.remove.map((r) => r.path)).toEqual([wt("agent-aaa")]);
+	});
+});
+
+describe("selectProcessesUnderPath — a structural signal, never a mention (review S7)", () => {
+	const target = wt("agent-abc");
+	const select = (command: string, cwd?: string) =>
+		selectProcessesUnderPath([{ pid: 42, ppid: 1, command, cwd }], target);
+
+	it("keeps a search tool listing files under the worktree", () => {
+		expect(select(`rg --files ${target}`)).toEqual([]);
+	});
+
+	it("keeps an editor holding a file inside the worktree", () => {
+		expect(
+			select(
+				`"C:/Program Files/Microsoft VS Code/Code.exe" ${target}/README.md`,
+			),
+		).toEqual([]);
+	});
+
+	it("keeps a PowerShell process listing the worktree", () => {
+		expect(
+			select(
+				`powershell.exe -NoProfile -Command "Get-ChildItem ${target} -Recurse"`,
+			),
+		).toEqual([]);
+	});
+
+	it("keeps a sibling-prefix worktree's own script", () => {
+		expect(select(`node ${target}EXTRA/scripts/x.mjs`)).toEqual([]);
+	});
+
+	it("keeps a node -e supervisor that merely names the worktree", () => {
+		expect(select(`node -e "spawn('${target}/x.mjs')"`)).toEqual([]);
+	});
+
+	it("selects a runtime running a script inside the worktree", () => {
+		expect(select(`node ${target}/scripts/x.mjs`).map((r) => r.pid)).toEqual([
+			42,
+		]);
+	});
+
+	it("selects a binary that lives inside the worktree", () => {
+		expect(
+			select(`${target}/node_modules/.bin/vitest --run`).map((r) => r.pid),
+		).toEqual([42]);
+	});
+
+	it("selects a process whose cwd is inside the worktree", () => {
+		expect(
+			select("node elsewhere.mjs", `${target}/clients`).map((r) => r.pid),
+		).toEqual([42]);
+	});
+});
+
+describe("verifySnapshotIntegrity / planOrphanSweep (review S5)", () => {
+	const fixtureCommand = "node /repo/tests/fixtures/fake-lsp-server.mjs";
+	const intact = [
+		{ pid: 1, ppid: 0, command: "init" },
+		{ pid: 10, ppid: 1, command: "claude" },
+		{ pid: 20, ppid: 10, command: "node hook" },
+		{ pid: 30, ppid: 99, command: fixtureCommand },
+	];
+
+	it("accepts a table containing this process and its whole ancestor chain", () => {
+		expect(verifySnapshotIntegrity(intact, 20)).toEqual({
+			ok: true,
+			reason: null,
+		});
+	});
+
+	it("rejects a table that does not contain this process at all", () => {
+		expect(verifySnapshotIntegrity(intact, 12345)).toEqual({
+			ok: false,
+			reason: "self-missing",
+		});
+	});
+
+	it("rejects a truncated table missing an ancestor", () => {
+		const truncated = intact.filter((row) => row.pid !== 10);
+		expect(verifySnapshotIntegrity(truncated, 20)).toEqual({
+			ok: false,
+			reason: "chain-incomplete",
+		});
+	});
+
+	it("rejects an empty table", () => {
+		expect(verifySnapshotIntegrity([], 20).ok).toBe(false);
+	});
+
+	it("kills nothing and records a degradation for a truncated table", () => {
+		// The orphan predicate reads "parent absent from the snapshot" as
+		// "parent has exited". On a TRUNCATED listing that reads every live
+		// helper as an orphan — the predicate fails OPEN — so an unverifiable
+		// snapshot must disable the sweep, loudly.
+		const truncated = intact.filter((row) => row.pid !== 10);
+		const plan = planOrphanSweep({ rows: truncated, selfPid: 20 });
+		expect(plan.orphans).toEqual([]);
+		expect(plan.degraded).toEqual({ reason: "chain-incomplete" });
+	});
+
+	it("kills nothing and records a degradation when the listing itself failed", () => {
+		const plan = planOrphanSweep({
+			rows: intact,
+			selfPid: 20,
+			listingOk: false,
+		});
+		expect(plan.orphans).toEqual([]);
+		expect(plan.degraded).toEqual({ reason: "listing-failed" });
+	});
+
+	it("sweeps orphans when the snapshot verifies", () => {
+		const plan = planOrphanSweep({ rows: intact, selfPid: 20 });
+		expect(plan.orphans.map((o) => o.row.pid)).toEqual([30]);
+		expect(plan.degraded).toBeNull();
+	});
+
+	it("restricts the sweep to one agent's tree when asked", () => {
+		const tree = wt("agent-abc");
+		const rows = [
+			...intact,
+			{
+				pid: 40,
+				ppid: 98,
+				command: `node ${tree}/tests/fixtures/fake-lsp-server.mjs`,
+			},
+		];
+		const plan = planOrphanSweep({ rows, selfPid: 20, restrictToPath: tree });
+		expect(plan.orphans.map((o) => o.row.pid)).toEqual([40]);
+		expect(plan.degraded).toBeNull();
+	});
+});
+
+describe("capRemovals (review S8)", () => {
+	const row = (name: string, ageMs: number) => ({
+		path: wt(name),
+		branch: null,
+		ageMs,
+		locked: false,
+		selected: false,
+	});
+	const rows = [
+		row("agent-a", 1000),
+		row("agent-b", 9000),
+		row("agent-c", 5000),
+	];
+
+	it("keeps only the oldest eligible tree when capped at one", () => {
+		expect(capRemovals(rows, 1).map((r) => r.path)).toEqual([wt("agent-b")]);
+	});
+
+	it("returns every removal when there is no cap", () => {
+		expect(capRemovals(rows, null)).toHaveLength(3);
+	});
+
+	it("does not mutate the caller's array", () => {
+		const before = rows.map((r) => r.path);
+		capRemovals(rows, 1);
+		expect(rows.map((r) => r.path)).toEqual(before);
+	});
+});
+
+describe("planBranchDeletions (review S10)", () => {
+	const base = {
+		containedInOrigin: true,
+		hasUpstream: true,
+		upstreamGone: true,
+		checkedOut: false,
+	};
+	const branches = [
+		{ ...base, name: "pr-2433" },
+		{ ...base, name: "pr-2438" },
+		{ ...base, name: "review/2401" },
+	];
+
+	it("deletes nothing when no worktree was removed", () => {
+		expect(planBranchDeletions({ branches, removedBranchRefs: [] })).toEqual(
+			[],
+		);
+	});
+
+	it("deletes only the branch whose worktree was just removed", () => {
+		expect(
+			planBranchDeletions({
+				branches,
+				removedBranchRefs: ["refs/heads/pr-2433"],
+			}),
+		).toEqual(["pr-2433"]);
+	});
+
+	it("still refuses a branch whose head is not contained in origin", () => {
+		expect(
+			planBranchDeletions({
+				branches: [{ ...base, name: "pr-2433", containedInOrigin: false }],
+				removedBranchRefs: ["refs/heads/pr-2433"],
+			}),
+		).toEqual([]);
+	});
+
+	it("ignores a null branch ref left by a detached worktree", () => {
+		expect(
+			planBranchDeletions({ branches, removedBranchRefs: [null] }),
+		).toEqual([]);
+	});
+});
+
+describe("snapshot integrity — stale ppid vs truncated listing (review S5)", () => {
+	// Measured on the #2435 box: the sweep's own chain is node -> bash -> bash
+	// -> bash -> claude -> powershell -> WindowsTerminal -> pid 3156, and 3156
+	// had genuinely exited (458-row listing, exit 0, kill(3156,0) => ESRCH).
+	// Windows keeps a recorded parent pid after the parent dies, so refusing on
+	// "ancestor absent" alone disables the orphan sweep on every Windows box —
+	// #2435 AC 2 itself. Liveness is the discriminator.
+	const chain = [
+		{ pid: 3000, ppid: 2000, command: "terminal" },
+		{ pid: 4000, ppid: 3000, command: "claude" },
+		{ pid: 5000, ppid: 4000, command: "node sweep" },
+	];
+	const fixture = {
+		pid: 6000,
+		ppid: 5900,
+		command: "node /repo/tests/fixtures/fake-lsp-server.mjs",
+	};
+	const rows = [...chain, fixture];
+
+	it("accepts a chain whose missing ancestor has genuinely exited", () => {
+		expect(
+			verifySnapshotIntegrity(rows, 5000, { isPidAlive: () => false }),
+		).toEqual({ ok: true, reason: null });
+	});
+
+	it("still refuses when the missing ancestor is alive — rows are missing", () => {
+		expect(
+			verifySnapshotIntegrity(rows, 5000, {
+				isPidAlive: (pid) => pid === 2000,
+			}),
+		).toEqual({ ok: false, reason: "chain-incomplete" });
+	});
+
+	it("keeps a helper whose parent is absent from the table but still alive", () => {
+		// The truncated-listing case at the level that matters: the predicate
+		// must not read "absent" as "dead" when the box says otherwise.
+		const plan = planOrphanSweep({
+			rows,
+			selfPid: 5000,
+			isPidAlive: (pid) => pid === 5900,
+		});
+		expect(plan.orphans).toEqual([]);
+		expect(plan.degraded).toBeNull();
+	});
+
+	it("reaps a helper whose parent is absent and confirmed gone", () => {
+		const plan = planOrphanSweep({
+			rows,
+			selfPid: 5000,
+			isPidAlive: () => false,
+		});
+		expect(plan.orphans.map((o) => o.row.pid)).toEqual([6000]);
 	});
 });

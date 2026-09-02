@@ -27,6 +27,18 @@ export interface PruneCliOptions {
 
 export function parseArgs(argv: string[]): PruneCliOptions;
 
+export interface HookPolicy {
+	removeWorktrees: boolean;
+	deleteBranches: boolean;
+	orphanSweep: boolean;
+	scopedToAgentTree: boolean;
+	maxRemovals: number | null;
+}
+
+export const HOOK_POLICIES: Readonly<Record<string, HookPolicy>>;
+
+export function resolveHookPolicy(hook: string | null | undefined): HookPolicy;
+
 export function worktreePathFromHookPayload(
 	payload: unknown,
 	repoRoot: string,

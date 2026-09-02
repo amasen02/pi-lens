@@ -106,6 +106,51 @@ export function parseWrapperArgs(argv) {
 	return result;
 }
 
+/**
+ * Tokens that look like a test PATH or glob rather than a flag, a flag's
+ * value, or a subcommand.
+ */
+const PATH_SHAPED = /[/\\*]|\.[cm]?[jt]sx?$/;
+
+/**
+ * True when a `--shared` invocation names no test files — i.e. it is a FULL
+ * suite run wearing a shared slot.
+ *
+ * PR #2438 review S11: `npm run test:targeted` with no arguments expands to
+ * `with-test-lock.mjs --shared -- vitest run`, which collects the entire
+ * suite while holding one of N *concurrent* slots. Several of those can run
+ * at once — precisely the contention #1101's exclusive lock exists to
+ * prevent, reached through the mechanism added to relieve it. A shared slot
+ * is for a batch of named files; a full run takes the exclusive lock.
+ *
+ * A name filter (`-t <pattern>`) still collects the whole suite, so it does
+ * NOT satisfy the requirement: only a path- or glob-shaped positional does.
+ * The check is deliberately conservative — it blocks, so it must be wrong
+ * only in the direction of asking for an explicit path.
+ *
+ * @param {string[]} commandArgs Everything after `--` (argv[0] is the binary).
+ * @returns {boolean}
+ */
+export function sharedModeRequiresPaths(commandArgs) {
+	const args = (commandArgs ?? []).slice(1);
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i];
+		if (typeof arg !== "string" || arg.startsWith("-")) continue;
+		// A bare value directly after a bare flag (`-t name`, `--project x`) is
+		// that flag's argument, not a path.
+		const previous = args[i - 1];
+		if (
+			typeof previous === "string" &&
+			previous.startsWith("-") &&
+			!previous.includes("=")
+		) {
+			continue;
+		}
+		if (PATH_SHAPED.test(arg)) return false;
+	}
+	return true;
+}
+
 // Resolve vitest's own JS entry point (its package.json `bin` field) so it
 // can be launched via `node <entry> <args>` — a plain argv array, `shell:
 // false`, no cmd.exe/sh in the loop at all, identical on every OS. This is
@@ -229,6 +274,15 @@ async function main() {
 	if (errors.length > 0 || commandArgs.length === 0) {
 		console.error(
 			"Usage: node scripts/with-test-lock.mjs [--shared[=N]] -- <command> [args...]",
+		);
+		process.exitCode = 2;
+		return;
+	}
+
+	if (shared && sharedModeRequiresPaths(commandArgs)) {
+		console.error(
+			"[with-test-lock] --shared requires at least one test path or glob. " +
+				"A full-suite run must take the EXCLUSIVE lock: use `npm test`.",
 		);
 		process.exitCode = 2;
 		return;

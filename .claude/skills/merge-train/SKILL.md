@@ -18,6 +18,11 @@ reviewed, zero unreviewed merges). Apply it to each PR in the queue.
    `pi-lens-fixer` on the branch with the findings inlined. Reviewer
    worktrees may be pruned after their report; **fixer worktrees stay until
    the PR merges** (pruning breaks resume).
+   The hygiene sweep (#2435) respects this: `SubagentStop` never removes a
+   worktree. Fixer and reviewer trees are reaped by the `SessionStart` sweep
+   once they have been idle ≥30m and are clean and pushed — by which point a
+   resume is no longer live, and a fresh fixer simply checks the branch out
+   again for the next fix round.
 3. **Verify.** The SAME reviewer verifies each fix round with its own probes.
    Do not take the fixer's word; do not swap reviewers mid-PR.
 4. **Merge gate.** Merge only when: verdict is merge-ready; Unit tests and

@@ -16,9 +16,11 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
 	DEFAULT_HOOK_BUDGET_MS,
 	DEFAULT_MANUAL_BUDGET_MS,
+	REMOVE_TIMEOUT_MS,
 	getHygieneLogPath,
 	parseArgs,
 	parseProcessTable,
+	resolveHookPolicy,
 	worktreePathFromHookPayload,
 } from "../../scripts/prune-agent-worktrees.mjs";
 import { DEFAULT_MIN_AGE_MS } from "../../scripts/lib/worktree-hygiene.mjs";
@@ -210,6 +212,76 @@ describe("getHygieneLogPath", () => {
 		process.env.PILENS_DATA_DIR = path.join(os.tmpdir(), "data-should-win");
 		expect(getHygieneLogPath()).toBe(
 			path.join(os.tmpdir(), "data-should-win", "hygiene.log"),
+		);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// PR #2438 review round 1 (S1, S8, S9)
+// ---------------------------------------------------------------------------
+
+describe("resolveHookPolicy (review S1/S8)", () => {
+	it("never removes a worktree on SubagentStop", () => {
+		// Resume-by-SendMessage happens AFTER SubagentStop, and
+		// .claude/skills/merge-train/SKILL.md keeps fixer worktrees until the
+		// PR merges. So the subagent-stop hook only reaps that agent's own
+		// dead-parent fixture helpers; removal is the session-start sweep's job.
+		expect(resolveHookPolicy("subagent-stop")).toMatchObject({
+			removeWorktrees: false,
+			deleteBranches: false,
+			orphanSweep: true,
+			scopedToAgentTree: true,
+			maxRemovals: 0,
+		});
+	});
+
+	it("removes at most one tree per SessionStart run", () => {
+		// The hook has a hard wall-clock timeout and `git worktree remove` is
+		// bounded at REMOVE_TIMEOUT_MS; more than one removal per run cannot fit
+		// inside any sane hook timeout, and a SIGKILLed removal leaves a
+		// half-removed tree.
+		expect(resolveHookPolicy("session-start")).toMatchObject({
+			removeWorktrees: true,
+			deleteBranches: true,
+			scopedToAgentTree: false,
+			maxRemovals: 1,
+		});
+	});
+
+	it("leaves a manual run uncapped", () => {
+		expect(resolveHookPolicy(null)).toMatchObject({
+			removeWorktrees: true,
+			deleteBranches: true,
+			scopedToAgentTree: false,
+			maxRemovals: null,
+		});
+	});
+
+	it("treats an unknown event as a manual run rather than a destructive one", () => {
+		expect(resolveHookPolicy("who-knows")).toEqual(resolveHookPolicy(null));
+	});
+});
+
+describe(".claude/settings.json hook registration (review S8/S9)", () => {
+	const settingsPath = path.resolve(__dirname, "../../.claude/settings.json");
+	const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+
+	it("tracks hooks only — permissions stay in the ignored settings.local.json", () => {
+		// The maintainer's own .claude/settings.json holds a permissions.allow
+		// list. Tracking anything but hooks here would collide with it on merge.
+		expect(Object.keys(settings).sort()).toEqual(["$schema", "hooks"]);
+	});
+
+	it("gives SessionStart room to finish one bounded worktree removal", () => {
+		const timeoutS = settings.hooks.SessionStart[0].hooks[0].timeout;
+		expect(timeoutS * 1000).toBeGreaterThanOrEqual(REMOVE_TIMEOUT_MS + 10_000);
+	});
+
+	it("keeps SubagentStop short, because it never removes a tree", () => {
+		const timeoutS = settings.hooks.SubagentStop[0].hooks[0].timeout;
+		expect(timeoutS).toBeLessThanOrEqual(15);
+		expect(settings.hooks.SubagentStop[0].hooks[0].command).toContain(
+			"--hook subagent-stop",
 		);
 	});
 });

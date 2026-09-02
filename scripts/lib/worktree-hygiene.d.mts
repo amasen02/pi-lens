@@ -59,6 +59,7 @@ export interface ProcRow {
 export function toComparablePath(p: string): string;
 export function toComparableText(text: string): string;
 export function isAgentWorktreePath(p: string): boolean;
+export function enclosingAgentWorktree(p: string): string | null;
 export function parseWorktreeList(porcelain: string): WorktreeListRow[];
 export function parseLockPid(
 	lockedReason: string | null | undefined,
@@ -94,8 +95,48 @@ export function selectProcessesUnderPath(
 
 export function selectOrphanFixtureProcesses(
 	rows: ProcRow[],
-	options?: { selfPid?: number; protectedPids?: Set<number> },
+	options?: {
+		selfPid?: number;
+		protectedPids?: Set<number>;
+		isPidAlive?: (pid: number) => boolean;
+	},
 ): { row: ProcRow; reason: string }[];
+
+export function commandExecutionPaths(command: string): string[];
+
+export function verifySnapshotIntegrity(
+	rows: ProcRow[],
+	selfPid: number,
+	options?: { isPidAlive?: (pid: number) => boolean },
+): { ok: boolean; reason: string | null };
+
+export function planOrphanSweep(options: {
+	rows: ProcRow[];
+	selfPid: number;
+	protectedPids?: Set<number>;
+	restrictToPath?: string | null;
+	listingOk?: boolean;
+	isPidAlive?: (pid: number) => boolean;
+}): {
+	orphans: { row: ProcRow; reason: string }[];
+	degraded: { reason: string } | null;
+};
+
+export function capRemovals<T extends { ageMs: number }>(
+	removals: T[],
+	max: number | null | undefined,
+): T[];
+
+export function planBranchDeletions(options: {
+	branches: {
+		name: string;
+		containedInOrigin: boolean;
+		hasUpstream: boolean;
+		upstreamGone: boolean;
+		checkedOut: boolean;
+	}[];
+	removedBranchRefs: (string | null | undefined)[];
+}): string[];
 
 export const AGENT_BRANCH_SHAPES: RegExp[];
 
@@ -142,7 +183,12 @@ export function formatWorktreeRecord(input: {
 }): string;
 
 export function formatScanRecord(input: {
-	reason: "skipped" | "empty";
+	reason:
+		| "skipped"
+		| "empty"
+		| "listing-failed"
+		| "self-missing"
+		| "chain-incomplete";
 	budgetMs: number;
 	remainingMs?: number;
 	rows?: number;

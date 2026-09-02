@@ -76,15 +76,26 @@ export const FIXTURE_HELPER_MARKERS = [
  * is not under our control on any OS. Mirrors the read-guard path-key
  * invariant (one normalizer, never raw keys -- #210).
  *
+ * BOTH separators are folded, on BOTH platforms, and folded BEFORE
+ * `path.resolve` (PR #2438 review S6). Splitting on `path.sep` folded only
+ * the host's own separator, so on POSIX a Windows-spelled path kept its
+ * backslashes and compared unequal to the same path spelled with slashes --
+ * five CI failures on Linux that could not reproduce on the win32 box this
+ * was written on. Folding must precede `resolve` because `path.resolve` on
+ * POSIX treats `\tmp\x` as a RELATIVE path and prefixes the cwd; folding
+ * first makes it the absolute `/tmp/x` it means. The cost is that a POSIX
+ * filename containing a literal backslash is normalized as a separator --
+ * accepted deliberately: these keys are compared against process command
+ * lines, where the same fold already had to happen (toComparableText).
+ *
  * @param {string} p
  * @returns {string}
  */
 export function toComparablePath(p) {
 	if (typeof p !== "string" || p.length === 0) return "";
 	return path
-		.resolve(p)
-		.split(path.sep)
-		.join("/")
+		.resolve(p.replace(/\\/g, "/"))
+		.replace(/\\/g, "/")
 		.replace(/\/+$/, "")
 		.toLowerCase();
 }
@@ -110,6 +121,31 @@ export function toComparableText(text) {
  */
 export function isAgentWorktreePath(p) {
 	return toComparablePath(p).includes(AGENT_WORKTREE_SEGMENT);
+}
+
+/**
+ * The `.claude/worktrees/agent-<id>` directory that ENCLOSES `p`, as a
+ * comparable key, or null when `p` is not inside one.
+ *
+ * PR #2438 review S4: the self rail used to be exact equality against
+ * `[SCRIPT_DIR, process.cwd()]`. SCRIPT_DIR is `<worktree>/scripts` and cwd
+ * is wherever the agent happened to invoke from -- NEITHER is ever the
+ * worktree root, so the rail that stops the sweep deleting the tree it is
+ * running inside never fired at all. Containment is the correct test, and it
+ * is a prefix walk to the first separator AFTER the `agent-` segment so a
+ * sibling (`agent-abc2`) resolves to itself rather than to `agent-abc`.
+ *
+ * @param {string} p
+ * @returns {string|null}
+ */
+export function enclosingAgentWorktree(p) {
+	const key = toComparablePath(p);
+	if (!key) return null;
+	const at = key.indexOf(AGENT_WORKTREE_SEGMENT);
+	if (at === -1) return null;
+	const afterSegment = at + AGENT_WORKTREE_SEGMENT.length;
+	const nextSeparator = key.indexOf("/", afterSegment);
+	return nextSeparator === -1 ? key : key.slice(0, nextSeparator);
 }
 
 /**
@@ -244,9 +280,14 @@ export function planWorktreePrune({
 	isPidAlive = () => false,
 }) {
 	const selectedKeys = only ? new Set(only.map(toComparablePath)) : null;
+	// By CONTAINMENT, not equality (review S4): the caller's "where am I"
+	// paths are a `scripts/` directory and a cwd, never a worktree root.
+	// Anything outside every agent worktree falls back to its own key, which
+	// simply never matches an agent tree -- harmless, and it keeps a caller
+	// that already passes a root working.
 	const selfKeys = new Set(
 		(Array.isArray(selfPath) ? selfPath : selfPath ? [selfPath] : [])
-			.map(toComparablePath)
+			.map((entry) => enclosingAgentWorktree(entry) ?? toComparablePath(entry))
 			.filter(Boolean),
 	);
 	const remove = [];
@@ -341,25 +382,78 @@ const SCRIPT_RUNTIMES = new Set(["node", "bun", "deno", "npx", "tsx"]);
 const INLINE_CODE_FLAG_RE = /(?:^|\s)(?:-e|-p|--eval|--print)(?:\s|=|$)/;
 
 /**
- * The executable of a command line: the first token, honoring one level of
- * quoting (`"C:\Program Files\nodejs\node.exe" -e ...`), lowercased,
- * basename only, `.exe` stripped.
+ * Split a command line into argv-ish tokens, honoring one level of double
+ * quoting (`"C:\Program Files\nodejs\node.exe" -e ...`). Not a shell parser
+ * -- it only has to answer "which token is the executable, and which is the
+ * script it runs", which is all any caller here asks.
+ *
+ * @param {string} normalizedCommand Output of toComparableText.
+ * @returns {string[]}
+ */
+function tokenizeCommand(normalizedCommand) {
+	const tokens = [];
+	const pattern = /"([^"]*)"|(\S+)/g;
+	let match = pattern.exec(normalizedCommand);
+	while (match !== null) {
+		tokens.push(match[1] ?? match[2]);
+		match = pattern.exec(normalizedCommand);
+	}
+	return tokens;
+}
+
+/**
+ * The executable of a command line: the first token, lowercased, basename
+ * only, `.exe`/`.cmd`/`.bat` stripped.
  *
  * @param {string} normalizedCommand Output of toComparableText.
  * @returns {string}
  */
 function commandExecutable(normalizedCommand) {
-	const trimmed = normalizedCommand.trimStart();
-	let token;
-	if (trimmed.startsWith('"')) {
-		const close = trimmed.indexOf('"', 1);
-		token = close === -1 ? trimmed.slice(1) : trimmed.slice(1, close);
-	} else {
-		const space = trimmed.search(/\s/);
-		token = space === -1 ? trimmed : trimmed.slice(0, space);
-	}
+	const token = tokenizeCommand(normalizedCommand)[0] ?? "";
 	const base = token.split("/").pop() ?? "";
 	return base.replace(/\.(exe|cmd|bat)$/, "");
+}
+
+/** An already-normalized token that names an absolute path. */
+function isAbsoluteToken(token) {
+	return token.startsWith("/") || /^[a-z]:\//.test(token);
+}
+
+/**
+ * The paths this process is EXECUTING, as opposed to merely mentioning:
+ * its own executable, plus -- when that executable is a script runtime --
+ * the script it was handed. Nothing else.
+ *
+ * PR #2438 review S7. The previous rule was a bare `command.includes(needle)`,
+ * which authorizes a kill on any process that so much as NAMES the worktree:
+ * `rg --files <wt>`, an editor holding `<wt>/README.md`, a PowerShell
+ * `Get-ChildItem <wt>`, and -- worst -- a live sibling worktree
+ * `<wt>EXTRA/...`, whose path merely starts with the target's. Every one of
+ * those is a reader, not an occupant. Same defect shape as the fixture
+ * predicate two functions up (catalog: substring matching used to authorize
+ * a destructive action); the fix is the same, a positive structural signal.
+ *
+ * @param {string} command
+ * @returns {string[]} absolute, normalized path tokens
+ */
+export function commandExecutionPaths(command) {
+	const normalized = toComparableText(command);
+	if (!normalized) return [];
+	const tokens = tokenizeCommand(normalized);
+	if (tokens.length === 0) return [];
+	const paths = [];
+	if (isAbsoluteToken(tokens[0])) paths.push(tokens[0]);
+	// Only a script RUNTIME executes a path taken from its argument list. For
+	// anything else -- a search tool, an editor, a shell -- a path in argv is
+	// DATA being read, and killing on it reaps a reader of the tree.
+	if (
+		SCRIPT_RUNTIMES.has(commandExecutable(normalized)) &&
+		!INLINE_CODE_FLAG_RE.test(normalized)
+	) {
+		const script = tokens.slice(1).find((token) => !token.startsWith("-"));
+		if (script && isAbsoluteToken(script)) paths.push(script);
+	}
+	return paths;
 }
 
 /**
@@ -431,9 +525,21 @@ export function collectAncestorPids(rows, startPid) {
 const SELF_COMMAND_MARKER = "prune-agent-worktrees";
 
 /**
- * Processes whose command line or cwd is under `targetPath`. Used only for
- * worktrees the plan has ALREADY cleared for removal (clean + pushed +
- * eligible), so the directory is by construction not in active use.
+ * True iff an already-normalized absolute path key is at or under `needle`.
+ * Boundary-guarded, so `<needle>2` is never "under" `<needle>`.
+ */
+function isUnder(key, needle) {
+	return key === needle || key.startsWith(`${needle}/`);
+}
+
+/**
+ * Processes OCCUPYING `targetPath`: their cwd is inside it, or the thing
+ * they are executing lives inside it. Used only for worktrees the plan has
+ * ALREADY cleared for removal (clean + pushed + eligible).
+ *
+ * A mention of the path anywhere else on the command line is deliberately
+ * NOT a signal -- see commandExecutionPaths for the four live false
+ * positives that motivated it (review S7).
  *
  * @param {ProcRow[]} rows
  * @param {string} targetPath
@@ -450,9 +556,9 @@ export function selectProcessesUnderPath(rows, targetPath, options = {}) {
 		const command = toComparableText(row.command);
 		if (command.includes(SELF_COMMAND_MARKER)) return false;
 		const cwd = row.cwd ? toComparablePath(row.cwd) : "";
-		return (
-			(command !== "" && command.includes(needle)) ||
-			(cwd !== "" && (cwd === needle || cwd.startsWith(`${needle}/`)))
+		if (cwd !== "" && isUnder(cwd, needle)) return true;
+		return commandExecutionPaths(row.command).some((key) =>
+			isUnder(key, needle),
 		);
 	});
 }
@@ -460,14 +566,18 @@ export function selectProcessesUnderPath(rows, targetPath, options = {}) {
 /**
  * The orphan predicate (#2435 AC 2): a fixture helper whose parent is gone.
  *
- * Parent liveness is read from the SNAPSHOT, not from `process.kill(ppid,
- * 0)`: the snapshot is a full process table taken at one instant, so
- * "ppid absent from the table" is exactly "the parent has exited". This also
- * fails SAFE under pid recycling -- a recycled ppid reads as present, so the
- * helper is KEPT, never wrongly killed.
+ * Parent liveness is read from the SNAPSHOT: the snapshot is a full process
+ * table taken at one instant, so "ppid absent from the table" is exactly
+ * "the parent has exited". This fails SAFE under pid recycling -- a recycled
+ * ppid reads as present, so the helper is KEPT, never wrongly killed.
+ *
+ * That inference is only as good as the table, though, so a caller that CAN
+ * probe passes `isPidAlive` and every absence is CONFIRMED before it
+ * authorizes a kill (review S5). On a truncated listing the parent is absent
+ * but still running, and the probe keeps the helper alive.
  *
  * @param {ProcRow[]} rows
- * @param {{ selfPid?: number, protectedPids?: Set<number> }} [options]
+ * @param {{ selfPid?: number, protectedPids?: Set<number>, isPidAlive?: (pid: number) => boolean }} [options]
  * @returns {{ row: ProcRow, reason: string }[]}
  */
 export function selectOrphanFixtureProcesses(rows, options = {}) {
@@ -475,6 +585,7 @@ export function selectOrphanFixtureProcesses(rows, options = {}) {
 	const livePids = new Set(table.map((row) => row.pid));
 	const selfPid = options.selfPid ?? -1;
 	const protectedPids = options.protectedPids ?? new Set();
+	const isPidAlive = options.isPidAlive ?? null;
 	const orphans = [];
 	for (const row of table) {
 		if (!Number.isInteger(row.pid) || row.pid <= 0) continue;
@@ -484,6 +595,16 @@ export function selectOrphanFixtureProcesses(rows, options = {}) {
 		const parentAlive =
 			typeof ppid === "number" && ppid > 0 && livePids.has(ppid);
 		if (parentAlive) continue;
+		// Absent from the table AND still answering a signal 0 => the table is
+		// missing rows, not the parent missing from the box.
+		if (
+			isPidAlive !== null &&
+			typeof ppid === "number" &&
+			ppid > 0 &&
+			isPidAlive(ppid)
+		) {
+			continue;
+		}
 		orphans.push({
 			row,
 			reason:
@@ -493,6 +614,138 @@ export function selectOrphanFixtureProcesses(rows, options = {}) {
 		});
 	}
 	return orphans;
+}
+
+/**
+ * Is the process snapshot trustworthy enough to reason about ABSENCE?
+ *
+ * PR #2438 review S5. `selectOrphanFixtureProcesses` reads "ppid absent from
+ * the table" as "the parent has exited" -- sound for a COMPLETE table, and a
+ * fail-OPEN disaster for a truncated one, where every live helper's parent is
+ * also missing and every live helper therefore reads as an orphan. The
+ * snapshot's own consistency is the only available evidence, so: this process
+ * must appear in it, and so must every ancestor its own ppid chain names. A
+ * listing that cannot see the process doing the listing has not seen the box.
+ *
+ * A STALE ppid is not truncation. Measured on the #2435 box: the chain from
+ * this sweep walks node -> bash -> bash -> bash -> claude -> powershell ->
+ * WindowsTerminal and then names pid 3156, which had genuinely exited (a
+ * complete 458-row listing, exit 0, `process.kill(3156, 0)` -> ESRCH).
+ * Windows keeps the recorded parent pid after the parent dies, so a
+ * chain-walk alone cannot tell "the listing is missing rows" from "an
+ * ancestor exited" — and refusing on the latter would disable the orphan
+ * sweep permanently on every Windows box, which is #2435 AC 2 itself. The
+ * discriminator is liveness: a pid that is ALIVE but absent from the
+ * snapshot proves the snapshot is partial; a pid that is gone and absent is
+ * simply consistent. Callers that cannot probe (the pure tests) omit
+ * `isPidAlive` and get the strict reading.
+ *
+ * @param {ProcRow[]} rows
+ * @param {number} selfPid
+ * @param {{ isPidAlive?: (pid: number) => boolean }} [options]
+ * @returns {{ ok: boolean, reason: string|null }}
+ */
+export function verifySnapshotIntegrity(rows, selfPid, options = {}) {
+	const table = rows ?? [];
+	if (table.length === 0) return { ok: false, reason: "empty" };
+	const byPid = new Map(table.map((row) => [row.pid, row]));
+	if (!byPid.has(selfPid)) return { ok: false, reason: "self-missing" };
+	const isPidAlive = options.isPidAlive ?? null;
+	const seen = new Set([selfPid]);
+	let cursor = byPid.get(selfPid);
+	while (cursor) {
+		const ppid = cursor.ppid;
+		// A chain that reaches pid 0 (or a row with no parent recorded) has
+		// terminated normally; a cycle terminates too rather than hanging.
+		if (typeof ppid !== "number" || ppid <= 0) break;
+		if (seen.has(ppid)) break;
+		const parent = byPid.get(ppid);
+		if (!parent) {
+			// Absent AND still running => rows are missing => refuse.
+			if (isPidAlive === null || isPidAlive(ppid)) {
+				return { ok: false, reason: "chain-incomplete" };
+			}
+			break;
+		}
+		seen.add(ppid);
+		cursor = parent;
+	}
+	return { ok: true, reason: null };
+}
+
+/**
+ * The whole orphan-sweep decision in one pure call: verify the snapshot,
+ * select the orphans, optionally scope them to one agent's worktree, and
+ * report a DEGRADATION instead of a silent empty result when the snapshot
+ * cannot be trusted. The caller writes `degraded` to the ledger; a sweep that
+ * ran blind must never look like a sweep that found nothing (defect shape 10).
+ *
+ * @param {object} options
+ * @param {ProcRow[]} options.rows
+ * @param {number} options.selfPid
+ * @param {Set<number>} [options.protectedPids]
+ * @param {string|null} [options.restrictToPath] Only reap helpers occupying
+ *   this worktree -- the SubagentStop hook's scope.
+ * @param {boolean} [options.listingOk] False when the listing subprocess
+ *   itself failed (non-zero exit, timeout, spawn error).
+ * @param {(pid: number) => boolean} [options.isPidAlive] Liveness probe used
+ *   to tell a truncated listing from a genuinely exited ancestor/parent.
+ * @returns {{ orphans: { row: ProcRow, reason: string }[], degraded: { reason: string }|null }}
+ */
+export function planOrphanSweep({
+	rows,
+	selfPid,
+	protectedPids = new Set(),
+	restrictToPath = null,
+	listingOk = true,
+	isPidAlive = undefined,
+}) {
+	if (!listingOk)
+		return { orphans: [], degraded: { reason: "listing-failed" } };
+	const integrity = verifySnapshotIntegrity(rows, selfPid, { isPidAlive });
+	if (!integrity.ok) {
+		return { orphans: [], degraded: { reason: integrity.reason } };
+	}
+	let orphans = selectOrphanFixtureProcesses(rows, {
+		selfPid,
+		protectedPids,
+		isPidAlive,
+	});
+	if (restrictToPath) {
+		const occupants = new Set(
+			selectProcessesUnderPath(rows, restrictToPath, { protectedPids }).map(
+				(row) => row.pid,
+			),
+		);
+		orphans = orphans.filter((orphan) => occupants.has(orphan.row.pid));
+	}
+	return { orphans, degraded: null };
+}
+
+/**
+ * Cap a removal plan at `max` trees, keeping the OLDEST (a tree untouched
+ * longest is the safest one to reap, and the order is deterministic).
+ *
+ * PR #2438 review S8: a Claude Code hook is killed at its configured timeout,
+ * and `git worktree remove` is bounded at REMOVE_TIMEOUT_MS on purpose -- a
+ * SIGKILLed recursive delete leaves a half-removed tree plus a stale admin
+ * directory. One removal per hook run is the only count that fits inside a
+ * sane hook timeout; a manual `npm run hygiene` passes no cap and clears the
+ * backlog in one go.
+ *
+ * @template {{ ageMs: number }} T
+ * @param {T[]} removals
+ * @param {number|null|undefined} max Null/absent/non-positive = uncapped.
+ * @returns {T[]}
+ */
+export function capRemovals(removals, max) {
+	const list = [...(removals ?? [])];
+	if (typeof max !== "number" || !Number.isFinite(max) || max <= 0) return list;
+	if (list.length <= max) return list;
+	return list
+		.slice()
+		.sort((a, b) => (Number(b.ageMs) || 0) - (Number(a.ageMs) || 0))
+		.slice(0, Math.floor(max));
 }
 
 /**
@@ -529,6 +782,36 @@ export function selectStaleBranches(branches) {
 			(branch) => isAgentBranchCandidate(branch) && branch.containedInOrigin,
 		)
 		.map((branch) => branch.name);
+}
+
+/**
+ * The branches this sweep may delete on THIS run: only those whose worktree
+ * it just removed, and only if it removed one.
+ *
+ * PR #2438 review S10: `deleteStaleBranches` ran on every non-dry sweep and
+ * considered every `pr-*` / `review/*` / `fixround-*` / `worktree-agent-*`
+ * ref in the repository -- so a sweep that removed nothing at all could still
+ * delete a branch belonging to a live agent whose worktree it had (correctly)
+ * kept. Scoping the candidate set to the removals just performed makes both
+ * halves of that one condition: no removals, no deletions.
+ *
+ * @param {object} options
+ * @param {{ name: string, containedInOrigin: boolean, hasUpstream: boolean, upstreamGone: boolean, checkedOut: boolean }[]} options.branches
+ * @param {(string|null|undefined)[]} options.removedBranchRefs Full refs
+ *   (`refs/heads/pr-1`) of the worktrees actually removed; a detached
+ *   worktree contributes null and is ignored.
+ * @returns {string[]}
+ */
+export function planBranchDeletions({ branches, removedBranchRefs }) {
+	const allowed = new Set(
+		(removedBranchRefs ?? [])
+			.filter((ref) => typeof ref === "string" && ref !== "")
+			.map((ref) => ref.replace(/^refs\/heads\//, "")),
+	);
+	if (allowed.size === 0) return [];
+	return selectStaleBranches(
+		(branches ?? []).filter((branch) => allowed.has(branch?.name)),
+	);
 }
 
 /**
@@ -609,7 +892,12 @@ export function formatWorktreeRecord(input) {
  * clean when it actually ran blind. Shape 10/13 of the defect catalog: a
  * degradation must be recorded, not merely survived.
  *
- * @param {{ reason: "skipped"|"empty", budgetMs: number, remainingMs?: number, rows?: number, nowIso?: string }} input
+ * Reasons: `skipped` (no budget left to scan), `empty` (the listing returned
+ * nothing), `listing-failed` (it exited non-zero / timed out / never
+ * spawned), `self-missing` and `chain-incomplete` (the listing came back
+ * TRUNCATED, so absence cannot be read as death -- review S5).
+ *
+ * @param {{ reason: "skipped"|"empty"|"listing-failed"|"self-missing"|"chain-incomplete", budgetMs: number, remainingMs?: number, rows?: number, nowIso?: string }} input
  * @returns {string}
  */
 export function formatScanRecord(input) {
