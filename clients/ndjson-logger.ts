@@ -100,6 +100,34 @@ interface NdjsonWriterState {
 	 * must re-arm at session_start).
 	 */
 	writeFailures: number;
+	/**
+	 * Best-known on-disk byte size, maintained in memory so the write path
+	 * doesn't `fs.statSync` before every single write (#2505). Undefined means
+	 * "unknown — needs a real stat before the next rotation decision" (fresh
+	 * state, or after a rotation attempt failed and left the on-disk truth
+	 * uncertain). Updated cheaply after every successful write/rotate/truncate;
+	 * periodically reconciled against the real file via `syncKnownSizeIfDue`
+	 * (bounded cadence, not per write) so drift from an external writer to the
+	 * same global log (another pi-lens process sharing ~/.pi-lens) self-heals.
+	 */
+	knownSize: number | undefined;
+	/** Writes since `knownSize` was last reconciled with a real `fs.statSync`. */
+	writesSinceStatSync: number;
+	/** `Date.now()` at the last real `fs.statSync` reconciliation (0 = never). */
+	lastStatSyncMs: number;
+	/**
+	 * Total successful rotations for this file this session. Process-lifetime,
+	 * in-memory only, same "pulled at READ time" shape as `writeFailures`
+	 * above: `degradation-ledger.ts` already imports THIS module
+	 * (`getSinkWriteFailures`), so a reverse import to call
+	 * `recordDegradationOnce` directly from here would close a
+	 * ndjson-logger.ts <-> degradation-ledger.ts cycle. `getSinkRotations()`
+	 * exposes this tally for `degradation-ledger.ts` to fold into
+	 * `getDegradationSummary()` at read time instead (see the
+	 * `log-sink-rotated` doc comment on `DegradationKind`). Reset at
+	 * session_start via `resetSinkRotations()` (catalog shape 17).
+	 */
+	rotationCount: number;
 }
 
 const NDJSON_GLOBAL_STATE_SCHEMA = "pi-lens.ndjson-logger.state";
@@ -268,6 +296,41 @@ export function resetSinkWriteFailures(): void {
 		state.writeFailures = 0;
 }
 
+export interface SinkRotationSummary {
+	/** Canonicalized absolute path of the sink that rotated. */
+	file: string;
+	/** Successful rotations this session (#2505). */
+	rotationCount: number;
+}
+
+/**
+ * Snapshot of mid-session rotations, one entry per sink that has rotated
+ * at least once (#2505). Pure in-memory read — no I/O — so a caller
+ * (`degradation-ledger.ts`) can fold this into a durable ledger entry the
+ * same way it folds `getSinkWriteFailures()`, without this module importing
+ * the ledger back (see `NdjsonWriterState.rotationCount`'s doc comment).
+ */
+export function getSinkRotations(): SinkRotationSummary[] {
+	if (!ndjsonGlobalState) return [];
+	const result: SinkRotationSummary[] = [];
+	for (const state of ndjsonGlobalState.writers.values()) {
+		if (state.rotationCount > 0) {
+			result.push({ file: state.file, rotationCount: state.rotationCount });
+		}
+	}
+	return result;
+}
+
+/**
+ * Session-boundary reset (catalog shape 17), same shape as
+ * `resetSinkWriteFailures`. Wired into `resetDegradationLedger()`.
+ */
+export function resetSinkRotations(): void {
+	if (!ndjsonGlobalState) return;
+	for (const state of ndjsonGlobalState.writers.values())
+		state.rotationCount = 0;
+}
+
 function requireCurrentGlobalState(): NdjsonGlobalState {
 	if (ndjsonGlobalState) return ndjsonGlobalState;
 	throw new Error(
@@ -308,9 +371,12 @@ function assertCompatibleWriterOptions(
 function writeQueueItemSync(state: NdjsonWriterState, item: QueueItem): void {
 	if (item.kind === "truncate") {
 		fs.writeFileSync(state.file, "");
+		noteTruncated(state);
 	} else {
-		rotateIfNeeded(state);
+		const bytes = Buffer.byteLength(item.line);
+		rotateIfNeeded(state, bytes);
 		fs.appendFileSync(state.file, item.line);
+		noteWriteSucceeded(state, bytes);
 	}
 }
 
@@ -389,6 +455,17 @@ function createWriterState(
 		if (!exitFlushers.has(existing.exitFlusher)) registerWriter(existing);
 		// A state adopted from a pre-#1970 module graph predates this field.
 		if (typeof existing.writeFailures !== "number") existing.writeFailures = 0;
+		// A state adopted from a pre-#2505 module graph predates these fields.
+		if (
+			typeof existing.knownSize !== "number" &&
+			existing.knownSize !== undefined
+		)
+			existing.knownSize = undefined;
+		if (typeof existing.writesSinceStatSync !== "number")
+			existing.writesSinceStatSync = 0;
+		if (typeof existing.lastStatSyncMs !== "number")
+			existing.lastStatSyncMs = 0;
+		if (typeof existing.rotationCount !== "number") existing.rotationCount = 0;
 		return existing;
 	}
 
@@ -403,6 +480,10 @@ function createWriterState(
 	state.ensuredDir = false;
 	state.exitFlusher = () => flushStateSync(state);
 	state.writeFailures = 0;
+	state.knownSize = undefined;
+	state.writesSinceStatSync = 0;
+	state.lastStatSyncMs = 0;
+	state.rotationCount = 0;
 	globalState.writers.set(file, state);
 	registerWriter(state);
 	return state;
@@ -426,17 +507,80 @@ async function ensureDirAsync(state: NdjsonWriterState): Promise<void> {
 	}
 }
 
-function rotateIfNeeded(state: NdjsonWriterState): void {
-	if (state.maxBytes === undefined) return;
+// Rotation-check cadence (#2505): the real `fs.statSync` reconciliation below
+// is throttled to at most once per this many writes OR this many elapsed ms,
+// whichever comes first — never once per individual write. Between
+// reconciliations, `state.knownSize` (updated cheaply, no I/O, after every
+// successful write) is trusted. A short window in both axes bounds how far a
+// concurrent writer to the same global log (another pi-lens process sharing
+// ~/.pi-lens) can drift `knownSize` from the real file before the next
+// reconciliation self-heals it.
+const ROTATION_STAT_RESYNC_WRITES = 25;
+const ROTATION_STAT_RESYNC_MS = 2_000;
+
+/** Reconcile `state.knownSize` with a real stat, gated by the cadence above. */
+function syncKnownSizeIfDue(state: NdjsonWriterState, now: number): void {
+	const due =
+		state.knownSize === undefined ||
+		state.writesSinceStatSync >= ROTATION_STAT_RESYNC_WRITES ||
+		now - state.lastStatSyncMs >= ROTATION_STAT_RESYNC_MS;
+	if (!due) return;
+	state.writesSinceStatSync = 0;
+	state.lastStatSyncMs = now;
 	try {
-		const size = fs.statSync(state.file).size;
-		if (size < state.maxBytes) return;
+		state.knownSize = fs.statSync(state.file).size;
+	} catch {
+		// No file yet (first write) or a transient stat error — treat as
+		// empty; the next successful write/rotate re-establishes the truth.
+		state.knownSize = 0;
+	}
+}
+
+/**
+ * Rotate BEFORE writing when the file this write is about to produce would
+ * cross `maxBytes` — accounting for the size of the write itself
+ * (`incomingBytes`), not only the size already on disk (#2505). A drain
+ * batch can coalesce many queued lines into one write far larger than
+ * `maxBytes`; checking only the pre-write on-disk size lets that single
+ * write sail straight past the bound with nothing left to trigger a
+ * follow-up check until the next write happens to arrive — which, on a
+ * long-lived or idle-tailed session (the warm MCP server never re-runs the
+ * session-start sweep in `log-cleanup.ts`), may be a long time or never.
+ */
+function rotateIfNeeded(state: NdjsonWriterState, incomingBytes: number): void {
+	if (state.maxBytes === undefined) return;
+	const now = Date.now();
+	syncKnownSizeIfDue(state, now);
+	state.writesSinceStatSync += 1;
+	const knownSize = state.knownSize ?? 0;
+	if (knownSize === 0) return; // nothing on disk worth rotating away
+	if (knownSize + incomingBytes < state.maxBytes) return;
+	try {
 		const backup = state.backupPath ?? `${state.file}.1`;
 		runBestEffort(() => fs.rmSync(backup, { force: true }));
 		fs.renameSync(state.file, backup);
+		state.knownSize = 0;
+		state.rotationCount += 1;
 	} catch {
-		// no file yet, or rename raced — nothing to rotate
+		// No file yet, or rename raced — nothing to rotate. `knownSize` may
+		// now be stale (a rotation was believed due); force a real re-sync on
+		// the next check instead of compounding the error.
+		state.knownSize = undefined;
 	}
+}
+
+/** Cheap in-memory bookkeeping after a write actually lands (#2505). */
+function noteWriteSucceeded(state: NdjsonWriterState, bytes: number): void {
+	if (state.maxBytes === undefined) return;
+	state.knownSize = (state.knownSize ?? 0) + bytes;
+}
+
+/** The file is now definitively empty — no guessing needed (#2505). */
+function noteTruncated(state: NdjsonWriterState): void {
+	if (state.maxBytes === undefined) return;
+	state.knownSize = 0;
+	state.writesSinceStatSync = 0;
+	state.lastStatSyncMs = Date.now();
 }
 
 async function writeQueueItemAsync(
@@ -445,13 +589,16 @@ async function writeQueueItemAsync(
 ): Promise<void> {
 	if (item.kind === "truncate") {
 		await fs.promises.writeFile(state.file, "");
+		noteTruncated(state);
 	} else {
 		// Rotation is deliberately synchronous here. This function is only
 		// reached from the already-deferred drain, and keeping stat/rm/rename
 		// in one synchronous section prevents flushSync from racing a late
 		// async rename after it has written new data.
-		rotateIfNeeded(state);
+		const bytes = Buffer.byteLength(item.line);
+		rotateIfNeeded(state, bytes);
 		await fs.promises.appendFile(state.file, item.line);
+		noteWriteSucceeded(state, bytes);
 	}
 }
 
@@ -492,20 +639,28 @@ async function drainLoop(state: NdjsonWriterState): Promise<void> {
 		const pending =
 			item.kind === "truncate" ? [item] : state.queue.slice(0, pendingEnd);
 		state.inFlightBatch = pending;
+		const joinedLines =
+			item.kind === "line"
+				? pending
+						.map((queued) => (queued as { kind: "line"; line: string }).line)
+						.join("")
+				: "";
+		const joinedBytes = Buffer.byteLength(joinedLines);
 		const writeBatch = async (): Promise<void> => {
 			if (item.kind === "truncate") {
 				await fs.promises.writeFile(state.file, "");
+				noteTruncated(state);
 			} else {
 				// Rotation is kept synchronous inside the deferred drain. The
 				// append remains async, but no awaited rotation step can run after
-				// flushSync has written to the active file.
-				rotateIfNeeded(state);
-				await fs.promises.appendFile(
-					state.file,
-					pending
-						.map((queued) => (queued as { kind: "line"; line: string }).line)
-						.join(""),
-				);
+				// flushSync has written to the active file. The WHOLE batch's byte
+				// size is checked, not just what's already on disk (#2505) — a
+				// coalesced batch that would itself cross `maxBytes` must not be
+				// allowed to sail past it just because the file looked fine before
+				// this write started.
+				rotateIfNeeded(state, joinedBytes);
+				await fs.promises.appendFile(state.file, joinedLines);
+				noteWriteSucceeded(state, joinedBytes);
 			}
 		};
 		try {

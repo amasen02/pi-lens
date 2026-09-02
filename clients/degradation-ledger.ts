@@ -9,7 +9,9 @@ import {
 } from "./ledger-bounds.js";
 import { logLatency } from "./latency-logger.js";
 import {
+	getSinkRotations,
 	getSinkWriteFailures,
+	resetSinkRotations,
 	resetSinkWriteFailures,
 } from "./ndjson-logger.js";
 // #2146: pulled at READ time, never pushed. `process-singletons.ts` is a
@@ -508,6 +510,20 @@ export type DegradationKind =
 	 */
 	| "log-sink-write-failure"
 	/**
+	 * `ndjson-logger.ts` rotated a shared file-sink at its configured
+	 * `maxBytes` bound mid-session (#2505) — the write path itself caught the
+	 * crossing, not the once-per-process `runLogCleanup` session-start sweep
+	 * (which a long-lived process, e.g. the warm MCP server, may never run
+	 * again). Subject is the sink's absolute path, count is the number of
+	 * rotations this session. Same "pulled at READ time" shape as
+	 * `log-sink-write-failure` above and for the same reason:
+	 * `degradation-ledger.ts` already imports `ndjson-logger.ts`
+	 * (`getSinkWriteFailures`), so a reverse import to call
+	 * `recordDegradation`/`recordDegradationOnce` directly from there would
+	 * close a cycle — see `NdjsonWriterState.rotationCount`'s doc comment.
+	 */
+	| "log-sink-rotated"
+	/**
 	 * A word-index posting named a file id the file table could not resolve to
 	 * a path, so the posting was dropped from a search result or a decoded hit
 	 * list (#2069). Since #2069 a posting carries an integer id rather than a
@@ -892,6 +908,27 @@ export function getDegradationSummary(): DegradationGroup[] {
 			})),
 		});
 	}
+	// #2505, same read-time fold: a mid-session rotation is visible without
+	// this module writing about it through the very sink family it is
+	// reporting on — see the `log-sink-rotated` doc comment on
+	// `DegradationKind`.
+	const sinkRotations = getSinkRotations();
+	if (sinkRotations.length > 0) {
+		summary.push({
+			kind: "log-sink-rotated",
+			count: sinkRotations.reduce(
+				(total, sink) => total + sink.rotationCount,
+				0,
+			),
+			droppedCount: 0,
+			latestReasons: sinkRotations.map((sink) => ({
+				subject: truncateForLedger(sink.file),
+				reason: truncateForLedger(
+					`${sink.rotationCount} rotation(s) at the configured byte bound`,
+				),
+			})),
+		});
+	}
 	// #2146, same read-time fold: process-singleton resets live in the leaf
 	// module's own bounded log. One entry per family, so this group's count is
 	// the number of families this build could not adopt, never an event tally.
@@ -966,6 +1003,10 @@ export function resetDegradationLedger(): void {
 	// process-lifetime latch too — it re-arms alongside the rest of the
 	// ledger rather than surviving past the session that observed it.
 	resetSinkWriteFailures();
+	// #2505, same catalog shape 17 re-arm: a rotation tally recurs (new writes
+	// keep crossing the bound), so clearing it costs nothing and a later
+	// session re-observes the fact fresh.
+	resetSinkRotations();
 	// #2146 review F3: the OTHER pulled source, `getProcessSingletonResets()`,
 	// deliberately does NOT re-arm here, and the difference from its neighbour
 	// above is the point. A sink write failure recurs — new writes fail, so

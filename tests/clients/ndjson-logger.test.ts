@@ -27,7 +27,9 @@ vi.mock("node:fs", async (importOriginal) => {
 import {
 	_exitFlushersForTest,
 	createNdjsonLogger,
+	getSinkRotations,
 	getSinkWriteFailures,
+	resetSinkRotations,
 	resetSinkWriteFailures,
 } from "../../clients/ndjson-logger.js";
 import { removeTempDirSync } from "./test-utils.js";
@@ -57,6 +59,7 @@ afterEach(() => {
 	}
 	removeTempDirSync(tmpDir);
 	resetSinkWriteFailures();
+	resetSinkRotations();
 });
 
 function readLines(file: string): string[] {
@@ -122,10 +125,12 @@ describe("createNdjsonLogger", () => {
 
 	it("rotates to <file>.1 at the byte threshold", async () => {
 		const backup = `${logFile}.1`;
-		// Keep each line below the threshold. Rotation is checked before a batch,
-		// so the second line may take the active file over the limit; the third
-		// line is the one that rotates the first two.
-		const logger = createNdjsonLogger({ filePath: logFile, maxBytes: 40 });
+		// first (32B incl. newline) + second (33B) = 65B, under the 80B
+		// threshold, so both fit together. Adding third (18B) would bring the
+		// cumulative total to 83B — the WRITE that would cross the bound
+		// rotates the file BEFORE it lands (#2505: the pre-write check accounts
+		// for the incoming write's own size, not only what is already on disk).
+		const logger = createNdjsonLogger({ filePath: logFile, maxBytes: 80 });
 		const first = '{"entry":"1234567890123456789"}';
 		const second = '{"entry":"abcdefghijABCDEFGHIJ"}';
 		const third = '{"entry":"third"}';
@@ -143,6 +148,39 @@ describe("createNdjsonLogger", () => {
 		await logger.flush();
 		expect(readLines(backup)).toEqual([first, second]);
 		expect(readLines(logFile)).toEqual([third]);
+	});
+
+	it("rotates BEFORE a write that alone would cross the bound, not after (#2505)", async () => {
+		// The pre-existing behavior only checked the size already on disk
+		// before writing a batch; a batch that itself is far larger than
+		// maxBytes could sail straight past the bound with nothing left to
+		// trigger a follow-up check. Seed some real on-disk content first (a
+		// session that has already been logging for a while), then send a
+		// burst that alone dwarfs maxBytes in one synchronous sweep (no awaits
+		// between enqueues) — the same shape a busy session or a slow
+		// filesystem (#462) produces when production outruns the drain.
+		const backup = `${logFile}.1`;
+		const logger = createNdjsonLogger({ filePath: logFile, maxBytes: 1024 });
+
+		logger.log({ seed: true });
+		await logger.flush();
+		const seedSize = fs.statSync(logFile).size;
+		expect(seedSize).toBeGreaterThan(0);
+		expect(seedSize).toBeLessThan(1024);
+
+		const line = "x".repeat(200);
+		for (let i = 0; i < 50; i++) logger.log({ i, line });
+		await logger.flush();
+
+		// The oversized burst rotated the SEED content away before writing
+		// itself — the crossing is caught at the write that causes it, not
+		// deferred until some later write (or, absent one, the next
+		// session-start sweep).
+		expect(fs.existsSync(backup)).toBe(true);
+		expect(fs.statSync(backup).size).toBe(seedSize);
+		const lines = readLines(logFile).map((l) => JSON.parse(l));
+		expect(lines).toHaveLength(50);
+		expect(lines[0]).toEqual({ i: 0, line });
 	});
 
 	it("never rotates when maxBytes is absent", async () => {
@@ -314,17 +352,25 @@ describe("createNdjsonLogger", () => {
 		expect(appendFile).toHaveBeenCalledTimes(1);
 		releaseFirstAppend?.();
 		await Promise.all([first.flush(), second.flush()]);
-		expect(readLines(logFile).map((line) => JSON.parse(line))).toEqual([
+		// "before-reload" (60B) landed first; "after-reload" (59B) is queued as
+		// its own follow-up batch once the hung append resolves, and 60+59=119B
+		// crosses maxBytes(100) — so this second write rotates "before-reload"
+		// away BEFORE landing itself (#2505: the pre-write check accounts for
+		// the incoming write's own size). Rotation is still serialized through
+		// the SAME shared state across the module re-evaluation either way.
+		expect(readLines(`${logFile}.1`).map((line) => JSON.parse(line))).toEqual([
 			{ source: "before-reload", payload: "x".repeat(20) },
+		]);
+		expect(readLines(logFile).map((line) => JSON.parse(line))).toEqual([
 			{ source: "after-reload", payload: "y".repeat(20) },
 		]);
 
 		// Rotation and truncate are also serialized through the same state. The
-		// next write rotates the oversized active batch, preserving every line.
+		// next write (59B existing + 54B incoming = 113B) crosses the bound
+		// again, rotating "after-reload" away in turn.
 		second.log({ source: "rotated", payload: "z".repeat(20) });
 		await second.flush();
 		expect(readLines(`${logFile}.1`).map((line) => JSON.parse(line))).toEqual([
-			{ source: "before-reload", payload: "x".repeat(20) },
 			{ source: "after-reload", payload: "y".repeat(20) },
 		]);
 		expect(readLines(logFile).map((line) => JSON.parse(line))).toEqual([
@@ -789,6 +835,73 @@ describe("createNdjsonLogger", () => {
 				expect(failures).toHaveLength(1);
 				expect(failures[0]?.droppedCount).toBe(1);
 			});
+		});
+	});
+
+	describe("rotation cadence and the degradation ledger (#2505)", () => {
+		it("does not fs.statSync on every write — the real stat is cadence-gated", async () => {
+			const statSync = vi.spyOn(fs, "statSync");
+			const logger = createNdjsonLogger({
+				filePath: logFile,
+				maxBytes: 1_000_000,
+			});
+			for (let i = 0; i < 40; i++) {
+				logger.log({ i });
+				await logger.flush();
+			}
+			// 40 separate flushed writes, each its own drain batch. A per-write
+			// stat would call this 40 times; the cadence gate (every
+			// ROTATION_STAT_RESYNC_WRITES writes, or every
+			// ROTATION_STAT_RESYNC_MS ms — whichever comes first) keeps it far
+			// below that, even though every write still ran a cheap in-memory
+			// size check (proven by the rotation tests above).
+			expect(statSync.mock.calls.length).toBeLessThan(40);
+			expect(statSync.mock.calls.length).toBeGreaterThan(0);
+		});
+
+		it("exposes a rotation count via getSinkRotations, reset at session start", async () => {
+			expect(getSinkRotations()).toEqual([]);
+			const logger = createNdjsonLogger({ filePath: logFile, maxBytes: 80 });
+			logger.append('{"entry":"1234567890123456789"}'); // 32B
+			await logger.flush();
+			logger.append('{"entry":"abcdefghijABCDEFGHIJ"}'); // 33B, cum 65B
+			await logger.flush();
+			logger.append('{"entry":"third"}'); // 18B, cum 83B >= 80B: rotates
+			await logger.flush();
+
+			const rotations = getSinkRotations();
+			expect(rotations).toHaveLength(1);
+			expect(rotations[0]?.file).toContain("test.log");
+			expect(rotations[0]?.rotationCount).toBe(1);
+
+			resetSinkRotations();
+			expect(getSinkRotations()).toEqual([]);
+		});
+
+		it("a mid-session rotation is observable through the degradation ledger (pilens_health)", async () => {
+			const { getDegradationSummary, resetDegradationLedger } =
+				await import("../../clients/degradation-ledger.js");
+			resetDegradationLedger();
+
+			const logger = createNdjsonLogger({ filePath: logFile, maxBytes: 80 });
+			logger.append('{"entry":"1234567890123456789"}');
+			await logger.flush();
+			logger.append('{"entry":"abcdefghijABCDEFGHIJ"}');
+			await logger.flush();
+			logger.append('{"entry":"third"}'); // rotates
+			await logger.flush();
+
+			const summary = getDegradationSummary();
+			const group = summary.find((g) => g.kind === "log-sink-rotated");
+			expect(group).toBeDefined();
+			expect(group?.count).toBe(1);
+			expect(
+				group?.latestReasons.some((entry) =>
+					entry.subject.includes("test.log"),
+				),
+			).toBe(true);
+
+			resetDegradationLedger();
 		});
 	});
 });
