@@ -17,6 +17,9 @@ import * as path from "node:path";
 import {
 	firstChildOfType,
 	withTreeSitterRoot,
+	type ComplexityLanguageId,
+	isComplexityLanguageId,
+	isComplexitySupportedFile,
 	resolveTreeSitterLanguage,
 	type TsNode,
 	walk,
@@ -228,7 +231,13 @@ const RUST: LangNodes = {
 	nameChildTypes: ["identifier"],
 };
 
-const LANGUAGE_NODES: Record<string, LangNodes> = {
+/**
+ * Node configuration per grammar. Keyed by {@link ComplexityLanguageId}, whose
+ * list lives in `tree-sitter-shared.ts` so `isComplexitySupportedFile` can
+ * answer without loading this module (#2467). `Record` over a finite union
+ * requires EXACTLY these keys, so the two cannot drift.
+ */
+const LANGUAGE_NODES: Record<ComplexityLanguageId, LangNodes> = {
 	typescript: JSTS,
 	tsx: JSTS,
 	javascript: JSTS,
@@ -484,17 +493,23 @@ export class ComplexityClient {
 		this.log = verbose ? createSubsystemLogger("complexity") : () => {};
 	}
 
-	/** True if the file's grammar has a complexity node mapping. */
+	/** True if the file's grammar has a complexity node mapping.
+	 *
+	 * Delegates to the module-free predicate in `tree-sitter-shared.ts`: the
+	 * same question is asked by `handleToolCallImpl` BEFORE the analyzer
+	 * bootstrap is loaded (#2467), and two copies of it would be two answers. */
 	isSupportedFile(filePath: string): boolean {
-		const languageId = resolveTreeSitterLanguage(filePath);
-		return Boolean(languageId && languageId in LANGUAGE_NODES);
+		return isComplexitySupportedFile(filePath);
 	}
 
 	/** Analyze complexity metrics for a file (null if unsupported / unparseable). */
 	async analyzeFile(filePath: string): Promise<FileComplexity | null> {
 		const absolutePath = path.resolve(filePath);
 		const languageId = resolveTreeSitterLanguage(absolutePath);
-		const nodes = languageId ? LANGUAGE_NODES[languageId] : undefined;
+		const nodes =
+			languageId && isComplexityLanguageId(languageId)
+				? LANGUAGE_NODES[languageId]
+				: undefined;
 		if (!nodes) return null;
 
 		let content: string;

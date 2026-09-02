@@ -51,6 +51,13 @@ import {
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
 import {
+	_analyzerBootstrapFailureStrikes as analyzerBootstrapStrikes,
+	_armAnalyzerBootstrapLatchForTests as armAnalyzerBootstrapLatch,
+	isAnalyzerBootstrapShutdown,
+	markAnalyzerBootstrapShutdown,
+	resetAnalyzerBootstrapSessionState,
+} from "../../clients/bootstrap.js";
+import {
 	lookupLearnedMutatingTool,
 	noteObservedMutation,
 	resetMutationAttribution,
@@ -220,6 +227,34 @@ function scratchCwd(): string {
 }
 
 export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
+	{
+		id: "bootstrap:shutdown-gate",
+		module: "bootstrap.ts",
+		state: "bootstrapShutdown",
+		policy: "session_start",
+		resetName: "resetAnalyzerBootstrapSessionState",
+		reason:
+			"#2467: the analyzer bootstrap refuses NEW loads once the primary session has torn down, which is a per-SESSION claim held in process-lived storage — without a session_start reset a replacement session in the same process would find every analyzer refused for the rest of the process (defect shape 17). The resident clients themselves are deliberately NOT dropped: they are stateless constructions whose session-scoped latches are re-armed by their own registered resets (resetInstallRetryLatches, #1497), so re-paying the seventeen-module load at every session boundary would cost the interactive path for nothing.",
+		probe: {
+			arm: () => markAnalyzerBootstrapShutdown(),
+			isArmed: () => !isAnalyzerBootstrapShutdown(),
+			reset: () => resetAnalyzerBootstrapSessionState(),
+		},
+	},
+	{
+		id: "bootstrap:failure-latch",
+		module: "bootstrap.ts",
+		state: "bootstrapFailureStrikes",
+		policy: "session_start",
+		resetName: "resetAnalyzerBootstrapSessionState",
+		reason:
+			"#2467 review: after BOOTSTRAP_FAILURE_STRIKE_LIMIT consecutive failed builds the seam stops rebuilding, so a permanently unresolvable analyzer module no longer re-runs seventeen dynamic imports plus collectInstallDiagnostics on every tool call. That verdict is about an ENVIRONMENT, and an environment is repaired between sessions (a dependency installed, a package layout fixed) — held process-wide without a session_start reset it would write the analyzers off for the life of the process, which is defect shape 17 exactly.",
+		probe: {
+			arm: () => armAnalyzerBootstrapLatch(),
+			isArmed: () => analyzerBootstrapStrikes() === 0,
+			reset: () => resetAnalyzerBootstrapSessionState(),
+		},
+	},
 	{
 		id: "test-runner-delivery:pending",
 		module: "test-runner-delivery.ts",
@@ -1325,6 +1360,10 @@ export const EXEMPT_SESSION_STATE_FILES: Readonly<Record<string, string>> = {
 export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"agent-nudge.ts": 1,
 	"blocker-freshness.ts": 2,
+	// #2467: flagged because the file now exports a session_start reset; the
+	// scan counts no module-scope CONTAINER here (the gate is a boolean and the
+	// resident slot a nullable reference).
+	"bootstrap.ts": 0,
 	"bounded-telemetry.ts": 2,
 	"bus-events-logger.ts": 1,
 	"bus-publish.ts": 0,

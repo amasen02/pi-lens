@@ -21,7 +21,11 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { AstGrepClient } from "../ast-grep-client.js";
-import { type BootstrapClients, loadBootstrapClients } from "../bootstrap.js";
+import {
+	type BootstrapClients,
+	loadBootstrapClients,
+	residentBootstrapAccess,
+} from "../bootstrap.js";
 import {
 	CacheManager,
 	MCP_TURN_STATE_OWNER_ID,
@@ -133,23 +137,12 @@ export async function runSessionStart(
 		dbg: noop,
 		log: noop,
 		runtime: ctx.runtime,
-		metricsClient: ctx.clients.metricsClient,
 		cacheManager: ctx.cacheManager,
-		todoScanner: ctx.clients.todoScanner,
 		astGrepClient: ctx.astGrepClient,
-		biomeClient: ctx.clients.biomeClient,
-		ruffClient: ctx.clients.ruffClient,
-		knipClient: ctx.clients.knipClient,
-		jscpdClient: ctx.clients.jscpdClient,
-		deadCodeClients: ctx.clients.deadCodeClients,
-		govulncheckClient: ctx.clients.govulncheckClient,
-		gitleaksClient: ctx.clients.gitleaksClient,
-		trivyClient: ctx.clients.trivyClient,
-		opengrepClient: ctx.clients.opengrepClient,
-		depChecker: ctx.clients.depChecker,
-		testRunnerClient: ctx.clients.testRunnerClient,
-		goClient: ctx.clients.goClient,
-		rustClient: ctx.clients.rustClient,
+		// The MCP server has already loaded the analyzer graph (an MCP call has
+		// nothing to defer to), so it hands the handler the same one-shape seam
+		// every other caller uses rather than a second, field-by-field shape.
+		bootstrap: residentBootstrapAccess(ctx.clients),
 		ensureTool: async (name: string) =>
 			(await import("../installer/index.js")).ensureTool(name),
 		cleanStaleTsBuildInfo: () => [],

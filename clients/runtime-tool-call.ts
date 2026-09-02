@@ -1,6 +1,7 @@
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
-import { loadBootstrapClients } from "./bootstrap.js";
+import { loadBootstrapClients, requestBootstrapClients } from "./bootstrap.js";
+import { getAmbientAbortSignal } from "./safe-spawn.js";
 import type { CacheManager } from "./cache-manager.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
 import { detectFileKind } from "./file-kinds.js";
@@ -19,6 +20,7 @@ import {
 import { normalizeForGuardMatch } from "./host-edit-normalize.js";
 import { retargetReplacementIndentation } from "./indent-retarget.js";
 import { LANGUAGE_POLICY } from "./language-policy.js";
+import { isComplexitySupportedFile } from "./tree-sitter-shared.js";
 import {
 	classifyMutatingTool,
 	readMutationPathField,
@@ -1016,15 +1018,40 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 		});
 	}
 
-	const { complexityClient } = await loadBootstrapClients();
 	// Record complexity baseline for historical tracking (booboo/tdi).
 	// Not shown inline - just captured for delta analysis.
+	//
+	// #2467: every client-free guard runs FIRST, so a tool call that cannot
+	// produce a baseline never loads the analyzer graph. This await used to sit
+	// above them and fire on EVERY tool_call — a bash command, a grep, a read
+	// of a vendored file, a second read of an already-baselined file all paid
+	// the seventeen-module load.
+	//
+	// `isComplexitySupportedFile` is the LAST of those guards and the one that
+	// matters most in a real repo: complexity has node mappings for six
+	// grammars, so every .md/.json/.yaml/.css/.java/.sh read is unsupported.
+	// Asking the CLIENT (`isSupportedFile`) would mean loading the graph to
+	// learn the answer is no — and because only a produced baseline memoizes
+	// the file, the same read would pay it again on every repeat. The predicate
+	// is the client's own answer, hoisted into `tree-sitter-shared.ts` where it
+	// needs nothing but the extension registry; `ComplexityClient.isSupportedFile`
+	// delegates to it, so this is not a second copy.
 	if (
 		!isExternalOrVendor &&
-		complexityClient.isSupportedFile(filePath) &&
-		!runtime.complexityBaselines.has(filePath)
+		filePath &&
+		!runtime.complexityBaselines.has(filePath) &&
+		isComplexitySupportedFile(filePath)
 	) {
-		const baseline = await complexityClient.analyzeFile(filePath);
+		// Fail open: no clients means no baseline for this call, counted once in
+		// the ledger. A complexity baseline is delta-analysis bookkeeping — it
+		// must never be the reason a user's tool call fails or stalls.
+		const complexityClient = (
+			await requestBootstrapClients({
+				reason: "tool-call-complexity-baseline",
+				signal: getAmbientAbortSignal(),
+			})
+		)?.complexityClient;
+		const baseline = await complexityClient?.analyzeFile(filePath);
 		if (baseline) {
 			runtime.complexityBaselines.set(filePath, baseline);
 			const { captureSnapshot } = await import("./metrics-history.js");

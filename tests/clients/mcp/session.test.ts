@@ -43,9 +43,10 @@ const stubClients = vi.hoisted(() => {
 
 vi.mock("../../../clients/runtime-session.js", () => ({ handleSessionStart }));
 vi.mock("../../../clients/runtime-turn.js", () => ({ handleTurnEnd }));
-vi.mock("../../../clients/bootstrap.js", () => ({
-	loadBootstrapClients: async () => stubClients,
-}));
+vi.mock("../../../clients/bootstrap.js", async () => {
+	const { bootstrapSeamMock } = await import("../../support/bootstrap-mock.js");
+	return bootstrapSeamMock(async () => stubClients);
+});
 vi.mock("../../../clients/ast-grep-client.js", () => ({
 	AstGrepClient: class {},
 }));
@@ -116,10 +117,17 @@ describe("runSessionStart", () => {
 		expect(typeof deps.getFlag).toBe("function");
 		expect(deps.cacheManager).toBeDefined();
 		expect(deps.runtime).toBeDefined();
-		// Bootstrap clients are wired through from the bundle.
-		expect(deps.knipClient).toBe(stubClients.knipClient);
-		expect(deps.jscpdClient).toBe(stubClients.jscpdClient);
-		expect(deps.testRunnerClient).toBe(stubClients.testRunnerClient);
+		// The bootstrap clients travel through the ONE seam `SessionStartDeps`
+		// now takes (#2467 review) — the MCP server has already loaded them, so
+		// both of the seam's questions answer with the real bundle rather than
+		// deferring. Asserting through the seam, not through fifteen forwarded
+		// fields, is what makes a dropped client impossible instead of silent.
+		const bootstrap = deps.bootstrap as {
+			peek: () => unknown;
+			request: (reason: string) => Promise<unknown>;
+		};
+		expect(bootstrap.peek()).toBe(stubClients);
+		expect(await bootstrap.request("session-start-scans")).toBe(stubClients);
 		expect(typeof deps.resetDispatchBaselines).toBe("function");
 	});
 
