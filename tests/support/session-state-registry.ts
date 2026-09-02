@@ -976,19 +976,18 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 			reset: () => resetPendingRunnerFindings(),
 		},
 	},
-	// ── #2455 fix round 2: GoClient/RustClient's own availability latches ──────
+	// ── #2455: GoClient/RustClient's own availability latches ─────────────────
 	// Found by hand while auditing what the widened predicate SHOULD have
 	// covered, not by the widened predicate itself. #2455 fix round 3, F4
 	// corrects the causal claim an earlier draft of this comment made: the
 	// sweep skips any file that exports no reset at all (`session-state-scan.ts`:
-	// `if (resets.length === 0) continue`), and on master neither
-	// `go-vet.ts` nor `rust-clippy.ts` exported one — so however wide the
-	// container predicate got, these two files could never yield a candidate.
-	// They became visible to the sweep only because THIS fix round added
-	// `resetGoAvailability`/`resetRustAvailability`, i.e. the reset came first
-	// and the visibility followed. The pair-with-reset gate is MISS 3 in
-	// `SWEEP_HEURISTIC_LIMITS` ("state with no reset seam at all") and this
-	// round does not narrow it.
+	// `if (resets.length === 0) continue`), and on master no file in this chain
+	// exported one — so however wide the container predicate got, none of them
+	// could yield a candidate. They became visible to the sweep only because
+	// #2455 added `resetGoAvailability`/`resetRustAvailability`, i.e. the reset
+	// came first and the visibility followed. The pair-with-reset gate is
+	// MISS 3 in `SWEEP_HEURISTIC_LIMITS` ("state with no reset seam at all")
+	// and #2455 does not narrow it.
 	//
 	// What the audit found stands on its own: `goClient`/`rustClient` are
 	// module-scope singletons wrapping a `createAvailabilityLatch()` each, and
@@ -996,29 +995,36 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 	// (`isLatchingOutcome`), so a go/cargo install between sessions stayed
 	// unobserved for the rest of the process's life, the same #1496 shape
 	// `package-manager.ts` and the same #1535 shape `zizmor-config.ts`'s
-	// `ghTokenLatch` already have registered resets for. `resetGoAvailability`/
-	// `resetRustAvailability` and the production wiring beside
-	// `resetZizmorTokenAvailability` in `clients/runtime-session.ts` are new in
-	// this fix round.
+	// `ghTokenLatch` already have registered resets for.
+	//
+	// #2455 fix round 4, F2 moved both instances and both resets OFF the
+	// runner modules and into the client modules that own the classes. Round 2
+	// left the runner holding one instance while `bootstrap.ts` built a second
+	// for `BootstrapClients.goClient`/`.rustClient` — the objects
+	// `handleSessionStart` reads for its "Active tools" line — so the reset
+	// re-armed a latch nothing user-visible consulted, and the bug survived its
+	// own fix. One instance per toolchain, beside the reset that clears it, is
+	// what makes the reset total; `tests/clients/toolchain-client-singleton.test.ts`
+	// is the ratchet.
 	{
-		id: "go-vet:goClientAvailability",
-		module: "dispatch/runners/go-vet.ts",
+		id: "go-client:goClientAvailability",
+		module: "go-client.ts",
 		state:
 			"goClient's ToolchainAvailability latch (resolved go path, availability verdict)",
 		policy: "session_start",
 		resetName: "resetGoAvailability",
 		reason:
-			"#2455 fix round 2: GoClient wraps createAvailabilityLatch() the same way zizmor-config.ts's standalone gh-token latch does, outside the dispatch generation counter (runner-helpers.ts) and outside the install-retry generation (availability-policy.ts, which only re-arms the install-EXHAUSTED ceiling, not a plain probe-class 'missing' verdict). A go binary installed mid-process stayed invisible until process restart.",
+			"#2455: GoClient wraps createAvailabilityLatch() the same way zizmor-config.ts's standalone gh-token latch does, outside the dispatch generation counter (runner-helpers.ts) and outside the install-retry generation (availability-policy.ts, which only re-arms the install-EXHAUSTED ceiling, not a plain probe-class 'missing' verdict). A go binary installed mid-process stayed invisible until process restart. Fix round 4, F2: the instance and this reset live in go-client.ts, which is what makes go-vet.ts's runner and bootstrap.ts's BootstrapClients.goClient the same object — two instances meant the reset never reached the session-start 'Active tools' line.",
 	},
 	{
-		id: "rust-clippy:rustClientAvailability",
-		module: "dispatch/runners/rust-clippy.ts",
+		id: "rust-client:rustClientAvailability",
+		module: "rust-client.ts",
 		state:
 			"rustClient's ToolchainAvailability latch (resolved cargo path, availability verdict); clippyAvailabilityByCargo (the cwd-keyed clippy-tool probe cache) is a SEPARATE, already-covered latch — it rides createCwdCachedProbe's shared availabilityGeneration counter (runner-helpers.ts's resetDispatchAvailabilityState, registered above as runner-helpers:availabilityGeneration), not this reset",
 		policy: "session_start",
 		resetName: "resetRustAvailability",
 		reason:
-			"#2455 fix round 2: same shape as go-vet:goClientAvailability — RustClient's own createAvailabilityLatch() sits outside every generation counter that already covers this file's OTHER cache. A cargo install mid-process stayed invisible until process restart.",
+			"#2455: same shape as go-client:goClientAvailability — RustClient's own createAvailabilityLatch() sits outside every generation counter that already covers the rust-clippy runner's OTHER cache. A cargo install mid-process stayed invisible until process restart. Fix round 4, F2: the instance and this reset live in rust-client.ts so the runner and bootstrap.ts share one object.",
 	},
 	{
 		id: "lsp-mutation:noBridgeDbgLogged",
@@ -1350,7 +1356,11 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	// method-name filter still missed it. Already registered above
 	// (dispatch-integration:sessionCaches names `sessionFacts` and its reset
 	// clears it via a method call) — only the pin was stale.
-	"dispatch/integration.ts": 10,
+	// #2455 fix round 4: the container regex now also allows an `export`
+	// prefix, so `CASCADE_GRAPH_KINDS` (an exported module-level `new Set`) is
+	// counted (10 -> 11). Import-time frozen vocabulary, same class as this
+	// file's other constant lookups above — SWEEP_HEURISTIC_LIMITS item 5.
+	"dispatch/integration.ts": 11,
 	"dispatch/lazy.ts": 0,
 	// #2215 added the language matrix's two derived lookups
 	// (`BINDING_BY_EXTENSION`, `LSP_ONLY_RULE_LANGUAGES`) (5 → 7). Both are
@@ -1358,20 +1368,9 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	// SWEEP_HEURISTIC_LIMITS item 5, not state that must re-arm.
 	"dispatch/runners/ast-grep-napi.ts": 7,
 	"dispatch/runners/biome-check.ts": 1,
-	// #2455 fix round 2: newly flagged. `goClient` (`new GoClient()`) is now
-	// recognised under the widened "declared in clients/" predicate; the file
-	// had no exported reset before, so it was never a candidate at all until
-	// `resetGoAvailability` was added (registered above,
-	// go-vet:goClientAvailability).
-	"dispatch/runners/go-vet.ts": 1,
+
 	"dispatch/runners/psscriptanalyzer.ts": 2,
-	// #2455 fix round 2: newly flagged, same reason as go-vet.ts. Two
-	// containers: `rustClient` (new, registered above,
-	// rust-clippy:rustClientAvailability) and `clippyAvailabilityByCargo` (a
-	// plain `new Map()`, already recognised by the built-in-container regex
-	// before this fix — it was invisible only because the file had no exported
-	// reset until `resetRustAvailability` was added).
-	"dispatch/runners/rust-clippy.ts": 2,
+
 	// #2442 review F2: the container regex now recognises BoundedFifoMap /
 	// BoundedLruCache, so this file's module-level bounded cache is counted.
 	"dispatch/runners/spotbugs.ts": 1,
@@ -1382,7 +1381,12 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"format-events-publish.ts": 0,
 	// #2442 review F2: the container regex now recognises BoundedFifoMap /
 	// BoundedLruCache, so this file's module-level bounded cache is counted.
-	"formatters.ts": 8,
+	// #2455 fix round 4: the container regex now also allows an `export`
+	// prefix, so `FORMATTERS_WITH_EXPLICIT_CONFIG_CHECK` (an exported
+	// module-level `new Set`) is counted (8 -> 9). An import-time frozen
+	// vocabulary with no session lifetime — SWEEP_HEURISTIC_LIMITS item 5, and
+	// this file's existing registry entries already cover its real caches.
+	"formatters.ts": 9,
 	// #2442 review F2: the container regex now recognises BoundedFifoMap /
 	// BoundedLruCache, so this file's module-level bounded cache is counted.
 	"generated-artifacts.ts": 3,
@@ -1391,6 +1395,17 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	// SWEEP_HEURISTIC_LIMITS item 5, not state that must re-arm.
 	"git-guard.ts": 2,
 	"git-tracked-ignore.ts": 3,
+	// #2455 fix round 4, F2: `go-client.ts` now owns the process's ONE
+	// `GoClient` (`export const goClient = new GoClient()`) and the
+	// `resetGoAvailability` seam beside it, so the pair-with-reset rule flags
+	// it here instead of in `dispatch/runners/go-vet.ts`. Round 2 put the
+	// instance in the runner and let `bootstrap.ts` build a SECOND one for the
+	// object `handleSessionStart` reads, so the reset re-armed a latch nothing
+	// user-visible consulted. Registered above (go-client:goClientAvailability).
+	// Visible only because the container regex now allows an `export` prefix —
+	// without that widening this fix would have moved the state OUT of the
+	// sweep's view.
+	"go-client.ts": 1,
 	// #2442 review F2: the container regex now recognises BoundedFifoMap /
 	// BoundedLruCache, so this file's module-level bounded cache is counted.
 	"installer/index.ts": 13,
@@ -1485,6 +1500,15 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	// #2060: 3 -> 5 for GIT_INTEGRATION_SUBCOMMANDS and
 	// GIT_GLOBAL_OPTIONS_WITH_VALUE — command-shape vocabulary, not state.
 	"runtime-tool-result.ts": 5,
+	// #2455 fix round 4, F2: the twin of `go-client.ts` above — the process's
+	// ONE `RustClient` plus `resetRustAvailability`, moved off
+	// `dispatch/runners/rust-clippy.ts`. That file keeps
+	// `clippyAvailabilityByCargo`, which is covered by
+	// `resetDispatchAvailabilityState`'s generation
+	// (runner-helpers:availabilityGeneration) and, exporting no reset of its
+	// own, is not a candidate on its own account — the pre-#2455 status quo,
+	// and MISS 3 in SWEEP_HEURISTIC_LIMITS.
+	"rust-client.ts": 1,
 	"safe-spawn.ts": 3,
 	// #2146 moved the four registration fields onto the process singleton, so the
 	// scan sees no module-scope container here either.

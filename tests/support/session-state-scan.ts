@@ -565,6 +565,15 @@ const containerDeclarationCache = new Map<string, RegExp>();
  * `dir`. Column zero is the signal for "module scope" — a container declared
  * inside a function is per-call state and re-armed by construction.
  *
+ * The `export` prefix is optional (#2455 fix round 4). It was not, and that
+ * was a miss of the same family as the two this issue already closed: whether
+ * a module-scope singleton is exported says nothing about whether it holds
+ * session state, and `export const goClient = new GoClient()` — the process's
+ * only Go availability latch — was invisible for no reason but the keyword in
+ * front of it. Seven pre-existing `export const … = new …` sites in `clients/`
+ * were equally unseen; the pins below record which of them the pairing rule
+ * turns into candidates.
+ *
  * Built fresh (once, cached) from a live class scan rather than a hand list —
  * see {@link containerClassNames}.
  */
@@ -575,7 +584,7 @@ function containerDeclarationRegex(dir: string): RegExp {
 		escapeRegExpLiteral,
 	);
 	const regex = new RegExp(
-		`^(?:const|let)\\s+([A-Za-z_$][\\w$]*)[^=\\n]*=\\s*new\\s+(?:${names.join("|")})\\b`,
+		`^(?:export\\s+)?(?:const|let)\\s+([A-Za-z_$][\\w$]*)[^=\\n]*=\\s*new\\s+(?:${names.join("|")})\\b`,
 		"gm",
 	);
 	containerDeclarationCache.set(dir, regex);

@@ -121,3 +121,30 @@ describe("createToolchainAvailability reset across an in-flight probe (#2455 fix
 		expect(await postReset).toBe(true);
 	});
 });
+
+describe("createToolchainAvailability findPath across a reset (#2455 fix round 4, F3)", () => {
+	it("does not memoize a path found before a reset that removed it", async () => {
+		const { candidatePath, install } = pendingToolchain("f3-removed");
+		install();
+		const availability = availabilityFor("f3-removed-toolchain", candidatePath);
+
+		// A separator-bearing candidate is resolved with `fs.existsSync`, so this
+		// sweep is already committed to "found" when the two synchronous
+		// statements below run; only its post-await WRITE is still pending.
+		const inFlight = availability.findPath();
+		availability.reset();
+		fs.rmSync(candidatePath);
+
+		// The pre-reset flight answers its own callers honestly: at the moment it
+		// looked, the toolchain was there.
+		expect(await inFlight).toBe(candidatePath);
+
+		// It must not write that path into the memo `reset()` just cleared.
+		// Without findPath's supersede guard the superseded sweep latches a path
+		// that no longer exists, and `if (toolPath) return toolPath` serves it
+		// forever — an INVERSION: the reset that exists to un-latch a false
+		// "missing" instead latches a false "found" for a toolchain that is gone.
+		expect(await availability.findPath()).toBeNull();
+		expect(await availability.isAvailable()).toBe(false);
+	});
+});

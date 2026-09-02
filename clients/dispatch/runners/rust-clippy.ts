@@ -6,7 +6,7 @@
 
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { findNearestContaining } from "../../path-utils.js";
-import { RustClient } from "../../rust-client.js";
+import { rustClient } from "../../rust-client.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import { stripAnsi } from "../../sanitize.js";
 import {
@@ -25,32 +25,6 @@ import type {
 } from "../types.js";
 import { PRIORITY } from "../priorities.js";
 import { createCwdCachedProbe } from "./utils/runner-helpers.js";
-
-const rustClient = new RustClient();
-
-/**
- * Forget `rustClient`'s memoized cargo path and latched availability verdict
- * — #2455 fix round 2. A probe-class "missing" verdict never expires
- * (`isLatchingOutcome`), so this module-scope client held a stale "no cargo"
- * answer for the life of the process. It was invisible to the session-state
- * sweep, but not for the reason an earlier draft of this comment gave (#2455
- * fix round 3, F4): the sweep skips any file exporting no reset at all, and
- * this file exported none, so widening the container predicate to "any class
- * declared in `clients/`" could not have surfaced it. Adding the reset below
- * is what made the file visible — the fix preceded the detection, and the
- * pair-with-reset blind spot (MISS 3 in `SWEEP_HEURISTIC_LIMITS`) is
- * unchanged. Same #1496/#1535
- * shape as `resetZizmorTokenAvailability`; wired into `handleSessionStart`
- * beside it (`clients/runtime-session.ts`) so a Rust toolchain installed
- * mid-process is observed by the next session instead of staying "missing"
- * for the rest of the process's life. `clippyAvailabilityByCargo` below is a
- * separate, already-covered latch — it rides `createCwdCachedProbe`'s shared
- * `availabilityGeneration` counter (see `runner-helpers.ts`'s
- * `resetDispatchAvailabilityState`), not this reset.
- */
-export function resetRustAvailability(): void {
-	rustClient.resetAvailability();
-}
 
 // Cached per-cwd `cargo clippy --version` probe (#120). Before this, the
 // probe fired on every Rust file save in a project where clippy was already

@@ -15,9 +15,7 @@ import {
 } from "./degradation-ledger.js";
 import type { DependencyChecker } from "./dependency-checker.js";
 import { getDiagnosticTracker } from "./diagnostic-tracker.js";
-import { resetGoAvailability } from "./dispatch/runners/go-vet.js";
 import { resetPsScriptAnalyzerAvailability } from "./dispatch/runners/psscriptanalyzer.js";
-import { resetRustAvailability } from "./dispatch/runners/rust-clippy.js";
 import { resetInstallRetryLatches } from "./dispatch/runners/utils/availability-policy.js";
 import { resetLazyInstallAttempts } from "./dispatch/runners/utils/lazy-installer.js";
 import { resetDispatchAvailabilityState } from "./dispatch/runners/utils/runner-helpers.js";
@@ -31,7 +29,7 @@ import {
 	getProjectDataDir,
 } from "./file-utils.js";
 import { GitleaksClient, type GitleaksResult } from "./gitleaks-client.js";
-import type { GoClient } from "./go-client.js";
+import { type GoClient, resetGoAvailability } from "./go-client.js";
 import {
 	GovulncheckClient,
 	type GovulncheckResult,
@@ -87,7 +85,7 @@ import {
 import type { RuffClient } from "./ruff-client.js";
 import { scanProjectRules } from "./rules-scanner.js";
 import type { RuntimeCoordinator } from "./runtime-coordinator.js";
-import type { RustClient } from "./rust-client.js";
+import { type RustClient, resetRustAvailability } from "./rust-client.js";
 import { resetSafeSpawnWindowsCommandCache } from "./safe-spawn.js";
 import {
 	getSlowFsVerdict,
@@ -2215,13 +2213,16 @@ export async function handleSessionStart(
 	// login` and starts a fresh session still reads the previous session's
 	// stale "no token" verdict until the cooldown (if any) happens to expire.
 	resetZizmorTokenAvailability();
-	// #2455 fix round 2: same #1266/#1535 shape, one caller later — GoClient
-	// and RustClient each hold their own `createAvailabilityLatch()` outside
-	// the dispatch generation counter above (they predate `createCwdCachedProbe`
-	// and were invisible to the session-state sweep until the detector widened
-	// to any class declared in `clients/`). A "missing" verdict never expires
+	// #2455: same #1496/#1535 process-lifetime-latch shape, one caller later —
+	// the `goClient`/`rustClient` singletons each hold their own
+	// `createAvailabilityLatch()` outside the dispatch generation counter above
+	// (they predate `createCwdCachedProbe`). A "missing" verdict never expires
 	// on its own, so without these a go/cargo install between sessions stayed
-	// unobserved for the rest of the process's life.
+	// unobserved for the rest of the process's life. Found by hand while
+	// auditing #2455's detector widening, NOT surfaced by it: the sweep skips
+	// any file exporting no reset at all, and neither client module exported
+	// one, so no container predicate could have yielded them (#2455 fix round 4,
+	// F5 — an earlier draft of this comment had the causality backwards).
 	resetGoAvailability();
 	resetRustAvailability();
 	// psscriptanalyzer's three latches (interpreter, module, -File exec) are

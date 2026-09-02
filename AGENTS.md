@@ -3279,20 +3279,34 @@ entry (names a class the live scan no longer finds) and a reason-less entry
 red via `auditContainerClassExclusions()`. Known boundaries the predicate
 still cannot see (`SWEEP_HEURISTIC_LIMITS`): a `new` bound to a constructor
 IMPORTED from outside `clients/` (a node_modules class), or built via a
-factory function instead of a bare `new Ctor(...)` call.
+factory function instead of a bare `new Ctor(...)` call. The declaration may
+carry an `export` prefix (round 4) — it could not before, which made
+`export const goClient = new GoClient()` invisible for no reason but the
+keyword in front of it.
 
 **The container predicate is not the gate that decides what the sweep looks
 at.** `scanSessionStateCandidates` skips a file outright when it exports no
 reset (`if (resets.length === 0) continue`), so widening the predicate can
 only ever surface state in files that ALREADY have a reset seam. A file
 holding session state with no reset at all stays invisible however wide the
-predicate gets — MISS 3, "state with no reset seam at all", and neither #2455
-round touched it. `go-vet.ts` and `rust-clippy.ts` are the worked example:
+predicate gets — MISS 3, "state with no reset seam at all", and no #2455
+round touched it. `go-client.ts` and `rust-client.ts` are the worked example:
 their `GoClient`/`RustClient` latches were found by HAND while auditing what
 the widening should have covered, and the files only entered the sweep once
 #2455 added `resetGoAvailability`/`resetRustAvailability`. Read a widened
 predicate as "the registry now describes more of what it already watches",
 never as "the sweep now finds unreset state".
+
+**A reset is only as total as the instance count behind it.** #2455 round 2
+added those two resets against the runner-module singletons while
+`bootstrap.ts` separately constructed its own `GoClient`/`RustClient` for
+`BootstrapClients`, which is what `handleSessionStart` reads for its "Active
+tools" line — so the reset re-armed a latch nothing user-visible consulted and
+the bug survived its own fix (round 4, F2). A per-session reset over a
+process-lived latch is wrong unless there is exactly ONE instance of that
+latch; put the instance in the module that owns the class, beside the reset,
+and let every consumer import it. `tests/clients/toolchain-client-singleton.test.ts`
+is the ratchet for the toolchain clients.
 
 ## Issue triage & labels
 

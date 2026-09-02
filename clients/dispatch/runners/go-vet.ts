@@ -6,7 +6,7 @@
 
 import { relative, resolve, sep, posix } from "node:path";
 
-import { GoClient } from "../../go-client.js";
+import { goClient } from "../../go-client.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import { stripAnsi } from "../../sanitize.js";
 import { skipUnlessToolRan } from "./utils/tool-failure.js";
@@ -17,29 +17,6 @@ import type {
 	RunnerResult,
 } from "../types.js";
 import { PRIORITY } from "../priorities.js";
-
-const goClient = new GoClient();
-
-/**
- * Forget `goClient`'s memoized go path and latched availability verdict —
- * #2455 fix round 2. A probe-class "missing" verdict never expires
- * (`isLatchingOutcome`), so this module-scope client held a stale "no go
- * toolchain" answer for the life of the process. It was invisible to the
- * session-state sweep, but not for the reason an earlier draft of this comment
- * gave (#2455 fix round 3, F4): the sweep skips any file exporting no reset at
- * all, and this file exported none, so widening the container predicate to
- * "any class declared in `clients/`" could not have surfaced it. Adding the
- * reset below is what made the file visible — the fix preceded the detection,
- * and the pair-with-reset blind spot (MISS 3 in `SWEEP_HEURISTIC_LIMITS`) is
- * unchanged. Same #1496/#1535
- * shape as `resetZizmorTokenAvailability`; wired into `handleSessionStart`
- * beside it (`clients/runtime-session.ts`) so a go toolchain installed
- * mid-process is observed by the next session instead of staying "missing"
- * for the rest of the process's life.
- */
-export function resetGoAvailability(): void {
-	goClient.resetAvailability();
-}
 
 const goVetRunner: RunnerDefinition = {
 	id: "go-vet",
