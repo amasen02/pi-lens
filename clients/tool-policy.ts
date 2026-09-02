@@ -2638,9 +2638,30 @@ export function stripGradleCommentsAndStrings(source: string): string {
 	return result;
 }
 
-/** Exported for `clients/gradle-ktfmt-style.ts` (#2468) — see the note above. */
-export function namedGradleBlockBodies(source: string, name: string): string[] {
-	const bodies: string[] = [];
+/** Half-open `[start, end)` offsets of a named block's body in `source`. */
+export interface GradleBlockRange {
+	start: number;
+	end: number;
+}
+
+/**
+ * Body ranges of every `<name> { ... }` block, in source order.
+ *
+ * The offsets exist so a caller can ask where a block sits RELATIVE to
+ * another one — `clients/gradle-ktfmt-style.ts` (#2468 review round 2) needs
+ * to know whether a `ktfmt { }` block is nested inside `subprojects { }`
+ * (Gradle applies it to the children, NOT to the project declaring it), and
+ * containment of two ranges is the only reliable way to answer that; matching
+ * body TEXT would collide whenever two blocks happen to have identical
+ * bodies. `namedGradleBlockBodies` stays the ergonomic form for callers that
+ * only need the text, and delegates here so there is exactly ONE Gradle
+ * brace scanner in the repo.
+ */
+export function namedGradleBlockRanges(
+	source: string,
+	name: string,
+): GradleBlockRange[] {
+	const ranges: GradleBlockRange[] = [];
 	const startPattern = new RegExp(`\\b${name}\\s*\\{`, "g");
 	for (const match of source.matchAll(startPattern)) {
 		const open = source.indexOf("{", match.index);
@@ -2649,12 +2670,19 @@ export function namedGradleBlockBodies(source: string, name: string): string[] {
 			if (source[index] === "{") depth += 1;
 			if (source[index] === "}") depth -= 1;
 			if (depth === 0) {
-				bodies.push(source.slice(open + 1, index));
+				ranges.push({ start: open + 1, end: index });
 				break;
 			}
 		}
 	}
-	return bodies;
+	return ranges;
+}
+
+/** Exported for `clients/gradle-ktfmt-style.ts` (#2468) — see the note above. */
+export function namedGradleBlockBodies(source: string, name: string): string[] {
+	return namedGradleBlockRanges(source, name).map((range) =>
+		source.slice(range.start, range.end),
+	);
 }
 
 export type SpotlessKotlinFormatter = "ktlint" | "ktfmt";
