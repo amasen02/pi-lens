@@ -402,52 +402,71 @@ export interface ServerSelection {
 }
 
 /**
- * Evaluate every registered server against a file and say WHY each answer came
- * out the way it did (#2427).
+ * THE server-selection gate: why this server does or does not attach to this
+ * file (#2427).
  *
- * This is the one evaluation; `getServersForFileWithConfig` is a projection of
- * it. Answering "why is server X not running" used to mean re-implementing
- * these three gates at the asking site — and a second copy of a filter is a
- * copy that drifts, which is exactly what AGENTS.md's single-source-of-truth
- * rule forbids. Deciding once and projecting twice makes the introspection
- * answer and the dispatch answer the same computation by construction.
+ * One evaluation, two projections. `getServersForFileWithConfig` asks it for a
+ * verdict and `explainServersForFile` asks it for a reason; before #2427 the
+ * verdict lived here and the reason did not exist, so answering "why is server
+ * X not running" meant re-implementing these three gates at the asking site —
+ * a second copy of a filter is a copy that drifts, which is what AGENTS.md's
+ * single-source-of-truth rule forbids.
+ *
+ * Returning a REASON rather than a boolean is also what keeps the verdict path
+ * allocation-free: `getServersForFileWithConfig` runs per file on the dispatch
+ * and cascade paths, and materializing one decision object per registered
+ * server per call would put ~46 short-lived objects on a hot path to serve a
+ * question only the introspection surface asks.
  *
  * Gate order is the ANSWER order, not just an implementation detail: a server
  * the operator disabled reports `disabled-by-config` even when the file's
  * extension would not have matched it anyway, because "you turned it off" is
  * the fact the asker can act on.
  */
+function selectionReason(
+	server: LSPServerInfo,
+	config: RegisteredLSPConfig,
+	filePath: string,
+	ext: string,
+	base: string,
+): ServerSelectionReason {
+	if (config.disabledServerIds.has(server.id)) return "disabled-by-config";
+	let matched = false;
+	for (const value of server.extensions) {
+		const lower = value.toLowerCase();
+		if (lower === ext || lower === base) {
+			matched = true;
+			break;
+		}
+	}
+	if (!matched) return "extension-mismatch";
+	// #636: a server's extension match can be intentionally broader than what
+	// it can usefully act on (zizmor attaches to "yaml" but only ever reports
+	// on GitHub Actions workflow/action/dependabot paths). `pathFilter`, when
+	// present, is an ADDITIONAL narrowing gate — never a widening one.
+	if (server.pathFilter && !server.pathFilter(filePath)) return "path-filter";
+	return "selected";
+}
+
+/** Every registered server's decision for a file, with the reason for each. */
 export function explainServersForFile(filePath: string): ServerSelection[] {
 	const config = getConfigForFile(filePath);
 	const ext = path.extname(filePath).toLowerCase();
 	const base = path.basename(filePath).toLowerCase();
 	return registeredServers(config).map((server) => {
-		if (config.disabledServerIds.has(server.id)) {
-			return { server, selected: false, reason: "disabled-by-config" as const };
-		}
-		const extensions = server.extensions.map((value) => value.toLowerCase());
-		if (!extensions.includes(ext) && !extensions.includes(base)) {
-			return {
-				server,
-				selected: false,
-				reason: "extension-mismatch" as const,
-			};
-		}
-		// #636: a server's extension match can be intentionally broader than what
-		// it can usefully act on (zizmor attaches to "yaml" but only ever reports
-		// on GitHub Actions workflow/action/dependabot paths). `pathFilter`, when
-		// present, is an ADDITIONAL narrowing gate — never a widening one.
-		if (server.pathFilter && !server.pathFilter(filePath)) {
-			return { server, selected: false, reason: "path-filter" as const };
-		}
-		return { server, selected: true, reason: "selected" as const };
+		const reason = selectionReason(server, config, filePath, ext, base);
+		return { server, selected: reason === "selected", reason };
 	});
 }
 
 export function getServersForFileWithConfig(filePath: string): LSPServerInfo[] {
-	return explainServersForFile(filePath)
-		.filter((entry) => entry.selected)
-		.map((entry) => entry.server);
+	const config = getConfigForFile(filePath);
+	const ext = path.extname(filePath).toLowerCase();
+	const base = path.basename(filePath).toLowerCase();
+	return registeredServers(config).filter(
+		(server) =>
+			selectionReason(server, config, filePath, ext, base) === "selected",
+	);
 }
 
 /**
