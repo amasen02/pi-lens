@@ -404,7 +404,15 @@ function discoverPiLensProjectConfig(startDir: string): DiscoveryCacheEntry {
 	return { info: undefined, dirMtimes };
 }
 
-function warnInvalidConfigOnce(configPath: string, reason: string): void {
+function warnInvalidConfigOnce(
+	configPath: string,
+	// A hand-authored string for a validated bad value/wrong type (every call
+	// site below but the JSON.parse catch); `{ parseError }` for a caught
+	// parse/read error, so `warnIgnoredConfigOnce` — not this wrapper — decides
+	// how much of a `JSON.parse` `SyntaxError#message` (which embeds a snippet
+	// of the source file on Node >=20, #2431) survives into the three sinks.
+	reason: string | { readonly parseError: unknown },
+): void {
 	// Shared seam since #2418: latch, extension.log line, durable
 	// `config-ignored` ledger row, and stable-coded notification in one place.
 	warnIgnoredConfigOnce({
@@ -453,12 +461,11 @@ function parseRulePolicyList(
 function parseConfigFile(configPath: string): PiLensProjectConfig {
 	const outcome = readConfigDocument(configPath);
 	if (outcome.status === "error") {
-		warnInvalidConfigOnce(
-			configPath,
-			outcome.error instanceof Error
-				? outcome.error.message
-				: "failed to parse JSON",
-		);
+		// `{ parseError }`, not a pre-stringified message (#2431): the shared read
+		// helper hands back the raw error precisely so `warnIgnoredConfigOnce` —
+		// the one seam — decides how much of a `JSON.parse` `SyntaxError#message`
+		// (which embeds a snippet of the file being parsed) reaches its sinks.
+		warnInvalidConfigOnce(configPath, { parseError: outcome.error });
 		return EMPTY_PROJECT_CONFIG;
 	}
 	// The file was stat'd as present by the discovery above, so `missing` here is

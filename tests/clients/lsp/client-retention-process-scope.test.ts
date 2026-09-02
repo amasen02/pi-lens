@@ -20,17 +20,11 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { launchLSP, stopLSP } from "../../../clients/lsp/launch.js";
+import { stopLSP } from "../../../clients/lsp/launch.js";
+import { spawnFakeLspServer } from "../../support/fake-lsp-server.js";
 import { removeTempDirSync } from "../test-utils.js";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const FAKE_SERVER_PATH = path.join(
-	__dirname,
-	"../../fixtures/fake-lsp-server.mjs",
-);
 
 type ClientModule = typeof import("../../../clients/lsp/client.js");
 
@@ -51,7 +45,7 @@ describe("live client accounting spans module evaluations (#2130)", () => {
 	}
 
 	async function spawnClient(mod: ClientModule, root: string): Promise<void> {
-		const proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+		const proc = await spawnFakeLspServer({
 			cwd: root,
 			env: { ...process.env, FAKE_LSP_SYNC_KIND: "2" },
 		});
@@ -109,7 +103,7 @@ describe("live client accounting spans module evaluations (#2130)", () => {
 			(await import("../../../clients/lsp/client.js")) as ClientModule;
 
 		const rootB = makeRoot("cliroot-gone");
-		const proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+		const proc = await spawnFakeLspServer({
 			cwd: rootB,
 			env: { ...process.env, FAKE_LSP_SYNC_KIND: "2" },
 		});
