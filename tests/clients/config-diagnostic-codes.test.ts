@@ -143,10 +143,16 @@ function configSurfaceSources(): ConfigSurfaceSource[] {
 				continue;
 			}
 			if (!entry.name.endsWith(".ts")) continue;
-			if (!/config/i.test(entry.name)) continue;
+			const relative = path.relative(REPO_ROOT, full).split(path.sep).join("/");
+			// The RELATIVE PATH, not the basename (#2425). `clients/config-core/`
+			// holds the shared config pipeline in files called `merge.ts`,
+			// `deny.ts`, `normalize.ts` — none of which a basename test can see, so
+			// a basename scan would have declared the whole config core audited
+			// while auditing none of it.
+			if (!/config/i.test(relative)) continue;
 			const raw = fs.readFileSync(full, "utf-8");
 			found.push({
-				file: path.relative(REPO_ROOT, full).split(path.sep).join("/"),
+				file: relative,
 				source: stripSource(raw, { strings: "keep" }),
 				raw,
 			});
@@ -425,6 +431,13 @@ describe("config-surface warnings carry a stable code (#2418)", () => {
 		expect(files).toContain("clients/lens-config.ts");
 		expect(files).toContain("clients/project-lens-config.ts");
 		expect(files).toContain("clients/lsp/config.ts");
+	});
+
+	it("audits the shared config core, whose filenames do not say `config`", () => {
+		const files = configSurfaceSources().map((entry) => entry.file);
+		expect(files).toContain("clients/config-core/normalize.ts");
+		expect(files).toContain("clients/config-core/deny.ts");
+		expect(files).toContain("clients/config-core/process-spec.ts");
 	});
 
 	it("passes a registered code option on every config-surface notifyUserDegradation call", () => {

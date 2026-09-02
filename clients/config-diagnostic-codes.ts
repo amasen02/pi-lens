@@ -100,6 +100,28 @@ export const CONFIG_DIAGNOSTIC_CODES = {
 	 * `PILENS_CFG_0002`.
 	 */
 	PILENS_CFG_0003: "deprecated config file location accepted",
+	/**
+	 * A config field no schema property claims was dropped.
+	 *
+	 * PRODUCED by `validate()` (`clients/config-core/normalize.ts`), which is
+	 * the one place the unknown-field policy in `docs/public-api-stability.md`
+	 * is implemented: warn and drop, never throw. It reaches a user through
+	 * `reportMigrationRecords` -> `warnIgnoredConfigOnce`, which #2426 wires
+	 * when the loaders adopt the core. Registered now because the resolution
+	 * pipeline already stamps records with it, and a record carrying an
+	 * unregistered code is exactly what the #2418 drift test forbids.
+	 */
+	PILENS_CFG_0004: "unknown config field ignored",
+	/**
+	 * A config field's value did not match its schema and was dropped.
+	 *
+	 * Wrong type, a value outside a declared `enum`, or a nesting depth past the
+	 * validator's bound. Same producer and same delivery path as
+	 * `PILENS_CFG_0004`. Kept distinct from it because the two need different
+	 * user actions: an unknown field is usually a typo or a removed key, while a
+	 * rejected value is a field the user meant and spelled wrongly.
+	 */
+	PILENS_CFG_0005: "config field value rejected by schema; ignored",
 } as const satisfies Record<`PILENS_CFG_${string}`, string>;
 
 export type ConfigDiagnosticCode = keyof typeof CONFIG_DIAGNOSTIC_CODES;
