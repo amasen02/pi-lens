@@ -22,6 +22,31 @@ import {
 export { LEDGER_FIELD_MAX, truncateForLedger };
 
 export type DegradationKind =
+	/**
+	 * #2430: a tool mutated a tracked file but matched no built-in name and no
+	 * mutation shape adapter, so pi-lens could only find the change by diffing
+	 * the disk around the call. Subject is the tool name, recorded ONCE per
+	 * tool, so a session report names every gap in the classification registry
+	 * instead of leaving the observational net's work invisible.
+	 */
+	| "unclassified-mutating-tool"
+	/**
+	 * #2430: an observational capture — the pre-snapshot, the post-diff, or the
+	 * `agent_settled` sweep — hit its per-turn wall-clock budget, timed out, or
+	 * was aborted. The net then has NO opinion about that call, which must be
+	 * visible rather than read as "nothing changed" (catalog shape 10).
+	 */
+	| "observed-mutation-budget"
+	/**
+	 * #2430: an armed observation's universe was TRUNCATED — the tool named a
+	 * directory with more entries than {@link
+	 * clients/observed-mutation.ts#OBSERVED_TARGET_DIR_MAX_ENTRIES}, so the
+	 * entries past the cap were never watched. Subject is the tool name. This
+	 * is deliberately NOT `observed-mutation-budget`: no clock and no byte
+	 * budget was exceeded, and a reader tuning a timeout would be chasing a
+	 * structural cap that no amount of time changes (#2449 review round 3).
+	 */
+	| "observed-mutation-dir-cap"
 	| "trust-refusal"
 	| "mode-suppression"
 	| "ts-idle-eviction"

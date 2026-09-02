@@ -45,6 +45,11 @@
   "./clients/message-end-attribution.js",
   "./clients/mutating-tool.js",
   "./clients/mutation-bridge.js",
+  // #2430: the agent_settled sweep and its post-drain re-baseline. Eager
+  // because they run inside the settle handler, on the same path as the
+  // deferred drain they bracket.
+  "./clients/observed-mutation-sources.js",
+  "./clients/observed-mutation.js",
   "./clients/package-root.js",
   "./clients/path-attribution-telemetry.js",
   "./clients/path-utils.js",

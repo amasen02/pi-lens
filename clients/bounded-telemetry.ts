@@ -133,6 +133,46 @@ export const BOUNDED_TELEMETRY_PHASES = [
 	"lsp_scanner_coverage_gap",
 	/** #2358: a busy CPU discriminator deferred notify-stall teardown. */
 	"lsp_notify_stall_cpu_busy",
+	/**
+	 * #2430: an observational pre/post snapshot was declined or cut short — the
+	 * per-turn budget was already spent, the capture timed out, or the turn was
+	 * aborted. Every unclassified tool call in a busy turn can reach this, so
+	 * it is capped per turn with the ledger holding the exact count.
+	 */
+	"observed_mutation_budget_exhausted",
+	/**
+	 * #2430: the `agent_settled` tracked-file sweep could not complete within
+	 * its bound. Once per settle at most, capped for the same reason.
+	 */
+	"observed_sweep_skipped_budget",
+	/**
+	 * #2430: a tracked file's size/mtime moved but no hashed baseline could
+	 * confirm the bytes actually changed — too large for the sweep's read
+	 * budget, or never hashed. Named rather than replayed, because a `touch`
+	 * moves mtime without moving a byte (#2449 review round 2, F7). Bounded
+	 * per turn: one settle can find many such files at once.
+	 */
+	"observed_sweep_unverifiable",
+	/**
+	 * #2430: an armed observation's universe was TRUNCATED because the tool
+	 * named a directory with more entries than the net may watch. Bounded per
+	 * turn with the ledger holding the exact count, and the identity is the
+	 * tool name so the record answers WHICH tool is being watched partially
+	 * (#2449 review round 3).
+	 */
+	"observed_target_dir_capped",
+	/**
+	 * #2430: the "pi-lens wrote these bytes itself" set hit
+	 * `OBSERVED_HANDLED_MAX` and dropped its oldest entry. The dropped file is
+	 * NAMED, because the eviction silently reintroduces the exact defect
+	 * #2449 round 3 (S5) fixed: the ledger still holds the pre-drain bytes
+	 * while the only record that those bytes were ours is gone, so the next
+	 * settled sweep replays pi-lens's own formatter output as third-party
+	 * drift. A cap that drops a mark has to say which one (catalog shape 10);
+	 * capped per turn because a turn that overflows the set overflows it many
+	 * times (#2449 review round 4, S2).
+	 */
+	"observed_handled_evicted",
 ] as const;
 
 export type BoundedPhase = (typeof BOUNDED_TELEMETRY_PHASES)[number];

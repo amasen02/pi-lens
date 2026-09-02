@@ -79,6 +79,9 @@ const HAND_ROLLED_GENERATION_GUARDS: Readonly<Record<string, string>> = {
 	"mcp/analyze.ts":
 		"the warm word-index idle eviction captures a per-entry generation before its timer fires and re-checks it in the callback, alongside an entry-identity compare. The eviction direction again, on a per-entry counter rather than a keyed map; a migration candidate once GenerationMap gains an entry-scoped form",
 
+	"observed-mutation.ts":
+		"the settle rejects a baseline whose sessionGeneration no longer matches the one the tool_result carries. This IS the capture-before/check-after shape, but the counter is RuntimeCoordinator.sessionGeneration — captured at tool_call, handed back at tool_result, and owned by runtime-coordinator.ts, whose own migration is deferred above. Declaring a GenerationSource here would mint a SECOND counter mirroring the session's, which is the single-source-of-truth defect the ratchet exists to prevent; this file migrates when runtime-coordinator.ts exposes its source as one",
+
 	// --- Not the shape: a generation is compared, but no post-await write
 	// hangs on the answer. ---
 	"dispatch/runners/utils/runner-helpers.ts":
