@@ -22,6 +22,17 @@
  * table (a `[[bin]] name = "..."` or `[package.metadata.*]` block preceding
  * `[package]`) silently returned the wrong crate name. `readCargoPackageName`
  * is table-scoped via `extractTomlTableSection` like every other reader here.
+ *
+ * Review round 2 (PR #2480) hardened the fold itself: `extractTomlTableSection`
+ * and `parseTomlStringArray` now run everything through {@link normalizeToml}
+ * (CRLF→LF, plus a per-line `#`-to-EOL comment strip that respects quoted
+ * strings) before any regex runs, and both the table heading and its
+ * terminator are anchored with `[ \t]*` rather than bare `^` so an indented
+ * heading or sub-table is read the same way the pre-fold, per-line `.trim()`d
+ * reader read it. `readCargoWorkspaceMembers` also gained `[workspace]`
+ * table-scoping and a sibling `readCargoWorkspaceExclude`, both now reused by
+ * `clients/lsp/server.ts` instead of that file hand-composing the same two
+ * primitives itself.
  */
 
 import { readFile } from "node:fs/promises";
@@ -41,29 +52,83 @@ export async function readTextFileOrUndefined(
 }
 
 /**
+ * Strip a `#`-to-end-of-line TOML comment from one line, leaving a `#`
+ * character INSIDE a single- or double-quoted string alone (a version spec or
+ * path containing a literal `#` is unusual but legal TOML). A whole-line
+ * comment (the line's first non-whitespace character is `#`) reduces to "".
+ */
+function stripTomlLineComment(line: string): string {
+	let quote: '"' | "'" | null = null;
+	for (let i = 0; i < line.length; i++) {
+		const ch = line[i];
+		if (quote) {
+			if (ch === quote) quote = null;
+			continue;
+		}
+		if (ch === '"' || ch === "'") {
+			quote = ch as '"' | "'";
+			continue;
+		}
+		if (ch === "#") return line.slice(0, i);
+	}
+	return line;
+}
+
+/**
+ * Normalize CRLF to LF and strip `#`-to-EOL comments line by line. Every
+ * regex-based reader below runs on the result: `^`/`$` line anchors assume LF
+ * line endings (review round 2, F2 — a CRLF manifest's `\r` sat between the
+ * matched text and `$`, so a heading/terminator line silently failed to
+ * match), and a commented-out entry must never survive into a captured
+ * table/array body (review round 2, F1 — the pre-fold `extractTomlArray`
+ * stripped comments per line before collecting; the fold's single multi-line
+ * regex scan dropped that pass, so a commented-out `# "member",` line stayed
+ * live because nothing removed it before the quoted-string scan ran over the
+ * whole bracketed span).
+ */
+function normalizeToml(content: string): string {
+	return content
+		.replace(/\r\n/g, "\n")
+		.split("\n")
+		.map(stripTomlLineComment)
+		.join("\n");
+}
+
+/**
  * Slice out ONE top-level TOML table's raw body — from its `[name]` heading
  * to the next top-level `[...]`/`[[...]]` heading or EOF. `members`/`exclude`
  * must be read from the `[workspace]` table specifically: `[package]` has its
  * OWN `exclude` key (the standard cargo-publish exclude list, conventionally
  * written above `[workspace]` in a virtual-manifest-less root crate), and a
  * whole-file regex would misread it as workspace membership (#1671 F4).
+ *
+ * Both the heading and the terminating next-heading are anchored with
+ * `[ \t]*` rather than bare `^` — TOML does not require a table heading to
+ * start in column 0, and the pre-fold reader (which `.trim()`ed each line
+ * before comparing) accepted an indented `  [package]` or `  [dependencies.
+ * tokio]` sub-table. The column-0-only anchor this fold shipped with missed
+ * both: an indented `[package]` heading never matched at all (the table read
+ * as absent), and an indented sub-table heading never terminated the parent
+ * slice (its keys leaked into the parent table's body) — review round 2, F2.
  */
 export function extractTomlTableSection(
 	content: string,
 	tableName: string,
 ): string {
-	const heading = new RegExp(`^\\[${tableName}\\][ \\t]*(?:#.*)?$`, "m");
-	const match = heading.exec(content);
+	const normalized = normalizeToml(content);
+	const heading = new RegExp(`^[ \\t]*\\[${tableName}\\][ \\t]*(?:#.*)?$`, "m");
+	const match = heading.exec(normalized);
 	if (!match) return "";
-	const rest = content.slice(match.index + match[0].length);
-	const nextHeading = rest.match(/^\[{1,2}[^\]]+\]{1,2}[ \t]*(?:#.*)?$/m);
+	const rest = normalized.slice(match.index + match[0].length);
+	const nextHeading = rest.match(/^[ \t]*\[{1,2}[^\]]+\]{1,2}[ \t]*(?:#.*)?$/m);
 	return nextHeading?.index !== undefined
 		? rest.slice(0, nextHeading.index)
 		: rest;
 }
 
 export function parseTomlStringArray(content: string, key: string): string[] {
-	const match = content.match(
+	const normalized = normalizeToml(content);
+	const match = normalized.match(
 		new RegExp(`^[ \\t]*${key}[ \\t]*=[ \\t]*\\[([\\s\\S]*?)\\]`, "m"),
 	);
 	if (!match) return [];
@@ -104,13 +169,42 @@ export function readCargoPackageName(content: string): string | undefined {
 
 /**
  * Read `members` off a (typically root/virtual) Cargo.toml for workspace
- * expansion. Matches `parseTomlStringArray`'s existing unscoped behavior —
- * `members` has no realistic collision with another table's same-named key,
- * unlike `[package] name` above, so this stays a thin wrapper rather than
- * adding `[workspace]` table-scoping the fold didn't set out to change.
+ * expansion, table-scoped to `[workspace]` (review round 2, F4). A whole-file
+ * `members` regex silently also matches `[workspace.metadata.*] members =
+ * [...]` or any other table happening to declare a same-named key — the
+ * exact "unscoped read of a same-named key under an unrelated table" defect
+ * shape `readCargoPackageName` above was already fixed for (#2473), except
+ * this reader shipped the fold WITHOUT that scoping and called it out
+ * explicitly as intentional in the comment this replaces. It also duplicated
+ * `clients/lsp/server.ts`'s independent, already-correctly-scoped
+ * `extractTomlTableSection(content, "workspace")` + `parseTomlStringArray`
+ * hand-composition for its own `members`/`exclude` read — the SAME
+ * single-source-of-truth violation #2473 was filed to close for the OTHER
+ * two Cargo.toml readers. `clients/lsp/server.ts` now calls this function
+ * (and {@link readCargoWorkspaceExclude} below) instead of re-composing the
+ * two primitives itself.
  */
 export function readCargoWorkspaceMembers(content: string): string[] {
-	return parseTomlStringArray(content, "members");
+	return parseTomlStringArray(
+		extractTomlTableSection(content, "workspace"),
+		"members",
+	);
+}
+
+/**
+ * Read `exclude` off a (typically root/virtual) Cargo.toml, table-scoped to
+ * `[workspace]` — `[package]` has its OWN `exclude` key (the cargo-publish
+ * exclude list; see {@link extractTomlTableSection}'s doc comment), so an
+ * unscoped read would misread it as workspace exclusion (#1671 F4). Companion
+ * to {@link readCargoWorkspaceMembers}; both replace `clients/lsp/server.ts`'s
+ * former hand-composed `extractTomlTableSection` + `parseTomlStringArray`
+ * pair (review round 2, F4).
+ */
+export function readCargoWorkspaceExclude(content: string): string[] {
+	return parseTomlStringArray(
+		extractTomlTableSection(content, "workspace"),
+		"exclude",
+	);
 }
 
 /**

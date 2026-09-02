@@ -66,7 +66,13 @@ export function findCargoManifestDirs(root) {
 		}
 	};
 	walk(root);
-	return dirs.sort((a, b) => a.localeCompare(b));
+	// Bare code-unit `.sort()` (like gen-language-snapshot.mjs), NOT
+	// `localeCompare` — the golden this feeds is byte-compared (review round
+	// 2, F5): a locale-aware comparator can order two entries differently than
+	// the plain code-unit sort JSON.stringify/diffing assumes, silently
+	// drifting the committed snapshot's row order from a fresh regen on a
+	// different locale.
+	return dirs.sort();
 }
 
 function relKey(dir) {
@@ -88,11 +94,11 @@ function describeDir(dir) {
 			internalDeps: [...m.internalDeps].sort(),
 			externalDeps: [...m.externalDeps].sort(),
 		}))
-		.sort((a, b) => a.name.localeCompare(b.name));
+		.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 	const dependents = Object.fromEntries(
 		[...graph.dependents.entries()]
 			.map(([name, deps]) => [name, [...deps].sort()])
-			.sort(([a], [b]) => a.localeCompare(b)),
+			.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
 	);
 	return { modules, dependents };
 }

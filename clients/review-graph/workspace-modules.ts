@@ -8,6 +8,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
+	extractTomlTableSection,
 	readCargoDependencyNames,
 	readCargoPackageName,
 	readCargoWorkspaceMembers,
@@ -90,7 +91,14 @@ function detectWorkspaceType(cwd: string): WorkspaceType | null {
 	if (markers.hasCargoToml) {
 		try {
 			const content = fs.readFileSync(path.join(cwd, "Cargo.toml"), "utf-8");
-			if (content.includes("[workspace]")) return "cargo";
+			// A substring `.includes` also matches a COMMENTED-OUT `# [workspace]`
+			// heading, wrongly classifying the project as a cargo workspace (and,
+			// since Cargo.toml is checked before package.json, short-circuiting past
+			// a real npm/pnpm workspace living alongside it) — `[workspace]` proper
+			// is a real, active TOML table, so the shared table-scoped reader (which
+			// strips comments before matching) is the correct check (review round 2,
+			// F3).
+			if (extractTomlTableSection(content, "workspace") !== "") return "cargo";
 		} catch {}
 	}
 	if (markers.hasPackageJson) {

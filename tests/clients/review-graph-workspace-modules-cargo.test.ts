@@ -38,6 +38,12 @@ const SYNTHETIC_WORKSPACE = fileURLToPath(
 	),
 );
 
+function fixtureDir(name: string): string {
+	return fileURLToPath(
+		new URL(`../fixtures/cargo-workspace-modules/${name}`, import.meta.url),
+	);
+}
+
 describe("cargo module-graph golden snapshot (#2473)", () => {
 	it("matches the committed fixture", () => {
 		const fixture = JSON.parse(readFileSync(SNAPSHOT_PATH, "utf8"));
@@ -77,5 +83,72 @@ describe("Cargo.toml reader table-scoping (#2473)", () => {
 		expect(graph?.modules.get("normal-with-deps")?.externalDeps.sort()).toEqual(
 			["serde", "tokio"],
 		);
+	});
+});
+
+/**
+ * Reviewer's adversarial cargo-workspace fixtures (review round 2, F6):
+ * `tests/fixtures/cargo-workspace-modules/adv-*`. Each isolates ONE finding
+ * from PR #2480 review round 2 at the `buildModuleGraph` level (the same
+ * externally observable surface the golden snapshot covers).
+ */
+describe("adversarial fixtures (#2473 review round 2, F1-F4)", () => {
+	it("F1: a commented-out member's crate does not enter the module graph even though it still exists on disk", () => {
+		clearModuleGraphCache();
+		const graph = buildModuleGraph(fixtureDir("adv-a-commented-member"));
+		expect(graph?.modules.has("adv-a-kept")).toBe(true);
+		expect(graph?.modules.has("adv-a-commented-out")).toBe(false);
+	});
+
+	it("F2: an indented [package] heading is still read (single-member workspace is not null)", () => {
+		clearModuleGraphCache();
+		const graph = buildModuleGraph(fixtureDir("adv-b-indented-package"));
+		expect(graph).not.toBeNull();
+		expect(graph?.modules.has("adv-b-indented")).toBe(true);
+	});
+
+	it("F2: an indented sub-table heading terminates the parent [dependencies] slice", () => {
+		clearModuleGraphCache();
+		const graph = buildModuleGraph(fixtureDir("adv-c-indented-subtable"));
+		const deps = graph?.modules.get("adv-c-subtable")?.externalDeps;
+		expect(deps).toEqual(["serde"]);
+		expect(deps).not.toContain("version");
+		expect(deps).not.toContain("features");
+	});
+
+	it("control: dev/build/target-scoped dependency tables never feed [dependencies] reads", () => {
+		clearModuleGraphCache();
+		const graph = buildModuleGraph(fixtureDir("adv-d-dev-only-deps"));
+		expect(graph?.modules.get("adv-d-devonly")?.externalDeps).toEqual([]);
+	});
+
+	it("F2: a CRLF manifest is read the same as an LF one", () => {
+		clearModuleGraphCache();
+		const graph = buildModuleGraph(fixtureDir("adv-e-crlf"));
+		expect(graph).not.toBeNull();
+		expect(graph?.modules.get("adv-e-crlf")?.externalDeps).toEqual(["serde"]);
+	});
+
+	it("control: a bare minimal [package] (name only) still resolves", () => {
+		clearModuleGraphCache();
+		const graph = buildModuleGraph(fixtureDir("adv-f-bare-package"));
+		expect(graph?.modules.has("adv-f-bare")).toBe(true);
+	});
+
+	it("a trailing comment on a table heading does not hide the table body", () => {
+		clearModuleGraphCache();
+		const graph = buildModuleGraph(fixtureDir("adv-g-heading-comment"));
+		expect(graph?.modules.get("adv-g-heading-comment")?.externalDeps).toEqual([
+			"serde",
+		]);
+	});
+
+	it("F3: a commented-out [workspace] heading falls through to a real npm workspace instead of resolving to null", () => {
+		clearModuleGraphCache();
+		const graph = buildModuleGraph(
+			fixtureDir("adv-h-commented-workspace-heading"),
+		);
+		expect(graph).not.toBeNull();
+		expect(graph?.modules.has("foo")).toBe(true);
 	});
 });
