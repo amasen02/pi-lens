@@ -60,6 +60,7 @@ import {
 import { normalizeMapKey } from "../../../clients/path-utils.js";
 import { hashDiagnosticContent } from "../../../clients/lsp/diagnostic-binding.js";
 import { applyWorkspaceEdit } from "../../../clients/lsp/edits.js";
+import type { LspMutationContext } from "../../../clients/lsp-mutation.js";
 // #1667: the LSPClientState fixture moved to a shared module so the
 // multi-identifier pull tests reuse it instead of maintaining a copy.
 import { createMockLspProcess, createMockState } from "./mock-client-state.js";
