@@ -61,11 +61,31 @@ export const MUTATION_ATTRIBUTION_FILE = "observed-mutating-tools.json";
 export const PERSIST_AFTER_OBSERVATIONS = 2;
 
 /**
- * Consecutive clean observations after which a tool stops being armed for the
- * session. Two, not one: a mutating tool whose FIRST call happened to be a
- * no-op (an edit that changed nothing) still gets a second chance.
+ * Consecutive clean observations after which an UNATTRIBUTED tool stops being
+ * armed for the session. Two, not one: a mutating tool whose FIRST call
+ * happened to be a no-op (an edit that changed nothing) still gets a second
+ * chance.
  */
 export const CLEAN_OBSERVATION_ARM_LIMIT = 2;
+
+/**
+ * Consecutive clean observations after which a SESSION-learned attribution is
+ * forgotten (#2449 review round 2, F4).
+ *
+ * The session map is a claim about a tool made from ONE disk observation, and
+ * a claim made from evidence has to be revisable by evidence. Three armed
+ * observations in a row where the tool's own target did not move is the
+ * signal that the first observation was a coincidence — a background write, a
+ * formatter, another agent — and the tool goes back to unattributed rather
+ * than staying mislabelled for the rest of the session.
+ *
+ * Higher than {@link CLEAN_OBSERVATION_ARM_LIMIT} on purpose: forgetting is
+ * the more consequential direction, so it takes strictly more evidence than
+ * merely deciding to stop watching. It applies only BEFORE persistence — an
+ * attribution that already earned {@link PERSIST_AFTER_OBSERVATIONS} is not
+ * armed any more, so nothing can un-learn it by accident.
+ */
+export const DEATTRIBUTE_AFTER_CLEAN_OBSERVATIONS = 3;
 
 /** Bound on distinct tool names remembered, in-memory and on disk. */
 export const MUTATION_ATTRIBUTION_MAX_TOOLS = 64;
@@ -212,18 +232,49 @@ export function lookupLearnedMutatingTool(
 }
 
 /**
- * Whether an unclassified call to `toolName` should still pay for a snapshot.
+ * Whether a SESSION attribution exists but has not yet earned persistence.
  *
- * `false` once the tool is attributed (classification no longer needs the
- * diff) or once it has been observed clean `CLEAN_OBSERVATION_ARM_LIMIT`
- * times (it is not an edit tool, and re-proving that on every call is the
- * hot-path cost this latch exists to remove).
+ * This is the window in which the tool IS classified by name (so #2430's
+ * second acceptance criterion holds) and is STILL watched, because the second
+ * observation that makes the attribution durable can only come from another
+ * real disk diff. `runtime-tool-call.ts` consults this alongside
+ * `classifyMutatingTool` when deciding whether to arm.
+ */
+export function isProvisionalLearnedAttribution(toolName: string): boolean {
+	const current = state();
+	if (current.fromDisk?.has(toolName) === true) return false;
+	const observation = current.session.get(toolName);
+	if (!observation || observation.persisted) return false;
+	return (
+		observation.mutating > 0 &&
+		observation.mutating < PERSIST_AFTER_OBSERVATIONS
+	);
+}
+
+/**
+ * Whether a call to `toolName` should still pay for a snapshot.
+ *
+ * Three states, in order:
+ *
+ * 1. **Attributed durably** — persisted this session, or adopted from disk at
+ *    `session_start`. Never armed: classification no longer needs the diff.
+ * 2. **Attributed provisionally** — one observation, not yet persisted. STILL
+ *    armed. The first cut returned `false` the moment
+ *    `lookupLearnedMutatingTool` went non-`undefined`, which is after ONE
+ *    observation, so `PERSIST_AFTER_OBSERVATIONS = 2` was unreachable on the
+ *    production path and no attribution ever reached disk (#2449 review round
+ *    2, F2). The only test that "proved" persistence called
+ *    `noteObservedMutation` directly, so it proved the counter, not the path.
+ * 3. **Unattributed** — armed until observed clean
+ *    {@link CLEAN_OBSERVATION_ARM_LIMIT} times (it is not an edit tool, and
+ *    re-proving that on every call is the hot-path cost this latch removes).
  */
 export function shouldArmObservationForTool(toolName: string): boolean {
-	if (lookupLearnedMutatingTool(toolName) !== undefined) return false;
-	return (
-		(state().session.get(toolName)?.clean ?? 0) < CLEAN_OBSERVATION_ARM_LIMIT
-	);
+	const observation = state().session.get(toolName);
+	if ((observation?.mutating ?? 0) > 0)
+		return isProvisionalLearnedAttribution(toolName);
+	if (state().fromDisk?.has(toolName) === true) return false;
+	return (observation?.clean ?? 0) < CLEAN_OBSERVATION_ARM_LIMIT;
 }
 
 export interface ObservedMutationAttribution {
@@ -264,9 +315,31 @@ export function noteObservedMutation(
 	return { observations: observation.mutating, persisted };
 }
 
-/** Record that an armed observation found nothing changed. */
+/**
+ * Record that an armed observation found the tool's own target unchanged.
+ *
+ * Also the DE-ATTRIBUTION point (#2449 review round 2, F4). A session
+ * attribution that then goes {@link DEATTRIBUTE_AFTER_CLEAN_OBSERVATIONS}
+ * consecutive armed observations without its target moving is withdrawn: the
+ * one observation behind it was a coincidence, and leaving it standing would
+ * keep a read-shaped tool labelled as mutating for the rest of the session.
+ *
+ * The counter is deliberately NOT reset when the attribution is withdrawn.
+ * Zeroing it would put the tool straight back into the armed-and-unattributed
+ * state and re-arm it forever; leaving it at or above
+ * {@link CLEAN_OBSERVATION_ARM_LIMIT} means "not attributed, and not worth
+ * watching either", which is the truth the observations support.
+ */
 export function noteObservedClean(toolName: string): void {
-	observationFor(toolName).clean += 1;
+	const observation = observationFor(toolName);
+	observation.clean += 1;
+	if (
+		observation.mutating > 0 &&
+		!observation.persisted &&
+		observation.clean >= DEATTRIBUTE_AFTER_CLEAN_OBSERVATIONS
+	) {
+		observation.mutating = 0;
+	}
 }
 
 function persistAttribution(

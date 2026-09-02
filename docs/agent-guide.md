@@ -198,13 +198,19 @@ pi-lens writes to files **outside your own tool calls** (`docs/features.md`
   that is still writing.
 - **A tool whose shape is unrecognized too:** pi-lens watches instead of
   guessing (`clients/observed-mutation.ts`). A call that names a file gets a
-  bounded pre/post snapshot, anything that changed is replayed through the same
-  chain, and the tool is then remembered as mutating — for this session on the
-  first sighting, persisted under the project's data directory on the second,
-  so a later session classifies it by name with no snapshot. A call that names
-  no file is caught at `agent_settled` by a hash check over the files pi-lens
-  has already read, written, diagnosed or opened on a language server; a file it
-  has never seen has no baseline, so that last-resort net does not cover it.
+  bounded pre/post snapshot of THAT PATH — the file itself, or a directory's own
+  entries — and nothing else, so a write landing on a neighbouring file is never
+  attributed to it. Anything that changed is replayed through the same chain,
+  and the tool is then remembered as mutating: for this session on the first
+  sighting, persisted under the project's data directory on the second, so a
+  later session classifies it by name with no snapshot at all. Three quiet
+  observations in a row withdraw a session attribution again. A call that names
+  no file is caught at `agent_settled` by an incremental content check over the
+  files pi-lens has already read, written, diagnosed or opened on a language
+  server — a rotating window per turn, reading only what actually moved; a file
+  it has never seen has no baseline, so that last-resort net does not cover it,
+  and a file it cannot verify is reported as such rather than reformatted on a
+  timestamp alone.
 - The conservative actionable-warnings autofix (LSP quickfixes, hard-capped)
   is unchanged: it always runs at `agent_end`.
 

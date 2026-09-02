@@ -2565,9 +2565,10 @@ function activateExtension(hostPi: ExtensionAPI) {
 				signal: ctx?.signal,
 				dbg,
 			});
-			if (result.drifted.length > 0) {
+			if (result.drifted.length > 0 || result.unverifiable.length > 0) {
 				dbg(
-					`observed_settled_sweep: ${result.drifted.length} drifted file(s), ${result.replayed} replayed`,
+					`observed_settled_sweep: ${result.drifted.length} drifted file(s), ${result.replayed} replayed, ` +
+						`${result.unverifiable.length} unverifiable; scanned ${result.scanned}, ${result.remaining} left for the next turn (cursor ${result.cursor})`,
 				);
 			}
 		} catch (sweepErr) {
@@ -2589,6 +2590,11 @@ function activateExtension(hostPi: ExtensionAPI) {
 						cwd,
 						limit: OBSERVED_TRACKED_MAX_FILES,
 					}),
+				// Same seeding shortcut the sweep uses: a file first seen here
+				// gets its baseline from the read-guard's stored per-line hashes
+				// rather than a read (#2449 review round 2, F3).
+				getStoredLineHashes: (candidate) =>
+					storedLineHashesFor(runtime.readGuard, candidate),
 				signal: ctx?.signal,
 			});
 		} catch (refreshErr) {

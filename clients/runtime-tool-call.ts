@@ -23,11 +23,8 @@ import {
 	classifyMutatingTool,
 	readMutationPathField,
 } from "./mutating-tool.js";
-import {
-	armObservedMutation,
-	OBSERVED_TRACKED_MAX_FILES,
-} from "./observed-mutation.js";
-import { collectTrackedPaths } from "./observed-mutation-sources.js";
+import { isProvisionalLearnedAttribution } from "./mutation-attribution.js";
+import { armObservedMutation } from "./observed-mutation.js";
 import type { LSPShutdownOptions } from "./lsp/client.js";
 import { getLSPService } from "./lsp/index.js";
 import {
@@ -611,11 +608,20 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 	// classified mutation never reaches here at all — that is what keeps the
 	// cost of a plain write/edit at zero.
 	//
+	// `isProvisionalLearnedAttribution` is the ONE exception (#2449 review round
+	// 2, F2): a tool attributed from a single observation IS classified from
+	// here on, but its attribution has not earned persistence yet, and the only
+	// thing that can earn it is a second real disk diff. Without this clause the
+	// tool is classified on call two and never observed again, so
+	// `PERSIST_AFTER_OBSERVATIONS = 2` is unreachable and nothing is ever
+	// written to disk for the next session to learn from.
+	//
 	// The eligibility check inside `armObservedMutation` is a map lookup, so an
-	// ineligible tool (already attributed, or twice observed clean) pays that
-	// and nothing else.
+	// ineligible tool (durably attributed, or twice observed clean) pays that
+	// and nothing else. The universe is the TARGET PATH alone, so an armed call
+	// costs one stat plus one hash of the file it named — not a directory walk.
 	if (
-		mutation === undefined &&
+		(mutation === undefined || isProvisionalLearnedAttribution(toolName)) &&
 		toolName !== "bash" &&
 		!getFlag("no-read-guard")
 	) {
@@ -632,12 +638,6 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 				cwd: ctx.cwd ?? runtime.projectRoot,
 				sessionGeneration: runtime.sessionGeneration,
 				turnIndex: runtime.turnIndex,
-				getTrackedPaths: () =>
-					collectTrackedPaths({
-						readGuard: runtime.readGuard,
-						cwd: ctx.cwd ?? runtime.projectRoot,
-						limit: OBSERVED_TRACKED_MAX_FILES,
-					}),
 				signal: ctx.signal,
 				dbg,
 			});

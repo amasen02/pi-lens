@@ -2553,30 +2553,59 @@ bookkeeping; `ast_grep_replace apply:true` is the in-repo consumer.
 are finite and the population of third-party edit tools is not, so a fourth
 tier WATCHES. When `classifyMutatingTool` returns `undefined` for a call whose
 input still carries a path-shaped field, `clients/observed-mutation.ts` takes a
-bounded pre-snapshot (that path's directory plus the tracked-file set, never a
-workspace walk) and diffs it at the `tool_result`; whatever changed is replayed
-through the mutation bridge as `kind: "edit"` with `provenance: "observed"` and
-`editRanges` derived from the read-guard's stored per-line hashes.
-`clients/mutation-attribution.ts` then remembers the tool: `provenance:
-"learned"` for the session on the first observation, persisted under
-`getProjectDataDir(cwd)` on the second, so later sessions classify it by name
-with NO snapshot — and one `unclassified-mutating-tool` degradation per tool
-keeps the registry gap visible. A tool that names no file is caught by the
-`agent_settled` sweep, which runs BEFORE the deferred drain, hash-checks only
-files pi-lens has already read, written, diagnosed or opened on a language
-server, and re-baselines after the drain so pi-lens's own formatter output is
-never read as third-party drift; a file it has never seen has no baseline and is
-not covered, by design. Do not add a second scanner: the snapshot and diff
-primitives are `captureFileStatsForPaths` / `diffFileStats` in
+bounded pre-snapshot and diffs it at the `tool_result`; whatever changed is
+replayed through the mutation bridge as `kind: "edit"` with `provenance:
+"observed"` and `editRanges` derived from the read-guard's stored per-line
+hashes. **The observation universe is the TARGET PATH ALONE** — that path's
+file, or, when it is a directory, that directory's own entries non-recursively
+and capped. Never siblings, never the tracked set: watching the neighbourhood
+attributed a background write to whatever tool happened to be running, so a
+`read`-shaped tool got learned as an editor from one coincidence. The tracked
+set is the SETTLED SWEEP's domain, and only its.
+
+`clients/mutation-attribution.ts` remembers the tool: `provenance: "learned"`
+for the session on the first observation, persisted under
+`getProjectDataDir(cwd)` on the second — and a session-learned tool STAYS armed
+until that second observation lands, because nothing else can produce it (latch
+off at observation one and the persist threshold is unreachable). Three
+consecutive clean observations withdraw a provisional attribution again; a
+persisted one is never withdrawn. One `unclassified-mutating-tool` degradation
+per tool keeps the registry gap visible.
+
+A tool that names no file is caught by the `agent_settled` sweep, which runs
+BEFORE the deferred drain and re-baselines after it so pi-lens's own formatter
+output is never read as third-party drift. The sweep is INCREMENTAL and
+**stat-first**: it stats a bounded window of the tracked set per turn from a
+carried cursor and reads a file only when its size or mtime moved, so coverage
+of a large tracked set accumulates across turns instead of timing out in one,
+and the record reports its own `scanned`/`remaining`/`cursor`. Two rules there
+are not negotiable — **never replay on size+mtime alone** (a `touch` moves mtime
+without moving a byte, so a candidate is confirmed by content hash or named in
+`unverifiable`), and **never trust the stat short-circuit against a baseline
+recorded while the file's mtime was still fresh** (`LedgerEntry.seenAtMs`, the
+same-tick same-size rewrite of catalog shape 6). A file pi-lens has never seen
+has no baseline and is not covered, by design.
+
+`deriveObservedEditRanges` reports ranges only when it can MEASURE them: a
+windowed read-guard baseline, a changed line count, an unreadable file or a
+spent read budget all return `undefined` so the bridge over-approximates to the
+whole file. Naming lines that were never touched is worse than naming none.
+
+Do not add a second scanner: the snapshot and diff primitives are
+`captureFileStatsForPaths` / `captureFileStatsForPathsSync` / `diffFileStats` in
 `clients/opaque-mutation-scan.ts`, shared with the #2000 bash recovery so the
-two paths cannot disagree about what "changed" means. Every capture carries a
+paths cannot disagree about what "changed" means. Every ASYNC capture carries a
 timeout AND an abort race, a file cap, a hash-byte budget and a per-turn
 wall-clock budget; exceeding any of them writes a bounded
 `observed_mutation_budget_exhausted` record and an `observed-mutation-budget`
-ledger tally, never a silent skip. Steady-state cost is zero for a classified
-`write`/`edit` (the net is gated on `classifyMutatingTool` having returned
-`undefined`) and ~44ms for one armed observation, paid at most twice per tool
-name per session.
+ledger tally, never a silent skip. The SETTLE is the deliberate exception on
+both counts: it is synchronous, because `handleToolResult` may not yield before
+it dispatches the pipeline (#1086), and it is not budget-gated, because a
+settle clamped to a spent budget drops a mutation that was already measured.
+Steady-state cost is zero for a classified `write`/`edit` (the net is gated on
+`classifyMutatingTool` having returned `undefined` or the attribution still
+being provisional) and ~1.3ms for one armed observation of a file target, paid
+at most a handful of times per tool name per session.
 `tests/clients/mutating-tool-classification.test.ts` greps `clients/`, `tools/`
 and `index.ts` and fails when a mutation decision reappears outside the seam —
 `===`/`!==`/`==`/`!=` against `"write"`/`"edit"`/`"multiedit"` (any

@@ -46,6 +46,7 @@ import {
 	type MutationKind,
 } from "./mutating-tool.js";
 import {
+	hasPendingObservation,
 	noteMutationHandled,
 	settleObservedMutation,
 } from "./observed-mutation.js";
@@ -939,11 +940,22 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	// returns. On the FIRST call of an unknown tool nothing below this line will
 	// run — that is the bug — so the disk diff is the only thing that can put
 	// the file in `turn-state.json`, and it replays through the mutation bridge
-	// to get the identical bookkeeping a `write` gets. From the SECOND call the
-	// attribution classifies the tool by name, no snapshot is armed, and this
-	// settle is a single map miss.
-	if (!getFlag("no-read-guard")) {
-		const observed = await settleObservedMutation({
+	// to get the identical bookkeeping a `write` gets.
+	//
+	// Two properties of this block are load-bearing, both from #2449 review
+	// round 2 (F1). It must not YIELD: `handleToolResult` has no `await` before
+	// it registers with `debouncedPipelines`/`inFlightPipelines`, and
+	// `tests/clients/runtime-tool-result-debounce.test.ts` asserts exactly that
+	// (a microtask here lets a racing second tool_result miss the first's
+	// entry). And it must do NOTHING on the overwhelmingly common path where no
+	// baseline was armed. So: a synchronous map probe first, and a synchronous
+	// settle — the universe is one path, so there is nothing here worth
+	// yielding for.
+	if (
+		!getFlag("no-read-guard") &&
+		hasPendingObservation(resolveToolCallCorrelationId(event))
+	) {
+		const observed = settleObservedMutation({
 			toolCallId: resolveToolCallCorrelationId(event),
 			toolName: event.toolName,
 			sessionGeneration: runtime.sessionGeneration,
@@ -959,7 +971,11 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		});
 		if (observed.replayed > 0) {
 			dbg(
-				`tool_result: observed ${observed.replayed} mutation(s) from unclassified tool "${event.toolName}"`,
+				`tool_result: observed ${observed.replayed} mutation(s) from tool "${event.toolName}"`,
+			);
+		} else if (observed.reason) {
+			dbg(
+				`tool_result: observation for "${event.toolName}" did not settle: ${observed.reason}`,
 			);
 		}
 	}

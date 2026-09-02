@@ -17,6 +17,8 @@ import {
 import { getProjectDataDir } from "../../clients/file-utils.js";
 import {
 	CLEAN_OBSERVATION_ARM_LIMIT,
+	DEATTRIBUTE_AFTER_CLEAN_OBSERVATIONS,
+	isProvisionalLearnedAttribution,
 	MUTATION_ATTRIBUTION_FILE,
 	lookupLearnedMutatingTool,
 	noteObservedClean,
@@ -86,12 +88,19 @@ describe("#2430 item 2 — session attribution", () => {
 });
 
 describe("#2430 item 2 — the arming predicate", () => {
-	it("arms an unknown tool and stops arming once it is attributed", () => {
+	it("arms an unknown tool, keeps arming it while provisional, and stops once durable", () => {
+		// The three-state predicate (#2449 review round 2, F2), and a mutation
+		// proof for each boundary: a predicate hard-wired `true` fails the last
+		// assertion, one hard-wired `false` fails the first, and one that
+		// latches off after the FIRST observation — the shipped bug — fails the
+		// middle one and makes PERSIST_AFTER_OBSERVATIONS unreachable.
 		expect(shouldArmObservationForTool("patch_file")).toBe(true);
 		noteObservedMutation("patch_file", undefined);
-		// The second call must be classified WITHOUT a snapshot: this is the
-		// predicate that makes the observational cost bounded per tool.
+		expect(shouldArmObservationForTool("patch_file")).toBe(true);
+		expect(isProvisionalLearnedAttribution("patch_file")).toBe(true);
+		noteObservedMutation("patch_file", undefined);
 		expect(shouldArmObservationForTool("patch_file")).toBe(false);
+		expect(isProvisionalLearnedAttribution("patch_file")).toBe(false);
 	});
 
 	it("stops arming after the clean-observation limit, and not before", () => {
@@ -110,9 +119,48 @@ describe("#2430 item 2 — the arming predicate", () => {
 	it("re-arms a tool whose clean run is followed by a real mutation", () => {
 		noteObservedClean("sometimes_writes");
 		noteObservedMutation("sometimes_writes", undefined);
-		// Attributed now, so no more snapshots — but the clean counter was reset
-		// rather than left to latch the tool off on its next quiet call.
+		// Attributed now — and the clean counter was reset rather than left to
+		// latch the tool off on its next quiet call.
 		expect(lookupLearnedMutatingTool("sometimes_writes")).toBe("session");
+	});
+
+	it("withdraws a provisional attribution after three consecutive clean runs", () => {
+		// #2449 review round 2, F4. One observation is one piece of evidence,
+		// and evidence has to be revisable: three armed observations in a row
+		// where nothing moved say the first was a coincidence.
+		expect(DEATTRIBUTE_AFTER_CLEAN_OBSERVATIONS).toBe(3);
+		noteObservedMutation("coincidence", undefined);
+		expect(lookupLearnedMutatingTool("coincidence")).toBe("session");
+		noteObservedClean("coincidence");
+		noteObservedClean("coincidence");
+		// Off-by-one guard: two is not enough.
+		expect(lookupLearnedMutatingTool("coincidence")).toBe("session");
+		noteObservedClean("coincidence");
+		expect(lookupLearnedMutatingTool("coincidence")).toBeUndefined();
+		expect(isProvisionalLearnedAttribution("coincidence")).toBe(false);
+		// The clean counter is NOT reset by the withdrawal, so the tool does not
+		// go straight back to being armed on every call.
+		expect(shouldArmObservationForTool("coincidence")).toBe(false);
+	});
+
+	it("never withdraws an attribution that already reached disk", () => {
+		const env = setupTestEnvironment("pi-lens-2449-durable-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		try {
+			noteObservedMutation("real_writer", env.tmpDir);
+			noteObservedMutation("real_writer", env.tmpDir);
+			expect(lookupLearnedMutatingTool("real_writer")).toBe("session");
+			for (let run = 0; run < 10; run += 1) noteObservedClean("real_writer");
+			// Two observations earned persistence; clean runs after that cannot
+			// un-learn it, and nothing arms for it either way.
+			expect(lookupLearnedMutatingTool("real_writer")).toBe("session");
+			expect(shouldArmObservationForTool("real_writer")).toBe(false);
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
 	});
 });
 

@@ -138,6 +138,14 @@ export const BOUNDED_TELEMETRY_PHASES = [
 	 * its bound. Once per settle at most, capped for the same reason.
 	 */
 	"observed_sweep_skipped_budget",
+	/**
+	 * #2430: a tracked file's size/mtime moved but no hashed baseline could
+	 * confirm the bytes actually changed — too large for the sweep's read
+	 * budget, or never hashed. Named rather than replayed, because a `touch`
+	 * moves mtime without moving a byte (#2449 review round 2, F7). Bounded
+	 * per turn: one settle can find many such files at once.
+	 */
+	"observed_sweep_unverifiable",
 ] as const;
 
 export type BoundedPhase = (typeof BOUNDED_TELEMETRY_PHASES)[number];

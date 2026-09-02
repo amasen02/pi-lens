@@ -18,7 +18,13 @@ import {
 	MUTATION_BRIDGE_KEY,
 	registerMutationBridge,
 } from "../../clients/mutation-bridge.js";
-import { resetMutationAttribution } from "../../clients/mutation-attribution.js";
+import { getProjectDataDir } from "../../clients/file-utils.js";
+import {
+	MUTATION_ATTRIBUTION_FILE,
+	primePersistedMutationAttribution,
+	resetMutationAttribution,
+	shouldArmObservationForTool,
+} from "../../clients/mutation-attribution.js";
 import { resetObservedMutationNet } from "../../clients/observed-mutation.js";
 import { readChangesSince } from "../../clients/project-changes.js";
 import { countFileLines } from "../../clients/read-guard-tool-lines.js";
@@ -230,6 +236,75 @@ describe("#2430 acceptance 2 — the SECOND call is classified without a snapsho
 				kind: "edit",
 				provenance: "learned",
 			});
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+});
+
+describe("#2430 acceptance 2 — persistence is reachable on the PRODUCTION path", () => {
+	it("persists after two real arm/settle cycles, and a fresh session classifies from disk", async () => {
+		// #2449 review round 2, F2. The pre-round test for this criterion called
+		// `noteObservedMutation` twice DIRECTLY, so it proved the counter and
+		// nothing about the path — and the path could not reach two, because
+		// `shouldArmObservationForTool` latched off the moment the tool became
+		// session-learned. `PERSIST_AFTER_OBSERVATIONS = 2` was unreachable and
+		// no attribution ever reached disk for the next session to adopt.
+		//
+		// Every step here goes through `handleToolCall`/`handleToolResult`.
+		const env = setupTestEnvironment("pi-lens-2430-persist-path-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		try {
+			const filePath = path.join(env.tmpDir, "persisted.ts");
+			fs.writeFileSync(filePath, SOURCE);
+			const { runtime, cacheManager } = newSession(env.tmpDir);
+
+			for (const [index, body] of [
+				`${SOURCE}const d = 4;\n`,
+				`${SOURCE}const d = 4;\nconst e = 5;\n`,
+			].entries()) {
+				const event = patchEvent(filePath, `call-2430-persist-${index}`);
+				await handleToolCall(
+					toolCallDeps({ event, cwd: env.tmpDir, runtime, cacheManager }),
+				);
+				fs.writeFileSync(filePath, body);
+				await handleToolResult(
+					toolResultDeps({ event, runtime, cacheManager }),
+				);
+			}
+
+			const attributionFile = path.join(
+				getProjectDataDir(env.tmpDir),
+				MUTATION_ATTRIBUTION_FILE,
+			);
+			expect(fs.existsSync(attributionFile)).toBe(true);
+			expect(
+				JSON.parse(fs.readFileSync(attributionFile, "utf-8")),
+			).toMatchObject({
+				version: 1,
+				tools: [{ name: "patch_file", observations: 2 }],
+			});
+
+			// A FRESH session: nothing in memory, only the file on disk.
+			resetMutationAttribution();
+			resetObservedMutationNet();
+			expect(
+				classifyMutatingTool(patchEvent(filePath, "call-2430-fresh")),
+			).toBeUndefined();
+
+			primePersistedMutationAttribution(env.tmpDir);
+			expect(
+				classifyMutatingTool(patchEvent(filePath, "call-2430-fresh")),
+			).toMatchObject({
+				kind: "edit",
+				provenance: "learned",
+				source: "attribution:persisted",
+			});
+			// And a durably attributed tool is never watched again.
+			expect(shouldArmObservationForTool("patch_file")).toBe(false);
 		} finally {
 			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
 			else process.env.PILENS_DATA_DIR = previousDataDir;
