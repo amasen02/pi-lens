@@ -6,7 +6,7 @@
 
 import { relative, resolve, sep, posix } from "node:path";
 
-import { GoClient } from "../../go-client.js";
+import { goClient } from "../../go-client.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import { stripAnsi } from "../../sanitize.js";
 import { skipUnlessToolRan } from "./utils/tool-failure.js";
@@ -17,8 +17,6 @@ import type {
 	RunnerResult,
 } from "../types.js";
 import { PRIORITY } from "../priorities.js";
-
-const goClient = new GoClient();
 
 const goVetRunner: RunnerDefinition = {
 	id: "go-vet",

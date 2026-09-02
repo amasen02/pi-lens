@@ -130,6 +130,35 @@ describe("rustfmtFormatter — Cargo edition carriage (#2466)", () => {
 		expect(resolved).toEqual(["rustfmt", "--edition", "2024", filePath]);
 	});
 
+	it("resolves the workspace edition when the package's own [workspace] table is EMPTY and sits last in the file with no trailing newline (F1, review round 3)", async () => {
+		// extractTomlTableSection returned "" both for "table absent" and
+		// "table present but empty" (heading is the very last bytes of the
+		// file, no trailing newline after it). resolveCargoPackageEdition's
+		// own-manifest-is-also-workspace-root check used that same !== ""
+		// sentinel, so this shape fell through to the (empty, isolated) tmp
+		// dir's ancestor climb and resolved undefined instead of "2024".
+		const tmpDir = newTmpDir("pi-lens-rustfmt-emptyws-eof-");
+		fs.writeFileSync(
+			path.join(tmpDir, "Cargo.toml"),
+			`[package]
+name = "demo"
+version = "0.1.0"
+edition.workspace = true
+
+[workspace.package]
+edition = "2024"
+
+[workspace]`,
+		);
+		const filePath = path.join(tmpDir, "src", "main.rs");
+		fs.mkdirSync(path.dirname(filePath), { recursive: true });
+		fs.writeFileSync(filePath, "fn main() {}");
+
+		const resolved = await rustfmtFormatter.resolveCommand?.(filePath, tmpDir);
+
+		expect(resolved).toEqual(["rustfmt", "--edition", "2024", filePath]);
+	});
+
 	it("climbs past an intermediate manifest with no [workspace] table to find the real workspace root (F1)", async () => {
 		// wsRoot declares [workspace] + [workspace.package]. Between it and the
 		// member sits ANOTHER Cargo.toml (a plain, unrelated [package] with no

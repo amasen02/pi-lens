@@ -100,11 +100,13 @@ this policy explicitly reserves the right to change.
 | Code | Meaning | Emitter |
 | --- | --- | --- |
 | `PILENS_CFG_0001` | A config file exists but could not be read or parsed, so it is ignored. | `warnIgnoredConfigOnce` (`clients/config-warn.ts`), the single choke point behind the LSP, global, and project config loaders. |
-| `PILENS_CFG_0002` | A deprecated config **key** was accepted inside its deprecation window. | Reserved. No emitter yet; #2416 slice 1 wires it when the migration path lands. |
-| `PILENS_CFG_0003` | A deprecated config **file location** was read inside its window. | Reserved. No emitter yet; same slice. |
-| `PILENS_CFG_0004` | A config field no schema property claims was dropped. | `validate()` (`clients/config-core/normalize.ts`) produces the record; `reportMigrationRecords` delivers it through `warnIgnoredConfigOnce` once a loader adopts the core (#2426). |
-| `PILENS_CFG_0005` | A config field's value did not match its schema and was dropped. | Same producer and same delivery path as `PILENS_CFG_0004`. |
+| `PILENS_CFG_0002` | A deprecated config **key** was accepted inside its deprecation window. | `deprecationRecords` (`clients/config-resolve.ts`), one record per `(file, key)`, delivered by `reportPiLensConfigRecords` (#2426). |
+| `PILENS_CFG_0003` | A deprecated config **file location** was read inside its window. | Same producer and same delivery path as `PILENS_CFG_0002`. |
+| `PILENS_CFG_0004` | A config field no schema property claims was dropped. | `validate()` (`clients/config-core/normalize.ts`) produces the record; `reportPiLensConfigRecords` (`clients/config-resolve.ts`) delivers it through `warnIgnoredConfigOnce` (#2426). |
+| `PILENS_CFG_0005` | A config field's value did not match its schema and was dropped. One FIELD; the rest of the file is in effect. | Same producer and same delivery path as `PILENS_CFG_0004`. |
 | `PILENS_CFG_0006` | A config key that would modify an object's prototype (`__proto__`, `constructor`, `prototype`) was refused. | Both halves of the config core, through the shared policy in `clients/config-core/safe-object.ts`. |
+| `PILENS_CFG_0007` | Further config notices were suppressed by a bound, and this one carries the count — the WHOLE count, including anything an earlier bound in the same pipeline dropped. Nothing about the config is wrong; the notice list was truncated. | `MigrationRecordCollector.finalize` (`clients/config-core/records.ts`) — the ONE producer, reached through `finalizeRecords` by every record list: the shared resolution, the global loader's unknown-key scan, the project loader's unknown-key scan, and its legacy-document enumeration. Rendered with neutral prose and recorded under the `config-notice-suppressed` degradation kind, never `config-ignored`. |
+| `PILENS_CFG_0008` | Resolving a config failed internally, so the WHOLE file was ignored and pi-lens ran on defaults. | The two guards under the pipeline: `resolveConfig` (`clients/config-core/resolve.ts`) and the global loader's post-parse catch (`clients/lens-config.ts`). Carries the error class only, never its message. |
 
 A reserved code is registered and referenced by the deprecation registry, but
 nothing emits it today. That is deliberate: the number must be pinned before the
@@ -200,8 +202,20 @@ merged, and explained. Every loader, catalog, and selector resolves through it
 The pipeline is `RawConfig -> validate(schema) -> NormalizedConfig ->
 merge(sources) -> Resolved<T>`, and `resolveConfig` runs both halves. It is
 pure: no file reads, no logging, no ledger writes. Reporting is the separate,
-explicit `reportMigrationRecords` step, so the warn-once latch stays with the
-loader that owns the file.
+explicit `reportPiLensConfigRecords` step (`clients/config-resolve.ts`, which is
+where the loaders share it — never inside the core), so the warn-once latch
+stays with the loaders rather than with the library.
+
+Every loader reports **every** record its own resolution produced — it does not
+filter to the records it "owns". Ownership is a property of the RECORD, not of
+the caller: `reportPiLensConfigRecords` derives the reporting subsystem from the
+record's own owner and tier, so an `lsp.*` key always reports as an LSP setting
+and a pi-lens key always reports under the loader for its tier, whichever loader
+happened to open the file. A `(file, key)` that three loaders all resolve is
+reported three times and the warn-once latch — keyed on
+`(subsystem, file, key, reason)` — collapses those into the one notice the user
+sees. Filtering by caller instead is what left a record no loader claimed
+reported by nobody at all (#2426 review round 3, F1).
 
 ### Source tiers
 
