@@ -38,14 +38,12 @@ export function _telemetryErrorForTest(
 	raw: string | undefined,
 ): string | undefined {
 	if (!raw) return undefined;
-	// oxlint-disable-next-line no-control-regex -- NUL (\0) is the literal byte this telemetry sink escapes before logging, not accidental input.
 	return raw.replace(/\0/g, "\\0").slice(0, 2_000);
 }
 
 export function _telemetryClassificationErrorForTest(
 	raw: string | undefined,
 ): string | undefined {
-	// oxlint-disable-next-line no-control-regex -- NUL (\0) is the literal byte this telemetry sink strips before logging, not accidental input.
 	return raw?.replace(/\0/g, "");
 }
 

@@ -425,7 +425,8 @@ export class WordForwardEntry {
 
 	/** Pack a tokenizer tally. Insertion order is preserved. */
 	static fromTally(tally: Map<string, number>): WordForwardEntry {
-		const tokenNames: string[] = Array.from({ length: tally.size });
+		const tokenNames: string[] = [];
+		tokenNames.length = tally.size;
 		const lineCounts = new Int32Array(tally.size);
 		let i = 0;
 		for (const [token, count] of tally) {

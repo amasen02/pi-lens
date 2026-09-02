@@ -2413,8 +2413,10 @@ function levenshteinDistance(a: string, b: string): number {
 	const bl = b.length;
 	if (al === 0) return bl;
 	if (bl === 0) return al;
-	let prev: number[] = Array.from({ length: bl + 1 });
-	let curr: number[] = Array.from({ length: bl + 1 });
+	let prev: number[] = [];
+	prev.length = bl + 1;
+	let curr: number[] = [];
+	curr.length = bl + 1;
 	for (let j = 0; j <= bl; j++) prev[j] = j;
 	for (let i = 1; i <= al; i++) {
 		curr[0] = i;

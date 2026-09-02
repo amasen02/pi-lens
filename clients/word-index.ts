@@ -1244,7 +1244,8 @@ export async function refreshWordIndexIncrementally(
 	const statResults: (
 		| { path: string; mtimeMs: number; size: number }
 		| undefined
-	)[] = Array.from({ length: walked.length });
+	)[] = [];
+	statResults.length = walked.length;
 	let cursor = 0;
 	let superseded = false;
 	const worker = async (): Promise<void> => {

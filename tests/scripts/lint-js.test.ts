@@ -39,12 +39,13 @@ const OXLINT_ENTRY = path.join(
 	"oxlint",
 );
 const OXLINT_CONFIG = path.join(REPO_ROOT, ".oxlintrc.json");
+const SPAWN_TIMEOUT_MS = 15_000;
 
 function runOxlint(targetFile: string) {
 	return spawnSync(
 		process.execPath,
 		[OXLINT_ENTRY, "--config", OXLINT_CONFIG, "-f", "unix", targetFile],
-		{ encoding: "utf8" },
+		{ encoding: "utf8", timeout: SPAWN_TIMEOUT_MS },
 	);
 }
 
@@ -123,20 +124,25 @@ describe("lint:js (#2439 — oxlint wired over .mjs/.cjs)", () => {
 		}
 	});
 
-	it("`npm run lint:js` — the repo's real self-lint scope — currently passes clean", () => {
-		// Spawns the REAL `npm run lint:js` (package.json's own script, not a
-		// hand-rolled copy of its ignore-pattern argv) so a drift between this
-		// pin and the actual wiring fails here, not just in CI. `--deny-warnings`
-		// is baked into the script itself, so a warning-only regression (the
-		// #2452 review-round-1 gap — 19 baseline hits exited 0 pre-fix) reds
-		// this case too, not just errors.
-		const result = spawnSync(NPM, ["run", "lint:js"], {
-			encoding: "utf8",
-			cwd: REPO_ROOT,
-			shell: IS_WIN,
-		});
-		expect(result.status, result.stdout + result.stderr).toBe(0);
-	});
+	it(
+		"`npm run lint:js` — the repo's real self-lint scope — currently passes clean",
+		() => {
+			// Spawns the REAL `npm run lint:js` (package.json's own script, not a
+			// hand-rolled copy of its ignore-pattern argv) so a drift between this
+			// pin and the actual wiring fails here, not just in CI. `--deny-warnings`
+			// is baked into the script itself, so a warning-only regression (the
+			// #2452 review-round-1 gap — 19 baseline hits exited 0 pre-fix) reds
+			// this case too, not just errors.
+			const result = spawnSync(NPM, ["run", "lint:js"], {
+				encoding: "utf8",
+				cwd: REPO_ROOT,
+				shell: IS_WIN,
+				timeout: SPAWN_TIMEOUT_MS,
+			});
+			expect(result.status, result.stdout + result.stderr).toBe(0);
+		},
+		SPAWN_TIMEOUT_MS + 5_000,
+	);
 });
 
 describe("lint:js — TS lane (#2454 — clients/tools/mcp/index.ts scanned for warning-tier hits)", () => {
@@ -155,33 +161,47 @@ describe("lint:js — TS lane (#2454 — clients/tools/mcp/index.ts scanned for 
 		expect(lintJs).not.toMatch(/--ignore-pattern\s+"?\*\*\/\*\.tsx?"?/);
 	});
 
-	it("mutation proof: a planted warning-tier hit in clients/ fails the real `npm run lint`", () => {
-		// This is the #2454 acceptance criterion's literal mutation proof,
-		// codified as a regression test rather than only a one-off manual run:
-		// a real hit inside the real clients/ tree, through the real npm
-		// script chain (tsc && lint:js), must fail — proving the TS lane is
-		// genuinely wired into the gate other contributors run, not just this
-		// test file's own direct oxlint invocations above.
-		const probePath = path.join(
-			REPO_ROOT,
-			"clients",
-			"__lint2454_mutation_probe.ts",
-		);
-		expect(fs.existsSync(probePath)).toBe(false);
-		fs.writeFileSync(
-			probePath,
-			"export function __lint2454MutationProbe(n: number): number[] {\n\treturn new Array(n);\n}\n",
-		);
-		try {
-			const result = spawnSync(NPM, ["run", "lint"], {
-				encoding: "utf8",
-				cwd: REPO_ROOT,
-				shell: IS_WIN,
-			});
-			expect(result.status).not.toBe(0);
-			expect(result.stdout + result.stderr).toContain("no-new-array");
-		} finally {
-			fs.rmSync(probePath, { force: true });
-		}
-	});
+	it(
+		"mutation proof: a planted warning-tier hit fails the real `npm run lint:js` argv",
+		() => {
+			// This is the #2454 acceptance criterion's literal mutation proof,
+			// codified as a regression test rather than only a one-off manual run.
+			// Round 2 (#2461 review): the probe used to be planted straight into
+			// the live, git-tracked `clients/` tree and driven through
+			// `npm run lint` (tsc + lint:js) — tsc alone runs ~25s in CI, blowing
+			// past vitest's 5000ms default test timeout and flaking the whole
+			// suite. It's also unsafe to plant into `clients/` at all: other
+			// vitest workers (or another agent sharing this worktree) can be
+			// running `npm run lint`/`lint:js` scanning `.` at the same moment,
+			// and a stray probe file sitting inside that scanned tree races their
+			// runs (#2007 directory isolation).
+			//
+			// Fixed by testing the flag actually under test — `lint:js`, not the
+			// tsc-fronted `lint` — and by pointing the REAL npm script (its own
+			// `--deny-warnings` + ignore-pattern argv from package.json, unchanged)
+			// at an isolated temp-dir probe passed as an extra oxlint target via
+			// `npm run lint:js -- <path>`, instead of writing into `clients/`.
+			const { tmpDir, cleanup } = setupTestEnvironment(
+				"pi-lens-lint-js-2454-mutation-",
+			);
+			try {
+				const probePath = path.join(tmpDir, "lint2454-mutation-probe.ts");
+				fs.writeFileSync(
+					probePath,
+					"export function __lint2454MutationProbe(n: number): number[] {\n\treturn new Array(n);\n}\n",
+				);
+				const result = spawnSync(NPM, ["run", "lint:js", "--", probePath], {
+					encoding: "utf8",
+					cwd: REPO_ROOT,
+					shell: IS_WIN,
+					timeout: SPAWN_TIMEOUT_MS,
+				});
+				expect(result.status).not.toBe(0);
+				expect(result.stdout + result.stderr).toContain("no-new-array");
+			} finally {
+				cleanup();
+			}
+		},
+		SPAWN_TIMEOUT_MS + 5_000,
+	);
 });
