@@ -290,13 +290,25 @@ describe("project_report retry claim (#1962)", () => {
 		const firstAttempt = getLastReviewGraphBuildAttempt(cwd);
 		_resetReviewGraphSizeSkipVerdictsForTests();
 
+		// #2441: pin the clock so the retry's `recordBuildAttempt` lands in the
+		// SAME millisecond as `firstAttempt` — reproducing "two build attempts
+		// recorded the same ISO timestamp" (CI, ms-resolution flake) on every
+		// run instead of only when two real attempts happen to race into one
+		// ms. `when` is wall-clock and MUST be allowed to collide; `buildId` is
+		// the latch's actual identity (a process-wide monotonic counter,
+		// `builder.ts`'s `_buildIdCounter`) and is the field that must move.
+		vi.spyOn(Date.prototype, "toISOString").mockReturnValue(
+			firstAttempt?.when as string,
+		);
 		const report = await projectReport(cwd);
 		// The hint still names the previous failure, but the reported attempt is
 		// the retry this call started — not the earlier record replayed as if it
 		// were current.
 		expect(report.hint).toContain("A retry was started.");
 		expect(report.lastBuildAttempt?.outcome).toBe("running");
-		expect(report.lastBuildAttempt?.when).not.toBe(firstAttempt?.when);
+		expect(report.lastBuildAttempt?.when).toBe(firstAttempt?.when);
+		expect(report.lastBuildAttempt?.buildId).not.toBe(firstAttempt?.buildId);
+		vi.restoreAllMocks();
 		await settleBackgroundBuild(cwd);
 	});
 

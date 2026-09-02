@@ -1,5 +1,5 @@
 import * as fs from "node:fs";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { FactStore } from "../../clients/dispatch/fact-store.js";
 import { normalizeMapKey } from "../../clients/path-utils.js";
 import {
@@ -38,6 +38,10 @@ describe("review-graph seq fast path (#451)", () => {
 	afterEach(() => {
 		clearReviewGraphWorkspaceCache();
 		delete process.env.PI_LENS_GRAPH_SEQ_FASTPATH;
+		// Backstop for the Date.prototype.toISOString spy below: if a test's
+		// awaited build rejects before its own try/finally restore runs, this
+		// still clears the pin before the next test in the file (#2446 F1).
+		vi.restoreAllMocks();
 	});
 
 	it("takes the fast path after a hinted build when one file is edited", async () => {
@@ -86,15 +90,38 @@ describe("review-graph seq fast path (#451)", () => {
 			);
 			hint.bump(aPath);
 
+			// #2441: pin the clock so this rebuild's `builtAt` lands in the SAME
+			// millisecond as `initialGraph.builtAt`, deterministically — wall-clock
+			// ISO strings are allowed to collide between two builds. `buildGeneration`
+			// (`builder.ts`'s process-wide `_graphGenerationCounter`) is bumped only
+			// on a real re-extract (#459) and is the field that must move here.
+			// #2446 F1: try/finally so a rejecting build still restores the
+			// process-global Date.prototype spy instead of leaking it to later
+			// tests in this file.
+			const isoSpy = vi
+				.spyOn(Date.prototype, "toISOString")
+				.mockReturnValue(initialGraph.builtAt);
 			clearGraphCache();
-			const graph = await buildOrUpdateGraph(env.tmpDir, [aPath], facts, hint);
-			expect(getLastGraphBuildInfo().mode).toBe("seq-fastpath");
-			expect(graph.builtAt).not.toBe(initialGraph.builtAt);
-			// The edit is reflected: gamma is now a symbol node.
-			const hasGamma = [...graph.nodes.values()].some(
-				(n) => n.symbolName === "gamma",
-			);
-			expect(hasGamma).toBe(true);
+			try {
+				const graph = await buildOrUpdateGraph(
+					env.tmpDir,
+					[aPath],
+					facts,
+					hint,
+				);
+				expect(getLastGraphBuildInfo().mode).toBe("seq-fastpath");
+				// #2446 F2: assert the pin fired rather than the mocked artifact
+				// (`graph.builtAt`), so a future clock refactor doesn't red this.
+				expect(isoSpy).toHaveBeenCalled();
+				expect(graph.buildGeneration).not.toBe(initialGraph.buildGeneration);
+				// The edit is reflected: gamma is now a symbol node.
+				const hasGamma = [...graph.nodes.values()].some(
+					(n) => n.symbolName === "gamma",
+				);
+				expect(hasGamma).toBe(true);
+			} finally {
+				vi.restoreAllMocks();
+			}
 		} finally {
 			env.cleanup();
 		}
