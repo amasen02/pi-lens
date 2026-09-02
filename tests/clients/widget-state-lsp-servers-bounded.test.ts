@@ -30,14 +30,25 @@ describe("#2442 lspServers (FIFO)", () => {
 		expect(ids).toContain("server-overflow");
 	});
 
-	it("a read (getFailedLspServerIds) never reorders eviction order (red on an accidental LRU substitution)", () => {
+	it("a re-record of the oldest server never reorders eviction order (red on an accidental LRU substitution)", () => {
 		for (let i = 0; i < MAX_LSP_SERVER_RECORDS; i++) {
 			recordLsp(`read-${i}`, "/repo", "spawn_failed");
 		}
-		for (let i = 0; i < 5; i++) getFailedLspServerIds();
+		// `lspServers` has NO production `get` — every read is
+		// `getFailedLspServerIds`'s `.values()` iteration, which reorders
+		// nothing under either class, so iterating it proved nothing (#2442
+		// review F4). The discriminating production access here is the WRITE
+		// path: `recordLsp` on an already-resident key is a bare `set`, which
+		// FIFO leaves in place and LRU promotes to newest.
+		recordLsp("read-0", "/repo", "spawn_failed");
 
 		recordLsp("read-overflow", "/repo", "spawn_failed");
 
-		expect(getFailedLspServerIds()).not.toContain("read-0");
+		const ids = getFailedLspServerIds();
+		// FIFO: the re-record did not move read-0, so it is still the oldest
+		// and is evicted. Under an LRU substitution both flip — read-0 survives
+		// and read-1, never re-recorded, is evicted instead.
+		expect(ids).not.toContain("read-0");
+		expect(ids).toContain("read-1");
 	});
 });

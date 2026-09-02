@@ -120,7 +120,13 @@ interface LineCountCacheEntry {
 export interface LineCountCache {
 	get(filePath: string): LineCountCacheEntry | undefined;
 	has(filePath: string): boolean;
-	set(filePath: string, entry: LineCountCacheEntry): unknown;
+	// `void`, not the concrete return type: TypeScript's void-return
+	// assignability rule accepts BOTH implementations (`Map#set` returns
+	// `this`, `BoundedFifoMap#set` returns the evicted pairs) while telling
+	// every caller the result is not theirs to read. `unknown` here tripped
+	// the repo's own `no-unknown-returns` ast-grep self-scan, which fails the
+	// whole Unit-tests step (#2442 review F1).
+	set(filePath: string, entry: LineCountCacheEntry): void;
 	readonly size: number;
 	clear(): void;
 }

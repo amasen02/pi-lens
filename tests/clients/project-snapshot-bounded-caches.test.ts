@@ -15,9 +15,11 @@ import {
 	_failedSnapshotPersistKeysForTests,
 	_resetProjectSnapshotParseCacheForTests,
 	_seedFailedSnapshotPersistForTests,
+	_snapshotParseCacheGetForTests,
 	_seedSnapshotParseCacheForTests,
 	_seedSuccessfulSnapshotPersistForTests,
 	_snapshotParseCacheKeysForTests,
+	_successfulSnapshotPersistGetForTests,
 	_successfulSnapshotPersistKeysForTests,
 	resetProjectSnapshotPersistWorkerForTests,
 } from "../../clients/project-snapshot.js";
@@ -80,6 +82,36 @@ describe("#2442 snapshotParseCache (FIFO, write-refresh)", () => {
 		expect(keys).toContain("/repo/refresh-0");
 		expect(keys).not.toContain("/repo/refresh-1");
 	});
+
+	it("a get of the oldest key never reorders eviction order (red on an accidental LRU substitution)", () => {
+		fill(SNAPSHOT_PARSE_CACHE_MAX, (i) =>
+			_seedSnapshotParseCacheForTests(`/repo/get-${i}`, {
+				mtimeMs: i,
+				size: 1,
+				snapshot: null,
+			}),
+		);
+		// The production READ — `snapshotParseCache.get(cacheKey)` in
+		// loadProjectSnapshot — on the oldest key, BEFORE the overflow write.
+		// The suite previously only looked at `.keys()`, which reorders nothing
+		// under either bounded class, so every test here passed under the LRU
+		// substitution they were written to catch (#2442 review F4).
+		for (let i = 0; i < 5; i++) {
+			expect(_snapshotParseCacheGetForTests("/repo/get-0")).toBe(true);
+		}
+
+		_seedSnapshotParseCacheForTests("/repo/get-overflow", {
+			mtimeMs: 999,
+			size: 1,
+			snapshot: null,
+		});
+
+		const keys = _snapshotParseCacheKeysForTests();
+		// FIFO: the reads left order alone, so get-0 is still oldest and goes.
+		// Under LRU both assertions flip.
+		expect(keys).not.toContain("/repo/get-0");
+		expect(keys).toContain("/repo/get-1");
+	});
 });
 
 describe("#2442 _successfulSnapshotPersists (FIFO, write-refresh)", () => {
@@ -107,6 +139,33 @@ describe("#2442 _successfulSnapshotPersists (FIFO, write-refresh)", () => {
 		expect(keys).toContain("/repo/persist-1");
 		expect(keys).toContain("/repo/persist-overflow");
 	});
+
+	it("a get of the oldest key never reorders eviction order (red on an accidental LRU substitution)", () => {
+		fill(PROJECT_SNAPSHOT_MAX_WARM_ROOTS, (i) =>
+			_seedSuccessfulSnapshotPersistForTests(`/repo/get-${i}`, {
+				seq: i,
+				fingerprint: `fp-${i}`,
+				generatedAt: "2026-01-01",
+				generation: 1,
+			}),
+		);
+		// The production read (`_successfulSnapshotPersists.get(key)`) on the
+		// oldest key, before the overflow write.
+		for (let i = 0; i < 5; i++) {
+			expect(_successfulSnapshotPersistGetForTests("/repo/get-0")).toBe(true);
+		}
+
+		_seedSuccessfulSnapshotPersistForTests("/repo/get-overflow", {
+			seq: 999,
+			fingerprint: "fp-overflow",
+			generatedAt: "2026-01-01",
+			generation: 1,
+		});
+
+		const keys = _successfulSnapshotPersistKeysForTests();
+		expect(keys).not.toContain("/repo/get-0");
+		expect(keys).toContain("/repo/get-1");
+	});
 });
 
 describe("#2442 _failedSnapshotPersists (FIFO, no write-refresh)", () => {
@@ -129,5 +188,31 @@ describe("#2442 _failedSnapshotPersists (FIFO, no write-refresh)", () => {
 		expect(keys).not.toContain("/repo/failed-0");
 		expect(keys).toContain("/repo/failed-1");
 		expect(keys).toContain("/repo/failed-overflow");
+	});
+
+	it("a re-record of the oldest key never reorders eviction order (red on an accidental LRU substitution)", () => {
+		fill(PROJECT_SNAPSHOT_MAX_WARM_ROOTS, (i) =>
+			_seedFailedSnapshotPersistForTests(`/repo/again-${i}`, {
+				seq: i,
+				generation: 1,
+			}),
+		);
+		// This map has NO production `get` — `recordSnapshotPersistFailure`
+		// only ever `set`s, and readers use `.delete()`. So the discriminating
+		// production access is a repeat failure for an already-recorded key: a
+		// bare `set`, which FIFO leaves in place and LRU promotes to newest.
+		_seedFailedSnapshotPersistForTests("/repo/again-0", {
+			seq: 100,
+			generation: 1,
+		});
+
+		_seedFailedSnapshotPersistForTests("/repo/again-overflow", {
+			seq: 999,
+			generation: 1,
+		});
+
+		const keys = _failedSnapshotPersistKeysForTests();
+		expect(keys).not.toContain("/repo/again-0");
+		expect(keys).toContain("/repo/again-1");
 	});
 });

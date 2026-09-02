@@ -1974,6 +1974,16 @@ export function _seedSnapshotParseCacheForTests(
 export function _snapshotParseCacheKeysForTests(): string[] {
 	return [...snapshotParseCache.keys()];
 }
+/**
+ * #2442 test-only: the exact `snapshotParseCache.get(key)` the production
+ * read at {@link loadProjectSnapshot}'s parse-cache hit performs. A `.has()`
+ * would not do — `.has()` reorders nothing on either bounded class, so a
+ * has-based test cannot tell FIFO from LRU, which is the axis these bounded
+ * tests exist to pin (#2442 review F4).
+ */
+export function _snapshotParseCacheGetForTests(key: string): boolean {
+	return snapshotParseCache.get(key) !== undefined;
+}
 
 /** Test-only: seed the successful-persist cache exactly as production would. */
 export function _seedSuccessfulSnapshotPersistForTests(
@@ -1989,6 +1999,12 @@ export function _seedSuccessfulSnapshotPersistForTests(
 }
 export function _successfulSnapshotPersistKeysForTests(): string[] {
 	return [..._successfulSnapshotPersists.keys()];
+}
+/** #2442 test-only: the same `_successfulSnapshotPersists.get(key)` the
+ *  persist-dedupe read and `getProjectSnapshotPersistStateForTests` perform.
+ *  See {@link _snapshotParseCacheGetForTests} for why `.has()` will not do. */
+export function _successfulSnapshotPersistGetForTests(key: string): boolean {
+	return _successfulSnapshotPersists.get(key) !== undefined;
 }
 
 /** Test-only: seed the failed-persist cache with the same write

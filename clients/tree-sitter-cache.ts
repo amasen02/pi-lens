@@ -138,9 +138,16 @@ export function deriveScanTreeCacheCapacity(
 }
 
 export class TreeCache {
-	private cache = new Map<string, CachedTree>();
+	// BoundedFifoMap, not BoundedLruCache, even though eviction here IS true
+	// LRU: recency is refreshed by this class's own explicit `delete`+`set`
+	// touch on a VALIDATED hit (see `get`), and only there. A `get` that
+	// promoted on every read would also promote entries `get` goes on to
+	// reject (content-hash mismatch returns null without removing), silently
+	// changing which entry eviction targets (#2442 review F7).
+	private cache = new BoundedFifoMap<string, CachedTree>(
+		TREE_CACHE_DEFAULT_MAX_SIZE,
+	);
 	private recentlyEvicted: BoundedFifoMap<string, string>;
-	private maxSize: number;
 	private evictionHistoryMax: number;
 	private debug: (msg: string) => void;
 	private counters = createTreeCacheCounters();
@@ -154,7 +161,7 @@ export class TreeCache {
 		counterObserver?: TreeCacheCounterObserver,
 		treeErrorObserver?: (error: unknown) => void,
 	) {
-		this.maxSize = maxSize;
+		this.cache.setMaxEntries(maxSize);
 		this.evictionHistoryMax = Math.max(1, Math.floor(evictionHistoryMax));
 		this.recentlyEvicted = new BoundedFifoMap<string, string>(
 			this.evictionHistoryMax,
@@ -178,7 +185,7 @@ export class TreeCache {
 
 	/** Current capacity ceiling (entry count, not bytes — see class docstring). */
 	getMaxSize(): number {
-		return this.maxSize;
+		return this.cache.getMaxEntries();
 	}
 
 	/**
@@ -190,15 +197,25 @@ export class TreeCache {
 	 * entries can never record a hit.
 	 */
 	setMaxSize(n: number): void {
-		const next = Math.max(1, Math.floor(n));
-		this.maxSize = next;
-		while (this.cache.size > this.maxSize) {
-			const firstKey = this.cache.keys().next().value;
-			if (firstKey === undefined) break;
-			const evicted = this.cache.get(firstKey);
-			if (evicted) this.rememberEviction(firstKey, evicted);
+		this.retireEvicted(this.cache.setMaxEntries(Math.max(1, Math.floor(n))));
+	}
+
+	/**
+	 * Book-keep entries the bounded map dropped: ghost history, the eviction
+	 * counter, and the WASM-heap tree retirement (#417/#890) that made this
+	 * cache's eviction side-effect-coupled in the first place. One
+	 * implementation, shared by the two paths that can overflow
+	 * ({@link setMaxSize} and {@link set}) — the shape `BoundedFifoMap.set`'s
+	 * `[key, value]` return exists to enable (#2442 review F7).
+	 */
+	private retireEvicted(evicted: ReadonlyArray<[string, CachedTree]>): void {
+		for (const [key, cached] of evicted) {
+			this.rememberEviction(key, cached);
 			this.recordCounter("evictions");
-			this.removeEntry(firstKey);
+			// The bounded map already removed the entry, so retire the tree
+			// directly rather than through removeEntry's re-lookup.
+			this.retireTree(cached.tree);
+			this.debug(`Evicted: ${key}`);
 		}
 	}
 
@@ -376,19 +393,12 @@ export class TreeCache {
 		if (this.cache.has(key)) {
 			this.recordCounter("replacements");
 			this.removeEntry(key);
-		} else if (this.cache.size >= this.maxSize) {
-			// Evict + free the least-recently-used entry when the cache is full:
-			// get() re-inserts hits, so Map insertion order IS recency order and
-			// the first key is the LRU entry (#890).
-			const firstKey = this.cache.keys().next().value;
-			if (firstKey) {
-				const evicted = this.cache.get(firstKey);
-				if (evicted) this.rememberEviction(firstKey, evicted);
-				this.recordCounter("evictions");
-				this.removeEntry(firstKey);
-				this.debug(`Evicted: ${firstKey}`);
-			}
 		}
+		// Overflow eviction itself now happens on the `this.cache.set` below —
+		// the bounded map evicts the least-recently-used entry (this class's
+		// explicit delete+set touch on a validated hit makes insertion order
+		// recency order, #890) and hands back the dropped [key, tree] pair for
+		// `retireEvicted` to free.
 
 		let mtime = 0;
 		try {
@@ -398,14 +408,16 @@ export class TreeCache {
 			// next get() will miss on mtime check and re-parse
 		}
 
-		this.cache.set(key, {
-			tree,
-			contentHash,
-			languageId,
-			fileSize: Buffer.byteLength(content, "utf8"),
-			lineCount: content.split("\n").length,
-			lastModified: mtime,
-		});
+		this.retireEvicted(
+			this.cache.set(key, {
+				tree,
+				contentHash,
+				languageId,
+				fileSize: Buffer.byteLength(content, "utf8"),
+				lineCount: content.split("\n").length,
+				lastModified: mtime,
+			}),
+		);
 
 		this.debug(`Cached: ${filePath} (${content.split("\n").length} lines)`);
 	}
@@ -436,7 +448,7 @@ export class TreeCache {
 		return {
 			...this.counters,
 			size: this.cache.size,
-			maxSize: this.maxSize,
+			maxSize: this.cache.getMaxEntries(),
 			totalLines,
 			totalBytes,
 			misses: this.counters.lookups - this.counters.hits,

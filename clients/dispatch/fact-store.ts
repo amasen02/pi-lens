@@ -412,7 +412,7 @@ export class FactStore implements ReadonlyFactStore {
 	setBoundedSessionFact(factId: string, value: unknown): void {
 		this.evictedSessionFactKeys.delete(factId);
 		const evicted = this.boundedSessionFacts.set(factId, value);
-		for (const oldestKey of evicted) {
+		for (const [oldestKey] of evicted) {
 			this.evictedSessionFactKeys.add(oldestKey);
 			while (this.evictedSessionFactKeys.size > MAX_SESSION_FACT_RECORDS) {
 				const oldestTombstone = this.evictedSessionFactKeys

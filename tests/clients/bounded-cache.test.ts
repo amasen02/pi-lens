@@ -26,11 +26,36 @@ describe("BoundedLruCache", () => {
 		expect(cache.has("b")).toBe(false);
 	});
 
-	it("set() returns the evicted keys, oldest first", () => {
+	it("set() returns the evicted [key, value] pairs, oldest first", () => {
 		const cache = new BoundedLruCache<string, number>(2);
 		expect(cache.set("a", 1)).toEqual([]);
 		expect(cache.set("b", 2)).toEqual([]);
-		expect(cache.set("c", 3)).toEqual(["a"]);
+		// The VALUE comes back too (#2442 review F7): tree-sitter-cache has to
+		// retire the evicted entry's WASM tree and tree-sitter-client has to
+		// delete() the evicted compiled query, and neither can read a value out
+		// of a map the eviction has already emptied.
+		expect(cache.set("c", 3)).toEqual([["a", 1]]);
+	});
+
+	it("setMaxEntries() shrinks immediately and reports what it dropped", () => {
+		const cache = new BoundedLruCache<string, number>(4);
+		cache.set("a", 1);
+		cache.set("b", 2);
+		cache.set("c", 3);
+		// Growing changes only the bound.
+		expect(cache.setMaxEntries(8)).toEqual([]);
+		expect(cache.getMaxEntries()).toBe(8);
+		expect(cache.size).toBe(3);
+		// Shrinking evicts oldest-first down to the new ceiling and hands back
+		// every dropped pair, so a caller with a dynamic cap (TreeCache's
+		// setMaxSize, tree-sitter-client's env-read ceiling) still frees the
+		// resources those entries owned.
+		expect(cache.setMaxEntries(1)).toEqual([
+			["a", 1],
+			["b", 2],
+		]);
+		expect(cache.getMaxEntries()).toBe(1);
+		expect(cache.entriesArray()).toEqual([["c", 3]]);
 	});
 });
 
@@ -73,11 +98,40 @@ describe("BoundedFifoMap (#2442)", () => {
 		expect(map.get("d")).toBe(4);
 	});
 
-	it("set() returns the evicted keys, oldest first", () => {
+	it("set() returns the evicted [key, value] pairs, oldest first", () => {
 		const map = new BoundedFifoMap<string, number>(2);
 		expect(map.set("a", 1)).toEqual([]);
 		expect(map.set("b", 2)).toEqual([]);
-		expect(map.set("c", 3)).toEqual(["a"]);
+		expect(map.set("c", 3)).toEqual([["a", 1]]);
+	});
+
+	it("setMaxEntries() shrinks immediately and reports what it dropped", () => {
+		const map = new BoundedFifoMap<string, number>(4);
+		map.set("a", 1);
+		map.set("b", 2);
+		map.set("c", 3);
+		expect(map.setMaxEntries(8)).toEqual([]);
+		expect(map.size).toBe(3);
+		expect(map.setMaxEntries(2)).toEqual([["a", 1]]);
+		expect(map.getMaxEntries()).toBe(2);
+		expect(map.entriesArray()).toEqual([
+			["b", 2],
+			["c", 3],
+		]);
+	});
+
+	it("BoundedLruCache IS a BoundedFifoMap, differing only in get and set", () => {
+		// #2442 review F3: the two classes shipped as near-identical copies
+		// (Sonar flagged 10.6% duplication on the file). BoundedLruCache now
+		// extends BoundedFifoMap and overrides exactly the two methods that
+		// differ, so eviction, capacity and the whole Map surface have ONE
+		// implementation. A new own-property on the subclass means a behavior
+		// fork that belongs in the base class instead.
+		const lru = new BoundedLruCache<string, number>(2);
+		expect(lru).toBeInstanceOf(BoundedFifoMap);
+		expect(
+			Object.getOwnPropertyNames(BoundedLruCache.prototype).sort(),
+		).toEqual(["constructor", "get", "set"]);
 	});
 
 	it("has/delete/clear/size/entriesArray behave as a bounded Map", () => {

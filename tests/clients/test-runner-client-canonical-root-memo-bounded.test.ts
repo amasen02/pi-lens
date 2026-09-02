@@ -63,16 +63,36 @@ describe("#2442 canonicalRootMemo (FIFO)", () => {
 		for (let i = 0; i < MAX_CANONICAL_ROOT_MEMO_ENTRIES; i++) {
 			client._getCanonicalProjectRootForTests(`/repo/read-${i}`);
 		}
+		// `getCanonicalProjectRoot` opens with `canonicalRootMemo.get(cwd)` and
+		// returns early on a hit — a REAL production get of the oldest key,
+		// taken before the overflow write below.
 		for (let i = 0; i < 5; i++) {
 			client._getCanonicalProjectRootForTests("/repo/read-0");
 		}
-		const callsBeforeOverflow = realpathNativeMock.mock.calls.length;
 
 		client._getCanonicalProjectRootForTests("/repo/read-overflow");
 
+		// read-1 FIRST, and only then read-0. Resolving an evicted key
+		// re-inserts it, pushing the map over capacity again and evicting the
+		// NEXT key — so checking read-1 afterwards would observe an eviction
+		// this test caused rather than the one it asserts about.
+		//
+		// read-1 was never read, so under FIFO it survives: a HIT, no fresh
+		// realpathSync.native. Under an LRU substitution the repeated reads
+		// would have promoted read-0 and read-1 would be evicted instead.
+		const callsBeforeRead1 = realpathNativeMock.mock.calls.length;
+		client._getCanonicalProjectRootForTests("/repo/read-1");
+		expect(realpathNativeMock.mock.calls.length).toBe(callsBeforeRead1);
+
+		// Baseline AFTER the overflow, not before (#2442 review F4a): the
+		// overflow resolve is itself a miss and calls realpathSync.native, so a
+		// baseline taken before it made this assertion unconditional and the
+		// test passed under an LRU substitution.
+		const callsAfterOverflow = realpathNativeMock.mock.calls.length;
+
 		client._getCanonicalProjectRootForTests("/repo/read-0");
 		expect(realpathNativeMock.mock.calls.length).toBeGreaterThan(
-			callsBeforeOverflow,
+			callsAfterOverflow,
 		); // evicted despite the repeat reads
 	});
 });

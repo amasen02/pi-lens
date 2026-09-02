@@ -31,15 +31,27 @@ describe("#2442 recentOldTextFailures (FIFO)", () => {
 		for (let i = 0; i < MAX_FAILURE_TRACKER_SIZE; i++) {
 			_trackOldTextFailureForTests(`/repo/read-${i}.ts`, "preview");
 		}
-		for (let i = 0; i < 5; i++) {
-			_hasOldTextFailureForTests("/repo/read-0.ts", "preview");
-		}
+		// The observation has to go through the tracker's REAL read, which is
+		// `recentOldTextFailures.get(key)` inside `trackOldTextFailure` — the
+		// escalation counter (#2442 review F4). `_hasOldTextFailureForTests` is
+		// a `.has()`, and `.has()` never reorders a BoundedLruCache either, so
+		// the earlier version of this test passed under the very substitution
+		// it claimed to catch. A repeat failure is also the production shape:
+		// the escalation path is exactly a get-then-set of a resident key.
+		expect(
+			_trackOldTextFailureForTests("/repo/read-0.ts", "preview"),
+		).toBeGreaterThan(1); // the get saw the previous entry: a real hit
 
 		_trackOldTextFailureForTests("/repo/read-overflow.ts", "preview");
 
+		// FIFO: the escalation neither promoted read-0 on the get nor on the
+		// set, so read-0 is still the oldest and is the one evicted. Under an
+		// LRU substitution BOTH assertions flip — read-0 survives and read-1,
+		// never touched, is evicted in its place.
 		expect(_hasOldTextFailureForTests("/repo/read-0.ts", "preview")).toBe(
 			false,
 		);
+		expect(_hasOldTextFailureForTests("/repo/read-1.ts", "preview")).toBe(true);
 	});
 
 	it("escalates the count for a genuine repeat within the TTL window", () => {

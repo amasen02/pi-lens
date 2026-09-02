@@ -1560,3 +1560,14 @@ export function _touchAttributionForTests(key: string): void {
 export function _recordSessionHashForTests(key: string, hash: string): void {
 	recordSessionHash(key, hash);
 }
+/**
+ * #2442 test-only: the exact `prefixHashBySession.get(key)` that
+ * `observeCachePrefix` performs to fetch a session's previous hash. A
+ * `.has()` reorders nothing on either bounded class, so only a real `get`
+ * can pin FIFO-vs-LRU behavior (#2442 review F4).
+ */
+export function _prefixHashBySessionGetForTests(
+	key: string,
+): string | undefined {
+	return prefixHashBySession.get(key);
+}

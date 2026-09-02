@@ -27,7 +27,13 @@ function fakeClient() {
 
 interface Harness {
 	state: { clients: Map<string, { shutdown: () => Promise<void> }> };
-	notifyStallDemotions: Map<string, number>;
+	// Structural, not `Map`: the real field is a BoundedFifoMap. Declaring the
+	// surface this test uses keeps the cast honest about what it reaches for.
+	notifyStallDemotions: {
+		get(key: string): number | undefined;
+		has(key: string): boolean;
+		readonly size: number;
+	};
 	demoteForNotifyStall(
 		key: string,
 		entry: { client: { shutdown: () => Promise<void> }; info: { id: string } },
@@ -75,6 +81,54 @@ describe("#2442 notifyStallDemotions (FIFO)", () => {
 		expect(harness.notifyStallDemotions.has("server-0@/repo")).toBe(false);
 		expect(harness.notifyStallDemotions.has("server-1@/repo")).toBe(true);
 		expect(harness.notifyStallDemotions.has(overflowKey)).toBe(true);
+
+		await service.shutdown();
+	});
+
+	it("a production `get` of the oldest key never reorders eviction order (red on an accidental LRU substitution)", async () => {
+		// The map's ONE production read is `this.notifyStallDemotions.get(key)`
+		// at clients/lsp/index.ts:~3233 (the "was this server demoted for a
+		// notify stall?" branch of the per-file diagnostics gather). The
+		// capacity test above only ever calls `.has()`, and `.has()` reorders
+		// nothing under either bounded class — so it passed under the exact LRU
+		// substitution it was written to catch (#2442 review F4). This one
+		// performs that `get` on the OLDEST key BEFORE the overflow write.
+		const service = new LSPService();
+		const harness = harnessOf(service);
+
+		for (let i = 0; i < MAX_NOTIFY_STALL_DEMOTIONS; i++) {
+			const key = `read-${i}@/repo`;
+			const client = fakeClient();
+			harness.state.clients.set(key, client);
+			harness.demoteForNotifyStall(
+				key,
+				{ client, info: { id: "fake" } },
+				"/repo/main.ts",
+				REASON,
+			);
+		}
+
+		// The production read, five times over, on the oldest key.
+		for (let i = 0; i < 5; i++) {
+			expect(harness.notifyStallDemotions.get("read-0@/repo")).toBeTypeOf(
+				"number",
+			);
+		}
+
+		const overflowKey = "read-overflow@/repo";
+		const overflowClient = fakeClient();
+		harness.state.clients.set(overflowKey, overflowClient);
+		harness.demoteForNotifyStall(
+			overflowKey,
+			{ client: overflowClient, info: { id: "fake" } },
+			"/repo/main.ts",
+			REASON,
+		);
+
+		// FIFO: the reads left insertion order alone, so read-0 is still the
+		// oldest and is the one evicted. Under LRU both assertions flip.
+		expect(harness.notifyStallDemotions.has("read-0@/repo")).toBe(false);
+		expect(harness.notifyStallDemotions.has("read-1@/repo")).toBe(true);
 
 		await service.shutdown();
 	});

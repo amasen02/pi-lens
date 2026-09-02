@@ -75,12 +75,31 @@ describe("#2442 windowsCommandCache (FIFO, negative-entry observation)", () => {
 		for (let i = 0; i < 5; i++) {
 			resolveWindowsCommandForEnvironment("read-0", "cwd", ENV);
 		}
-		const callsBeforeOverflow = statSyncMock.mock.calls.length;
 
 		resolveWindowsCommandForEnvironment("read-overflow", "cwd", ENV);
 
+		// read-1 FIRST, and only then read-0. Re-resolving an evicted key
+		// re-inserts it, which pushes the map over capacity again and evicts
+		// the NEXT key — so checking read-1 after read-0 would observe an
+		// eviction this test caused rather than the one it is asserting about.
+		//
+		// read-1 was never read, so under FIFO it survives: a cache HIT, zero
+		// extra statSync calls. Under an LRU substitution the repeated reads
+		// would have promoted read-0 and read-1 would be the eviction victim
+		// instead, making this a MISS.
+		const callsBeforeRead1 = statSyncMock.mock.calls.length;
+		resolveWindowsCommandForEnvironment("read-1", "cwd", ENV);
+		expect(statSyncMock.mock.calls.length).toBe(callsBeforeRead1);
+
+		// The baseline is taken AFTER the overflow resolve, not before it
+		// (#2442 review F4a). The overflow itself is a cache MISS and calls
+		// statSync, so a baseline captured before it made this assertion
+		// unconditionally true — the test passed under an LRU substitution,
+		// which is the one thing it exists to catch.
+		const callsAfterOverflow = statSyncMock.mock.calls.length;
+
 		resolveWindowsCommandForEnvironment("read-0", "cwd", ENV);
-		expect(statSyncMock.mock.calls.length).toBeGreaterThan(callsBeforeOverflow); // evicted despite the repeat reads
+		expect(statSyncMock.mock.calls.length).toBeGreaterThan(callsAfterOverflow); // evicted despite the repeat reads
 	});
 
 	it("a re-resolution of an already-cached command never grows the map (no spurious eviction on a same-key hit)", () => {
