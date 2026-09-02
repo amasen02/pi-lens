@@ -1568,6 +1568,18 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	// same turn") was met on the second call only. `observedReplayed > 0` is the
 	// whole condition now: the bridge recorded this edit, whoever the tool is.
 	if (observedReplayed > 0) {
+		// ## The `hostToolResultFailed` asymmetry, stated rather than hidden
+		//
+		// The classified chain returns below on `event.isError === true` with a
+		// `commitStatus: "failed"` receipt; this block does not consult it, so an
+		// unknown tool that reports failure and STILL moved bytes is recorded,
+		// analysed, and receipted as `committed`. That is deliberate: the
+		// observation is disk evidence, not a claim — the bytes changed whatever
+		// the tool says about itself — and the classified early return is safe
+		// only because a failed host edit did not write. Reading a third-party
+		// tool's self-reported status as authority over what is on disk is the
+		// exact gap the observational net exists to close.
+		//
 		// The gates below (`mutation === undefined` / `!filePath` /
 		// `isExternalOrVendorFile`) are deliberately NOT consulted for the SKIP:
 		// once the bridge has recorded the edit, re-running the classified chain
