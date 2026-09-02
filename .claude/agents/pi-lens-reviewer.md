@@ -40,6 +40,11 @@ merge — you report internally to the orchestrator.
      the test goes red. A guard that cannot fail is a finding.
    - Test doubles: are they production-faithful? Check sibling test files for
      the same double (the shared-seam trap).
+   - Duplication and reuse: does the diff re-implement machinery the repo
+     already has (a second warn-once latch, a private ext→language table, a
+     hand-rolled walker)? Grep for the sibling before accepting a new helper;
+     a near-identical body in two files is a finding even when SonarCloud is
+     green, and the class fix is one shared helper, not a comment.
 5. Run the targeted suites the PR names, PLUS grep tests/ for every symbol the
    diff touches and run every referencing file. `npm run build` first, always.
 6. Read CI on the exact head SHA (REST check-runs when GraphQL 503s). Confirm
