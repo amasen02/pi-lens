@@ -1,9 +1,10 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	CONFIG_DIAGNOSTIC_MARKER_PATTERN,
 	isConfigDiagnosticCode,
 } from "../../clients/config-diagnostic-codes.js";
 import {
+	normalizeParseErrorReason,
 	resetIgnoredConfigWarnCache,
 	warnIgnoredConfigOnce,
 } from "../../clients/config-warn.js";
@@ -15,6 +16,26 @@ import {
 	resetUserNotifier,
 	wireUserNotifier,
 } from "../../clients/user-notify.js";
+
+// #2431: `logExtension` is a no-op under `isTestMode()` (and, live, its NDJSON
+// writer already redacts the serialized line — see ndjson-logger.ts). Neither
+// of those defends the SOURCE this PR fixes: what `warnIgnoredConfigOnce`
+// hands `logExtension` before either layer runs. Mocked here (same pattern as
+// tests/clients/lsp/config.test.ts) to inspect exactly that.
+const loggedExtension: Array<{
+	message: string;
+	metadata?: Record<string, unknown>;
+}> = [];
+vi.mock("../../clients/extension-log.js", async (importOriginal) => {
+	const actual =
+		await importOriginal<typeof import("../../clients/extension-log.js")>();
+	return {
+		...actual,
+		logExtension: (entry: { message: string; metadata?: Record<string, unknown> }) => {
+			loggedExtension.push({ message: entry.message, metadata: entry.metadata });
+		},
+	};
+});
 
 /**
  * The shared ignored-config seam (#2418 review, S1 + F6).
@@ -42,6 +63,7 @@ const notified: Array<{ message: string; level: string | undefined }> = [];
 
 beforeEach(() => {
 	notified.length = 0;
+	loggedExtension.length = 0;
 	resetIgnoredConfigWarnCache();
 	resetDegradationLedger();
 	wireUserNotifier(() => (message, level) => {
@@ -266,5 +288,106 @@ describe("warnIgnoredConfigOnce across a session boundary (#2418 review R3 F1)",
 		warn();
 		warn();
 		expect(configIgnoredGroup()?.count).toBe(1);
+	});
+});
+
+/**
+ * #2431: Node's `JSON.parse` embeds a slice of the source text in its own
+ * `SyntaxError#message` — `Unexpected token 'g', ..."piToken": ghp_SECRET"...
+ * is not valid JSON` is the LITERAL shape from this issue's evidence. Every
+ * loader used to pass `error.message` straight through as `reason`, so a
+ * malformed config that happened to carry a credential leaked it into all
+ * three sinks this seam owns. This section pins the fix AT the seam: a real
+ * `JSON.parse` failure on content containing a `ghp_`-shaped token never
+ * reaches the notification, `logExtension`'s metadata, or the ledger row.
+ */
+describe("warnIgnoredConfigOnce parse-error reason redaction (#2431)", () => {
+	// GitHub PAT shape: `ghp_` + 36 alphanumerics. Real enough for
+	// `redact/secrets.ts`'s own scanner to recognize, exactly like a config
+	// author's real token would be.
+	const TOKEN = `ghp_${"A".repeat(36)}`;
+
+	function realJsonParseError(content: string): SyntaxError {
+		try {
+			JSON.parse(content);
+		} catch (error) {
+			if (error instanceof SyntaxError) return error;
+			throw error;
+		}
+		throw new Error("expected JSON.parse to throw for this fixture");
+	}
+
+	it("normalizeParseErrorReason never keeps a JSON.parse SyntaxError's message", () => {
+		// The exact evidence shape (#2431): an unquoted value next to a secret
+		// token, which V8 reports with NO derivable position at all — only a
+		// snippet. Node 24: `Unexpected token 'g', ..."piToken": ghp_AAAA..."...
+		// is not valid JSON`.
+		const error = realJsonParseError(`{"piToken": ${TOKEN}}`);
+		// V8 truncates its snippet, so the raw message carries a PREFIX of the
+		// token rather than all 40 chars — still a real leak (a prefix narrows a
+		// brute-force search enormously), and still what this fix must strip.
+		expect(error.message).toContain("ghp_");
+
+		const reason = normalizeParseErrorReason(error);
+		expect(reason).not.toContain(TOKEN);
+		expect(reason).not.toContain("ghp_");
+		expect(reason).toBe("SyntaxError");
+	});
+
+	it("normalizeParseErrorReason keeps line/col when V8 states one, never the message", () => {
+		// `{` alone: V8 states `Expected property name or '}' in JSON at
+		// position 1 (line 1 column 2)` — no snippet, but a real position.
+		const error = realJsonParseError("{");
+		const reason = normalizeParseErrorReason(error);
+		expect(reason).toBe("SyntaxError at line 1 col 2");
+	});
+
+	it("does not leak the token into the notification, logExtension metadata, or the ledger row", () => {
+		const content = `{"piToken": ${TOKEN}, "other": "value"}`;
+		const error = realJsonParseError(content);
+
+		warnIgnoredConfigOnce({
+			subsystem: "project-lens-config",
+			file: "/tmp/.pi-lens.json",
+			reason: { parseError: error },
+		});
+
+		// Sink 1: the human-facing notification.
+		expect(notified).toHaveLength(1);
+		expect(notified[0].message).not.toContain(TOKEN);
+		expect(notified[0].message).not.toContain("ghp_");
+
+		// Sink 2: the extension.log line `warnIgnoredConfigOnce` hands
+		// `logExtension` — message AND metadata.
+		expect(loggedExtension).toHaveLength(1);
+		expect(loggedExtension[0].message).not.toContain(TOKEN);
+		expect(loggedExtension[0].message).not.toContain("ghp_");
+		expect(JSON.stringify(loggedExtension[0].metadata)).not.toContain(TOKEN);
+		expect(JSON.stringify(loggedExtension[0].metadata)).not.toContain("ghp_");
+
+		// Sink 3: the durable degradation-ledger row (subject + reason;
+		// `metadata` for this kind is always just `{subsystem, configPath}` —
+		// the file's PATH, never its content, so it carries no token by
+		// construction — verified anyway).
+		const group = configIgnoredGroup();
+		expect(group?.count).toBe(1);
+		const entry = group?.latestReasons[0];
+		expect(entry?.subject).not.toContain(TOKEN);
+		expect(entry?.reason).not.toContain(TOKEN);
+		expect(entry?.reason).not.toContain("ghp_");
+		expect(entry?.reason).toBe("SyntaxError");
+	});
+
+	it("a hand-authored reason (not a parse error) still passes through verbatim", () => {
+		// Regression guard on the OTHER half of the union: normalization must
+		// never touch a caller's own validated-value message.
+		warnIgnoredConfigOnce({
+			subsystem: "lens-config",
+			file: "/tmp/a.json",
+			reason: "widget.visible must be a boolean",
+		});
+		expect(notified[0].message).toContain(
+			"widget.visible must be a boolean",
+		);
 	});
 });

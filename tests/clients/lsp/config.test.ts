@@ -152,6 +152,43 @@ describe("loadLSPConfig global configuration (#870)", () => {
 		);
 	});
 
+	it("does not leak a token from a malformed config into the warning (#2431)", async () => {
+		// The literal shape from #2431's evidence: Node's own JSON.parse
+		// SyntaxError embeds a slice of the source text, so an unquoted value
+		// next to a real-shaped credential leaked straight through as `reason`
+		// before this fix.
+		const TOKEN = `ghp_${"A".repeat(36)}`;
+		const projectDir = tmpDir("pi-lens-lsp-project-");
+		const globalDir = tmpDir("pi-lens-lsp-global-");
+		process.env.PI_LENS_HOME = globalDir;
+		fs.writeFileSync(
+			path.join(globalDir, "lsp.json"),
+			`{"piToken": ${TOKEN}}`,
+		);
+		const error = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		const { loadLSPConfig } = await import("../../../clients/lsp/config.js");
+		await expect(loadLSPConfig(projectDir)).resolves.toEqual({});
+		expect(error).toHaveBeenCalledTimes(1);
+		const [message] = error.mock.calls[0];
+		expect(message).not.toContain(TOKEN);
+		expect(message).not.toContain("ghp_");
+
+		const { getDegradationSummary } = await import(
+			"../../../clients/degradation-ledger.js"
+		);
+		const group = getDegradationSummary().find(
+			(g) => g.kind === "config-ignored",
+		);
+		const globalConfigPath = path.join(globalDir, "lsp.json");
+		const ledgerEntry = group?.latestReasons.find(
+			(entry) => entry.subject === globalConfigPath,
+		);
+		expect(ledgerEntry).toBeDefined();
+		expect(ledgerEntry?.reason).not.toContain(TOKEN);
+		expect(ledgerEntry?.reason).not.toContain("ghp_");
+	});
+
 	it("warns once per broken file, and again after the latch is reset", async () => {
 		// The seam S3 asks for, exercised rather than merely exported: the same
 		// path read twice nags once, and a caller that explicitly re-arms the

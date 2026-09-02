@@ -26,6 +26,7 @@
 import type { ConfigDiagnosticCode } from "./config-diagnostic-codes.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
 import { logExtension } from "./extension-log.js";
+import { redactSecrets } from "./redact/secrets.js";
 import { notifyUserDegradation } from "./user-notify.js";
 
 /**
@@ -69,13 +70,65 @@ const IGNORED_CONFIG_KIND = "config-ignored";
 /** Warn-once latch, keyed on (subsystem, file, key, reason). */
 const warnedIgnoredConfigs = new Set<string>();
 
+/**
+ * Position `JSON.parse`'s own `SyntaxError#message` states, when it states
+ * one. Two shapes ship across supported Node versions:
+ *   `... at position N (line L column C)` — an offset AND a line/col;
+ *   `... at position N`                   — offset only (older engines).
+ * Neither shows up on the message V8 has emitted since ~Node 20 for a token
+ * error — `Unexpected token 'x', "<snippet>"... is not valid JSON` — which
+ * carries no position at all, only a slice of the source text being parsed.
+ * That is the exact shape #2431's evidence hit (`ghp_SECRET` sitting in the
+ * snippet on Node 24).
+ */
+const JSON_PARSE_POSITION =
+	/at position (\d+)(?: \(line (\d+) column (\d+)\))?/;
+
+/**
+ * Normalize a caught parse/validation error into a bounded, snippet-free
+ * reason: the error's own class plus a position, when the engine's message
+ * states one — NEVER the raw message (#2431).
+ *
+ * `JSON.parse`'s `SyntaxError#message` is DOCUMENTED (V8) to embed a slice of
+ * the source text being parsed. A user's malformed config that happens to
+ * carry a credential next to the syntax error would otherwise leak it into
+ * `extension.log`, the user-facing notification, and the durable
+ * degradation-ledger row through this one seam — so a `SyntaxError` NEVER
+ * keeps its message, position-derived or not.
+ *
+ * Every other caught error reaching this helper (a loader's own hand-thrown
+ * validation error, an `fs` error) is not documented to embed file content,
+ * but is still routed through the repo's own secret scanner as defense in
+ * depth (#2431 AC3) rather than trusted on the strength of "it isn't
+ * SyntaxError" alone.
+ */
+export function normalizeParseErrorReason(error: unknown): string {
+	if (error instanceof SyntaxError) {
+		const match = JSON_PARSE_POSITION.exec(error.message);
+		if (!match) return error.constructor.name;
+		const [, offset, line, col] = match;
+		return line && col
+			? `${error.constructor.name} at line ${line} col ${col}`
+			: `${error.constructor.name} at offset ${offset}`;
+	}
+	const message = error instanceof Error ? error.message : String(error);
+	return redactSecrets(message);
+}
+
 export interface WarnIgnoredConfigOptions {
 	/** Which loader is ignoring the config; also the `extension.log` subsystem. */
 	readonly subsystem: IgnoredConfigSubsystem;
 	/** The config file being ignored, as the loader knows it. */
 	readonly file: string;
-	/** Why it is being ignored — a parse error, a bad value, a wrong type. */
-	readonly reason: string;
+	/**
+	 * Why it is being ignored. A hand-authored string for a validated bad
+	 * value / wrong type (already safe, never file-content-derived); or, for a
+	 * caught parse/read error, `{ parseError }` carrying the raw error so this
+	 * seam — and only this seam — is what decides how much of it survives into
+	 * the three sinks below (#2431). Callers that catch a `JSON.parse` or `fs`
+	 * error must use `{ parseError }`, never pre-stringify it themselves.
+	 */
+	readonly reason: string | { readonly parseError: unknown };
 	/**
 	 * The offending KEY inside the file, when the loader is rejecting one key
 	 * rather than the whole file. Part of the ledger subject, so
@@ -114,8 +167,15 @@ export interface WarnIgnoredConfigOptions {
  * twice but is counted as one degraded config.
  */
 export function warnIgnoredConfigOnce(options: WarnIgnoredConfigOptions): void {
-	const { subsystem, file, reason, key } = options;
+	const { subsystem, file, key } = options;
 	const code: ConfigDiagnosticCode = options.code ?? IGNORED_CONFIG_CODE;
+	// The ONLY place a caught parse/read error becomes a string (#2431). A
+	// hand-authored reason passes through verbatim; a `{ parseError }` is
+	// normalized to error class + position, never the raw message.
+	const reason: string =
+		typeof options.reason === "string"
+			? options.reason
+			: normalizeParseErrorReason(options.reason.parseError);
 
 	// The durable half (#2418 F6), and it runs BEFORE the latch on purpose
 	// (#2418 review round 3, F1). The latch is a PROCESS-lifetime Set; the
