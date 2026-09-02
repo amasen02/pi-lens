@@ -34,8 +34,21 @@ const NAMED_PROPERTY_CONTAINERS = ["properties", "patternProperties"] as const;
  * it needs no tier. Every property INSIDE one still does, which is exactly why
  * the walk has to descend into them: `$defs` is the easiest place for an
  * untiered field to hide.
+ *
+ * `dependentSchemas` (2020-12) and its draft-07 spelling `dependencies` sit
+ * here for the same reason (#2418 review round 3, F3): the KEY is a property
+ * name but the VALUE is a schema applied conditionally, not that property's
+ * own definition, so the value needs no tier while everything it publishes
+ * does. `dependencies` also has a property-NAME-LIST form
+ * (`{ a: ["b"] }`) — the walk's own object guard steps over the array, since
+ * a list of names has nothing to tier.
  */
-const NAMED_SUBSCHEMA_CONTAINERS = ["$defs", "definitions"] as const;
+const NAMED_SUBSCHEMA_CONTAINERS = [
+	"$defs",
+	"definitions",
+	"dependentSchemas",
+	"dependencies",
+] as const;
 
 /** Keywords whose value is an ARRAY of subschemas. */
 const SUBSCHEMA_LISTS = ["oneOf", "anyOf", "allOf", "prefixItems"] as const;
@@ -58,6 +71,10 @@ const SUBSCHEMA_VALUES = [
 	"if",
 	"then",
 	"else",
+	// The schema a string-encoded payload is validated against (#2418 review
+	// round 3, F3). An entire published shape can live under one of these and
+	// it is no less published for being carried as encoded content.
+	"contentSchema",
 ] as const;
 
 /**

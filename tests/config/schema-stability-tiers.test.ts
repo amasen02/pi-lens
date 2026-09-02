@@ -190,6 +190,29 @@ const COMPOSITION_CASES: ReadonlyArray<{
 		pointer: "/lsp/^ext-",
 	},
 	{
+		// 2020-12 conditional-shape keyword: the subschema applied when a
+		// property is present. Named subschemas, not properties themselves —
+		// but every field inside one is as published as any other.
+		keyword: "dependentSchemas",
+		build: (tier) => ({ dependentSchemas: { servers: withHidden(tier) } }),
+		pointer: "/lsp/dependentSchemas/servers/hidden",
+	},
+	{
+		// draft-07 spelling of the same thing. Schemas in the wild are still
+		// written against draft-07, and #2416 will consume whichever the
+		// catalog author reaches for.
+		keyword: "dependencies",
+		build: (tier) => ({ dependencies: { servers: withHidden(tier) } }),
+		pointer: "/lsp/dependencies/servers/hidden",
+	},
+	{
+		// The schema a string-encoded payload is validated against — an
+		// entire published shape can live under one `contentSchema`.
+		keyword: "contentSchema",
+		build: (tier) => ({ contentSchema: withHidden(tier) }),
+		pointer: "/lsp/contentSchema/hidden",
+	},
+	{
 		keyword: "items (tuple form)",
 		build: (tier) => ({ type: "array", items: [withHidden(tier)] }),
 		pointer: "/lsp/items/0/hidden",
@@ -199,7 +222,7 @@ const COMPOSITION_CASES: ReadonlyArray<{
 describe("schema stability tiers reach every composition keyword (#2418)", () => {
 	it("covers every keyword the walker claims to walk", () => {
 		// Declared floor: an emptied case table must FAIL, not read as clean.
-		expect(COMPOSITION_CASES.length).toBeGreaterThanOrEqual(13);
+		expect(COMPOSITION_CASES.length).toBeGreaterThanOrEqual(16);
 		expect(new Set(COMPOSITION_CASES.map((c) => c.keyword)).size).toBe(
 			COMPOSITION_CASES.length,
 		);
@@ -226,6 +249,17 @@ describe("schema stability tiers reach every composition keyword (#2418)", () =>
 			).toThrow(/invalid x-stability/);
 		});
 	}
+
+	it("does not choke on the property-name-list form of dependencies", () => {
+		// draft-07 lets `dependencies` map a property to an ARRAY OF NAMES
+		// rather than a subschema. Nothing to tier there, and the walk must
+		// step over it rather than treat the strings as a subschema.
+		expect(() =>
+			assertSchemaStabilityTiers(
+				envelopeWith({ dependencies: { servers: ["command"] } }),
+			),
+		).not.toThrow();
+	});
 
 	it("does not choke on the boolean form of additionalProperties", () => {
 		expect(() =>

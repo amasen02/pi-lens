@@ -47,7 +47,10 @@
  * clients/lsp/server.ts (e.g. "rust", "nix", "bash", "python", "go", "ts").
  */
 
-import { warnIgnoredConfigOnce } from "../config-warn.js";
+import {
+	resetIgnoredConfigWarnCache,
+	warnIgnoredConfigOnce,
+} from "../config-warn.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { BoundedLruCache } from "../bounded-cache.js";
@@ -135,6 +138,18 @@ function warnInvalidLSPConfig(configPath: string, error: unknown): void {
 		file: configPath,
 		reason: error instanceof Error ? error.message : String(error),
 	});
+}
+
+/**
+ * For tests that need to force the warn-once cache to reset between cases —
+ * the LSP loader's counterpart to `resetGlobalConfigWarnCache` in
+ * lens-config.ts and to the clear folded into `resetProjectLensConfigCache`
+ * (#2418 review round 3, S3). Without it, this loader's cases had to lean on
+ * every fixture landing in a fresh temp path to stay unlatched, which is a
+ * property of the fixture rather than of the test.
+ */
+export function resetLSPConfigWarnCache(): void {
+	resetIgnoredConfigWarnCache("lsp-config");
 }
 
 async function readLSPConfig(
@@ -430,6 +445,9 @@ export function resetLSPConfigStateForTests(): void {
 	// Reset both together: a cleared config store beside a live session-root
 	// registry would decline files for roots nothing can serve any more.
 	resetSessionRootsForTests();
+	// The warn latch is loader state too: a test that re-reads the same broken
+	// path after this reset must see the warning again, not a latched silence.
+	resetLSPConfigWarnCache();
 }
 
 /**

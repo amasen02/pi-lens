@@ -112,8 +112,29 @@ describe("config diagnostic markers (#2418)", () => {
  * Scans the config loaders themselves rather than a hand-maintained list of
  * call sites, so a new `*config*.ts` notifier is caught the day it lands.
  */
-function configSurfaceSources(): Array<{ file: string; source: string }> {
-	const found: Array<{ file: string; source: string }> = [];
+interface ConfigSurfaceSource {
+	readonly file: string;
+	/**
+	 * Comments blanked, string bodies KEPT. What the `notifyUserDegradation`
+	 * audit below reads: its evidence IS a string literal
+	 * (`"PILENS_CFG_0001"`), and a commented-out call must not read as a real
+	 * one.
+	 */
+	readonly source: string;
+	/**
+	 * The file verbatim. What the doc-reference leg reads (#2418 review round 3,
+	 * F2): a policy surface points users at `docs/…md` from a DOC COMMENT —
+	 * `clients/config-diagnostic-codes.ts`, `clients/config-warn.ts` and this
+	 * repo’s other config modules all do — so scanning the stripped text made
+	 * the tracked-doc gate blind to exactly the references that caused round 1’s
+	 * F1. Comments are the right input there and the wrong input above, so both
+	 * forms are carried rather than one being reused for a leg it cannot serve.
+	 */
+	readonly raw: string;
+}
+
+function configSurfaceSources(): ConfigSurfaceSource[] {
+	const found: ConfigSurfaceSource[] = [];
 	const walk = (dir: string): void => {
 		for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
 			const full = path.join(dir, entry.name);
@@ -123,14 +144,11 @@ function configSurfaceSources(): Array<{ file: string; source: string }> {
 			}
 			if (!entry.name.endsWith(".ts")) continue;
 			if (!/config/i.test(entry.name)) continue;
+			const raw = fs.readFileSync(full, "utf-8");
 			found.push({
 				file: path.relative(REPO_ROOT, full).split(path.sep).join("/"),
-				// Comments blanked, string bodies KEPT: the evidence this sweep
-				// reads IS a string literal (`"PILENS_CFG_0001"`), and a
-				// commented-out call must not read as a real one.
-				source: stripSource(fs.readFileSync(full, "utf-8"), {
-					strings: "keep",
-				}),
+				source: stripSource(raw, { strings: "keep" }),
+				raw,
 			});
 		}
 	};
@@ -308,9 +326,13 @@ export function auditNotifyCall(
  * this one asks git: every `docs/*.md` a policy surface names must be TRACKED.
  */
 function referencedDocPaths(
-	sources: ReadonlyArray<{ file: string; source: string }>,
+	sources: ReadonlyArray<ConfigSurfaceSource>,
 ): string[] {
-	const texts = sources.map((entry) => entry.source);
+	// `raw`, not `source` (#2418 review round 3, F2): a doc reference lives in
+	// a doc comment, which the stripped form blanks. Reading the stripped text
+	// here meant the gate saw only AGENTS.md and the changelog fragments, and a
+	// module pointing at a gitignored doc passed clean.
+	const texts = sources.map((entry) => entry.raw);
 	texts.push(fs.readFileSync(path.join(REPO_ROOT, "AGENTS.md"), "utf-8"));
 	const fragmentDir = path.join(REPO_ROOT, ".changelog");
 	for (const name of fs.readdirSync(fragmentDir)) {
@@ -342,6 +364,19 @@ describe("referenced policy docs are actually in the repo (#2418)", () => {
 		// Declared floor: a scan that finds nothing must FAIL, not read as clean.
 		assertNonEmptyScan("referenced docs", referenced.length, 1);
 		assertNonEmptyScan("tracked docs", tracked.size, 1);
+	});
+
+	it("reads references out of doc comments, not only out of code", () => {
+		// The round-3 F2 defect, pinned so it cannot come back without the
+		// probe: the doc-reference leg must read the file VERBATIM. A config
+		// module names its policy doc in a doc comment and nowhere else, so a
+		// stripped scan finds zero of them and the tracked-doc gate below
+		// degrades to checking AGENTS.md and the changelog only.
+		const docRef = new RegExp("docs/[A-Za-z0-9._-]+[.]md");
+		const commentOnly = sources.filter(
+			({ raw, source }) => docRef.test(raw) && !docRef.test(source),
+		);
+		assertNonEmptyScan("comment-only doc references", commentOnly.length, 1);
 	});
 
 	it("names the stability policy doc", () => {

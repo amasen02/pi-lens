@@ -79,7 +79,16 @@ export interface WarnIgnoredConfigOptions {
 	/**
 	 * The offending KEY inside the file, when the loader is rejecting one key
 	 * rather than the whole file. Part of the ledger subject, so
-	 * `<file>\0<key>` stays the identity a per-key degradation is counted under.
+	 * `<file>\0<key>` stays the identity a per-key degradation is counted under;
+	 * a whole-file rejection is just `<file>`, with no trailing separator.
+	 *
+	 * No production caller passes it TODAY (#2418 review round 3, S1). It is
+	 * kept rather than deleted because it is the forcing function for #2426:
+	 * the legacy-location/legacy-key deprecation records land through this same
+	 * helper as `PILENS_CFG_0002`/`0003`, and a per-KEY record that had to
+	 * share a subject with the whole file would be uncountable. The audit that
+	 * would otherwise flag it as dead is answered here, in one place, instead
+	 * of by re-deriving the seam in three months.
 	 */
 	readonly key?: string;
 	/**
@@ -95,20 +104,51 @@ export interface WarnIgnoredConfigOptions {
 /**
  * Warn once that a config file (or one key in it) is being ignored.
  *
- * Fires the machine log, the durable ledger row, and the user-facing
- * notification, in that order. Every one of the three is bounded: the latch
- * here bounds the log line and the notification, and `recordDegradationOnce`
- * bounds the ledger row on (kind, subject) — which is coarser than the latch on
- * purpose, so a file failing for two different reasons warns twice but is
- * counted as one degraded config.
+ * Fires the durable ledger row, the machine log, and the user-facing
+ * notification. Every one of the three is bounded, but on two DIFFERENT
+ * lifetimes: the latch here bounds the log line and the notification for the
+ * life of the PROCESS, while `recordDegradationOnce` bounds the ledger row on
+ * (kind, subject) for the life of the SESSION. That is why the ledger call sits
+ * in front of the latch's early return — see the comment on it. The ledger
+ * bound is also coarser, so a file failing for two different reasons warns
+ * twice but is counted as one degraded config.
  */
 export function warnIgnoredConfigOnce(options: WarnIgnoredConfigOptions): void {
 	const { subsystem, file, reason, key } = options;
+	const code: ConfigDiagnosticCode = options.code ?? IGNORED_CONFIG_CODE;
+
+	// The durable half (#2418 F6), and it runs BEFORE the latch on purpose
+	// (#2418 review round 3, F1). The latch is a PROCESS-lifetime Set; the
+	// ledger is per SESSION, reset by `resetDegradationLedger()` at the top of
+	// `handleSessionStart`. With the early return in front of this call, every
+	// session after the first recorded nothing while the config on disk was
+	// still ignored — the exact catalog-shape-17 defect
+	// `refreshGrammarSessionLatches` exists to prevent in tree-sitter-client.
+	//
+	// No second, generation-compared latch is needed to re-arm it, unlike that
+	// precedent: `recordDegradationOnce` already dedupes on (kind, subject)
+	// through its own once-key set, and that set IS cleared by the ledger
+	// reset. Calling it unconditionally makes the ledger the single source of
+	// truth for "once per session", instead of a parallel Set here that mirrors
+	// it and has to be kept in step. (tree-sitter needs its own gates because
+	// they guard `incrementDegradationCount`, which counts EVERY call, plus
+	// non-ledger state.)
+	//
+	// Subject is `<file>\0<key>` when a single key is rejected, and plain
+	// `<file>` otherwise, so a per-key rejection and a whole-file rejection are
+	// distinct rows for the same file without a trailing separator on every row.
+	recordDegradationOnce({
+		kind: IGNORED_CONFIG_KIND,
+		subject: key ? `${file}\0${key}` : file,
+		reason,
+		metadata: { subsystem, configPath: file },
+		code,
+	});
+
 	const latchKey = `${subsystem}\0${file}\0${key ?? ""}\0${reason}`;
 	if (warnedIgnoredConfigs.has(latchKey)) return;
 	warnedIgnoredConfigs.add(latchKey);
 
-	const code: ConfigDiagnosticCode = options.code ?? IGNORED_CONFIG_CODE;
 	const message = `ignoring invalid ${SUBSYSTEM_CONFIG_LABEL[subsystem]} ${file}: ${reason}`;
 
 	logExtension({
@@ -118,22 +158,12 @@ export function warnIgnoredConfigOnce(options: WarnIgnoredConfigOptions): void {
 		metadata: { configPath: file, reason, code, ...(key ? { key } : {}) },
 	});
 
-	// The durable half (#2418 F6): without this the ledger could not answer
-	// "did this session ignore a config the user wrote", and the stable code
-	// existed only in prose. Subject is `<file>\0<key>` so a per-key rejection
-	// and a whole-file rejection are distinct rows for the same file.
-	recordDegradationOnce({
-		kind: IGNORED_CONFIG_KIND,
-		subject: `${file}\0${key ?? ""}`,
-		reason,
-		metadata: { subsystem, configPath: file },
-		code,
-	});
-
 	// HUMAN-audience too: a config the user wrote is being ignored. Routed
 	// through the host's own render path (#1333), never a raw write. The stable
 	// code (#2418) is what a user matches or suppresses on; the prose may still
-	// change.
+	// change. Once per PROCESS, deliberately: re-nagging about the same broken
+	// file at every session boundary is noise, while the ledger row above is
+	// the per-session record.
 	notifyUserDegradation(`pi-lens: ${message}`, "warning", { code });
 }
 

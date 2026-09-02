@@ -1069,8 +1069,15 @@ export const EXEMPT_SESSION_STATE_FILES: Readonly<Record<string, string>> = {
 	// bodies were collapsed into one seam. Same lifetime as before — it is tied
 	// to the config file and reason it warned about, not to a session — and the
 	// loaders' own reset helpers delegate to resetIgnoredConfigWarnCache.
+	//
+	// Review round 3, F1: this latch guards the NOTIFICATION only. The durable
+	// ledger row is recorded ahead of it, so the per-session half of the seam
+	// is bounded by the ledger's own once-keys (which resetDegradationLedger
+	// clears) rather than by this process-lifetime Set. A gate in front of the
+	// record would have left every session after the first with no
+	// config-ignored row while the config was still being ignored.
 	"config-warn.ts":
-		"ignored-config warn-once latch, tied to the config file it warned about",
+		"ignored-config warn-once NOTIFICATION latch, tied to the config file it warned about; the per-session ledger row is bounded by the degradation ledger, not by this Set",
 	"instance-registry.ts": "instance-registry enablement flag",
 	"process-singletons.ts":
 		"the globalThis-keyed container for process-scope state (#2146). It owns storage, never lifecycle: every family keeps whatever boundary it already had, and each one is a PROCESS boundary rather than a session boundary. session-lifecycle.ts releases its registration at the primary's own session_shutdown (releasePrimarySession), not at session_start. startup-timing.ts's host-ready anchor is registered here as policy process_lifetime with a ForTests-only reset, because resetting it at a session boundary would fabricate host stalls from the original process boot. The instance-registry mutation tail must outlive every session by construction. A reset in this module would therefore wipe state no session boundary owns. Its only module-scope binding is the Symbol.for container key, a constant.",
