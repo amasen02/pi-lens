@@ -1119,11 +1119,13 @@ describe("#2464 review round 3 — F1: the observed dispatch shares the classifi
 
 			// Two physical states, two pipelines: A's observed dispatch and C's
 			// classified one. B joined A; D deduped against live C.
-			expect(vi.mocked(runPipeline)).toHaveBeenCalledTimes(2);
-			expect(gated.contexts.map((ctx) => ctx.toolName)).toEqual([
-				"patch_file",
-				"edit",
+			expect(
+				gated.contexts.map((ctx) => [ctx.toolName, ctx.telemetry]),
+			).toEqual([
+				["patch_file", expect.objectContaining({ writeIndex: 1 })],
+				["edit", expect.objectContaining({ writeIndex: 2 })],
 			]);
+			expect(vi.mocked(runPipeline)).toHaveBeenCalledTimes(2);
 
 			gated.release(0, gated.gates.length);
 			await Promise.all([third, fourth]);
