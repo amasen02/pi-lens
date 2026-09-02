@@ -19,6 +19,7 @@ import {
 	registerMutationBridge,
 } from "../../clients/mutation-bridge.js";
 import { getProjectDataDir } from "../../clients/file-utils.js";
+import { resolveLanguageRootForFile } from "../../clients/language-profile.js";
 import {
 	MUTATION_ATTRIBUTION_FILE,
 	primePersistedMutationAttribution,
@@ -619,13 +620,19 @@ describe("#2449 review round 4 — the observed-settle return skips only duplica
 	});
 });
 
-describe("#2464 — the observed-settle return also dispatches pipeline analysis", () => {
-	it("runs the pipeline exactly once for a provisionally-learned tool's second call, with no second change-log receipt", async () => {
-		// The early return under test used to skip the pipeline's own
-		// lint/diagnostics dispatch entirely (`runPipeline` never called) — that
-		// gap is #2464. It must NOT come back by re-running the classified
-		// chain's turn-state/change-log recording a second time either, which is
-		// exactly the defect the return exists to suppress (#2449 round 3, S2).
+describe("#2464 — the observed-settle path also dispatches pipeline analysis", () => {
+	it("analyses EVERY call of an unknown tool, first one included, with one change-log receipt each", async () => {
+		// #2464 review round 2, S2 (PROBE-P2). The observed path used to sit
+		// BELOW the `mutation === undefined` gate, so CALL ONE of every unknown
+		// tool — the call the observational net exists for — was recorded by the
+		// bridge and then returned unanalysed. Three calls therefore produced
+		// 0/1/2 pipeline runs where the contract (AC2: "an observed mutation gets
+		// its pipeline analysis in the same turn") demands 1/2/3.
+		//
+		// It must NOT be fixed by re-running the classified chain, which would
+		// re-record turn-state/change-log for an edit the bridge already recorded
+		// (#2449 round 3, S2) — the receipt assertion after each call is what
+		// catches that.
 		const env = setupTestEnvironment("pi-lens-2464-dispatch-");
 		const previousDataDir = process.env.PILENS_DATA_DIR;
 		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
@@ -637,52 +644,182 @@ describe("#2464 — the observed-settle return also dispatches pipeline analysis
 			const { runPipeline } = await import("../../clients/pipeline.js");
 			vi.mocked(runPipeline).mockClear();
 
-			// Call 1: a tool pi-lens has never met. `classifyMutatingTool` returns
-			// undefined, so the classified chain (and the dispatch this fix adds,
-			// gated behind it) never runs — only the bridge records it, exactly
-			// like #2430 acceptance 1.
-			const firstEvent = patchEvent(filePath, "call-2464-dispatch-0");
+			// Call 1 is UNCLASSIFIED (`classifyMutatingTool` returns undefined);
+			// calls 2 and 3 are classified by name from call 1's attribution and
+			// still armed, so all three settle observationally.
+			const bodies = [
+				`${SOURCE}const d = 4;\n`,
+				`${SOURCE}const d = 4;\nconst e = 5;\n`,
+				`${SOURCE}const d = 4;\nconst e = 5;\nconst f = 6;\n`,
+			];
+			for (const [index, body] of bodies.entries()) {
+				const event = patchEvent(filePath, `call-2464-dispatch-${index}`);
+				if (index === 0) {
+					expect(classifyMutatingTool(event as never)).toBeUndefined();
+				}
+				await handleToolCall(
+					toolCallDeps({ event, cwd: env.tmpDir, runtime, cacheManager }),
+				);
+				fs.writeFileSync(filePath, body);
+				await handleToolResult(
+					toolResultDeps({ event, runtime, cacheManager }),
+				);
+
+				// One dispatch per physical edit — including the FIRST one.
+				expect(vi.mocked(runPipeline)).toHaveBeenCalledTimes(index + 1);
+				// And still exactly one change-log receipt per physical edit: the
+				// #2449 round-3 property, unregressed by adding the dispatch.
+				expect(
+					readChangesSince(env.tmpDir, 0).map((change) => change.source),
+				).toEqual(Array.from({ length: index + 1 }, () => "agent-tool:patch_file"));
+			}
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+
+	it("dispatches the observed mutation with the observed-provenance context, not merely SOME context", async () => {
+		// #2464 review round 2, S4 (PROBE-P1). A call-count assertion alone
+		// cannot tell a dispatch of the right file under the right root from a
+		// dispatch of anything at all — pin the context the pipeline actually
+		// receives.
+		const env = setupTestEnvironment("pi-lens-2464-context-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		try {
+			const filePath = path.join(env.tmpDir, "context.ts");
+			fs.writeFileSync(filePath, SOURCE);
+			const { runtime, cacheManager } = newSession(env.tmpDir);
+
+			const { runPipeline } = await import("../../clients/pipeline.js");
+			vi.mocked(runPipeline).mockClear();
+
+			const event = patchEvent(filePath, "call-2464-context-0");
 			await handleToolCall(
-				toolCallDeps({
-					event: firstEvent,
-					cwd: env.tmpDir,
-					runtime,
-					cacheManager,
-				}),
+				toolCallDeps({ event, cwd: env.tmpDir, runtime, cacheManager }),
 			);
 			fs.writeFileSync(filePath, `${SOURCE}const d = 4;\n`);
-			await handleToolResult(
-				toolResultDeps({ event: firstEvent, runtime, cacheManager }),
-			);
-			expect(vi.mocked(runPipeline)).not.toHaveBeenCalled();
+			await handleToolResult(toolResultDeps({ event, runtime, cacheManager }));
 
-			// Call 2: classified BY NAME from the round-1 attribution and still
-			// armed, so its tool_result takes the early return under test.
-			const secondEvent = patchEvent(filePath, "call-2464-dispatch-1");
+			expect(vi.mocked(runPipeline)).toHaveBeenCalledTimes(1);
+			const ctx = vi.mocked(runPipeline).mock.calls[0][0] as Record<
+				string,
+				unknown
+			>;
+			expect(ctx.filePath).toBe(filePath);
+			expect(ctx.cwd).toBe(resolveLanguageRootForFile(filePath, env.tmpDir));
+			expect(ctx.projectRoot).toBe(path.resolve(env.tmpDir));
+			// The tool's OWN name, not a synthesized "edit"/"write" stand-in.
+			expect(ctx.toolName).toBe("patch_file");
+			// An unknown edit-shaped tool takes the safe timing, so the
+			// `agent_settled` drain owns the fix/format — never an immediate one.
+			expect(ctx.autofixMode).toBe("deferred");
+			// No adapter/diff ranges exist for this provenance, so the dispatch is
+			// whole-file rather than falsely scoped to lines nobody measured.
+			expect(ctx.modifiedRanges).toBeUndefined();
+			// A real write token from the shared counter — the same one
+			// `lsp_diagnostics`' reconciliation orders verdicts by (#1561).
+			expect(
+				(ctx.telemetry as { writeIndex?: number } | undefined)?.writeIndex,
+			).toBe(runtime.peekWriteIndex());
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+
+	it("applies the post-pipeline post-conditions on the observed path too", async () => {
+		// #2464 review round 2, S1 (PROBE-P3). The observed path discarded the
+		// pipeline `result`, so all three post-conditions the classified path
+		// applies were skipped: the read-guard staleness re-stamp over
+		// `result.changedFiles` (under `--immediate-format` the pipeline rewrites
+		// the file, and without the re-stamp the NEXT edit is blocked with a
+		// spurious `file_modified`), the #2402 after-write hash stamp, and the
+		// already-analysed latch.
+		const env = setupTestEnvironment("pi-lens-2464-postconditions-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		try {
+			const filePath = path.join(env.tmpDir, "postconditions.ts");
+			fs.writeFileSync(filePath, SOURCE);
+			const { runtime, cacheManager } = newSession(env.tmpDir);
+
+			const { runPipeline } = await import("../../clients/pipeline.js");
+			vi.mocked(runPipeline).mockClear();
+			// Production-faithful on the axis under test: a pipeline that FORMATS
+			// rewrites the file and reports it in `changedFiles`. A double that
+			// left the bytes alone could not tell the fix from the bug.
+			vi.mocked(runPipeline).mockImplementationOnce((async () => {
+				fs.writeFileSync(filePath, `${SOURCE}const d = 4;\n\n// formatted\n`);
+				return {
+					output: "",
+					hasBlockers: false,
+					isError: false,
+					fileModified: true,
+					changedFiles: [filePath],
+				};
+			}) as never);
+
+			const recordWritten = vi.fn();
+			const readGuard = {
+				recordWritten,
+				getReadHistory: () => [],
+			} as unknown as NonNullable<
+				Parameters<typeof handleToolResult>[0]["readGuard"]
+			>;
+			const afterWriteSpy = vi.spyOn(
+				runtime.partialApplyRecords,
+				"noteAfterWriteHash",
+			);
+
+			// `retryEvent` carries the oldText/newText pair the #2402 applied-edit
+			// records are built from — without a recorded pair there is nothing for
+			// the after-write hash to stamp.
+			const event = retryEvent(filePath, "call-2464-post-0");
 			await handleToolCall(
-				toolCallDeps({
-					event: secondEvent,
-					cwd: env.tmpDir,
+				toolCallDeps({ event, cwd: env.tmpDir, runtime, cacheManager }),
+			);
+			fs.writeFileSync(filePath, `${SOURCE}const d = 4;\n`);
+			await handleToolResult({
+				...toolResultDeps({ event, runtime, cacheManager }),
+				readGuard,
+			});
+
+			expect(vi.mocked(runPipeline)).toHaveBeenCalledTimes(1);
+			// 1. The staleness stamp is re-taken over the file the pipeline itself
+			//    rewrote, so the agent's next edit is judged by read coverage.
+			expect(recordWritten).toHaveBeenCalledWith(path.resolve(filePath));
+			// 2. The #2402 record is re-stamped with the POST-pipeline hash, so an
+			//    identical retry against the formatted bytes is still recognized as
+			//    already applied instead of escalating the oldText ladder.
+			expect(afterWriteSpy).toHaveBeenCalledWith(
+				filePath,
+				"const a = 1;",
+				"const a = 9;",
+				expect.any(String),
+			);
+			afterWriteSpy.mockRestore();
+
+			// 3. The already-analysed latch is set, so a duplicate tool_result for
+			//    the SAME bytes in the same turn does not analyse the file twice.
+			await handleToolResult({
+				...toolResultDeps({
+					event: {
+						toolName: "write",
+						toolCallId: "call-2464-post-duplicate",
+						input: { path: filePath },
+						content: [{ type: "text", text: "written" }],
+					},
 					runtime,
 					cacheManager,
 				}),
-			);
-			fs.writeFileSync(filePath, `${SOURCE}const d = 4;\nconst e = 5;\n`);
-			await handleToolResult(
-				toolResultDeps({ event: secondEvent, runtime, cacheManager }),
-			);
-
-			// The pipeline analysed the observed mutation exactly once — not zero
-			// (the #2464 gap) and not twice (the classified chain re-running would
-			// mean it also re-recorded turn-state/change-log, which the next
-			// assertion below independently catches).
+				readGuard,
+				_bypassDebounce: true,
+			});
 			expect(vi.mocked(runPipeline)).toHaveBeenCalledTimes(1);
-
-			// Still one change-log receipt per physical edit — the #2449 round-3
-			// property this early return exists for, unregressed by adding dispatch.
-			expect(
-				readChangesSince(env.tmpDir, 0).map((change) => change.source),
-			).toEqual(["agent-tool:patch_file", "agent-tool:patch_file"]);
 		} finally {
 			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
 			else process.env.PILENS_DATA_DIR = previousDataDir;
