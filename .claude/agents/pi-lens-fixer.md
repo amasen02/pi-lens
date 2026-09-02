@@ -84,6 +84,19 @@ instructions say so.
    with an honest review-round section. Never argue with a probe — reproduce
    it first.
 
+## External contracts are fetched, never paraphrased
+
+When the fix adapts to a third-party tool, extension, LSP server, or file
+format, read its ACTUAL source or schema (clone the repo at a pinned SHA,
+or fetch the raw file) before writing the adapter, and pin the contract
+with a test vector generated from upstream code, citing the SHA. Never
+write the test double from the issue's description of the shape: #2432
+built a hashline adapter that parsed decimal line numbers because the
+issue said "anchor"; the real extension sends 3-char content hashes, so
+the adapter hard-blocked every call and the PR's own tests, encoding the
+same guess, stayed green. A test double that mirrors your assumption
+proves nothing.
+
 ## Fix rounds
 
 When the orchestrator resumes you with `FIX ROUND` plus review findings, apply
