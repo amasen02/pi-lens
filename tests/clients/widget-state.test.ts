@@ -935,9 +935,9 @@ describe("widget-state renderWidget", () => {
 			// delivered, so it must stop advancing — even if a caller asks.
 			expect(retireWidgetDependencyDriftBlockers(filePath)).toBe(true);
 			expect(incrementWidgetDependencyDriftDelivery(filePath)).toBe(0);
-			expect(
-				(getFileDiagnostics(filePath) ?? [])[0]?.staleDeliveryCount,
-			).toBe(2);
+			expect((getFileDiagnostics(filePath) ?? [])[0]?.staleDeliveryCount).toBe(
+				2,
+			);
 		});
 
 		// #2275 review F2: retirement HIDES the row from the footer. It must NOT
@@ -1035,9 +1035,7 @@ describe("widget-state renderWidget", () => {
 			);
 			markWidgetFileBlockersStale(filePath, "dependency-drift");
 			expect(retireWidgetDependencyDriftBlockers(filePath)).toBe(true);
-			expect(renderWidget(120, theme).join("\n")).not.toContain(
-				"still broken",
-			);
+			expect(renderWidget(120, theme).join("\n")).not.toContain("still broken");
 
 			recordDiagnostics(
 				filePath,
