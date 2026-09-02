@@ -45,6 +45,16 @@ import {
 	type MutatingToolClassification,
 	type MutationKind,
 } from "./mutating-tool.js";
+import {
+	hasPendingObservation,
+	noteMutationHandled,
+	settleObservedMutation,
+} from "./observed-mutation.js";
+import {
+	replayThroughMutationBridge,
+	storedLineHashesFor,
+} from "./observed-mutation-sources.js";
+import { getAmbientAbortSignal } from "./safe-spawn.js";
 import { resolveToolCallCorrelationId } from "./tool-event.js";
 import {
 	boundedIndexesForCount,
@@ -502,6 +512,87 @@ function recordProjectChange(args: {
 	});
 }
 
+/**
+ * #2402 applied-edit records for a native edit tool, so an identical retry is
+ * recognized as already-applied instead of escalating through the
+ * oldText-not-found ladder. `input` carries the EXECUTED args (post-autopatch),
+ * the same text the preflight resolves against.
+ *
+ * Extracted (#2449 review round 4, S4) because the observational-settle skip
+ * path needs the IDENTICAL records: the mutation bridge does not write them, so
+ * an early return that skipped this block left every retry of an observed
+ * tool's edit looking unapplied. One body, two call sites — a second copy on the
+ * skip path is the drift this repo keeps catching.
+ */
+function recordNativeAppliedPairs(args: {
+	runtime: RuntimeCoordinator;
+	input: unknown;
+	kind: MutationKind;
+	filePath: string;
+	stateHash: string;
+}): Array<{ oldText: string; newText: string | undefined }> {
+	const pairs: Array<{ oldText: string; newText: string | undefined }> = [];
+	if (args.kind !== "edit") return pairs;
+	const appliedInput = args.input as {
+		oldText?: string;
+		newText?: string;
+		edits?: Array<{ oldText?: string; newText?: string }>;
+	};
+	const record = (oldText?: string, newText?: string): void => {
+		if (typeof oldText === "string" && oldText.length > 0) {
+			args.runtime.partialApplyRecords.record(
+				args.filePath,
+				oldText,
+				newText,
+				args.stateHash,
+			);
+			pairs.push({ oldText, newText });
+		}
+	};
+	if (Array.isArray(appliedInput.edits)) {
+		for (const edit of appliedInput.edits) record(edit.oldText, edit.newText);
+	} else {
+		record(appliedInput.oldText, appliedInput.newText);
+	}
+	return pairs;
+}
+
+/**
+ * Keep `cachedExports` in sync after each write/edit so the pre-write STOP check
+ * does not fire on names that were removed from this file this session.
+ *
+ * Extracted for the same reason as {@link recordNativeAppliedPairs} (#2449
+ * review round 4, S4): the mutation bridge does not touch this cache, so the
+ * observational-settle skip path left it holding names an observed tool had
+ * just deleted.
+ */
+function refreshCachedExports(
+	runtime: RuntimeCoordinator,
+	filePath: string,
+): void {
+	if (runtime.cachedExports.size === 0 || !nodeFs.existsSync(filePath)) return;
+	const exportRe = new RegExp(
+		"export\\s+(?:async\\s+)?(?:function|class|const|let|type|interface)\\s+(\\w+)",
+		"g",
+	);
+	for (const [name, file] of runtime.cachedExports) {
+		if (path.resolve(file) === path.resolve(filePath)) {
+			runtime.cachedExports.delete(name);
+		}
+	}
+	try {
+		const freshContent = nodeFs.readFileSync(filePath, "utf-8");
+		for (const match of freshContent.matchAll(exportRe)) {
+			const name = match[1];
+			if (!runtime.cachedExports.has(name)) {
+				runtime.cachedExports.set(name, filePath);
+			}
+		}
+	} catch {
+		// Non-fatal — stale entry is worse than a missing one
+	}
+}
+
 export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	content: Array<{ type: string; text?: string }>;
 	isError?: boolean;
@@ -926,6 +1017,59 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		sessionId: deps.sessionId,
 		recognizeOnly: true,
 	});
+	// #2430: settle the observational baseline BEFORE the classification gate
+	// returns. On the FIRST call of an unknown tool nothing below this line will
+	// run — that is the bug — so the disk diff is the only thing that can put
+	// the file in `turn-state.json`, and it replays through the mutation bridge
+	// to get the identical bookkeeping a `write` gets.
+	//
+	// The PROBE is synchronous and is the first thing asked, so the
+	// overwhelmingly common call — no baseline armed — pays one map lookup and
+	// nothing else (#2449 round 2, F1).
+	//
+	// The SETTLE is async (#2449 round 3, T4: no synchronous filesystem work on
+	// this path), so it yields. `handleToolResult` has no other `await` before
+	// it registers with `debouncedPipelines`/`inFlightPipelines`, and
+	// `tests/clients/runtime-tool-result-debounce.test.ts` asserts that a
+	// racing second tool_result for the same path cannot miss the first's
+	// entry — so everything the chain below derives from the file's POST-RESULT
+	// bytes is read HERE, before the yield. Otherwise the racing call rewrites
+	// the file while this one is awaiting and this one registers under the
+	// OTHER call's state hash, collapsing two distinct pipelines into one.
+	const observationPending =
+		!getFlag("no-read-guard") &&
+		hasPendingObservation(resolveToolCallCorrelationId(event));
+	const preSettleStateHash =
+		observationPending && mutation !== undefined && filePath
+			? getFileStateHash(filePath)
+			: undefined;
+	let observedReplayed = 0;
+	if (observationPending) {
+		const observed = await settleObservedMutation({
+			toolCallId: resolveToolCallCorrelationId(event),
+			toolName: event.toolName,
+			sessionGeneration: runtime.sessionGeneration,
+			turnIndex: runtime.turnIndex,
+			signal: getAmbientAbortSignal(),
+			record: replayThroughMutationBridge,
+			getStoredLineHashes: (candidate) =>
+				storedLineHashesFor(deps.readGuard, candidate),
+			isRecordable: (candidate) =>
+				!isExternalOrVendorFile(candidate, workspaceRoot) &&
+				!isPathIgnoredByProject(candidate, workspaceRoot, false),
+			dbg,
+		});
+		observedReplayed = observed.replayed;
+		if (observed.replayed > 0) {
+			dbg(
+				`tool_result: observed ${observed.replayed} mutation(s) from tool "${event.toolName}"`,
+			);
+		} else if (observed.reason) {
+			dbg(
+				`tool_result: observation for "${event.toolName}" did not settle: ${observed.reason}`,
+			);
+		}
+	}
 	if (mutation === undefined) {
 		dbg(
 			`tool_result: skipped turn tracking - toolName="${event.toolName}" is not a classified mutation`,
@@ -946,6 +1090,70 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		);
 		return;
 	}
+	// #2449 review round 3 (S2), narrowed in round 4 (S4). A tool learned from
+	// ONE observation is classified by NAME from here on AND is still armed —
+	// that second property is what makes a second observation, and therefore
+	// persistence, reachable at all (round 2, F2). Both halves then recorded the
+	// same physical edit: the settle above replayed it through the mutation
+	// bridge with measured ranges, and the chain below recorded it AGAIN as a
+	// whole-file change, so a three-edit session produced four change-log
+	// receipts.
+	//
+	// The settle wins, deliberately. It ran the disk diff, so it knows which
+	// LINES moved; the chain, reached through `recognizeOnly`, has no ranges for
+	// an unknown tool and over-approximates to the file. Skipping the arm
+	// instead would be the other way to fix this, and it is the wrong one — it
+	// makes PERSIST_AFTER_OBSERVATIONS unreachable again.
+	//
+	// ## What this return skips, stated in full (round 4, S4)
+	//
+	// The first cut called this "skipping turn tracking" and returned. It skipped
+	// considerably more than turn tracking, and THREE of those steps have no
+	// counterpart in `recordMutationThroughSeam`, so nothing else ran them. Those
+	// three run here, before the return:
+	//
+	//   - the #2402 applied-edit records — without them an identical retry of
+	//     the observed tool's edit escalates through the oldText-not-found ladder
+	//     instead of being recognized as already applied;
+	//   - `recordMutationToolReceipt`, the write→edit sticky turn transition,
+	//     which is pure ordering state the bridge never touches;
+	//   - the `cachedExports` refresh — without it the pre-write STOP check keeps
+	//     firing on names this very edit removed.
+	//
+	// What stays skipped is skipped because the BRIDGE already did it: the
+	// read-guard staleness stamp, the `turn-state.json` modified ranges, the
+	// attributed change-log receipt, and the deferred autofix/format pair —
+	// `recordMutationThroughSeam` steps 1-4. The one genuinely UNCOVERED step is
+	// the pipeline's own lint/diagnostics dispatch, and it cannot just be
+	// re-enabled here: the pipeline body is also what writes the duplicate ranges
+	// and receipt this return exists to suppress. Separating those is #2464,
+	// filed rather than half-done inside a review round.
+	if (observedReplayed > 0) {
+		const observedStateHash = preSettleStateHash ?? getFileStateHash(filePath);
+		recordNativeAppliedPairs({
+			runtime,
+			input: event.input,
+			kind: mutation.kind,
+			filePath,
+			stateHash: observedStateHash,
+		});
+		(runtime as Partial<RuntimeCoordinator>).recordMutationToolReceipt?.call(
+			runtime,
+			filePath,
+			mutation.kind,
+		);
+		refreshCachedExports(runtime, filePath);
+		dbg(
+			`tool_result: the observational settle already recorded ${observedReplayed} mutation(s) for "${event.toolName}"; kept the applied-edit records, mutation receipt and cachedExports refresh, skipped the bridge-covered staleness stamp / turn-state ranges / change-log receipt / deferred autofix+format, and the pipeline dispatch (#2464)`,
+		);
+		return syntheticWriteContent.length > 0
+			? { content: [...event.content, ...syntheticWriteContent] }
+			: undefined;
+	}
+	// #2430: a classified mutation is accounted for by the chain below, so the
+	// `agent_settled` sweep must re-baseline this file rather than report the
+	// same bytes as unexplained drift.
+	noteMutationHandled(filePath);
 	const readGuardCorrelationId = getReadGuardCorrelationId(event);
 	const resultDetails = (event.details ?? {}) as Record<string, unknown>;
 	const isPartialApplyResult = resultDetails.piLensPartialApply === true;
@@ -990,41 +1198,24 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	// for the pipeline dedup key (`initialStateHash`) further down (finding 3):
 	// nothing between here and that point rewrites the file, so a second read
 	// would only re-derive the same digest.
-	const postWriteStateHash = getFileStateHash(filePath);
+	//
+	// `preSettleStateHash` is that same digest taken BEFORE the observational
+	// settle's yield, on the only path that has one (#2449 round 3, T4). Reusing
+	// it is not an optimization: re-reading here would read whatever a racing
+	// tool_result wrote while this call was awaiting.
+	const postWriteStateHash = preSettleStateHash ?? getFileStateHash(filePath);
 
 	// #2402: a fully-applied native edit is also an applied record, so an
 	// identical retry is recognized as already-applied instead of escalating
 	// through the oldText-not-found ladder. `event.input` carries the EXECUTED
 	// args (post-autopatch), the same text the preflight resolves against.
-	const nativeAppliedPairs: Array<{
-		oldText: string;
-		newText: string | undefined;
-	}> = [];
-	if (mutation.kind === "edit") {
-		const appliedInput = event.input as {
-			oldText?: string;
-			newText?: string;
-			edits?: Array<{ oldText?: string; newText?: string }>;
-		};
-		const record = (oldText?: string, newText?: string): void => {
-			if (typeof oldText === "string" && oldText.length > 0) {
-				runtime.partialApplyRecords.record(
-					filePath,
-					oldText,
-					newText,
-					postWriteStateHash,
-				);
-				nativeAppliedPairs.push({ oldText, newText });
-			}
-		};
-		if (Array.isArray(appliedInput.edits)) {
-			for (const edit of appliedInput.edits) {
-				record(edit.oldText, edit.newText);
-			}
-		} else {
-			record(appliedInput.oldText, appliedInput.newText);
-		}
-	}
+	const nativeAppliedPairs = recordNativeAppliedPairs({
+		runtime,
+		input: event.input,
+		kind: mutation.kind,
+		filePath,
+		stateHash: postWriteStateHash,
+	});
 
 	// Must happen before debounce admission: latestDeps intentionally retains only
 	// the latest event, but write -> edit is a sticky turn transition.
@@ -1060,26 +1251,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 
 	// Keep cachedExports in sync after each write/edit so the pre-write STOP
 	// check doesn't fire on names that were removed from this file this session.
-	if (runtime.cachedExports.size > 0 && nodeFs.existsSync(filePath)) {
-		const exportRe =
-			/export\s+(?:async\s+)?(?:function|class|const|let|type|interface)\s+(\w+)/g;
-		for (const [name, file] of runtime.cachedExports) {
-			if (path.resolve(file) === path.resolve(filePath)) {
-				runtime.cachedExports.delete(name);
-			}
-		}
-		try {
-			const freshContent = nodeFs.readFileSync(filePath, "utf-8");
-			for (const match of freshContent.matchAll(exportRe)) {
-				const name = match[1];
-				if (!runtime.cachedExports.has(name)) {
-					runtime.cachedExports.set(name, filePath);
-				}
-			}
-		} catch {
-			// Non-fatal — stale entry is worse than a missing one
-		}
-	}
+	refreshCachedExports(runtime, filePath);
 
 	// Reuse the hash taken right after the write landed (finding 3): the file is
 	// unchanged between that read and here, so this is byte-identical.

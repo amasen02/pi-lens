@@ -2765,6 +2765,30 @@ export class LSPService {
 	}
 
 	/**
+	 * Documents currently open on any live client rooted at or under `cwd`
+	 * (#2430), as normalized path keys.
+	 *
+	 * The third contributor to the observational mutation net's tracked-file
+	 * set, alongside the read-guard's read/write set and the widget's diagnostic
+	 * files. It is pure in-memory enumeration — no spawn, no open, no stat —
+	 * and it is deliberately capped by the caller rather than here, because the
+	 * cap belongs to the sweep's budget, not to the pool's bookkeeping.
+	 */
+	getOpenDocumentPaths(cwd: string): string[] {
+		const paths = new Set<string>();
+		for (const { client } of this.activeClientsForCwd(cwd)) {
+			try {
+				for (const filePath of client.openDocumentPaths?.() ?? [])
+					paths.add(filePath);
+			} catch {
+				// A client torn down mid-enumeration contributes nothing; the sweep
+				// is advisory and must never break on a dying server.
+			}
+		}
+		return [...paths];
+	}
+
+	/**
 	 * Get or create LSP client for a file
 	 * Prevents duplicate client creation via in-flight promise tracking
 	 */
