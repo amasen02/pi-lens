@@ -847,14 +847,9 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	const {
 		event,
 		getFlag,
-		getFlagSource,
 		dbg,
 		runtime,
 		cacheManager,
-		biomeClient,
-		ruffClient,
-		metricsClient,
-		resetLSPService,
 		agentBehaviorRecord,
 		formatBehaviorWarnings,
 	} = deps;
@@ -1393,7 +1388,8 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		// is always "edit" here (#2430 tier 4 only ever classifies "learned" as
 		// "edit"), so the un-receipted default is "deferred" either way.
 		const observedAutofixMode: "immediate" | "deferred" = deps._bypassDebounce
-			? (deps._autofixMode ?? (mutation.kind === "edit" ? "deferred" : "immediate"))
+			? (deps._autofixMode ??
+				(mutation.kind === "edit" ? "deferred" : "immediate"))
 			: (receiptOutcome?.autofixMode ??
 				(mutation.kind === "edit" ? "deferred" : "immediate"));
 		const observedReadGuardCorrelationId = getReadGuardCorrelationId(event);
