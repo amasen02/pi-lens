@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { withResidentBootstrap } from "../support/bootstrap-mock.js";
+import { withResidentBootstrap } from "../support/bootstrap-access.js";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { getGlobalPiLensDir } from "../../clients/file-utils.js";
@@ -146,82 +146,84 @@ async function runSessionStart(
 	mockTouchFile.mockClear();
 
 	try {
-		await handleSessionStart(withResidentBootstrap({
-			ctxCwd: env.tmpDir,
-			getFlag: (name: string) => {
-				if (name === "lens-lsp") return true;
-				if (name === "no-lsp") return false;
-				return false;
-			},
-			notify,
-			dbg,
-			log: () => {},
-			runtime: {
-				sessionGeneration: 1,
-				isCurrentSession: () => true,
-				markStartupScanInFlight: (name: string) => {
-					inFlightScans.add(name);
+		await handleSessionStart(
+			withResidentBootstrap({
+				ctxCwd: env.tmpDir,
+				getFlag: (name: string) => {
+					if (name === "lens-lsp") return true;
+					if (name === "no-lsp") return false;
+					return false;
 				},
-				clearStartupScanInFlight: (name: string) => {
-					inFlightScans.delete(name);
+				notify,
+				dbg,
+				log: () => {},
+				runtime: {
+					sessionGeneration: 1,
+					isCurrentSession: () => true,
+					markStartupScanInFlight: (name: string) => {
+						inFlightScans.add(name);
+					},
+					clearStartupScanInFlight: (name: string) => {
+						inFlightScans.delete(name);
+					},
+					complexityBaselines: new Map(),
+					resetForSession: () => {},
+					projectRoot: "",
+					projectRulesScan: { hasCustomRules: false, rules: [] },
+					cachedExports: new Map(),
+					errorDebtBaseline: { testsPassed: true, buildPassed: true },
 				},
-				complexityBaselines: new Map(),
-				resetForSession: () => {},
-				projectRoot: "",
-				projectRulesScan: { hasCustomRules: false, rules: [] },
-				cachedExports: new Map(),
-				errorDebtBaseline: { testsPassed: true, buildPassed: true },
-			},
-			metricsClient: { reset: () => {} },
-			cacheManager: {
-				writeCache: () => {},
-				readCache: (key: string) => {
-					if (key === "errorDebt") {
-						return {
-							data: { pendingCheck: true, baselineTestsPassed: true },
-						};
-					}
-					return null;
+				metricsClient: { reset: () => {} },
+				cacheManager: {
+					writeCache: () => {},
+					readCache: (key: string) => {
+						if (key === "errorDebt") {
+							return {
+								data: { pendingCheck: true, baselineTestsPassed: true },
+							};
+						}
+						return null;
+					},
 				},
-			},
-			todoScanner: { scanDirectory, scanFile },
-			astGrepClient: {
-				isAvailable: () => false,
-				ensureAvailable: astGrepEnsure,
-				scanExports,
-			},
-			biomeClient: {
-				isAvailable: () => false,
-				ensureAvailable: biomeEnsure,
-			},
-			ruffClient: {
-				isAvailable: () => false,
-				ensureAvailable: ruffEnsure,
-			},
-			knipClient: {
-				isAvailable: () => false,
-				ensureAvailable: knipEnsure,
-				analyze: knipAnalyze,
-			},
-			jscpdClient: {
-				isAvailable: () => false,
-				ensureAvailable: jscpdEnsure,
-			},
-			depChecker: {
-				isAvailable: () => false,
-				ensureAvailable: depEnsure,
-			},
-			testRunnerClient: {
-				detectRunner: () => ({ runner: "vitest", config: null }),
-				runTestFile: () => ({ failed: 1, error: false }),
-			},
-			goClient: { isGoAvailableAsync: async () => false },
-			rustClient: { isAvailableAsync: async () => false },
-			ensureTool,
-			cleanStaleTsBuildInfo: () => ["tsconfig.tsbuildinfo"],
-			resetDispatchBaselines: () => {},
-			resetLSPService,
-		}) as any);
+				todoScanner: { scanDirectory, scanFile },
+				astGrepClient: {
+					isAvailable: () => false,
+					ensureAvailable: astGrepEnsure,
+					scanExports,
+				},
+				biomeClient: {
+					isAvailable: () => false,
+					ensureAvailable: biomeEnsure,
+				},
+				ruffClient: {
+					isAvailable: () => false,
+					ensureAvailable: ruffEnsure,
+				},
+				knipClient: {
+					isAvailable: () => false,
+					ensureAvailable: knipEnsure,
+					analyze: knipAnalyze,
+				},
+				jscpdClient: {
+					isAvailable: () => false,
+					ensureAvailable: jscpdEnsure,
+				},
+				depChecker: {
+					isAvailable: () => false,
+					ensureAvailable: depEnsure,
+				},
+				testRunnerClient: {
+					detectRunner: () => ({ runner: "vitest", config: null }),
+					runTestFile: () => ({ failed: 1, error: false }),
+				},
+				goClient: { isGoAvailableAsync: async () => false },
+				rustClient: { isAvailableAsync: async () => false },
+				ensureTool,
+				cleanStaleTsBuildInfo: () => ["tsconfig.tsbuildinfo"],
+				resetDispatchBaselines: () => {},
+				resetLSPService,
+			}) as any,
+		);
 
 		// The returned `cleanup` waits for the tmpDir-touching background scans
 		// to settle (see the #810 comment above `inFlightScans`) before deleting
@@ -342,30 +344,32 @@ describe(
 					},
 				});
 
-				await handleSessionStart(withResidentBootstrap({
-					ctxCwd: env.tmpDir,
-					getFlag: (name: string) => name === "no-lsp",
-					notify: () => {},
-					dbg: () => {},
-					log: () => {},
-					runtime,
-					metricsClient: { reset: () => {} },
-					cacheManager: { writeCache: () => {}, readCache: () => null },
-					todoScanner: { scanDirectory: () => ({ items: [] }) },
-					astGrepClient: {},
-					biomeClient: {},
-					ruffClient: {},
-					knipClient: {},
-					jscpdClient: {},
-					depChecker: {},
-					testRunnerClient: {},
-					goClient: {},
-					rustClient: {},
-					ensureTool: async () => null,
-					cleanStaleTsBuildInfo: () => [],
-					resetDispatchBaselines: () => {},
-					resetLSPService: () => {},
-				}) as any);
+				await handleSessionStart(
+					withResidentBootstrap({
+						ctxCwd: env.tmpDir,
+						getFlag: (name: string) => name === "no-lsp",
+						notify: () => {},
+						dbg: () => {},
+						log: () => {},
+						runtime,
+						metricsClient: { reset: () => {} },
+						cacheManager: { writeCache: () => {}, readCache: () => null },
+						todoScanner: { scanDirectory: () => ({ items: [] }) },
+						astGrepClient: {},
+						biomeClient: {},
+						ruffClient: {},
+						knipClient: {},
+						jscpdClient: {},
+						depChecker: {},
+						testRunnerClient: {},
+						goClient: {},
+						rustClient: {},
+						ensureTool: async () => null,
+						cleanStaleTsBuildInfo: () => [],
+						resetDispatchBaselines: () => {},
+						resetLSPService: () => {},
+					}) as any,
+				);
 
 				expect(runtime.cachedExports.get("fromSnapshot")).toBe(
 					path.join(env.tmpDir, "src/a.ts"),
@@ -413,30 +417,32 @@ describe(
 					projectRulesScan: { hasCustomRules: true, rules: [] },
 				});
 
-				await handleSessionStart(withResidentBootstrap({
-					ctxCwd: nestedCwd,
-					getFlag: (name: string) => name === "no-lsp",
-					notify: () => {},
-					dbg: () => {},
-					log: () => {},
-					runtime,
-					metricsClient: { reset: () => {} },
-					cacheManager: { writeCache: () => {}, readCache: () => null },
-					todoScanner: { scanDirectory: () => ({ items: [] }) },
-					astGrepClient: {},
-					biomeClient: {},
-					ruffClient: {},
-					knipClient: {},
-					jscpdClient: {},
-					depChecker: {},
-					testRunnerClient: {},
-					goClient: {},
-					rustClient: {},
-					ensureTool: async () => null,
-					cleanStaleTsBuildInfo: () => [],
-					resetDispatchBaselines: () => {},
-					resetLSPService: () => {},
-				}) as any);
+				await handleSessionStart(
+					withResidentBootstrap({
+						ctxCwd: nestedCwd,
+						getFlag: (name: string) => name === "no-lsp",
+						notify: () => {},
+						dbg: () => {},
+						log: () => {},
+						runtime,
+						metricsClient: { reset: () => {} },
+						cacheManager: { writeCache: () => {}, readCache: () => null },
+						todoScanner: { scanDirectory: () => ({ items: [] }) },
+						astGrepClient: {},
+						biomeClient: {},
+						ruffClient: {},
+						knipClient: {},
+						jscpdClient: {},
+						depChecker: {},
+						testRunnerClient: {},
+						goClient: {},
+						rustClient: {},
+						ensureTool: async () => null,
+						cleanStaleTsBuildInfo: () => [],
+						resetDispatchBaselines: () => {},
+						resetLSPService: () => {},
+					}) as any,
+				);
 
 				expect(runtime.cachedExports.get("nestedSnapshot")).toBe(nestedFile);
 				expect(runtime.projectRulesScan.hasCustomRules).toBe(true);
@@ -704,76 +710,78 @@ describe(
 			delete process.env.PI_LENS_STARTUP_MODE;
 			const dbg = vi.fn();
 			try {
-				await handleSessionStart(withResidentBootstrap({
-					ctxCwd: env.tmpDir,
-					startupModeOverride: "full",
-					getFlag: (name: string) => name === "no-lsp",
-					notify: () => {},
-					dbg,
-					log: () => {},
-					runtime: {
-						sessionGeneration: 1,
-						isCurrentSession: () => true,
-						markStartupScanInFlight: () => {},
-						clearStartupScanInFlight: () => {},
-						complexityBaselines: new Map(),
-						resetForSession: () => {},
-						projectRoot: "",
-						projectRulesScan: { hasCustomRules: false, rules: [] },
-						cachedExports: new Map(),
-						errorDebtBaseline: { testsPassed: true, buildPassed: true },
-					},
-					metricsClient: { reset: () => {} },
-					cacheManager: { writeCache: () => {}, readCache: () => null },
-					todoScanner: {
-						scanDirectory: () => ({ items: [] }),
-						scanFile: () => [],
-					},
-					astGrepClient: {
-						isAvailable: () => false,
-						ensureAvailable: async () => false,
-						scanExports: async () => new Map(),
-					},
-					biomeClient: {
-						isAvailable: () => false,
-						ensureAvailable: async () => false,
-					},
-					ruffClient: {
-						isAvailable: () => false,
-						ensureAvailable: async () => false,
-					},
-					knipClient: {
-						isAvailable: () => false,
-						ensureAvailable: async () => false,
-						analyze: async () => ({
-							success: true,
-							issues: [],
-							unusedExports: [],
-							unusedFiles: [],
-							unusedDeps: [],
-							unlistedDeps: [],
-							summary: "skipped",
-						}),
-					},
-					jscpdClient: {
-						isAvailable: () => false,
-						ensureAvailable: async () => false,
-					},
-					depChecker: {
-						isAvailable: () => false,
-						ensureAvailable: async () => false,
-					},
-					testRunnerClient: {
-						detectRunner: () => ({ runner: "vitest", config: null }),
-						runTestFile: () => ({ failed: 1, error: false }),
-					},
-					goClient: { isGoAvailableAsync: async () => false },
-					rustClient: { isAvailableAsync: async () => false },
-					ensureTool: async () => null,
-					cleanStaleTsBuildInfo: () => [],
-					resetDispatchBaselines: () => {},
-					resetLSPService: () => {},
-				}) as any);
+				await handleSessionStart(
+					withResidentBootstrap({
+						ctxCwd: env.tmpDir,
+						startupModeOverride: "full",
+						getFlag: (name: string) => name === "no-lsp",
+						notify: () => {},
+						dbg,
+						log: () => {},
+						runtime: {
+							sessionGeneration: 1,
+							isCurrentSession: () => true,
+							markStartupScanInFlight: () => {},
+							clearStartupScanInFlight: () => {},
+							complexityBaselines: new Map(),
+							resetForSession: () => {},
+							projectRoot: "",
+							projectRulesScan: { hasCustomRules: false, rules: [] },
+							cachedExports: new Map(),
+							errorDebtBaseline: { testsPassed: true, buildPassed: true },
+						},
+						metricsClient: { reset: () => {} },
+						cacheManager: { writeCache: () => {}, readCache: () => null },
+						todoScanner: {
+							scanDirectory: () => ({ items: [] }),
+							scanFile: () => [],
+						},
+						astGrepClient: {
+							isAvailable: () => false,
+							ensureAvailable: async () => false,
+							scanExports: async () => new Map(),
+						},
+						biomeClient: {
+							isAvailable: () => false,
+							ensureAvailable: async () => false,
+						},
+						ruffClient: {
+							isAvailable: () => false,
+							ensureAvailable: async () => false,
+						},
+						knipClient: {
+							isAvailable: () => false,
+							ensureAvailable: async () => false,
+							analyze: async () => ({
+								success: true,
+								issues: [],
+								unusedExports: [],
+								unusedFiles: [],
+								unusedDeps: [],
+								unlistedDeps: [],
+								summary: "skipped",
+							}),
+						},
+						jscpdClient: {
+							isAvailable: () => false,
+							ensureAvailable: async () => false,
+						},
+						depChecker: {
+							isAvailable: () => false,
+							ensureAvailable: async () => false,
+						},
+						testRunnerClient: {
+							detectRunner: () => ({ runner: "vitest", config: null }),
+							runTestFile: () => ({ failed: 1, error: false }),
+						},
+						goClient: { isGoAvailableAsync: async () => false },
+						rustClient: { isAvailableAsync: async () => false },
+						ensureTool: async () => null,
+						cleanStaleTsBuildInfo: () => [],
+						resetDispatchBaselines: () => {},
+						resetLSPService: () => {},
+					}) as any,
+				);
 				// dbg records the resolved startup mode synchronously
 				expect(
 					dbg.mock.calls.some(([msg]) =>
@@ -807,76 +815,78 @@ describe(
 			delete process.env.PI_LENS_STARTUP_MODE;
 			const dbg = vi.fn();
 			try {
-				await handleSessionStart(withResidentBootstrap({
-					ctxCwd: env.tmpDir,
-					// no startupModeOverride → TUI heuristic applies → quick
-					getFlag: (name: string) => name === "no-lsp",
-					notify: () => {},
-					dbg,
-					log: () => {},
-					runtime: {
-						sessionGeneration: 1,
-						isCurrentSession: () => true,
-						markStartupScanInFlight: () => {},
-						clearStartupScanInFlight: () => {},
-						complexityBaselines: new Map(),
-						resetForSession: () => {},
-						projectRoot: "",
-						projectRulesScan: { hasCustomRules: false, rules: [] },
-						cachedExports: new Map(),
-						errorDebtBaseline: { testsPassed: true, buildPassed: true },
-					},
-					metricsClient: { reset: () => {} },
-					cacheManager: { writeCache: () => {}, readCache: () => null },
-					todoScanner: {
-						scanDirectory: () => ({ items: [] }),
-						scanFile: () => [],
-					},
-					astGrepClient: {
-						isAvailable: () => false,
-						ensureAvailable: async () => false,
-						scanExports: async () => new Map(),
-					},
-					biomeClient: {
-						isAvailable: () => false,
-						ensureAvailable: async () => false,
-					},
-					ruffClient: {
-						isAvailable: () => false,
-						ensureAvailable: async () => false,
-					},
-					knipClient: {
-						isAvailable: () => false,
-						ensureAvailable: async () => false,
-						analyze: async () => ({
-							success: true,
-							issues: [],
-							unusedExports: [],
-							unusedFiles: [],
-							unusedDeps: [],
-							unlistedDeps: [],
-							summary: "skipped",
-						}),
-					},
-					jscpdClient: {
-						isAvailable: () => false,
-						ensureAvailable: async () => false,
-					},
-					depChecker: {
-						isAvailable: () => false,
-						ensureAvailable: async () => false,
-					},
-					testRunnerClient: {
-						detectRunner: () => ({ runner: "vitest", config: null }),
-						runTestFile: () => ({ failed: 1, error: false }),
-					},
-					goClient: { isGoAvailableAsync: async () => false },
-					rustClient: { isAvailableAsync: async () => false },
-					ensureTool: async () => null,
-					cleanStaleTsBuildInfo: () => [],
-					resetDispatchBaselines: () => {},
-					resetLSPService: () => {},
-				}) as any);
+				await handleSessionStart(
+					withResidentBootstrap({
+						ctxCwd: env.tmpDir,
+						// no startupModeOverride → TUI heuristic applies → quick
+						getFlag: (name: string) => name === "no-lsp",
+						notify: () => {},
+						dbg,
+						log: () => {},
+						runtime: {
+							sessionGeneration: 1,
+							isCurrentSession: () => true,
+							markStartupScanInFlight: () => {},
+							clearStartupScanInFlight: () => {},
+							complexityBaselines: new Map(),
+							resetForSession: () => {},
+							projectRoot: "",
+							projectRulesScan: { hasCustomRules: false, rules: [] },
+							cachedExports: new Map(),
+							errorDebtBaseline: { testsPassed: true, buildPassed: true },
+						},
+						metricsClient: { reset: () => {} },
+						cacheManager: { writeCache: () => {}, readCache: () => null },
+						todoScanner: {
+							scanDirectory: () => ({ items: [] }),
+							scanFile: () => [],
+						},
+						astGrepClient: {
+							isAvailable: () => false,
+							ensureAvailable: async () => false,
+							scanExports: async () => new Map(),
+						},
+						biomeClient: {
+							isAvailable: () => false,
+							ensureAvailable: async () => false,
+						},
+						ruffClient: {
+							isAvailable: () => false,
+							ensureAvailable: async () => false,
+						},
+						knipClient: {
+							isAvailable: () => false,
+							ensureAvailable: async () => false,
+							analyze: async () => ({
+								success: true,
+								issues: [],
+								unusedExports: [],
+								unusedFiles: [],
+								unusedDeps: [],
+								unlistedDeps: [],
+								summary: "skipped",
+							}),
+						},
+						jscpdClient: {
+							isAvailable: () => false,
+							ensureAvailable: async () => false,
+						},
+						depChecker: {
+							isAvailable: () => false,
+							ensureAvailable: async () => false,
+						},
+						testRunnerClient: {
+							detectRunner: () => ({ runner: "vitest", config: null }),
+							runTestFile: () => ({ failed: 1, error: false }),
+						},
+						goClient: { isGoAvailableAsync: async () => false },
+						rustClient: { isAvailableAsync: async () => false },
+						ensureTool: async () => null,
+						cleanStaleTsBuildInfo: () => [],
+						resetDispatchBaselines: () => {},
+						resetLSPService: () => {},
+					}) as any,
+				);
 				expect(
 					dbg.mock.calls.some(([msg]) =>
 						String(msg).includes("startup mode: quick"),
@@ -909,76 +919,78 @@ describe(
 			process.env.PI_LENS_STARTUP_MODE = "quick";
 			const dbg = vi.fn();
 			try {
-				await handleSessionStart(withResidentBootstrap({
-					ctxCwd: env.tmpDir,
-					startupModeOverride: "full", // would normally force full for MCP host…
-					getFlag: (name: string) => name === "no-lsp",
-					notify: () => {},
-					dbg,
-					log: () => {},
-					runtime: {
-						sessionGeneration: 1,
-						isCurrentSession: () => true,
-						markStartupScanInFlight: () => {},
-						clearStartupScanInFlight: () => {},
-						complexityBaselines: new Map(),
-						resetForSession: () => {},
-						projectRoot: "",
-						projectRulesScan: { hasCustomRules: false, rules: [] },
-						cachedExports: new Map(),
-						errorDebtBaseline: { testsPassed: true, buildPassed: true },
-					},
-					metricsClient: { reset: () => {} },
-					cacheManager: { writeCache: () => {}, readCache: () => null },
-					todoScanner: {
-						scanDirectory: () => ({ items: [] }),
-						scanFile: () => [],
-					},
-					astGrepClient: {
-						isAvailable: () => false,
-						ensureAvailable: async () => false,
-						scanExports: async () => new Map(),
-					},
-					biomeClient: {
-						isAvailable: () => false,
-						ensureAvailable: async () => false,
-					},
-					ruffClient: {
-						isAvailable: () => false,
-						ensureAvailable: async () => false,
-					},
-					knipClient: {
-						isAvailable: () => false,
-						ensureAvailable: async () => false,
-						analyze: async () => ({
-							success: true,
-							issues: [],
-							unusedExports: [],
-							unusedFiles: [],
-							unusedDeps: [],
-							unlistedDeps: [],
-							summary: "skipped",
-						}),
-					},
-					jscpdClient: {
-						isAvailable: () => false,
-						ensureAvailable: async () => false,
-					},
-					depChecker: {
-						isAvailable: () => false,
-						ensureAvailable: async () => false,
-					},
-					testRunnerClient: {
-						detectRunner: () => ({ runner: "vitest", config: null }),
-						runTestFile: () => ({ failed: 1, error: false }),
-					},
-					goClient: { isGoAvailableAsync: async () => false },
-					rustClient: { isAvailableAsync: async () => false },
-					ensureTool: async () => null,
-					cleanStaleTsBuildInfo: () => [],
-					resetDispatchBaselines: () => {},
-					resetLSPService: () => {},
-				}) as any);
+				await handleSessionStart(
+					withResidentBootstrap({
+						ctxCwd: env.tmpDir,
+						startupModeOverride: "full", // would normally force full for MCP host…
+						getFlag: (name: string) => name === "no-lsp",
+						notify: () => {},
+						dbg,
+						log: () => {},
+						runtime: {
+							sessionGeneration: 1,
+							isCurrentSession: () => true,
+							markStartupScanInFlight: () => {},
+							clearStartupScanInFlight: () => {},
+							complexityBaselines: new Map(),
+							resetForSession: () => {},
+							projectRoot: "",
+							projectRulesScan: { hasCustomRules: false, rules: [] },
+							cachedExports: new Map(),
+							errorDebtBaseline: { testsPassed: true, buildPassed: true },
+						},
+						metricsClient: { reset: () => {} },
+						cacheManager: { writeCache: () => {}, readCache: () => null },
+						todoScanner: {
+							scanDirectory: () => ({ items: [] }),
+							scanFile: () => [],
+						},
+						astGrepClient: {
+							isAvailable: () => false,
+							ensureAvailable: async () => false,
+							scanExports: async () => new Map(),
+						},
+						biomeClient: {
+							isAvailable: () => false,
+							ensureAvailable: async () => false,
+						},
+						ruffClient: {
+							isAvailable: () => false,
+							ensureAvailable: async () => false,
+						},
+						knipClient: {
+							isAvailable: () => false,
+							ensureAvailable: async () => false,
+							analyze: async () => ({
+								success: true,
+								issues: [],
+								unusedExports: [],
+								unusedFiles: [],
+								unusedDeps: [],
+								unlistedDeps: [],
+								summary: "skipped",
+							}),
+						},
+						jscpdClient: {
+							isAvailable: () => false,
+							ensureAvailable: async () => false,
+						},
+						depChecker: {
+							isAvailable: () => false,
+							ensureAvailable: async () => false,
+						},
+						testRunnerClient: {
+							detectRunner: () => ({ runner: "vitest", config: null }),
+							runTestFile: () => ({ failed: 1, error: false }),
+						},
+						goClient: { isGoAvailableAsync: async () => false },
+						rustClient: { isAvailableAsync: async () => false },
+						ensureTool: async () => null,
+						cleanStaleTsBuildInfo: () => [],
+						resetDispatchBaselines: () => {},
+						resetLSPService: () => {},
+					}) as any,
+				);
 				// PI_LENS_STARTUP_MODE=quick wins → resolveStartupMode() returns "quick"
 				// before the heuristic even runs (env var check skips the override branch)
 				expect(

@@ -4,7 +4,7 @@
  * lazy translation-unit indexing.
  */
 
-import { withResidentBootstrap } from "../support/bootstrap-mock.js";
+import { withResidentBootstrap } from "../support/bootstrap-access.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";

@@ -12,7 +12,7 @@
  *   - a normal (small, `canWarmCaches: true`) project never fires it.
  */
 
-import { withResidentBootstrap } from "../support/bootstrap-mock.js";
+import { withResidentBootstrap } from "../support/bootstrap-access.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";

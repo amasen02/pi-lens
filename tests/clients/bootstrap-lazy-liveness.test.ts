@@ -188,11 +188,21 @@ describe("#2467 — session-start demands are not turn-scoped", () => {
 		setAmbientAbortSignal(stale.signal);
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-2467-stale-"));
 		fs.writeFileSync(path.join(cwd, "index.ts"), "export const a = 1;\n");
+		fs.writeFileSync(
+			path.join(cwd, "package.json"),
+			JSON.stringify({ name: "stale-signal-fixture", version: "0.0.0" }),
+		);
 		try {
 			await pi.emit("session_start", {}, makeCtx({ cwd }));
-			// Not merely "the demand was made" — it was SERVED, so the scan
-			// bodies behind it actually ran.
-			expect(served).toContain("session-start-scans");
+			// Not merely "the demand was made" — EVERY demand was SERVED, so the
+			// scan and probe bodies behind them actually ran. Pre-fix the demands
+			// are identical and `served` is empty: the aborted signal made every
+			// one of them answer `null`, and nothing retries.
+			const requested = demands
+				.filter((d) => d.startsWith("request:"))
+				.map((d) => d.slice("request:".length));
+			expect(requested.length).toBeGreaterThan(0);
+			expect(served).toEqual(requested);
 			expect(served).toContain("session-start-tool-probes");
 		} finally {
 			setAmbientAbortSignal(undefined);

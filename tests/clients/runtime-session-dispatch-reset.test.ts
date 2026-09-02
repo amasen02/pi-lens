@@ -11,7 +11,7 @@
  * asserts the tool is retried afterward.
  */
 
-import { withResidentBootstrap } from "../support/bootstrap-mock.js";
+import { withResidentBootstrap } from "../support/bootstrap-access.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { handleSessionStart } from "../../clients/runtime-session.js";
 import { removeTempDirSync, setupTestEnvironment } from "./test-utils.js";

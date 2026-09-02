@@ -13,7 +13,7 @@
  * `formatters.ts`'s `tryLazyInstallFormatterTool`.
  */
 
-import { withResidentBootstrap } from "../support/bootstrap-mock.js";
+import { withResidentBootstrap } from "../support/bootstrap-access.js";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	resetProjectTrust,

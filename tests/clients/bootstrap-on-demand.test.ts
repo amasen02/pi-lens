@@ -403,7 +403,9 @@ describe("#2467 — a load that cannot succeed latches after N strikes", () => {
 
 		for (let i = 0; i < 5; i++) {
 			expect(
-				await bootstrap.requestBootstrapClients({ reason: "session-start-scans" }),
+				await bootstrap.requestBootstrapClients({
+					reason: "session-start-scans",
+				}),
 			).toBeNull();
 		}
 		expect(bootstrap._analyzerBootstrapLoadAttempts()).toBe(3);

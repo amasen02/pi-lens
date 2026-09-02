@@ -11,7 +11,7 @@
  * the full path (where those steps actually run instead of being skipped).
  */
 
-import { withResidentBootstrap } from "../support/bootstrap-mock.js";
+import { withResidentBootstrap } from "../support/bootstrap-access.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { LatencyEntry } from "../../clients/latency-logger.js";
 

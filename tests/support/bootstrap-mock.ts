@@ -24,31 +24,14 @@
  *   already resident would hide the very laziness this issue introduced.
  */
 
-import {
-	type BootstrapClients,
-	type SessionBootstrapAccess,
-	residentBootstrapAccess,
-} from "../../clients/bootstrap.js";
-
 /**
- * Give a fixture's loose client stubs the ONE shape `handleSessionStart` takes.
- *
- * `SessionStartDeps` used to carry fifteen optional analyzer-client fields
- * beside the seam, so a fixture could supply either shape — and so could a
- * production caller that forgot one (#2467 review). There is one shape now,
- * and this is how a caller that already HOLDS its clients presents them. It
- * delegates to the production wrapper rather than re-implementing `peek` and
- * `request`, so a fixture cannot be served by a seam production would not
- * have built.
+ * NOTHING here may statically import `clients/bootstrap.js`: this module is
+ * loaded from INSIDE `vi.doMock` factories for that module, and importing the
+ * module under mock from its own factory deadlocks resolution — every case in
+ * `bootstrap-lazy-liveness.test.ts` sat until its 30s timeout. The
+ * fixture-side `withResidentBootstrap` wrapper therefore lives in
+ * `bootstrap-access.ts`.
  */
-export function withResidentBootstrap<T extends object>(
-	deps: T,
-): T & { bootstrap: SessionBootstrapAccess } {
-	return {
-		...deps,
-		bootstrap: residentBootstrapAccess(deps as unknown as BootstrapClients),
-	};
-}
 
 /** The options `requestBootstrapClients` is called with in production. */
 export interface BootstrapDemandOptions {
@@ -67,7 +50,10 @@ export interface BootstrapSeamMock {
 	markAnalyzerBootstrapShutdown: () => void;
 	resetAnalyzerBootstrapSessionState: () => void;
 	isAnalyzerBootstrapShutdown: () => boolean;
-	residentBootstrapAccess: (clients: BootstrapClients) => SessionBootstrapAccess;
+	residentBootstrapAccess: (clients: unknown) => {
+		peek: () => unknown;
+		request: () => Promise<unknown>;
+	};
 	degradedClient: () => unknown;
 	BOOTSTRAP_LOAD_TIMEOUT_MS: number;
 }
@@ -108,7 +94,14 @@ export function bootstrapSeamMock(
 			shutdown = false;
 		},
 		isAnalyzerBootstrapShutdown: () => shutdown,
-		residentBootstrapAccess,
+		// Deliberately re-stated rather than delegated: see this file's header
+		// for why nothing here may import the module it doubles. The
+		// fixture-side wrapper (`bootstrap-access.ts`) is the one that
+		// delegates to production.
+		residentBootstrapAccess: (clients: unknown) => ({
+			peek: () => clients,
+			request: async () => clients,
+		}),
 		degradedClient: () => ({}),
 		BOOTSTRAP_LOAD_TIMEOUT_MS: 10_000,
 	};

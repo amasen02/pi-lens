@@ -8,7 +8,7 @@
  * (decision 2: fold into the existing warmup, not a new mechanism).
  */
 
-import { withResidentBootstrap } from "../support/bootstrap-mock.js";
+import { withResidentBootstrap } from "../support/bootstrap-access.js";
 import * as fs from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {

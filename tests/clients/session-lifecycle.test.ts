@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { withResidentBootstrap } from "../support/bootstrap-mock.js";
+import { withResidentBootstrap } from "../support/bootstrap-access.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { handleSessionStart } from "../../clients/runtime-session.js";
 import {
@@ -405,33 +405,35 @@ async function runGuardedSessionStart(
 	if (!decision.runFullSessionStart) {
 		return decision;
 	}
-	await handleSessionStart(withResidentBootstrap({
-		ctxCwd: tmpDir,
-		getFlag: () => false,
-		notify: () => {},
-		dbg: () => {},
-		log: () => {},
-		runtime,
-		metricsClient: { reset: () => {} },
-		cacheManager: { writeCache: () => {}, readCache: () => null },
-		todoScanner: { scanDirectory: () => ({ items: [] }) },
-		astGrepClient: {},
-		biomeClient: {},
-		ruffClient: {},
-		knipClient: {},
-		jscpdClient: {},
-		depChecker: {},
-		testRunnerClient: {
-			detectRunner: () => null,
-			runTestFile: () => ({ failed: 0, error: false }),
-		},
-		goClient: { isGoAvailableAsync: async () => false },
-		rustClient: { isAvailableAsync: async () => false },
-		ensureTool: async () => null,
-		cleanStaleTsBuildInfo: () => [],
-		resetDispatchBaselines: () => {},
-		resetLSPService,
-	}) as any);
+	await handleSessionStart(
+		withResidentBootstrap({
+			ctxCwd: tmpDir,
+			getFlag: () => false,
+			notify: () => {},
+			dbg: () => {},
+			log: () => {},
+			runtime,
+			metricsClient: { reset: () => {} },
+			cacheManager: { writeCache: () => {}, readCache: () => null },
+			todoScanner: { scanDirectory: () => ({ items: [] }) },
+			astGrepClient: {},
+			biomeClient: {},
+			ruffClient: {},
+			knipClient: {},
+			jscpdClient: {},
+			depChecker: {},
+			testRunnerClient: {
+				detectRunner: () => null,
+				runTestFile: () => ({ failed: 0, error: false }),
+			},
+			goClient: { isGoAvailableAsync: async () => false },
+			rustClient: { isAvailableAsync: async () => false },
+			ensureTool: async () => null,
+			cleanStaleTsBuildInfo: () => [],
+			resetDispatchBaselines: () => {},
+			resetLSPService,
+		}) as any,
+	);
 	return decision;
 }
 

@@ -1,5 +1,5 @@
 import * as fs from "node:fs";
-import { withResidentBootstrap } from "../support/bootstrap-mock.js";
+import { withResidentBootstrap } from "../support/bootstrap-access.js";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as languageProfile from "../../clients/language-profile.js";
