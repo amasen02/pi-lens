@@ -74,7 +74,11 @@ instructions say so.
    job.
 6. If the issue asks for a class sweep, run it and report coverage honestly:
    what you searched, what you found, what you deliberately left.
-7. Ship: changelog fragment in `.changelog/`; tpope-style commit (conventional
+7. Ship: changelog fragment in `.changelog/` — validate it with
+   `node scripts/check-changelog-fragments.mjs` (the CI gate: YAML front
+   matter with one `section:`, exactly ONE top-level entry per file);
+   `npm run changelog:check` is a DIFFERENT, weaker script and passing it
+   proves nothing about the fragment (#2456 round 4 shipped red on this); tpope-style commit (conventional
    prefix, imperative ≤50-char subject, 72-col what+why body) ending with
    `Refs #<N>` and the session trailers; push; open the PR with the issue ref
    in the TITLE — `closes` only if every acceptance criterion is met,
