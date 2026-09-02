@@ -168,12 +168,73 @@ const LAYOUTS: readonly Layout[] = [
 
 /**
  * Deliberate, changelogged projection changes #2426 makes. Keyed by
- * `<layout>.<projection>`; each entry replaces that projection wholesale so a
- * reviewer reads the new value beside the frozen old one.
+ * `<layout>.<projection>`; `apply` rewrites the FROZEN value into what the
+ * change makes it, so a reviewer reads the transformation rather than a second
+ * opaque blob, and anything not named here must still match byte for byte.
+ *
+ * Every entry corresponds to a line in `.changelog/feat-2426-*.md`.
  */
 const ENUMERATED_DELTAS: Readonly<
-	Record<string, { readonly why: string; readonly value: unknown }>
-> = {};
+	Record<
+		string,
+		{ readonly why: string; readonly apply: (frozen: unknown) => unknown }
+	>
+> = {
+	"canonical-only.lsp": {
+		why:
+			"The `lsp` NAMESPACE is now the canonical home of LSP settings, so the " +
+			"LSP projection is the `lsp` section rather than the whole file. Before, " +
+			"`loadLSPConfig` returned every top-level key of `.pi-lens.json` — " +
+			"`ignore`, `rules`, `maxProjectFiles` included — as if they were LSP " +
+			"config, and the `lsp` section a user wrote did nothing at all.",
+		apply: () => ({
+			disabledServers: ["typos"],
+			servers: { custom: CUSTOM_SERVER },
+		}),
+	},
+	"mixed.lsp": {
+		why:
+			"Two changes, both #2426 scope. (a) The CANONICAL file wins: " +
+			"`.pi-lens.json`'s `servers`/`warmFiles` now outrank the deprecated " +
+			"`.pi-lens/lsp.json`, which previously won outright by being first in " +
+			"the candidate list — a migration the user could never complete. (b) " +
+			"Objects merge FIELD-WISE across sources (#2415), so `servers` carries " +
+			"both entries instead of one file's map replacing the other's.",
+		apply: () => ({
+			disabledServers: ["typos"],
+			servers: {
+				canonical: { ...CUSTOM_SERVER, name: "FromPiLensJson" },
+				legacy: { ...CUSTOM_SERVER, name: "FromLspJson" },
+			},
+			warmFiles: ["src/main.rs"],
+		}),
+	},
+	"nested-package.lsp": {
+		why:
+			"Nested project configs LAYER (nearest wins per field) instead of the " +
+			"nearest one winning wholesale, matching what `.pi-lens.json`'s `ignore` " +
+			"has done since #783. The root's `lsp.disabledServers` now survives " +
+			"beside the package's `lsp.warmFiles`; before, the package config " +
+			"replaced the root config entirely — and, as in `canonical-only`, the " +
+			"whole file was returned instead of its `lsp` section.",
+		apply: () => ({
+			disabledServers: ["typos"],
+			warmFiles: ["src/a.ts"],
+		}),
+	},
+	"global-and-project.lsp": {
+		why:
+			"Same `lsp`-section projection: `.pi-lens.json`'s `ignore` is a project " +
+			"config key and no longer leaks into `LSPConfig`. Everything else in " +
+			"this layout — the field-wise `servers` merge across global and " +
+			"project, `serverOverrides`, `disabledServers`, `warmFiles` — is " +
+			"unchanged, which is the point of keeping the layout in the set.",
+		apply: (frozen) => {
+			const { ignore: _ignore, ...rest } = frozen as Record<string, unknown>;
+			return rest;
+		},
+	},
+};
 
 const tempRoots: string[] = [];
 
@@ -222,15 +283,12 @@ async function captureLayout(layout: Layout): Promise<unknown> {
 	process.env.PI_LENS_HOME = path.join(home, ".pi-lens");
 	process.env.PI_LENS_CONFIG_PATH = path.join(home, ".pi-lens", "config.json");
 
-	const { loadLSPConfig, resetLSPConfigWarnCache } = await import(
-		"../../clients/lsp/config.js"
-	);
-	const { loadPiLensGlobalConfig, resetGlobalConfigWarnCache } = await import(
-		"../../clients/lens-config.js"
-	);
-	const { loadPiLensProjectConfig, resetProjectLensConfigCache } = await import(
-		"../../clients/project-lens-config.js"
-	);
+	const { loadLSPConfig, resetLSPConfigWarnCache } =
+		await import("../../clients/lsp/config.js");
+	const { loadPiLensGlobalConfig, resetGlobalConfigWarnCache } =
+		await import("../../clients/lens-config.js");
+	const { loadPiLensProjectConfig, resetProjectLensConfigCache } =
+		await import("../../clients/project-lens-config.js");
 	resetLSPConfigWarnCache();
 	resetGlobalConfigWarnCache();
 	resetProjectLensConfigCache();
@@ -261,7 +319,7 @@ function withDeltas(name: string, frozen: Record<string, unknown>): unknown {
 	const out: Record<string, unknown> = { ...frozen };
 	for (const projection of Object.keys(out)) {
 		const delta = ENUMERATED_DELTAS[`${name}.${projection}`];
-		if (delta) out[projection] = delta.value;
+		if (delta) out[projection] = delta.apply(out[projection]);
 	}
 	return out;
 }
@@ -275,17 +333,22 @@ describe("config loader golden projections (#2426)", () => {
 		it(`projects ${layout.name} as its frozen pre-#2426 fixture`, async () => {
 			const actual = await captureLayout(layout);
 			if (CAPTURE) {
+				// Capture mode writes the frozen record instead of comparing to it.
+				// It still ASSERTS rather than returning early — a capture run that
+				// silently produced nothing would be indistinguishable from a passing
+				// one, which is the vacuous-skip shape #2089 exists to forbid.
 				fs.mkdirSync(FIXTURE_DIR, { recursive: true });
 				fs.writeFileSync(
 					fixturePath(layout.name),
 					`${JSON.stringify(actual, null, "\t")}\n`,
 				);
-				return;
+				expect(fs.existsSync(fixturePath(layout.name))).toBe(true);
+			} else {
+				const frozen = JSON.parse(
+					fs.readFileSync(fixturePath(layout.name), "utf-8"),
+				) as Record<string, unknown>;
+				expect(actual).toEqual(withDeltas(layout.name, frozen));
 			}
-			const frozen = JSON.parse(
-				fs.readFileSync(fixturePath(layout.name), "utf-8"),
-			) as Record<string, unknown>;
-			expect(actual).toEqual(withDeltas(layout.name, frozen));
 		});
 	}
 });

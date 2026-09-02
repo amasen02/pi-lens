@@ -414,15 +414,19 @@ describe("loadPiLensProjectConfig", () => {
 			);
 		});
 
-		it("does NOT warn on foreign LSP namespaces or $schema", () => {
+		it("does NOT warn on the `lsp` namespace or $schema", () => {
 			fs.writeFileSync(
 				path.join(tmpDir, ".pi-lens.json"),
 				JSON.stringify({
 					$schema: "https://example.com/pi-lens.json",
-					servers: { foo: { name: "foo" } },
-					serverOverrides: { rust: {} },
-					disabledServers: ["go"],
-					warmFiles: ["src/main.ts"],
+					// The CANONICAL spelling since #2426: `lsp` is a namespace inside
+					// `.pi-lens.json`, read by the LSP loader out of the same file.
+					lsp: {
+						servers: { foo: { name: "foo" } },
+						serverOverrides: { rust: {} },
+						disabledServers: ["go"],
+						warmFiles: ["src/main.ts"],
+					},
 					// Legitimate project keys alongside them.
 					ignore: ["dist/**"],
 					format: { enabled: false },
@@ -430,6 +434,41 @@ describe("loadPiLensProjectConfig", () => {
 			);
 			loadPiLensProjectConfig(tmpDir);
 			expect(console.error).not.toHaveBeenCalled();
+		});
+
+		it("warns a MIGRATION notice, not a typo, on a legacy root LSP key (#2426)", () => {
+			// The four legacy root keys are still honored for their deprecation
+			// window (`DEPRECATED_CONFIG_SURFACES`), so this is not an "unknown key"
+			// and not an "ignoring invalid" — the setting APPLIES. What the user
+			// gets is one notice per key naming where it moves to.
+			fs.writeFileSync(
+				path.join(tmpDir, ".pi-lens.json"),
+				JSON.stringify({
+					servers: { foo: { name: "foo" } },
+					serverOverrides: { rust: {} },
+					disabledServers: ["go"],
+					warmFiles: ["src/main.ts"],
+					ignore: ["dist/**"],
+				}),
+			);
+			loadPiLensProjectConfig(tmpDir);
+			for (const key of [
+				"servers",
+				"serverOverrides",
+				"disabledServers",
+				"warmFiles",
+			]) {
+				expect(warnedFor(`move "${key}" to "lsp.${key}"`), key).toBe(true);
+				expect(warnedFor(`unknown key "${key}"`), key).toBe(false);
+			}
+			// The whole-file "ignoring invalid" prose must NOT appear: nothing was
+			// ignored.
+			expect(warnedFor("ignoring invalid")).toBe(false);
+			// One notice per (file, key) — four keys, four notices, no more.
+			const notices = (console.error as ReturnType<typeof vi.fn>).mock.calls
+				.flat()
+				.filter((arg) => typeof arg === "string" && arg.includes("deprecated"));
+			expect(notices).toHaveLength(4);
 		});
 
 		it("does NOT warn on the pi-lens-native `trivy` key (read via .raw)", () => {
@@ -446,13 +485,30 @@ describe("loadPiLensProjectConfig", () => {
 		it("signals that a global-only lens key is not honored at project scope", () => {
 			fs.writeFileSync(
 				path.join(tmpDir, ".pi-lens.json"),
-				JSON.stringify({ lsp: { enabled: false }, tests: { enabled: false } }),
+				JSON.stringify({
+					delta: { enabled: false },
+					tests: { enabled: false },
+				}),
 			);
 			loadPiLensProjectConfig(tmpDir);
 			expect(warnedFor("not honored in a project")).toBe(true);
-			expect(warnedFor('"lsp"')).toBe(true);
+			expect(warnedFor('"delta"')).toBe(true);
 			expect(warnedFor('"tests"')).toBe(true);
 			// It is NOT reported as a typo — it is a real key, wrong scope.
+			expect(warnedFor('unknown key "delta"')).toBe(false);
+		});
+
+		it("does NOT call `lsp` a global-only key any more (#2426)", () => {
+			// `lsp` used to be global-only at project scope, because the LSP loader
+			// read its settings from the ROOT of `.pi-lens.json`. Since #2426 `lsp`
+			// IS the project-scoped namespace those settings live in, so telling a
+			// user their `lsp` section does nothing here would be false.
+			fs.writeFileSync(
+				path.join(tmpDir, ".pi-lens.json"),
+				JSON.stringify({ lsp: { disabledServers: ["go"] } }),
+			);
+			loadPiLensProjectConfig(tmpDir);
+			expect(warnedFor('"lsp" is a global-only')).toBe(false);
 			expect(warnedFor('unknown key "lsp"')).toBe(false);
 		});
 

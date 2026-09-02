@@ -51,9 +51,18 @@ vi.mock("../../../clients/trivy-client.js", () => ({
 	resolveSeverityFloor,
 }));
 
-vi.mock("../../../clients/degradation-ledger.js", () => ({
-	incrementDegradationCount,
-}));
+// Partial mock, not a replacement (#2426): the runner reaches
+// `loadPiLensProjectConfig`, which now resolves through the config core, and
+// `config-core/records.ts` reads this module's `DEGRADATION_ENTRIES_PER_KIND`
+// at import time. A whole-module stub silently removed that export and the
+// suite failed to load rather than failing an assertion.
+vi.mock("../../../clients/degradation-ledger.js", async (importOriginal) => {
+	const actual =
+		await importOriginal<
+			typeof import("../../../clients/degradation-ledger.js")
+		>();
+	return { ...actual, incrementDegradationCount };
+});
 
 vi.mock("../../../clients/dispatch/runners/utils/runner-helpers.js", () => ({
 	createAvailabilityChecker: () => ({

@@ -187,6 +187,77 @@ describe("loadLSPConfig global configuration (#870)", () => {
 });
 
 /**
+ * #2426, at the public loader rather than at the resolver seam.
+ *
+ * Both cases below are RED on pre-#2426 `loadLSPConfig`: the walk ran to the
+ * filesystem root with no `$HOME` stop, and the candidate list took the first
+ * hit, which put a deprecated location ahead of the canonical one.
+ */
+describe("loadLSPConfig walk confinement and canonical precedence (#2426)", () => {
+	it("does not adopt a legacy LSP config from at or above HOME", async () => {
+		// Cross-form paths per the read-guard path-key rule: the ceiling is
+		// supplied in `/` form and the cwd in native form, so a ceiling that only
+		// holds when both were spelled the same way does not pass here.
+		const root = tmpDir("pi-lens-lsp-ceiling-");
+		const home = path.join(root, "home");
+		const projectDir = path.join(home, "proj", "src");
+		fs.mkdirSync(projectDir, { recursive: true });
+		process.env.PI_LENS_HOME = tmpDir("pi-lens-lsp-global-");
+
+		// Above HOME.
+		fs.mkdirSync(path.join(root, ".pi-lens"), { recursive: true });
+		fs.writeFileSync(
+			path.join(root, ".pi-lens", "lsp.json"),
+			JSON.stringify({ warmFiles: ["from-above-home"] }),
+		);
+		// And IN HOME, which is equally off limits.
+		fs.writeFileSync(
+			path.join(home, "pi-lsp.json"),
+			JSON.stringify({ warmFiles: ["from-home"] }),
+		);
+
+		const { loadLSPConfig } = await import("../../../clients/lsp/config.js");
+		await expect(
+			loadLSPConfig(projectDir, home.replace(/\\/g, "/")),
+		).resolves.toEqual({});
+
+		// Mutation guard: the same fixture with a config BELOW the ceiling is
+		// still read, so the two assertions above cannot pass by reading nothing.
+		fs.writeFileSync(
+			path.join(home, "proj", ".pi-lens.json"),
+			JSON.stringify({ lsp: { warmFiles: ["from-project"] } }),
+		);
+		await expect(
+			loadLSPConfig(projectDir, home.replace(/\\/g, "/")),
+		).resolves.toEqual({ warmFiles: ["from-project"] });
+	});
+
+	it("lets the canonical .pi-lens.json beat a leftover .pi-lens/lsp.json", async () => {
+		const root = tmpDir("pi-lens-lsp-canonical-");
+		const home = path.join(root, "home");
+		const projectDir = path.join(home, "proj");
+		fs.mkdirSync(path.join(projectDir, ".pi-lens"), { recursive: true });
+		process.env.PI_LENS_HOME = tmpDir("pi-lens-lsp-global-");
+
+		fs.writeFileSync(
+			path.join(projectDir, ".pi-lens", "lsp.json"),
+			JSON.stringify({ warmFiles: ["legacy"], disabledServers: ["typos"] }),
+		);
+		fs.writeFileSync(
+			path.join(projectDir, ".pi-lens.json"),
+			JSON.stringify({ lsp: { warmFiles: ["canonical"] } }),
+		);
+
+		const { loadLSPConfig } = await import("../../../clients/lsp/config.js");
+		const config = await loadLSPConfig(projectDir, home);
+		expect(config.warmFiles).toEqual(["canonical"]);
+		// The legacy file is still READ — deprecation, not removal — so a key the
+		// user has not migrated yet keeps working.
+		expect(config.disabledServers).toEqual(["typos"]);
+	});
+});
+
+/**
  * In-flight ABA release (#1968, kit-driven white-box probe — sibling of
  * dead-code-client's/knip-client's bare-`.finally` release, same shape).
  *

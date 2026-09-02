@@ -83,21 +83,25 @@ export const CONFIG_DIAGNOSTIC_CODES = {
 	/**
 	 * A deprecated config KEY was accepted inside its deprecation window.
 	 *
-	 * RESERVED, NOT YET EMITTED. Nothing in pi-lens raises this today: the
-	 * migration warnings it describes arrive with #2416 slice 1, which is also
-	 * the first release in which any key is actually inside its window. The
-	 * number is registered now because the namespace is append-only — a number
-	 * cannot be chosen after the fact — and `DEPRECATED_CONFIG_SURFACES` already
-	 * points its `kind: "key"` rows at it, so the wiring is a call site, not a
-	 * new public surface. Deliberately reserved-but-inert per AGENTS.md's
-	 * "Issue and PR design contract".
+	 * EMITTED since #2426, by `deprecationRecords` (`clients/config-resolve.ts`)
+	 * for every `kind: "key"` row below that appears at the ROOT of a canonical
+	 * file — one record per `(file, key)` — and delivered through
+	 * `reportMigrationRecords` -> `warnIgnoredConfigOnce`, which renders it as
+	 * `deprecated <label> key in <file>: …` and records a `config-deprecated`
+	 * ledger row rather than a `config-ignored` one. The setting still APPLIES;
+	 * the code says only that the spelling is on a removal schedule.
+	 *
+	 * The record carries `canonicalKey`, so the auto-migrator #2426 defers can
+	 * be a pure function over these records rather than a prose parser.
 	 */
 	PILENS_CFG_0002: "deprecated config key accepted",
 	/**
 	 * A deprecated config FILE LOCATION was read inside its window.
 	 *
-	 * RESERVED, NOT YET EMITTED — same slice, same reasoning as
-	 * `PILENS_CFG_0002`.
+	 * EMITTED since #2426 — same producer, same delivery path, and the same
+	 * one-record-per-`(file, key)` granularity as `PILENS_CFG_0002`; this is the
+	 * code for the `kind: "file"` rows below. Per-key rather than per-file so the
+	 * warning can name the destination of each setting the user has to move.
 	 */
 	PILENS_CFG_0003: "deprecated config file location accepted",
 	/**

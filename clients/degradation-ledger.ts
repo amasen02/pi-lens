@@ -562,7 +562,19 @@ export type DegradationKind =
 	 * observability question, the fact of the ignore is. This is the only kind
 	 * that carries a `code` (`PILENS_CFG_0001`) into the durable row.
 	 */
-	| "config-ignored";
+	| "config-ignored"
+	/**
+	 * A config file location or root key the user wrote is DEPRECATED and was
+	 * still honored (#2426). The deliberate opposite of `config-ignored`: the
+	 * setting applied exactly as written, and the location it was written in is
+	 * on the removal schedule in `DEPRECATED_CONFIG_SURFACES`. Kept as its own
+	 * kind so "how many sessions ran on defaults because a config was rejected"
+	 * stays answerable from the ledger without subtracting deprecations out of
+	 * it. Same producer and same `<file>\0<key>` subject as `config-ignored`,
+	 * one row per `(file, key)` per session, carrying `PILENS_CFG_0002`
+	 * (deprecated key) or `PILENS_CFG_0003` (deprecated file location).
+	 */
+	| "config-deprecated";
 
 export interface DegradationRecord {
 	kind: unknown;

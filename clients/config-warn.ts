@@ -23,7 +23,10 @@
  * warning inside a refactor is still not a thing this PR does.
  */
 
-import type { ConfigDiagnosticCode } from "./config-diagnostic-codes.js";
+import {
+	type ConfigDiagnosticCode,
+	DEPRECATED_CONFIG_SURFACES,
+} from "./config-diagnostic-codes.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
 import { logExtension } from "./extension-log.js";
 import { notifyUserDegradation } from "./user-notify.js";
@@ -65,6 +68,29 @@ const IGNORED_CONFIG_CODE: ConfigDiagnosticCode = "PILENS_CFG_0001";
  * explosion.
  */
 const IGNORED_CONFIG_KIND = "config-ignored";
+
+/**
+ * The degradation kind a DEPRECATION notice records under (#2426).
+ *
+ * Kept apart from `config-ignored` because the two are opposite facts about a
+ * session: an ignored config means pi-lens ran on defaults instead of what the
+ * user asked for, while a deprecated one means it ran on exactly what the user
+ * asked for and the location will stop working. Folding them together would
+ * have made "how many sessions ran degraded" un-answerable from the ledger.
+ */
+const DEPRECATED_CONFIG_KIND = "config-deprecated";
+
+/**
+ * The codes that mean "accepted, but deprecated". DERIVED from the deprecation
+ * registry rather than listed, so a future `kind` of deprecated surface with a
+ * new code cannot render as `ignoring invalid …` by omission.
+ */
+const DEPRECATION_NOUN_BY_CODE: ReadonlyMap<string, string> = new Map(
+	DEPRECATED_CONFIG_SURFACES.map((row) => [
+		row.code,
+		row.kind === "file" ? "location" : "key",
+	]),
+);
 
 /** Warn-once latch, keyed on (subsystem, file, key, reason). */
 const warnedIgnoredConfigs = new Set<string>();
@@ -137,8 +163,10 @@ export function warnIgnoredConfigOnce(options: WarnIgnoredConfigOptions): void {
 	// Subject is `<file>\0<key>` when a single key is rejected, and plain
 	// `<file>` otherwise, so a per-key rejection and a whole-file rejection are
 	// distinct rows for the same file without a trailing separator on every row.
+	const deprecationNoun = DEPRECATION_NOUN_BY_CODE.get(code);
+
 	recordDegradationOnce({
-		kind: IGNORED_CONFIG_KIND,
+		kind: deprecationNoun ? DEPRECATED_CONFIG_KIND : IGNORED_CONFIG_KIND,
 		subject: key ? `${file}\0${key}` : file,
 		reason,
 		metadata: { subsystem, configPath: file },
@@ -149,7 +177,13 @@ export function warnIgnoredConfigOnce(options: WarnIgnoredConfigOptions): void {
 	if (warnedIgnoredConfigs.has(latchKey)) return;
 	warnedIgnoredConfigs.add(latchKey);
 
-	const message = `ignoring invalid ${SUBSYSTEM_CONFIG_LABEL[subsystem]} ${file}: ${reason}`;
+	// Two prose shapes for two opposite facts. A deprecation notice that said
+	// "ignoring invalid …" would tell the user their setting is not being
+	// applied when it IS — the one thing #2426's "no user is broken silently"
+	// rule cannot afford to get backwards.
+	const message = deprecationNoun
+		? `deprecated ${SUBSYSTEM_CONFIG_LABEL[subsystem]} ${deprecationNoun} in ${file}: ${reason}`
+		: `ignoring invalid ${SUBSYSTEM_CONFIG_LABEL[subsystem]} ${file}: ${reason}`;
 
 	logExtension({
 		subsystem,

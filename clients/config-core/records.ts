@@ -42,6 +42,17 @@ export interface MigrationRecord {
 	readonly subject: string;
 	/** Structural description. Never the offending value. */
 	readonly reason: string;
+	/**
+	 * Where the key MOVES TO, for a deprecation record (`PILENS_CFG_0002` /
+	 * `0003`). Absent on a validation record, which describes a key that is
+	 * going nowhere.
+	 *
+	 * Carried as DATA beside the rendered `reason` on purpose (#2426 scope item
+	 * 4): the auto-migrator that #2426 explicitly leaves out of scope is then a
+	 * pure function over a list of records — `(file, key) -> canonicalKey` — and
+	 * never has to parse a message whose prose is documented as free to change.
+	 */
+	readonly canonicalKey?: string;
 }
 
 /**

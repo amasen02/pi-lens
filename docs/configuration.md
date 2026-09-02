@@ -1,0 +1,109 @@
+# Configuring pi-lens
+
+There are **two** pi-lens config files:
+
+| File | Scope | Notes |
+| --- | --- | --- |
+| `.pi-lens.json` | the project | Committed or not, your call. Nearest one wins **per field** — a package can override one setting without restating the repo root's. |
+| `~/.pi-lens/config.json` | the machine | Your defaults across every project. `PI_LENS_CONFIG_PATH` relocates it. |
+
+Both files have the same shape. Everything LSP-related lives under an `lsp`
+namespace inside them:
+
+```jsonc
+{
+  "$schema": "https://raw.githubusercontent.com/apmantza/pi-lens/master/docs/schema/pi-lens-config-v1.json",
+  "ignore": ["dist/**"],
+  "maxProjectFiles": 8000,
+  "rules": { "high-complexity": { "threshold": 25 } },
+  "lsp": {
+    "enabled": true,
+    "disabledServers": ["typos"],
+    "warmFiles": ["src/main.rs"],
+    "servers": {
+      "my-server": {
+        "name": "My Custom LSP",
+        "extensions": [".myext"],
+        "command": "my-lsp-server",
+        "args": ["--stdio"]
+      }
+    },
+    "serverOverrides": {
+      "rust": {
+        "initializationOptions": { "check": { "command": "clippy" } }
+      }
+    }
+  }
+}
+```
+
+## Which file wins
+
+One order, lowest precedence first. A later tier replaces an earlier tier's
+value **for that field only** — objects are merged field-wise, never replaced
+whole, so setting one key never silently drops the rest of a section.
+
+1. **builtin** — pi-lens's shipped defaults.
+2. **global** — `~/.pi-lens/config.json`.
+3. **project root** — the outermost `.pi-lens.json` at or above your working
+   directory.
+4. **nested-project** — every `.pi-lens.json` between that root and your working
+   directory, outermost first. The nearest file wins, per field.
+5. **env** — `PI_LENS_*` environment variables.
+6. **cli** — `--lens-*` flags.
+7. **host** — what the host application decides (including project trust).
+
+Two rules make the rest of the table unambiguous:
+
+- **The search stops at `$HOME`.** pi-lens never reads a config file in your
+  home directory or above it. A stray `pi-lens.json` in `$HOME` (or at `C:\`)
+  is not adopted by every project on the machine. The machine-global file is
+  read by its own path, so it is unaffected.
+- **The canonical spelling wins.** Where a legacy file or a legacy key means the
+  same thing as the canonical one, the canonical one is used — otherwise the
+  migration below could never be completed.
+
+## Legacy locations (still read; being removed)
+
+These are read for their deprecation window and then **removed**. Each one you
+still have produces one warning per setting, naming exactly where to move it —
+carrying the stable code `PILENS_CFG_0003` (a deprecated file) or
+`PILENS_CFG_0002` (a deprecated key), so you can match or suppress on the code
+rather than on the prose.
+
+| Legacy | Move it to | Code |
+| --- | --- | --- |
+| `.pi-lens/lsp.json` | `.pi-lens.json` → `lsp.*` | `PILENS_CFG_0003` |
+| `pi-lsp.json` | `.pi-lens.json` → `lsp.*` | `PILENS_CFG_0003` |
+| `pi-lens.json` (undotted) | `.pi-lens.json` | `PILENS_CFG_0003` |
+| `~/.pi-lens/lsp.json` | `~/.pi-lens/config.json` → `lsp.*` | `PILENS_CFG_0003` |
+| `servers` at the file root | `lsp.servers` | `PILENS_CFG_0002` |
+| `serverOverrides` at the file root | `lsp.serverOverrides` | `PILENS_CFG_0002` |
+| `disabledServers` at the file root | `lsp.disabledServers` | `PILENS_CFG_0002` |
+| `warmFiles` at the file root | `lsp.warmFiles` | `PILENS_CFG_0002` |
+
+**Deprecated since 4.2.0. Read for the last time before 5.0.0.** The window is
+declared as data in `clients/config-diagnostic-codes.ts`
+(`DEPRECATED_CONFIG_SURFACES`) and enforced by test, so the schedule above and
+the code cannot drift apart. `docs/public-api-stability.md` describes the policy
+these dates instantiate.
+
+A `.pi-lens.json` that mixes both spellings is fine while you migrate: the
+canonical key wins, and the keys you have not moved yet keep working.
+
+## When a config is ignored
+
+A file that cannot be read or parsed is **ignored, never partially applied** —
+pi-lens runs on defaults for it and says so once, with the code
+`PILENS_CFG_0001`. A field whose value does not match its declared type is
+dropped on its own (`PILENS_CFG_0005`), and an unrecognized field is dropped
+with a message naming the key (`PILENS_CFG_0004`). Nothing about your config is
+ever ignored silently.
+
+## See also
+
+- `docs/globalconfig.md` — every key of `~/.pi-lens/config.json`, in detail.
+- `docs/settings.md` — the CLI flags and what they map to.
+- `docs/environment-variables.md` — the `PI_LENS_*` tier.
+- `docs/public-api-stability.md` — what `x-stability`, the `PILENS_CFG_*` codes,
+  and the deprecation windows commit pi-lens to.

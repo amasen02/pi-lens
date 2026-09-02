@@ -15,9 +15,35 @@ import {
 	readFlagConfigValue,
 } from "./lens-flag-registry.js";
 import {
+	type ConfigLocation,
+	CANONICAL_GLOBAL_CONFIG_FILE,
+	GLOBAL_CONFIG_LOCATIONS,
+} from "./config-locations.js";
+import {
+	reportPiLensConfigRecords,
+	resolveOnePiLensConfigDocument,
+} from "./config-resolve.js";
+import {
 	findNestedProjectMutationValue,
 	type PiLensProjectConfig,
 } from "./project-lens-config.js";
+
+/**
+ * The canonical global location, looked up rather than constructed, so a change
+ * to the shared table cannot leave this loader describing a file that is no
+ * longer canonical.
+ */
+function globalCanonicalLocation(): ConfigLocation {
+	const location = GLOBAL_CONFIG_LOCATIONS.find(
+		(candidate) => candidate.relativePath === CANONICAL_GLOBAL_CONFIG_FILE,
+	);
+	if (!location) {
+		throw new Error(
+			`no canonical global config location named ${CANONICAL_GLOBAL_CONFIG_FILE}`,
+		);
+	}
+	return location;
+}
 
 export type PiLensFormatMode = "deferred" | "immediate";
 
@@ -151,7 +177,22 @@ export function loadPiLensGlobalConfig(
 		const parsed = JSON.parse(fs.readFileSync(configPath, "utf-8")) as unknown;
 		if (!parsed || typeof parsed !== "object") return undefined;
 
-		const raw = parsed as Record<string, unknown>;
+		// Through the #2425 core (#2426). The canonical global file is resolved as
+		// a single `global`-tier source against the canonical schema, so the depth
+		// bound, the prototype-key policy and the declared `lsp.*` types apply to
+		// `~/.pi-lens/config.json` exactly as they do to `.pi-lens.json`. The
+		// field-by-field projection below is unchanged and keeps owning the
+		// per-key prose its tests assert on — the core validates the SHAPE, this
+		// function still decides what a bad value is called.
+		const document = {
+			tier: "global" as const,
+			file: configPath,
+			location: globalCanonicalLocation(),
+			value: parsed,
+		};
+		const resolved = resolveOnePiLensConfigDocument(document);
+		reportPiLensConfigRecords(resolved.records, "lens-config");
+		const raw = resolved.value;
 		const warnInvalid = (reason: string) =>
 			warnInvalidGlobalConfigOnce(configPath, reason);
 		const config: Record<string, unknown> = {};

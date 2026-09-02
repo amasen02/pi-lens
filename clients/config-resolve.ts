@@ -1,0 +1,430 @@
+/**
+ * The ONE config resolution path (#2426).
+ *
+ * Every pi-lens config file — canonical or legacy, project or global — is read,
+ * validated and layered here, through `config-core`'s `resolveConfig` over the
+ * canonical schema in `config-schema.ts`. The three exported loaders
+ * (`loadLSPConfig`, `loadPiLensGlobalConfig`, `loadPiLensProjectConfig`) keep
+ * their names and return types and become PROJECTIONS of what this module
+ * resolves, so their ~20 call sites are untouched.
+ *
+ * THE DOCUMENTED LOOKUP ORDER, lowest precedence first:
+ *
+ *   builtin -> global -> project root -> nested-project -> env -> cli -> host
+ *
+ * It is `config-core`'s own `TIER_PRECEDENCE`, not a second ordering: this
+ * module places files into tiers and the core sorts them. `docs/configuration.md`
+ * documents the same order once, and `tests/clients/config-resolve.test.ts`
+ * walks it.
+ *
+ * WITHIN a tier, the canonical file is added LAST and therefore wins, because
+ * `merge` keeps caller order on a precedence tie. That is the whole deprecation
+ * story in one line: a legacy file is still read, and it loses to the file the
+ * user is being told to move to.
+ *
+ * NO COMPAT REWRITING HAPPENS TO A VALUE. An earlier draft normalized legacy
+ * root keys into the `lsp` namespace before merging, which would have injected
+ * an `lsp` key into `PiLensProjectConfig.raw` that was never in the user's file.
+ * Instead the legacy root keys stay where they are, are merged as themselves,
+ * and `lspSectionOf` below combines them with the canonical `lsp` namespace at
+ * PROJECTION time, canonical winning. The value a projection reads is therefore
+ * always a value some file actually contained.
+ */
+
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import {
+	type ConfigDiagnosticCode,
+	type DeprecatedConfigSurface,
+	DEPRECATED_CONFIG_SURFACES,
+} from "./config-diagnostic-codes.js";
+import {
+	type ConfigLocation,
+	CANONICAL_GLOBAL_CONFIG_FILE,
+	CANONICAL_PROJECT_CONFIG_FILE,
+	GLOBAL_CONFIG_LOCATIONS,
+	LEGACY_ROOT_LSP_KEYS,
+	LSP_NAMESPACE_KEY,
+	PROJECT_CONFIG_LOCATIONS,
+	configSearchDirs,
+} from "./config-locations.js";
+import {
+	type MigrationRecord,
+	type Provenance,
+	type RawConfigSource,
+	type SourceTier,
+	migrationSubject,
+	reportMigrationRecords,
+	resolveConfig,
+} from "./config-core/index.js";
+import { PI_LENS_CONFIG_SCHEMA } from "./config-schema.js";
+import type { IgnoredConfigSubsystem } from "./config-warn.js";
+import { homeRelativePath } from "./path-utils.js";
+
+/** What reading one candidate path produced. */
+export type ConfigReadOutcome =
+	| { readonly status: "missing" }
+	| { readonly status: "error"; readonly error: unknown }
+	| { readonly status: "ok"; readonly value: unknown };
+
+/**
+ * Read and JSON-parse one config file.
+ *
+ * Deliberately does NOT warn: the three loaders each render their own prose
+ * (`ignoring invalid LSP config …` / `… global config …` / `… project config …`)
+ * and their tests assert on it, so the decision of what to say about a bad file
+ * stays with the loader while the reading itself is shared.
+ */
+export function readConfigDocument(file: string): ConfigReadOutcome {
+	let text: string;
+	try {
+		text = fs.readFileSync(file, "utf-8");
+	} catch (error) {
+		if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+			return { status: "missing" };
+		}
+		return { status: "error", error };
+	}
+	try {
+		return { status: "ok", value: JSON.parse(text) as unknown };
+	} catch (error) {
+		return { status: "error", error };
+	}
+}
+
+/** One config file that exists on disk and parsed. */
+export interface ConfigDocument {
+	readonly tier: SourceTier;
+	readonly file: string;
+	readonly location: ConfigLocation;
+	readonly value: unknown;
+}
+
+export interface ResolvePiLensConfigOptions {
+	/** Directory the project/nested tiers are discovered from. */
+	readonly cwd?: string;
+	/** Absolute path of the canonical machine-global config. */
+	readonly globalConfigPath?: string;
+	/** Absolute path of the machine-global pi-lens directory (`~/.pi-lens`). */
+	readonly globalDir?: string;
+	/** The `$HOME` ceiling for the project walk. Test seam. */
+	readonly homeDir?: string;
+	/** Called for a file that exists but could not be read or parsed. */
+	readonly onReadError?: (file: string, error: unknown) => void;
+}
+
+export interface PiLensConfigResolution {
+	/** The merged configuration. */
+	readonly value: Record<string, unknown>;
+	readonly provenance: ReadonlyMap<string, Provenance>;
+	/** Validation drops AND deprecation notices, in discovery order. */
+	readonly records: readonly MigrationRecord[];
+	/** The files that actually contributed, lowest precedence first. */
+	readonly documents: readonly ConfigDocument[];
+}
+
+function collectDocuments(
+	dir: string,
+	locations: readonly ConfigLocation[],
+	tier: SourceTier,
+	onReadError: ((file: string, error: unknown) => void) | undefined,
+): ConfigDocument[] {
+	const documents: ConfigDocument[] = [];
+	for (const location of locations) {
+		const file = path.join(dir, location.relativePath);
+		const outcome = readConfigDocument(file);
+		if (outcome.status === "missing") continue;
+		if (outcome.status === "error") {
+			onReadError?.(file, outcome.error);
+			continue;
+		}
+		documents.push({ tier, file, location, value: outcome.value });
+	}
+	return documents;
+}
+
+/**
+ * Assemble every config document for a resolution, lowest precedence first.
+ *
+ * The project walk is ceiling-bounded by `configSearchDirs`. The OUTERMOST
+ * config-bearing directory is the `project` tier and everything nearer the cwd
+ * is `nested-project`, which is what makes "nearest wins, per field" fall out
+ * of the core's tier precedence instead of being re-implemented here.
+ */
+export function collectPiLensConfigDocuments(
+	options: ResolvePiLensConfigOptions,
+): ConfigDocument[] {
+	const documents: ConfigDocument[] = [];
+	const { globalDir, globalConfigPath, onReadError } = options;
+
+	if (globalDir !== undefined || globalConfigPath !== undefined) {
+		for (const location of GLOBAL_CONFIG_LOCATIONS) {
+			const file =
+				location.relativePath === CANONICAL_GLOBAL_CONFIG_FILE
+					? globalConfigPath
+					: globalDir === undefined
+						? undefined
+						: path.join(globalDir, location.relativePath);
+			if (file === undefined) continue;
+			const outcome = readConfigDocument(file);
+			if (outcome.status === "missing") continue;
+			if (outcome.status === "error") {
+				onReadError?.(file, outcome.error);
+				continue;
+			}
+			documents.push({ tier: "global", file, location, value: outcome.value });
+		}
+	}
+
+	if (options.cwd !== undefined) {
+		// Innermost first from the walk; reversed so the OUTERMOST directory is
+		// emitted first and lands in the lower-precedence `project` tier.
+		const dirs = configSearchDirs(
+			options.cwd,
+			options.homeDir ?? os.homedir(),
+		).reverse();
+		const bearing = dirs
+			.map((dir) => ({
+				dir,
+				found: collectDocuments(
+					dir,
+					PROJECT_CONFIG_LOCATIONS,
+					"project",
+					onReadError,
+				),
+			}))
+			.filter((entry) => entry.found.length > 0);
+		bearing.forEach((entry, index) => {
+			const tier: SourceTier = index === 0 ? "project" : "nested-project";
+			for (const document of entry.found) documents.push({ ...document, tier });
+		});
+	}
+
+	return documents;
+}
+
+/** Resolve every discovered document into one configuration. */
+export function resolvePiLensConfig(
+	options: ResolvePiLensConfigOptions,
+): PiLensConfigResolution {
+	const documents = collectPiLensConfigDocuments(options);
+	const sources: RawConfigSource[] = documents.map((document) => ({
+		tier: document.tier,
+		file: document.file,
+		value: document.value,
+	}));
+	const resolution = resolveConfig<Record<string, unknown>>({
+		sources,
+		schema: PI_LENS_CONFIG_SCHEMA,
+	});
+	return {
+		value: resolution.resolved.value ?? {},
+		provenance: resolution.resolved.provenance,
+		records: [
+			...resolution.records,
+			...deprecationRecords(documents, options.homeDir ?? os.homedir()),
+		],
+		documents,
+	};
+}
+
+/**
+ * Resolve ONE document — the shape both single-file loaders need.
+ *
+ * Still the core's pipeline, not a shortcut around it: the value is validated
+ * against the canonical schema (depth bound, prototype-key policy, the declared
+ * `lsp.*` types) and merged from one source, so a single-file loader and the
+ * multi-file one cannot disagree about what a value means.
+ */
+export function resolveOnePiLensConfigDocument(
+	document: ConfigDocument,
+	homeDir: string = os.homedir(),
+): {
+	readonly value: Record<string, unknown>;
+	readonly records: readonly MigrationRecord[];
+} {
+	const resolution = resolveConfig<Record<string, unknown>>({
+		sources: [
+			{ tier: document.tier, file: document.file, value: document.value },
+		],
+		schema: PI_LENS_CONFIG_SCHEMA,
+	});
+	return {
+		value: resolution.resolved.value ?? {},
+		records: [
+			...resolution.records,
+			...deprecationRecords([document], homeDir),
+		],
+	};
+}
+
+/**
+ * The `ConfigLocation` for a project-relative basename, for a caller that
+ * discovered the file through its own (cached) walk rather than through
+ * `collectPiLensConfigDocuments`. Falls back to the canonical location so an
+ * unrecognized basename is never reported as deprecated.
+ */
+export function projectLocationFor(file: string): ConfigLocation {
+	const base = path.basename(file);
+	return (
+		PROJECT_CONFIG_LOCATIONS.find(
+			(candidate) => path.posix.basename(candidate.relativePath) === base,
+		) ?? PROJECT_CONFIG_LOCATIONS[PROJECT_CONFIG_LOCATIONS.length - 1]
+	);
+}
+
+// --- deprecation records (#2418 codes 0002 / 0003, #2426 is their producer) ---
+
+const WINDOW_BY_SURFACE: ReadonlyMap<string, DeprecatedConfigSurface> = new Map(
+	DEPRECATED_CONFIG_SURFACES.map(
+		(row) => [row.surface as string, row as DeprecatedConfigSurface] as const,
+	),
+);
+
+function windowSuffix(surface: string | undefined): string {
+	const row =
+		surface === undefined ? undefined : WINDOW_BY_SURFACE.get(surface);
+	return row
+		? ` (deprecated since ${row.deprecatedSince}; read for the last time before ${row.removeNotBefore})`
+		: "";
+}
+
+/** The canonical file a legacy document's keys belong in. */
+function canonicalDestination(
+	document: ConfigDocument,
+	homeDir: string,
+): string {
+	if (document.tier === "global") {
+		return homeRelativePath(
+			path.join(path.dirname(document.file), CANONICAL_GLOBAL_CONFIG_FILE),
+			homeDir,
+		);
+	}
+	return CANONICAL_PROJECT_CONFIG_FILE;
+}
+
+/**
+ * The canonical KEY a legacy key moves to.
+ *
+ * Carried on the record (`canonicalKey`) rather than only rendered into the
+ * message, so the auto-migrator #2426 explicitly defers can be a pure function
+ * over these records instead of re-parsing prose.
+ */
+function canonicalKeyFor(document: ConfigDocument, key: string): string {
+	if (document.location.lspScoped) return `${LSP_NAMESPACE_KEY}.${key}`;
+	return LEGACY_ROOT_LSP_KEYS.includes(key)
+		? `${LSP_NAMESPACE_KEY}.${key}`
+		: key;
+}
+
+function topLevelKeys(value: unknown): string[] {
+	return value && typeof value === "object" && !Array.isArray(value)
+		? Object.keys(value as Record<string, unknown>)
+		: [];
+}
+
+/**
+ * One record per `(file, key)` — never one per file, and never one per nested
+ * leaf. A per-file record cannot tell a user which setting to move; a per-leaf
+ * record would re-nag once per custom server.
+ */
+export function deprecationRecords(
+	documents: readonly ConfigDocument[],
+	homeDir: string,
+): MigrationRecord[] {
+	const records: MigrationRecord[] = [];
+	for (const document of documents) {
+		if (document.location.legacy) {
+			const destination = canonicalDestination(document, homeDir);
+			for (const key of topLevelKeys(document.value)) {
+				const canonicalKey = canonicalKeyFor(document, key);
+				records.push(
+					record({
+						code: "PILENS_CFG_0003",
+						file: document.file,
+						key,
+						canonicalKey,
+						reason:
+							`move "${key}" to ${destination}` +
+							(canonicalKey === key ? "" : ` under "${canonicalKey}"`) +
+							windowSuffix(document.location.surface),
+					}),
+				);
+			}
+			continue;
+		}
+		// A CANONICAL file carrying legacy ROOT LSP keys: the file stays, the keys
+		// move into the `lsp` namespace inside it.
+		for (const key of topLevelKeys(document.value)) {
+			if (!LEGACY_ROOT_LSP_KEYS.includes(key)) continue;
+			const canonicalKey = `${LSP_NAMESPACE_KEY}.${key}`;
+			records.push(
+				record({
+					code: "PILENS_CFG_0002",
+					file: document.file,
+					key,
+					canonicalKey,
+					reason: `move "${key}" to "${canonicalKey}" in the same file${windowSuffix(
+						key,
+					)}`,
+				}),
+			);
+		}
+	}
+	return records;
+}
+
+function record(input: {
+	code: ConfigDiagnosticCode;
+	file: string;
+	key: string;
+	canonicalKey: string;
+	reason: string;
+}): MigrationRecord {
+	return {
+		code: input.code,
+		file: input.file,
+		key: input.key,
+		canonicalKey: input.canonicalKey,
+		subject: migrationSubject(input.file, input.key),
+		reason: input.reason,
+	};
+}
+
+/** Thread a resolution's records to the shared warn seam under one subsystem. */
+export function reportPiLensConfigRecords(
+	records: readonly MigrationRecord[],
+	subsystem: IgnoredConfigSubsystem,
+): void {
+	reportMigrationRecords(records, subsystem);
+}
+
+/**
+ * The effective `lsp` section of a resolved configuration.
+ *
+ * Canonical `lsp.*` wins over a legacy root key of the same name, per #2426's
+ * "canonical wins on collision" — per KEY, so a file that has migrated
+ * `servers` into `lsp` but still spells `warmFiles` at the root keeps both. The
+ * combination is deliberately not deeper than that: a half-migrated `servers`
+ * merged entry-by-entry with its own legacy twin would make the migrated file's
+ * meaning depend on the file it was migrated FROM, which is the opposite of
+ * what a user completing a migration expects.
+ */
+export function lspSectionOf(
+	value: Record<string, unknown>,
+): Record<string, unknown> {
+	const section: Record<string, unknown> = {};
+	for (const key of LEGACY_ROOT_LSP_KEYS) {
+		if (value[key] !== undefined) section[key] = value[key];
+	}
+	const namespace = value[LSP_NAMESPACE_KEY];
+	if (namespace && typeof namespace === "object" && !Array.isArray(namespace)) {
+		for (const [key, entry] of Object.entries(
+			namespace as Record<string, unknown>,
+		)) {
+			if (entry !== undefined) section[key] = entry;
+		}
+	}
+	return section;
+}

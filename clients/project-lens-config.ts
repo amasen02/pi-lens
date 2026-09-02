@@ -72,40 +72,38 @@ import {
 	LENS_FLAGS,
 	type LensFlagSpec,
 	PROJECT_FOREIGN_CONFIG_NAMESPACES,
+	PROJECT_NON_FLAG_CONFIG_SECTIONS,
 	PROJECT_SCOPED_LENS_FLAGS,
 	readFlagConfigValue,
 } from "./lens-flag-registry.js";
+import {
+	configSearchDirs,
+	PROJECT_CONFIG_LOCATIONS,
+} from "./config-locations.js";
+import {
+	projectLocationFor,
+	readConfigDocument,
+	reportPiLensConfigRecords,
+	resolveOnePiLensConfigDocument,
+} from "./config-resolve.js";
 import { isAtOrAboveHomeDir, walkUpDirs } from "./path-utils.js";
 import { findPiLensConfigMarkerInDir } from "./workspace-topology.js";
 
 /**
- * Project config basenames, in precedence order. Exported so the
- * deprecation-window registry test (#2418) checks deprecated FILE rows against
- * the basenames actually read rather than a hand-copied second list.
+ * Project config basenames, in DESCENDING precedence (first match wins), for
+ * this loader's own discovery. Derived from the shared location table in
+ * `config-locations.ts` (#2426) rather than restated: that table is what
+ * `config-resolve.ts` walks, and two lists of the same filenames is exactly the
+ * mirror the single-source-of-truth rule forbids.
+ *
+ * The LSP-scoped legacy locations (`.pi-lens/lsp.json`, `pi-lsp.json`) are
+ * filtered out: their root keys are LSP settings, not the pi-lens config
+ * sections this loader projects.
  */
-export const PROJECT_CONFIG_BASENAMES = [".pi-lens.json", "pi-lens.json"];
-
-/**
- * The project loader's OWN recognized top-level keys — pi-lens-native sections,
- * whether parsed here into typed fields (`ignore`, `rules`, `maxProjectFiles`,
- * `reviewGraph`) or read off `PiLensProjectConfig.raw` by another pi-lens
- * consumer (`trivy`, read via `.raw` in `trivy-client.ts`). The project-scoped
- * flag sections (`format`, `autofix`, `actionableWarnings`) are NOT listed here;
- * they are derived from `PROJECT_SCOPED_LENS_FLAGS` so the registry stays the
- * single source of truth (#883). Foreign (non-pi-lens) namespaces the shared
- * file also carries live in `PROJECT_FOREIGN_CONFIG_NAMESPACES` beside the
- * registry.
- */
-const PROJECT_OWN_CONFIG_KEYS = [
-	"ignore",
-	"rules",
-	"maxProjectFiles",
-	"reviewGraph",
-	"trivy",
-	// `helm.renderValidation.enabled` — the opt-in for rendered-manifest
-	// validation, read via `.raw` in the helm-render runner (#1283).
-	"helm",
-] as const;
+export const PROJECT_CONFIG_BASENAMES: string[] =
+	PROJECT_CONFIG_LOCATIONS.filter((location) => !location.lspScoped)
+		.map((location) => location.relativePath)
+		.reverse();
 
 export interface PiLensProjectRuleConfig {
 	/** Optional override for the rule's primary numeric threshold. */
@@ -381,7 +379,11 @@ function discoveryCacheStillFresh(entry: DiscoveryCacheEntry): boolean {
 
 function discoverPiLensProjectConfig(startDir: string): DiscoveryCacheEntry {
 	const dirMtimes: Array<{ dir: string; mtimeMs: number }> = [];
-	for (const dir of walkUpDirs(startDir)) {
+	// #2426: ceiling-bounded, same rule and same shared primitive as the LSP
+	// loader and as `findNestedProjectMutationValue` below. This walk ran to the
+	// filesystem root before, so a `.pi-lens.json` in `$HOME` (or at `C:\`) was
+	// adopted by every project on the machine — the #622/#625 class.
+	for (const dir of configSearchDirs(startDir)) {
 		dirMtimes.push({ dir, mtimeMs: safeDirMtimeMs(dir) });
 		for (const name of PROJECT_CONFIG_BASENAMES) {
 			const candidate = path.join(dir, name);
@@ -449,24 +451,47 @@ function parseRulePolicyList(
 }
 
 function parseConfigFile(configPath: string): PiLensProjectConfig {
-	let raw: unknown;
-	try {
-		const text = fs.readFileSync(configPath, "utf-8");
-		raw = JSON.parse(text);
-	} catch (error) {
+	const outcome = readConfigDocument(configPath);
+	if (outcome.status === "error") {
 		warnInvalidConfigOnce(
 			configPath,
-			error instanceof Error ? error.message : "failed to parse JSON",
+			outcome.error instanceof Error
+				? outcome.error.message
+				: "failed to parse JSON",
 		);
 		return EMPTY_PROJECT_CONFIG;
 	}
+	// The file was stat'd as present by the discovery above, so `missing` here is
+	// a delete that raced the read. Nothing to warn about — the next call
+	// re-discovers and finds no config at all.
+	if (outcome.status === "missing") return EMPTY_PROJECT_CONFIG;
 
-	if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+	if (
+		!outcome.value ||
+		typeof outcome.value !== "object" ||
+		Array.isArray(outcome.value)
+	) {
 		warnInvalidConfigOnce(configPath, "top-level value must be an object");
 		return EMPTY_PROJECT_CONFIG;
 	}
 
-	const obj = raw as Record<string, unknown>;
+	// Through the #2425 core (#2426): the value is validated against the
+	// canonical schema before this loader's own field parsing sees it, so the
+	// depth bound, the prototype-key policy and the declared `lsp.*` types apply
+	// here exactly as they do in the LSP loader. `raw` is the VALIDATED value
+	// rather than the parse output, which is the one place the field's
+	// documented "the parsed JSON as-is" narrows: a `__proto__` key or a
+	// 4000-deep blob no longer rides into `.raw`'s consumers (`trivy-client.ts`,
+	// the helm-render runner).
+	const resolved = resolveOnePiLensConfigDocument({
+		tier: "project",
+		file: configPath,
+		location: projectLocationFor(configPath),
+		value: outcome.value,
+	});
+	reportPiLensConfigRecords(resolved.records, "project-lens-config");
+	const raw: unknown = resolved.value;
+	const obj = resolved.value;
 
 	const ignore = Array.isArray(obj.ignore)
 		? obj.ignore.filter((p): p is string => typeof p === "string")
@@ -598,7 +623,7 @@ function parseConfigFile(configPath: string): PiLensProjectConfig {
 	// than being lumped in with typos — docs previously called this "silently
 	// ignored".
 	const knownProjectKeys = new Set<string>([
-		...PROJECT_OWN_CONFIG_KEYS,
+		...PROJECT_NON_FLAG_CONFIG_SECTIONS,
 		...flagConfigSectionKeys(PROJECT_SCOPED_LENS_FLAGS),
 		...PROJECT_FOREIGN_CONFIG_NAMESPACES,
 	]);
