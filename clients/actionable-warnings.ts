@@ -12,6 +12,12 @@ import type { LSPCodeAction, LSPDiagnostic } from "./lsp/client.js";
 import { applyWorkspaceEdit } from "./lsp/edits.js";
 import { getLSPService } from "./lsp/index.js";
 import { isUnderDir, normalizeMapKey } from "./path-utils.js";
+import { combineAbortSignals, withDeadline } from "./deadline-utils.js";
+import {
+	armDeferredLspWork,
+	awaitDeferredLspWork,
+	registerDeferredLspWork,
+} from "./deferred-lsp-work.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
 import {
 	recordLspMutationBatch,
@@ -511,6 +517,14 @@ function mergeWarnings(
 export const ACTIONABLE_WARNINGS_LSP_FILE_CAP = 25;
 export const ACTIONABLE_WARNINGS_LSP_BUDGET_MS = 2_500;
 export const ACTIONABLE_WARNINGS_DEFERRED_BUDGET_MS = 60_000;
+/**
+ * #2504 review round 2 (F3): the per-round-trip bound. The batch deadlines
+ * above are checked only BETWEEN files, so a single wedged `getDiagnostics`
+ * (or `openFile`, or `codeAction`) was unbounded no matter how small the
+ * batch budget was. Generous relative to the ~880 ms a real cold pull costs —
+ * this is a wedge detector, not a latency target.
+ */
+export const ACTIONABLE_WARNINGS_LSP_PULL_TIMEOUT_MS = 10_000;
 
 export interface BuildActionableWarningsArgs {
 	cwd: string;
@@ -531,6 +545,8 @@ export interface BuildActionableWarningsArgs {
 	lspBudgetMs?: number;
 	/** #2504: turn abort signal, raced against the wall budgets. */
 	signal?: AbortSignal;
+	/** #2504 review round 2 (F3): per-LSP-round-trip timeout. */
+	lspPullTimeoutMs?: number;
 	/**
 	 * #2504: receives the completed report when the cold fresh-pull loop was
 	 * moved off the awaited hook. The caller writes it to the same
@@ -550,10 +566,64 @@ interface LspEnrichmentTarget {
  * The in-flight deferred fresh-pull, if any. Exposed for tests only: the
  * deferral is fire-and-forget by design, and a test asserting that the work
  * still happens off-hook needs a handle to await.
+ *
+ * #2504 review round 2 (F3): the handle no longer lives here as a bare
+ * module-level `let` that a second deferral silently overwrote (leaving the
+ * first loop running, untracked and unstoppable) and that nothing ever reset.
+ * `clients/deferred-lsp-work.ts` owns the single slot and its abort signal.
  */
-let deferredLspPull: Promise<void> | undefined;
 export function _awaitDeferredLspPullForTest(): Promise<void> {
-	return deferredLspPull ?? Promise.resolve();
+	return awaitDeferredLspWork();
+}
+
+/** Everything one enrichment round trip needs to stay bounded (#2504 r2 F3). */
+interface LspEnrichmentDeps {
+	/**
+	 * Resolved ONCE per loop, not per file. Re-resolving through
+	 * `getLSPService()` inside the deferred loop let it hand itself a brand
+	 * new service — and therefore re-spawn servers — after the idle reset or a
+	 * session boundary had deliberately retired the one it started with.
+	 */
+	lspService: ReturnType<typeof getLSPService>;
+	/** Per-round-trip timeout; the bound a between-files deadline cannot give. */
+	pullTimeoutMs: number;
+	/** The loop's live abort signal. */
+	signal?: AbortSignal;
+	/**
+	 * One pre-built abort leg for the whole loop. Built once so racing every
+	 * round trip against the signal adds exactly ONE listener to it rather than
+	 * three per file.
+	 */
+	abortRace?: Promise<undefined>;
+}
+
+/** A promise that resolves (never rejects) the moment `signal` aborts. */
+function makeAbortRace(signal: AbortSignal): Promise<undefined> {
+	return new Promise<undefined>((resolve) => {
+		if (signal.aborted) {
+			resolve(undefined);
+			return;
+		}
+		signal.addEventListener("abort", () => resolve(undefined), { once: true });
+	});
+}
+
+/**
+ * Both bounds on ONE LSP round trip (#2504 review round 2, F3), as AGENTS.md
+ * requires of any async step in a sweep loop: a per-call timeout AND the abort
+ * signal. Resolves `undefined` when either bound wins; the caller reads that
+ * as "this file was not checked", never as "this file is clean".
+ */
+async function boundedLspCall<T>(
+	call: () => Promise<T>,
+	deps: LspEnrichmentDeps,
+): Promise<T | undefined> {
+	if (deps.signal?.aborted) return undefined;
+	const timed: Promise<T | undefined> = withDeadline(call(), {
+		ms: deps.pullTimeoutMs,
+		onTimeout: "undefined",
+	});
+	return deps.abortRace ? Promise.race([timed, deps.abortRace]) : timed;
 }
 
 /** Positive finite bound, else the default. Guards NaN from env/config. */
@@ -679,6 +749,20 @@ export async function buildActionableWarningsReport(
 		const exhausted = (): boolean =>
 			args.signal?.aborted === true || Date.now() >= deadline;
 
+		const pullTimeoutMs = boundedNumber(
+			args.lspPullTimeoutMs,
+			ACTIONABLE_WARNINGS_LSP_PULL_TIMEOUT_MS,
+		);
+		// #2504 review round 2 (F3): the in-band loop gets the same per-call
+		// bound and the same once-resolved service as the deferred one — the
+		// deferral must not be the only path that is bounded.
+		const inBandDeps: LspEnrichmentDeps = {
+			lspService,
+			pullTimeoutMs,
+			signal: args.signal,
+			abortRace: args.signal ? makeAbortRace(args.signal) : undefined,
+		};
+
 		let unchecked = 0;
 		const runInBand = async (targets: LspEnrichmentTarget[]): Promise<void> => {
 			for (const target of targets) {
@@ -686,7 +770,9 @@ export async function buildActionableWarningsReport(
 					unchecked += targets.length - targets.indexOf(target);
 					break;
 				}
-				records.push(...(await enrichFileFromLsp(cwd, args, target)));
+				records.push(
+					...(await enrichFileFromLsp(cwd, args, target, inBandDeps)),
+				);
 			}
 		};
 
@@ -703,7 +789,24 @@ export async function buildActionableWarningsReport(
 		if (cold.length > 0 && primed.length === 0) {
 			const carried = [...records];
 			const deferredArgs = args;
-			deferredLspPull = (async () => {
+			// #2504 review round 2 (F3). The pre-fix loop captured
+			// `args.signal` — the COMPLETED turn's `ctx.signal`, which
+			// `index.ts` clears from the ambient slot in its `finally`, so it
+			// could never fire. `armDeferredLspWork` returns the module slot's
+			// live signal (and aborts any earlier deferral that still held the
+			// slot); `resetLSPService` fires it, which is how session_shutdown,
+			// session_start and the idle reset all reach this loop. The turn's
+			// own signal is still folded in so a genuine mid-turn abort counts.
+			const deferredSignal = armDeferredLspWork();
+			const loopSignal =
+				combineAbortSignals(args.signal, deferredSignal) ?? deferredSignal;
+			const deferredDeps: LspEnrichmentDeps = {
+				lspService,
+				pullTimeoutMs,
+				signal: loopSignal,
+				abortRace: makeAbortRace(loopSignal),
+			};
+			const deferredWork = (async () => {
 				// Yield a full macrotask first. Without this the loop would run
 				// its first open+pull inside the awaited call's own microtask
 				// drain — "deferred" only on paper, and still on the hook.
@@ -712,16 +815,20 @@ export async function buildActionableWarningsReport(
 				const deferredDeadline =
 					Date.now() + ACTIONABLE_WARNINGS_DEFERRED_BUDGET_MS;
 				let deferredUnchecked = 0;
+				let abortedMidLoop = false;
 				for (const target of cold) {
-					if (
-						deferredArgs.signal?.aborted === true ||
-						Date.now() >= deferredDeadline
-					) {
+					if (loopSignal.aborted || Date.now() >= deferredDeadline) {
+						abortedMidLoop = loopSignal.aborted;
 						deferredUnchecked += cold.length - cold.indexOf(target);
 						break;
 					}
 					deferredRecords.push(
-						...(await enrichFileFromLsp(cwd, deferredArgs, target)),
+						...(await enrichFileFromLsp(
+							cwd,
+							deferredArgs,
+							target,
+							deferredDeps,
+						)),
 					);
 				}
 				if (deferredUnchecked > 0) {
@@ -731,12 +838,30 @@ export async function buildActionableWarningsReport(
 						reason: `deferred LSP enrichment stopped early; ${deferredUnchecked} file(s) were not checked for code actions`,
 					});
 				}
+				// An ABORTED loop delivers nothing (#2504 review round 2, F3).
+				// The service it was reading is gone — session_shutdown,
+				// session_start, or the idle reset retired it — so its partial
+				// record set describes nothing current, and publishing it would
+				// be exactly the stale-clobber F2 guards against on the other
+				// side.
+				if (abortedMidLoop || loopSignal.aborted) {
+					logActionableWarningsEvent({
+						event: "lsp_pull_aborted",
+						sessionId: deferredArgs.sessionId,
+						metadata: {
+							turnIndex: deferredArgs.turnIndex,
+							unchecked: deferredUnchecked,
+						},
+					});
+					return;
+				}
 				deferredArgs.onDeferredReport?.(
 					assembleReport(cwd, deferredArgs, deferredRecords),
 				);
 			})().catch((err) => {
 				args.dbg?.(`actionable_warnings: deferred LSP pull failed: ${err}`);
 			});
+			registerDeferredLspWork(deferredSignal, deferredWork);
 			logActionableWarningsEvent({
 				event: "lsp_pull_deferred",
 				sessionId: args.sessionId,
@@ -771,8 +896,9 @@ async function enrichFileFromLsp(
 	cwd: string,
 	args: BuildActionableWarningsArgs,
 	target: LspEnrichmentTarget,
+	deps: LspEnrichmentDeps,
 ): Promise<ActionableWarningRecord[]> {
-	const lspService = getLSPService();
+	const { lspService } = deps;
 	const { filePath } = target;
 	const out: ActionableWarningRecord[] = [];
 	let diags: LSPDiagnostic[];
@@ -780,9 +906,46 @@ async function enrichFileFromLsp(
 	if (target.cached !== undefined) {
 		diags = target.cached;
 	} else {
+		// #2504 review round 2 (F3): never OPEN a file once the loop has been
+		// signalled. The checks inside `boundedLspCall` cover the round trips;
+		// this one covers the decision to touch the file at all, which is what
+		// makes a session_shutdown landing mid-loop a no-op rather than one
+		// more document handed to a service that is being torn down.
+		if (deps.signal?.aborted) {
+			logActionableWarningsEvent({
+				event: "lsp_file_skipped",
+				sessionId: args.sessionId,
+				filePath,
+				metadata: { reason: "aborted" },
+			});
+			return out;
+		}
 		try {
-			if (target.content) await lspService.openFile(filePath, target.content);
-			diags = await lspService.getDiagnostics(filePath);
+			if (target.content) {
+				await boundedLspCall(
+					() => lspService.openFile(filePath, target.content as string),
+					deps,
+				);
+			}
+			const pulled = await boundedLspCall(
+				() => lspService.getDiagnostics(filePath),
+				deps,
+			);
+			if (pulled === undefined) {
+				// Either bound won. A failed pull is NEVER read as clean (#240):
+				// the file is reported unchecked and contributes no records.
+				logActionableWarningsEvent({
+					event: "lsp_file_skipped",
+					sessionId: args.sessionId,
+					filePath,
+					metadata: {
+						reason: deps.signal?.aborted ? "aborted" : "pull_timeout",
+						pullTimeoutMs: deps.pullTimeoutMs,
+					},
+				});
+				return out;
+			}
+			diags = pulled;
 			lspSource = "fresh";
 		} catch (err) {
 			args.dbg?.(
@@ -809,14 +972,18 @@ async function enrichFileFromLsp(
 		}
 		const record = recordFromLspDiagnostic(diag, filePath, cwd);
 		try {
-			const actions = await lspService.codeAction(
-				filePath,
-				diag.range.start.line,
-				diag.range.start.character,
-				diag.range.end.line,
-				diag.range.end.character,
+			const actions = await boundedLspCall(
+				() =>
+					lspService.codeAction(
+						filePath,
+						diag.range.start.line,
+						diag.range.start.character,
+						diag.range.end.line,
+						diag.range.end.character,
+					),
+				deps,
 			);
-			record.actions = actions.map(serializeAction).slice(0, 5);
+			record.actions = (actions ?? []).map(serializeAction).slice(0, 5);
 		} catch (err) {
 			args.dbg?.(
 				`actionable_warnings: LSP codeAction failed for ${filePath}: ${err}`,
@@ -916,6 +1083,106 @@ export function writeActionableWarningsReport(
 	report: ActionableWarningsReport,
 ): void {
 	cacheManager.writeCache("actionable-warnings", report, cwd);
+}
+
+/**
+ * #2504 review round 2 (F2) — the guarded write for a DEFERRED report.
+ *
+ * The deferred fresh-pull loop is stamped with the ORIGINATING turn's
+ * `turnIndex`/`projectSeqStart`/`projectSeqEnd` and may run for up to
+ * `ACTIONABLE_WARNINGS_DEFERRED_BUDGET_MS` — many turns in a busy session. It
+ * then wrote `actionable-warnings` unconditionally, so a report describing
+ * turn N landed on top of turn N+1's. `agent_end` reads that cache back
+ * through `checkActionableWarningsReportFresh`, sees `project_seq_mismatch`
+ * and silently skips the autofix pass; `lens_diagnostics` re-serves the same
+ * stale delta to the model. The fix is not to re-stamp the deferred report —
+ * its findings genuinely describe turn N — but to refuse to publish it over
+ * anything newer.
+ *
+ * Returns whether the write happened, and why not when it did not. Never
+ * silent: a skip records a bounded degradation, because the turn's warnings
+ * really did go undelivered on this channel.
+ */
+export function writeDeferredActionableWarningsReport(args: {
+	cacheManager: CacheManager;
+	cwd: string;
+	report: ActionableWarningsReport;
+	/** The runtime's CURRENT projectSeq, if the caller has a runtime. */
+	currentProjectSeq?: number;
+	dbg?: (msg: string) => void;
+}): { written: boolean; reason?: string } {
+	const reason = deferredReportSupersededReason(args);
+	if (reason !== undefined) {
+		recordDegradationOnce({
+			kind: "actionable-warnings-deferred-superseded",
+			subject: `${path.resolve(args.cwd)}:deferred-report`,
+			reason: `a deferred actionable-warnings report from turn ${args.report.turnIndex} was discarded rather than overwrite a newer one (${reason}); its findings are re-derived by the next turn's report`,
+		});
+		args.dbg?.(
+			`turn_end: deferred actionable-warnings write skipped — ${reason}`,
+		);
+		return { written: false, reason };
+	}
+	writeActionableWarningsReport(args.cacheManager, args.cwd, args.report);
+	appendActionableWarningsHistory(args.cwd, args.report);
+	return { written: true };
+}
+
+/**
+ * Why this deferred report must not be published, or `undefined` to publish.
+ *
+ * Ordered strongest-evidence first. `generatedAt` is checked LAST and only as
+ * a backstop: the deferred report is assembled when its loop finishes, so its
+ * own stamp is later than the report it would clobber — wall-clock time says
+ * nothing about which report describes the newer project state. `projectSeq`
+ * and `turnIndex` do.
+ */
+function deferredReportSupersededReason(args: {
+	cacheManager: CacheManager;
+	cwd: string;
+	report: ActionableWarningsReport;
+	currentProjectSeq?: number;
+}): string | undefined {
+	const { report } = args;
+	if (
+		typeof args.currentProjectSeq === "number" &&
+		typeof report.projectSeqEnd === "number" &&
+		args.currentProjectSeq > report.projectSeqEnd
+	) {
+		return `the project has advanced to projectSeq ${args.currentProjectSeq}, past this report's projectSeqEnd ${report.projectSeqEnd}`;
+	}
+	// A read with no TTL: "is something newer already on disk" is a question
+	// about ordering, not about freshness, so an entry old enough to have
+	// expired for a CONSUMER still has to be respected by this writer.
+	const persisted = args.cacheManager.readCache<ActionableWarningsReport>(
+		"actionable-warnings",
+		args.cwd,
+		Number.MAX_SAFE_INTEGER,
+	)?.data;
+	if (!persisted) return undefined;
+	if (
+		typeof persisted.projectSeqEnd === "number" &&
+		typeof report.projectSeqEnd === "number" &&
+		persisted.projectSeqEnd > report.projectSeqEnd
+	) {
+		return `the persisted report's projectSeqEnd ${persisted.projectSeqEnd} is newer than this one's ${report.projectSeqEnd}`;
+	}
+	if (
+		typeof persisted.turnIndex === "number" &&
+		persisted.turnIndex > report.turnIndex
+	) {
+		return `the persisted report is from turn ${persisted.turnIndex}, newer than turn ${report.turnIndex}`;
+	}
+	const persistedAt = Date.parse(persisted.generatedAt ?? "");
+	const reportAt = Date.parse(report.generatedAt ?? "");
+	if (
+		Number.isFinite(persistedAt) &&
+		Number.isFinite(reportAt) &&
+		persistedAt > reportAt
+	) {
+		return `the persisted report was generated at ${persisted.generatedAt}, after this one's ${report.generatedAt}`;
+	}
+	return undefined;
 }
 
 export interface ActionableWarningsHistoryEntry {

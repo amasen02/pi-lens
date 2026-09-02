@@ -34,6 +34,7 @@ import {
 import { shouldPreferPullOnlyDiagnostics } from "../lsp-budget.js";
 import { sampleProcessTreeCpuPercent } from "../resource-sampler.js";
 import { withDeadline, withTimeout } from "../deadline-utils.js";
+import { abortDeferredLspWork } from "../deferred-lsp-work.js";
 import {
 	acquireWorkspaceSweepHold,
 	clearWorkspaceSweepHoldForSessionStart,
@@ -9471,6 +9472,16 @@ export async function notifyExternalFileChange(
 }
 
 export function resetLSPService(options: LSPShutdownOptions = {}): void {
+	// #2504 review round 2 (F3): whatever the retiring service was still being
+	// asked for off-hook must stop HERE, before any teardown and before the
+	// `!retiringService` early return below (a `session_start` reset with no
+	// live service must still retire a loop the previous session armed). This
+	// is the one choke point every lifecycle path goes through —
+	// `session_shutdown`, `session_start`, and the idle reset — so the
+	// deferred actionable-warnings pull cannot open another file against a
+	// dying service, cannot re-spawn one after the idle reset, and cannot be
+	// mid-`openFile` when the loop closes (#234). Aborting spawns nothing.
+	abortDeferredLspWork(`lsp service reset: ${options.reason ?? "unspecified"}`);
 	// Invalidate availability publication started by the retiring service before
 	// any asynchronous teardown. The launch seam checks this generation after
 	// every managed lookup, install, and process launch (#2351).

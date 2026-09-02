@@ -5,6 +5,7 @@ import {
 	buildActionableWarningsReport,
 	formatActionableWarningsAdvisory,
 	writeActionableWarningsReport,
+	writeDeferredActionableWarningsReport,
 } from "./actionable-warnings.js";
 import { logActionableWarningsEvent } from "./actionable-warnings-logger.js";
 import {
@@ -2592,8 +2593,23 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				// hook — it lands in the same cache the in-band report goes to.
 				onDeferredReport: (deferred) => {
 					try {
-						writeActionableWarningsReport(cacheManager, cwd, deferred);
-						appendActionableWarningsHistory(cwd, deferred);
+						// #2504 review round 2 (F2): GUARDED. This callback fires up
+						// to a minute after the turn that armed it, and the report
+						// it carries is stamped with THAT turn's
+						// turnIndex/projectSeq. Writing it unconditionally
+						// overwrote a newer report, which `agent_end` then rejected
+						// as `project_seq_mismatch` (silently skipping the autofix
+						// pass) and `lens_diagnostics` re-served as a stale delta.
+						// `runtime.projectSeq` is read HERE, at write time, not at
+						// arm time — the whole point is how far the project moved
+						// while the loop ran.
+						writeDeferredActionableWarningsReport({
+							cacheManager,
+							cwd,
+							report: deferred,
+							currentProjectSeq: runtime.projectSeq,
+							dbg,
+						});
 					} catch (deferErr) {
 						dbg(
 							`turn_end: deferred actionable-warnings write failed — ${deferErr}`,

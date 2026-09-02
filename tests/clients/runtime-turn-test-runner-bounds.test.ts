@@ -33,7 +33,16 @@ const EMPTY_KNIP_RESULT = {
 };
 
 const SOURCE_COUNT = 20;
-/** Sources whose conventional test companion does NOT exist on disk. */
+/**
+ * Sources whose conventional test companion does NOT exist on disk.
+ *
+ * They are the FIRST sources in the worklist, deliberately (#2504 review
+ * round 2, F4). Placed last — past `TEST_RUNNER_MAX_TARGETS` — the existsSync
+ * guard was untestable: deleting it left those sources to be dropped by the
+ * target-count cap instead, so `ran` still held no missing file and the
+ * assertion below stayed green over the deleted guard. Ahead of the cap
+ * boundary, deleting the guard puts them straight into the fired batch.
+ */
 const MISSING_TEST_COMPANIONS = 3;
 
 let env: { tmpDir: string; cleanup: () => void };
@@ -136,8 +145,10 @@ describe("#2504 AC2 — turn_end wires the bounds into the real fan-out", () => 
 				path.join(env.tmpDir, "src", `f${i}.ts`),
 				`export const v${i} = ${i};\n`,
 			);
-			// The last N sources deliberately have NO test file on disk.
-			if (i < SOURCE_COUNT - MISSING_TEST_COMPANIONS) {
+			// The FIRST N sources deliberately have NO test file on disk — see
+			// MISSING_TEST_COMPANIONS. Everything after them does, so the
+			// target-count cap is still reached and still exercised.
+			if (i >= MISSING_TEST_COMPANIONS) {
 				fs.writeFileSync(
 					path.join(env.tmpDir, "src", `f${i}.test.ts`),
 					"export {};\n",
@@ -216,6 +227,15 @@ describe("#2504 AC2 — turn_end wires the bounds into the real fan-out", () => 
 		for (const testFile of ran) {
 			expect(fs.existsSync(testFile)).toBe(true);
 		}
+		// Named, so a failure says WHICH guard broke rather than only that some
+		// nonexistent file was spawned for. These three sit ahead of the
+		// target-count cap, so only the existsSync guard can keep them out.
+		for (let i = 0; i < MISSING_TEST_COMPANIONS; i++) {
+			expect(ran.some((f) => f.endsWith(`f${i}.test.ts`))).toBe(false);
+		}
+		// The cap is genuinely reached even after the missing companions are
+		// dropped, so this case still covers both bounds at once.
+		expect(ran.length).toBe(TEST_RUNNER_MAX_TARGETS);
 	});
 });
 

@@ -131,16 +131,25 @@ export class CacheManager {
 	 * Get turn-state entry for a file path using normalized lookup.
 	 */
 	/**
-	 * #2504: is this path inside the project the worklist belongs to?
+	 * #2504: is this path inside the PROJECT the worklist belongs to?
 	 *
 	 * Routed through `isUnderDir` (which normalises via `normalizeFilePath`) so
 	 * the answer is separator- and case-form independent, the same key rule
-	 * every other turn-state map obeys. `toTurnStateKey` encodes "outside" by
-	 * falling back to the absolute path; this is the same predicate stated
-	 * positively, so the two cannot drift.
+	 * every other turn-state map obeys.
+	 *
+	 * The root is the PROJECT root, not the caller's `cwd` (#2504 review round
+	 * 2, F1). The two coincide for every producer whose `cwd` IS the session
+	 * root, but not for `clients/lsp-mutation.ts`: `tools/lsp-navigation.ts`
+	 * threads a `cwd`-scoped context for a call issued from a sub-package
+	 * directory, so a monorepo-wide server's edit on a SIBLING package is
+	 * inside the project and outside that `cwd`. Judging it against `cwd`
+	 * dropped exactly the server-initiated edits #2450/#2479 exist to record.
+	 * This is the same root `isRecordableProjectPath` (clients/file-utils.ts)
+	 * is given at that call site — one predicate root, taken from
+	 * `runtime.projectRoot`, not two that can disagree.
 	 */
-	isTurnStatePathWithinCwd(filePath: string, cwd: string): boolean {
-		const root = path.resolve(cwd);
+	isTurnStatePathWithinRoot(filePath: string, projectRoot: string): boolean {
+		const root = path.resolve(projectRoot);
 		const abs = path.resolve(root, filePath);
 		if (normalizeMapKey(abs) === normalizeMapKey(root)) return false;
 		return isUnderDir(abs, root);
@@ -437,16 +446,24 @@ export class CacheManager {
 		cwd: string,
 		sessionId?: string | null,
 		ownerKind: TurnStateOwnerKind = "pi",
+		projectRoot?: string,
 	): TurnState {
-		// #2504: the worklist is a PROJECT worklist. A path outside `cwd` was
-		// accepted and keyed by its absolute path, so a prior session's
+		// #2504: the worklist is a PROJECT worklist. A path outside the project
+		// was accepted and keyed by its absolute path, so a prior session's
 		// scratchpad, `~/.claude/plans/*.md` and `~/.plegma/work/.../TASK.md`
 		// all became "modified files" that turn_end then fed to the test runner
 		// and opened in an LSP client. Reject before the owner stamp below, so
 		// an out-of-project write cannot claim the worklist either.
-		if (!this.isTurnStatePathWithinCwd(filePath, cwd)) {
+		//
+		// `projectRoot` defaults to `cwd` — true for every producer whose cwd
+		// IS the session root. A caller whose `cwd` is NARROWER than the
+		// project (an LSP call issued from a sub-package directory) passes the
+		// real root explicitly; `cwd` still selects which `turn-state.json`
+		// the entry lands in, exactly as before (#2504 review round 2, F1).
+		const containmentRoot = projectRoot ?? cwd;
+		if (!this.isTurnStatePathWithinRoot(filePath, containmentRoot)) {
 			this.log(
-				`turn-state: rejected out-of-project path ${filePath} (cwd ${cwd})`,
+				`turn-state: rejected out-of-project path ${filePath} (project root ${containmentRoot})`,
 			);
 			return this.readTurnState(cwd);
 		}
