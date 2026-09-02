@@ -32,10 +32,7 @@ import {
 } from "../clients/lsp/language.js";
 import { tsLangForFile } from "../clients/module-report.js";
 import { TREE_SITTER_EXT_TO_LANG } from "../clients/project-diagnostics/scanner.js";
-import {
-	CODE_FILE_EXTENSIONS,
-	readExpansionLanguage,
-} from "../clients/read-expansion.js";
+import { readExpansionLanguage } from "../clients/read-expansion.js";
 import { mapKindToTreeSitterLanguage } from "../clients/review-graph/builder.js";
 import { EXT_TO_LANG } from "../clients/tree-sitter-shared.js";
 
@@ -71,7 +68,10 @@ export function extensionUnion() {
 	for (const key of Object.keys(TREE_SITTER_EXT_TO_LANG)) {
 		all.add(key.toLowerCase());
 	}
-	for (const key of CODE_FILE_EXTENSIONS) all.add(key.toLowerCase());
+	// read-expansion contributes no key of its own: it resolves through the same
+	// registry ext -> grammar column as EXT_TO_LANG above. It used to re-export
+	// that column's key set as `CODE_FILE_EXTENSIONS`, which had no production
+	// consumer and is deleted (#2424 review, named output b).
 	return [...all].sort();
 }
 

@@ -25,6 +25,7 @@ import {
 	getResourceFootprint as getResourceFootprintSnapshot,
 	type ResourceFootprint,
 } from "./instance-registry.js";
+import { extensionsForLanguageToken } from "./language-registry.js";
 import { initLSPConfig } from "./lsp/config.js";
 import { getLSPService } from "./lsp/index.js";
 import { acquireWarmWordIndex } from "./mcp/analyze.js";
@@ -342,45 +343,24 @@ export interface SymbolSearchOptions {
 	lang?: string;
 }
 
-// Same language identifiers ast_grep_search's `lang` param accepts
-// (tools/shared.ts's LANGUAGES) mapped to source file extensions. Duplicated
-// here rather than imported — clients/ never reaches into tools/ (see
-// AGENTS.md's MCP-mirror layering note) — so this is symbol_search's own small
-// copy, scoped to what its `lang` filter needs (extension matching only, no
-// AST/LSP concerns).
-const SYMBOL_SEARCH_LANG_EXTENSIONS: Readonly<
-	Record<string, readonly string[]>
-> = {
-	bash: [".sh", ".bash"],
-	c: [".c", ".h"],
-	cpp: [".cpp", ".cc", ".cxx", ".hpp", ".hh", ".hxx"],
-	csharp: [".cs"],
-	css: [".css", ".scss", ".less"],
-	elixir: [".ex", ".exs"],
-	go: [".go"],
-	haskell: [".hs", ".lhs"],
-	html: [".html", ".htm"],
-	java: [".java"],
-	javascript: [".js", ".jsx", ".mjs", ".cjs"],
-	json: [".json", ".jsonc", ".json5"],
-	kotlin: [".kt", ".kts"],
-	lua: [".lua"],
-	nix: [".nix"],
-	php: [".php"],
-	python: [".py", ".pyi"],
-	ruby: [".rb", ".rake", ".gemspec"],
-	rust: [".rs"],
-	scala: [".scala", ".sc"],
-	solidity: [".sol"],
-	swift: [".swift"],
-	tsx: [".tsx"],
-	typescript: [".ts", ".mts", ".cts"],
-	yaml: [".yaml", ".yml"],
-};
-
+/**
+ * symbol_search's `lang` filter.
+ *
+ * The extension table this used to consult was a NINTH hand-written language ->
+ * extensions map, kept here because `clients/` never reaches into `tools/`
+ * (AGENTS.md's MCP-mirror layering note) — and it had drifted from every other
+ * one (#2424 review, S2): `css` claimed `.scss`/`.less`, `json` claimed
+ * `.jsonc`, `php` omitted its four alias extensions, `ruby` omitted `.ru`, and
+ * `solidity` was not a language the registry (or any grammar, or the ast-grep
+ * napi matrix) knows at all.
+ *
+ * The layering constraint was never a reason to duplicate the DATA, only a
+ * reason not to import the tool's token list. `extensionsForLanguageToken`
+ * resolves the token against the canonical registry instead.
+ */
 function fileMatchesLang(file: string, lang: string): boolean {
-	const exts = SYMBOL_SEARCH_LANG_EXTENSIONS[lang];
-	if (!exts) return false;
+	const exts = extensionsForLanguageToken(lang);
+	if (exts.length === 0) return false;
 	return exts.includes(path.extname(file).toLowerCase());
 }
 

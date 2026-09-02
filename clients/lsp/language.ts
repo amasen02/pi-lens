@@ -1,7 +1,6 @@
 import path from "node:path";
 import {
 	getLanguageId as getKindLanguageId,
-	KIND_EXTENSIONS,
 	SPECIAL_FILENAMES,
 } from "../file-kinds.js";
 import { getLspCapableKinds } from "../language-policy.js";
@@ -13,33 +12,29 @@ import { EXTENSION_TO_LSP_ID } from "../language-registry.js";
  * Maps file extensions to LSP language identifiers.
  */
 
-// Extension -> LSP languageId, projected from the canonical language registry
-// (clients/language-registry.ts, #2424). One FileKind can span several LSP ids
-// (jsts covers typescript/typescriptreact/vue, cxx covers c and cpp) and the
-// protocol spells some of them differently from the canonical id
-// ("shellscript", not "shell"), so the registry carries an lspId column and
-// this map is a pure projection of it. These win over the derived fill-in below.
-const CURATED_LANGUAGE_EXTENSIONS: Record<string, string> = EXTENSION_TO_LSP_ID;
-
 /**
- * Curated ids plus a derived fill-in for every extension an lspCapable kind
- * registers. Before #1545 this table was hand-maintained alone and had drifted:
+ * Extension -> LSP `languageId`, projected from the canonical language registry
+ * (clients/language-registry.ts, #2424). One FileKind can span several LSP ids
+ * (jsts covers typescript/typescriptreact/vue, cxx covers c and cpp) and the
+ * protocol spells some of them differently from the canonical id
+ * ("shellscript", not "shell"), so the registry carries an `lspId` column and
+ * this map is a pure projection of it — `Readonly` because the projection is
+ * `Object.freeze`d at the source (#2424 review, S4).
+ *
+ * #1545 added a derived per-kind fill-in on top of the then-hand-curated table:
  * powershell had no entry at all and cxx covered a third of its extensions, so
  * `didOpen` announced those files as "plaintext". Tolerance for that varies by
  * server — json/yaml/clangd answer the same either way, a DocumentSelector
  * server may not handle the document at all — so the id is sent correctly
- * rather than relied on being ignored. A newly registered language now reaches
- * this seam by being lspCapable.
+ * rather than relied on being ignored. The registry now owns every extension of
+ * every lspCapable kind, so that fill-in contributed ZERO entries and is gone
+ * (#2424 review, named output a). The net it provided is now a test, not a
+ * runtime `??=`: lsp-capable-seam-coverage's "maps every lspCapable kind's
+ * extensions to an LSP language id" fails the moment the registry misses one,
+ * which is the fix a silent per-kind fallback would have hidden.
  */
-export const LANGUAGE_EXTENSIONS: Record<string, string> = (() => {
-	const map: Record<string, string> = { ...CURATED_LANGUAGE_EXTENSIONS };
-	for (const kind of getLspCapableKinds()) {
-		for (const extension of KIND_EXTENSIONS[kind]) {
-			map[extension] ??= getKindLanguageId(kind);
-		}
-	}
-	return map;
-})();
+export const LANGUAGE_EXTENSIONS: Readonly<Record<string, string>> =
+	EXTENSION_TO_LSP_ID;
 
 /**
  * file-kinds.ts's basename classifier (Makefile, Dockerfile.<suffix>,

@@ -103,6 +103,108 @@ export type LanguageId =
 	| "yaml"
 	| "zig";
 
+/**
+ * The `LanguageId` inventory pinned as VALUES, and type-linked to the union in
+ * BOTH directions so neither half can move alone (#2424 review, F1):
+ *
+ *  - `satisfies readonly LanguageId[]` rejects a pinned id that is not a
+ *    union member;
+ *  - {@link LANGUAGE_ID_PIN_IS_EXHAUSTIVE} rejects a union member that is not
+ *    pinned;
+ *  - `tests/clients/language-registry-drift.test.ts` asserts this list equals
+ *    `LANGUAGES.map(e => e.id)`, so a pinned id with no registry ENTRY fails
+ *    too.
+ *
+ * Together those make "add `| "brainfuck"` to the union and ship" impossible:
+ * the union edit alone fails `npm run build`, and satisfying the compiler
+ * forces the pin edit, which fails the drift test until an entry exists. Before
+ * this, the pin lived only in the test file as an unlinked string array, so a
+ * union member with no entry compiled clean and left all 22 drift tests green.
+ */
+export const PINNED_LANGUAGE_IDS = [
+	"ada",
+	"astro",
+	"c",
+	"clojure",
+	"cmake",
+	"cobol",
+	"cpp",
+	"csharp",
+	"css",
+	"cue",
+	"dart",
+	"dockerfile",
+	"elixir",
+	"erlang",
+	"fish",
+	"fortran",
+	"fsharp",
+	"gleam",
+	"go",
+	"go-mod",
+	"graphql",
+	"haskell",
+	"helm",
+	"html",
+	"java",
+	"javascript",
+	"javascriptreact",
+	"json",
+	"jsonc",
+	"julia",
+	"kotlin",
+	"less",
+	"lua",
+	"markdown",
+	"nix",
+	"ocaml",
+	"pascal",
+	"perl",
+	"php",
+	"powershell",
+	"prisma",
+	"proto",
+	"python",
+	"r",
+	"ron",
+	"ruby",
+	"rust",
+	"sass",
+	"scala",
+	"scss",
+	"shell",
+	"sql",
+	"svelte",
+	"swift",
+	"systemverilog",
+	"terraform",
+	"terragrunt",
+	"toml",
+	"typescript",
+	"typescriptreact",
+	"typst",
+	"verilog",
+	"vhdl",
+	"vue",
+	"yaml",
+	"zig",
+] as const satisfies readonly LanguageId[];
+
+/**
+ * Compile-time exhaustiveness for the pin above. When every `LanguageId` is
+ * pinned this type is `true` and the initializer type-checks; the moment a
+ * union member is added without being pinned, the type collapses to the
+ * literal message below and `true` stops being assignable to it, so
+ * `npm run build` fails at THIS line with the reason spelled out.
+ */
+export const LANGUAGE_ID_PIN_IS_EXHAUSTIVE: Exclude<
+	LanguageId,
+	(typeof PINNED_LANGUAGE_IDS)[number]
+> extends never
+	? true
+	: "a LanguageId is missing from PINNED_LANGUAGE_IDS in clients/language-registry.ts" =
+	true;
+
 export interface LanguageEntry {
 	/** Canonical, host-neutral language id. */
 	readonly id: LanguageId;
@@ -421,9 +523,62 @@ const BY_ID = new Map<string, LanguageEntry>(
 	LANGUAGES.map((entry) => [entry.id, entry]),
 );
 
-/** Look a language up by its canonical id. */
-export function languageById(id: string): LanguageEntry | undefined {
-	return BY_ID.get(id);
+/**
+ * Every extension the registry gives the language with this canonical id, or
+ * `[]` for an id it does not know. The id-keyed half of the vocabulary a
+ * `lang:` filter accepts — see {@link GRAMMAR_TO_EXTENSIONS} for the other.
+ */
+export function extensionsForLanguage(id: string): readonly string[] {
+	return BY_ID.get(id)?.extensions ?? [];
+}
+
+/**
+ * tree-sitter / ast-grep GRAMMAR name -> every extension owned by a language
+ * that uses that grammar (`javascript` collects both the `javascript` and
+ * `javascriptreact` entries; `bash` collects `shell`'s).
+ *
+ * This is the inverse of {@link EXTENSION_TO_GRAMMAR} widened back to the
+ * entry's full extension list rather than its `grammarExtensions` narrowing,
+ * because the consumer is a FILTER ("is this file a `java` file?"), not a
+ * parser routing decision: over-including an extension whose files carry no
+ * symbols is invisible, while under-including one hides real hits.
+ * `clients/lens-engine.ts`'s symbol_search `lang` filter projects this (#2424
+ * review, S2).
+ */
+export const GRAMMAR_TO_EXTENSIONS: Readonly<
+	Record<string, readonly string[]>
+> = Object.freeze(
+	(() => {
+		const byGrammar = new Map<string, string[]>();
+		for (const entry of LANGUAGES) {
+			if (!entry.grammar) continue;
+			const list = byGrammar.get(entry.grammar) ?? [];
+			list.push(...entry.extensions);
+			byGrammar.set(entry.grammar, list);
+		}
+		return Object.fromEntries(
+			[...byGrammar].map(([grammar, extensions]) => [
+				grammar,
+				Object.freeze([...new Set(extensions)].sort()),
+			]),
+		);
+	})(),
+);
+
+/**
+ * Extensions a caller-supplied language TOKEN selects, for consumers that take
+ * a language name from an agent/tool argument rather than from a file path —
+ * `symbol_search`'s `lang` filter today (#2424 review, S2).
+ *
+ * A token may be spelled either way round, because both vocabularies are in
+ * live use: `ast_grep_search`'s `lang` enum uses the tree-sitter GRAMMAR names
+ * (`bash`, `tsx`, `cpp`), while languages with no grammar are only nameable by
+ * their canonical id (`haskell`, `nix`, `scala`). Grammar wins on a collision,
+ * which is a no-op — `cpp`/`java`/`lua` name the same entry either way. An
+ * unrecognized token selects nothing, so a filter on it returns no hits.
+ */
+export function extensionsForLanguageToken(token: string): readonly string[] {
+	return GRAMMAR_TO_EXTENSIONS[token] ?? extensionsForLanguage(token);
 }
 
 function basenameOf(filePath: string): string {

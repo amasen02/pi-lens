@@ -25,98 +25,25 @@ import { LANGUAGE_TO_GRAMMAR } from "../../clients/grammar-source.js";
 import {
 	EXTENSION_TO_GRAMMAR,
 	EXTENSION_TO_LSP_ID,
+	extensionsForLanguage,
+	extensionsForLanguageToken,
+	GRAMMAR_TO_EXTENSIONS,
 	grammarExtensionsOf,
 	KIND_TO_GRAMMAR,
 	type LanguageEntry,
 	LANGUAGES,
 	lspLanguageId,
+	PINNED_LANGUAGE_IDS,
 	resolveLanguage,
 } from "../../clients/language-registry.js";
 import { LANGUAGE_EXTENSIONS } from "../../clients/lsp/language.js";
 import { tsLangForFile } from "../../clients/module-report.js";
 import { TREE_SITTER_EXT_TO_LANG } from "../../clients/project-diagnostics/scanner.js";
-import {
-	CODE_FILE_EXTENSIONS,
-	readExpansionLanguage,
-} from "../../clients/read-expansion.js";
+import { readExpansionLanguage } from "../../clients/read-expansion.js";
 import { mapKindToTreeSitterLanguage } from "../../clients/review-graph/builder.js";
 import { FORMATTER_POLICY_BY_EXTENSION } from "../../clients/tool-policy.js";
 import { EXT_TO_LANG } from "../../clients/tree-sitter-shared.js";
 import { getSymbolQueryLanguages } from "../../clients/tree-sitter-symbol-extractor.js";
-
-/**
- * The public LanguageId inventory (#2424). Pinned the same way
- * PINNED_LSP_LANGUAGE_IDS is: adding an id is a review decision, and an id
- * without a registry entry cannot appear silently.
- */
-const PINNED_LANGUAGE_IDS = [
-	"ada",
-	"astro",
-	"c",
-	"clojure",
-	"cmake",
-	"cobol",
-	"cpp",
-	"csharp",
-	"css",
-	"cue",
-	"dart",
-	"dockerfile",
-	"elixir",
-	"erlang",
-	"fish",
-	"fortran",
-	"fsharp",
-	"gleam",
-	"go",
-	"go-mod",
-	"graphql",
-	"haskell",
-	"helm",
-	"html",
-	"java",
-	"javascript",
-	"javascriptreact",
-	"json",
-	"jsonc",
-	"julia",
-	"kotlin",
-	"less",
-	"lua",
-	"markdown",
-	"nix",
-	"ocaml",
-	"pascal",
-	"perl",
-	"php",
-	"powershell",
-	"prisma",
-	"proto",
-	"python",
-	"r",
-	"ron",
-	"ruby",
-	"rust",
-	"sass",
-	"scala",
-	"scss",
-	"shell",
-	"sql",
-	"svelte",
-	"swift",
-	"systemverilog",
-	"terraform",
-	"terragrunt",
-	"toml",
-	"typescript",
-	"typescriptreact",
-	"typst",
-	"verilog",
-	"vhdl",
-	"vue",
-	"yaml",
-	"zig",
-];
 
 /**
  * Extensions the registry owns that file-kinds.ts does NOT classify into a
@@ -195,6 +122,29 @@ describe("language registry invariants", () => {
 		expect(
 			duplicated.map(([extension, ids]) => `${extension}: ${ids.join(", ")}`),
 			"extension(s) claimed by more than one registry entry",
+		).toEqual([]);
+	});
+
+	// #2424 review, S5: the sibling of the per-extension guard above. Exact
+	// filenames resolve BEFORE extensions in `resolveLanguage`, so two entries
+	// claiming one basename is the same silent-shadowing defect with a higher
+	// blast radius — `BY_FILENAME` keeps whichever entry the LANGUAGES array
+	// happens to visit last, and every consumer of that filename flips language
+	// on an unrelated re-sort.
+	it("gives every exact filename exactly one owner", () => {
+		const owners = new Map<string, string[]>();
+		for (const entry of LANGUAGES) {
+			for (const filename of entry.filenames ?? []) {
+				const key = filename.toLowerCase();
+				owners.set(key, [...(owners.get(key) ?? []), entry.id]);
+			}
+		}
+		const duplicated = [...owners.entries()].filter(
+			([, ids]) => ids.length > 1,
+		);
+		expect(
+			duplicated.map(([filename, ids]) => `${filename}: ${ids.join(", ")}`),
+			"filename(s) claimed by more than one registry entry",
 		).toEqual([]);
 	});
 
@@ -368,9 +318,6 @@ describe("consumer projections track the registry", () => {
 	});
 
 	it("projects read expansion's map (clients/read-expansion.ts)", () => {
-		expect([...CODE_FILE_EXTENSIONS].sort()).toEqual(
-			Object.keys(EXTENSION_TO_GRAMMAR).sort(),
-		);
 		for (const extension of Object.keys(EXTENSION_TO_GRAMMAR)) {
 			expect(
 				readExpansionLanguage(sample(extension)),
@@ -422,6 +369,124 @@ describe("consumer projections track the registry", () => {
 		expect(tsLangForFile("src/App.tsx", "jsts")).toBe("tsx");
 		expect(tsLangForFile("src/main.js", "jsts")).toBe("javascript");
 		expect(tsLangForFile("src/App.vue", "jsts")).toBe("typescript");
+	});
+
+	// #2424 review, S2. `clients/lens-engine.ts` carried a NINTH hand-written
+	// language -> extensions table for symbol_search's `lang` filter, keyed by
+	// the ast_grep_search token vocabulary (tools/shared.ts's LANGUAGES) and
+	// drifted from the registry in five places. It is now a projection via
+	// `extensionsForLanguageToken`; these are that projection's guards.
+	describe("symbol_search lang filter (clients/lens-engine.ts)", () => {
+		// The token vocabulary symbol_search documents, mirrored (not imported —
+		// clients/ never reaches into tools/). Every one must still select a
+		// non-empty extension set, so folding the table cannot silently make a
+		// documented `lang` value inert.
+		const AST_GREP_LANG_TOKENS = [
+			"bash",
+			"c",
+			"cpp",
+			"csharp",
+			"css",
+			"elixir",
+			"go",
+			"haskell",
+			"html",
+			"java",
+			"javascript",
+			"json",
+			"kotlin",
+			"lua",
+			"nix",
+			"php",
+			"python",
+			"ruby",
+			"rust",
+			"scala",
+			"swift",
+			"tsx",
+			"typescript",
+			"yaml",
+		];
+
+		it("resolves every documented lang token to a non-empty extension set", () => {
+			const inert = AST_GREP_LANG_TOKENS.filter(
+				(token) => extensionsForLanguageToken(token).length === 0,
+			);
+			expect(
+				inert,
+				"lang token(s) that select no file at all after the registry fold",
+			).toEqual([]);
+		});
+
+		it("resolves a token by grammar name first, then by canonical id", () => {
+			// Grammar-spelled tokens (how ast_grep_search names them).
+			expect(extensionsForLanguageToken("bash")).toEqual(
+				GRAMMAR_TO_EXTENSIONS.bash,
+			);
+			expect(extensionsForLanguageToken("tsx")).toEqual([".tsx"]);
+			// Id-spelled tokens for languages with no grammar at all.
+			expect(extensionsForLanguageToken("haskell")).toEqual(
+				extensionsForLanguage("haskell"),
+			);
+			// Id-derived sets keep the entry's declaration order; grammar-derived
+			// ones are deduped and sorted (two entries can share a grammar).
+			expect(extensionsForLanguageToken("scala")).toEqual([".scala", ".sc"]);
+			// An unknown token selects nothing rather than everything.
+			expect(extensionsForLanguageToken("solidity")).toEqual([]);
+			expect(extensionsForLanguageToken("brainfuck")).toEqual([]);
+		});
+
+		it("groups every entry sharing a grammar under that grammar", () => {
+			for (const [grammar, extensions] of Object.entries(
+				GRAMMAR_TO_EXTENSIONS,
+			)) {
+				const expected = new Set(
+					LANGUAGES.filter((entry) => entry.grammar === grammar).flatMap(
+						(entry) => entry.extensions,
+					),
+				);
+				expect(
+					new Set(extensions),
+					`extensions for grammar ${grammar}`,
+				).toEqual(expected);
+			}
+			// `javascript` is the grouping case: two entries (javascript and
+			// javascriptreact) share one grammar.
+			expect(GRAMMAR_TO_EXTENSIONS.javascript).toContain(".jsx");
+			expect(GRAMMAR_TO_EXTENSIONS.javascript).toContain(".mjs");
+		});
+
+		/**
+		 * The five reconciled rows, pinned as old -> new so the decision is a
+		 * review artifact and not an accident of the fold. Every narrowing is a
+		 * language with no `SYMBOL_QUERIES` entry, so no real hit can be hidden:
+		 * scss/less/jsonc files never parse under the css/json grammars and
+		 * neither css nor json has symbol queries at all.
+		 */
+		it("pins the reconciled lang -> extension decisions", () => {
+			// Narrowed: .scss/.less are their own registry entries with no grammar.
+			expect(extensionsForLanguageToken("css")).toEqual([".css"]);
+			// Narrowed: .jsonc is its own entry with no grammar.
+			expect(extensionsForLanguageToken("json")).toEqual([".json", ".json5"]);
+			// Widened: the registry owns php's four alias extensions.
+			expect(extensionsForLanguageToken("php")).toEqual([
+				".php",
+				".php3",
+				".php4",
+				".php5",
+				".phtml",
+			]);
+			// Widened: the registry owns .ru (Rack config).
+			expect(extensionsForLanguageToken("ruby")).toContain(".ru");
+			// Widened: shell's .zsh, and the full cxx extension set for cpp.
+			expect(extensionsForLanguageToken("bash")).toContain(".zsh");
+			expect(extensionsForLanguageToken("cpp")).toContain(".ixx");
+			// Dropped: no registry entry, no wasm grammar, no napi binding, no
+			// symbol queries — a .sol file can never carry an indexed symbol.
+			expect(LANGUAGES.some((entry) => entry.extensions.includes(".sol"))).toBe(
+				false,
+			);
+		});
 	});
 
 	it("keeps the formatter policy table inside the registry's vocabulary", () => {

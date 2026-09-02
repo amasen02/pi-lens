@@ -108,7 +108,11 @@ export function _resetSharedTreeSitterClientForTests(): void {
 // same registry column, so none of them can drift from this one: before #2424
 // the scanner spread this map and layered java/kotlin on top while read
 // expansion kept a hand-copied near-copy of it.
-export const EXT_TO_LANG: Record<string, string> = EXTENSION_TO_GRAMMAR;
+// `Readonly` because the projection is `Object.freeze`d at the source, and the
+// mutable `Record` type let a caller type-check a write that would throw at
+// runtime (#2424 review, S4).
+export const EXT_TO_LANG: Readonly<Record<string, string>> =
+	EXTENSION_TO_GRAMMAR;
 
 /** Resolve a tree-sitter grammar/language id from a file path's extension. */
 export function resolveTreeSitterLanguage(

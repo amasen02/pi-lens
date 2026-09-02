@@ -79,7 +79,16 @@ const FACT_RULE_EXTENSIONS = new Set([
 // plain alias. scanner.test.ts asserts this map covers every non-disabled rule
 // dir whose grammar is loadable, so adding a language dir fails a test until
 // its extension is registered in the registry.
-export const TREE_SITTER_EXT_TO_LANG: Record<string, string> = EXT_TO_LANG;
+//
+// This map is the scan's language RESOLVER, not its eligibility gate: it now
+// answers for grammars with no rule dir too (bash/dart/elixir/lua/ocaml/swift/
+// zig), and the pass gates each file on `hasTreeSitterRules` so a grammar
+// without rules costs no read (#2424 review, F2).
+// `Readonly` because the projection is `Object.freeze`d at the source (#2424
+// review, S4) — the mutable `Record` type is what let the pre-#2424 spread
+// layer java/kotlin on by hand in the first place.
+export const TREE_SITTER_EXT_TO_LANG: Readonly<Record<string, string>> =
+	EXT_TO_LANG;
 
 function normalizeSeverity(
 	severity: string | undefined,
@@ -165,6 +174,28 @@ async function scanFileMajorRules(
 	// file out, so the caller can report a truncated filesScanned honestly.
 	let filesScanned = 0;
 	let wasmAborted = isTreeSitterWasmAborted();
+
+	/**
+	 * Does this project actually have ENABLED tree-sitter rules for `langId`?
+	 *
+	 * The gate below used to read "does the extension have a grammar", which was
+	 * the same question only because the ext -> grammar map hand-listed exactly
+	 * the twelve grammars that also ship a `rules/tree-sitter-queries/<lang>/`
+	 * dir. #2424 projected that map from the registry's full grammar column, so
+	 * bash/dart/elixir/lua/ocaml/swift/zig arrived WITHOUT rules and every such
+	 * file started being read, walked and counted for a rule set that is empty
+	 * (#2424 review, F2). Memoized per language: `queriesForLanguage` rebuilds
+	 * and filters its array on every call, and the scan asks once per file.
+	 */
+	const ruleCoverage = new Map<string, boolean>();
+	const hasTreeSitterRules = (langId: string): boolean => {
+		if (!queryMap || !client) return false;
+		const memo = ruleCoverage.get(langId);
+		if (memo !== undefined) return memo;
+		const covered = queriesForLanguage(queryMap, langId).length > 0;
+		ruleCoverage.set(langId, covered);
+		return covered;
+	};
 
 	const scanTreeSitterFile = async (
 		filePath: string,
@@ -263,7 +294,11 @@ async function scanFileMajorRules(
 			}
 			if (isTestFile(filePath)) continue;
 			const ext = path.extname(filePath);
-			const langId = TREE_SITTER_EXT_TO_LANG[ext];
+			// A grammar is not a consumer: only a language this project has
+			// ENABLED rules for can turn this file's bytes into a finding.
+			const grammarId = TREE_SITTER_EXT_TO_LANG[ext];
+			const langId =
+				grammarId && hasTreeSitterRules(grammarId) ? grammarId : undefined;
 			const factEligible = FACT_RULE_EXTENSIONS.has(ext);
 			let astGrepLang: ReturnType<typeof astGrepGetLang> | undefined;
 			if (sgModule && astGrepCanHandle(filePath)) {

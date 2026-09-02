@@ -23,18 +23,6 @@ const EXPANDED_SIZE_CAP_LINES = 300;
 export const EXPANSION_BUDGET_MS = 200;
 
 /**
- * Canonical set of source-code file extensions pi-lens understands, derived
- * from the canonical language registry's ext -> grammar column (#2424) - the
- * same column the per-edit tree-sitter runner, project scanner and
- * module-report resolve through. Exported as the single source of truth so
- * language-spanning scanners cover every supported language instead of a
- * hardcoded subset (#262). Before #2424 this module kept its own hand-copied
- * near-copy of that map, which had drifted in both directions.
- */
-export const CODE_FILE_EXTENSIONS: readonly string[] =
-	Object.keys(EXTENSION_TO_GRAMMAR);
-
-/**
  * The grammar this module would parse `filePath` with, or undefined when read
  * expansion does not understand the extension. Exported so the
  * language-identity golden snapshot can record this consumer's answer.
