@@ -759,10 +759,20 @@ function collectToolNameAliases(source: string): string[] {
 	return [...names];
 }
 
+/**
+ * Escape every regex metacharacter, not just the ones an identifier can hold.
+ * `$` is legal in a JS identifier and is an anchor in a regex, which is the
+ * case that actually matters here — but a partial escape is the
+ * `js/incomplete-sanitization` shape CodeQL flags (and is one backslash away
+ * from being wrong if this helper is ever reused), so escape the whole class.
+ */
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function aliasComparisonPatterns(aliases: string[]): RegExp[] {
-	// `$` is legal in an identifier and is an anchor in a regex, so escape it.
 	return aliases.flatMap((raw) => {
-		const name = raw.replace(/\$/g, "\\$");
+		const name = escapeRegExp(raw);
 		return [
 			new RegExp(`\\b${name}\\s*[=!]==?\\s*"(?:write|edit|multiedit)"`),
 			new RegExp(`"(?:write|edit|multiedit)"\\s*[=!]==?\\s*${name}\\b`),
