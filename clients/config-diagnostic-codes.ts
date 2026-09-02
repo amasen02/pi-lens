@@ -183,76 +183,78 @@ export interface DeprecatedConfigSurface {
  * `kind: "key"` rows below. Listing the file itself would have promised users
  * that the file they were just told to migrate TO is going away.
  */
+/**
+ * The window every surface below shares. One window, not eight copies: the
+ * whole point of policy point 4 is that a deprecation is announced ONCE and
+ * removed at ONE major, so a per-row date is an invitation to drift. Spelling
+ * it once also means the S3 rule — `deprecatedSince` is the release that
+ * announces, never one that already shipped — has a single place to be wrong.
+ */
+const LSP_DEPRECATION_WINDOW = {
+	deprecatedSince: "4.2.0",
+	removeNotBefore: "5.0.0",
+} as const;
+
+/** A legacy top-level LSP KEY inside a config file that is itself canonical. */
+const LEGACY_KEY = {
+	kind: "key",
+	code: "PILENS_CFG_0002",
+	...LSP_DEPRECATION_WINDOW,
+} as const;
+
+/** A legacy config FILE LOCATION that a loader still reads. */
+const LEGACY_FILE = {
+	kind: "file",
+	code: "PILENS_CFG_0003",
+	...LSP_DEPRECATION_WINDOW,
+} as const;
+
 export const DEPRECATED_CONFIG_SURFACES = [
 	{
+		...LEGACY_KEY,
 		surface: "servers",
-		kind: "key",
-		code: "PILENS_CFG_0002",
-		deprecatedSince: "4.2.0",
-		removeNotBefore: "5.0.0",
 		reason:
 			"custom-server definitions move to the unified catalog schema; the bare string command + args form is replaced by the trust-gated ProcessSpec (#2416).",
 	},
 	{
+		...LEGACY_KEY,
 		surface: "serverOverrides",
-		kind: "key",
-		code: "PILENS_CFG_0002",
-		deprecatedSince: "4.2.0",
-		removeNotBefore: "5.0.0",
 		reason:
 			"per-server initializationOptions overrides fold into the catalog's field-wise merge, keyed by the same public server IDs (#2416).",
 	},
 	{
+		...LEGACY_KEY,
 		surface: "disabledServers",
-		kind: "key",
-		code: "PILENS_CFG_0002",
-		deprecatedSince: "4.2.0",
-		removeNotBefore: "5.0.0",
 		reason:
 			"replaced by the catalog's per-entry `enabled: false`, which carries monotonic deny precedence (#1416/#2415).",
 	},
 	{
+		...LEGACY_KEY,
 		surface: "warmFiles",
-		kind: "key",
-		code: "PILENS_CFG_0002",
-		deprecatedSince: "4.2.0",
-		removeNotBefore: "5.0.0",
 		reason:
 			"session warm-up seeds become a per-server catalog field rather than a config-root list (#2416).",
 	},
 	{
+		...LEGACY_FILE,
 		surface: ".pi-lens/lsp.json",
-		kind: "file",
-		code: "PILENS_CFG_0003",
-		deprecatedSince: "4.2.0",
-		removeNotBefore: "5.0.0",
 		reason:
 			"project LSP settings consolidate into `.pi-lens.json` under the unified envelope (#2426).",
 	},
 	{
+		...LEGACY_FILE,
 		surface: "pi-lsp.json",
-		kind: "file",
-		code: "PILENS_CFG_0003",
-		deprecatedSince: "4.2.0",
-		removeNotBefore: "5.0.0",
 		reason:
 			"pre-rename project location; superseded by `.pi-lens.json` (#2426).",
 	},
 	{
+		...LEGACY_FILE,
 		surface: "pi-lens.json",
-		kind: "file",
-		code: "PILENS_CFG_0003",
-		deprecatedSince: "4.2.0",
-		removeNotBefore: "5.0.0",
 		reason:
 			"undotted project-config basename; superseded by `.pi-lens.json` (#2426).",
 	},
 	{
+		...LEGACY_FILE,
 		surface: "~/.pi-lens/lsp.json",
-		kind: "file",
-		code: "PILENS_CFG_0003",
-		deprecatedSince: "4.2.0",
-		removeNotBefore: "5.0.0",
 		reason:
 			"global LSP settings consolidate into `~/.pi-lens/config.json` (#2426).",
 	},
