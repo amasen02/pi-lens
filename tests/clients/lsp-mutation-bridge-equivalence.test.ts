@@ -8,9 +8,12 @@
  * IDENTICAL `fileDetails` (same range, same `importsChanged`), once with
  * `runtime`/`cacheManager` threaded (the direct branch) and once without (the
  * bridge fallback branch, driven against a REAL registered bridge, not a
- * spy), and deep-equals every side effect a caller can observe: the
+ * spy), then deep-equals every side effect a caller can observe: the
  * turn-state entry, the change-log receipt's range, the deferred-format
- * queue, and the read-guard stamp.
+ * queue, and the read-guard stamp. Each surface is its own `it()` (rather
+ * than one long test) so a regression in any single surface reds
+ * independently instead of being masked by an earlier assertion throwing
+ * first.
  *
  * Both runs use an edit on line 7 (1-based) of an 8-line fixture, never line
  * 1 — a line-1 edit's real range collides with the `{1,1}` resource-op/
@@ -20,7 +23,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { CacheManager } from "../../clients/cache-manager.js";
 import {
 	type LspMutationContext,
@@ -73,140 +76,149 @@ function resultsFor(filePath: string) {
 }
 
 describe("bookkeepLspMutation — direct path and bridge fallback are equivalent (#2450 review round 2)", () => {
-	it("produce the same turn-state entry, receipt range, deferred queue, and read-guard stamp for identical fileDetails", () => {
-		const base = setupTestEnvironment("pi-lens-2450-equiv-");
-		const previousDataDir = process.env.PILENS_DATA_DIR;
+	let previousDataDir: string | undefined;
+	let base: ReturnType<typeof setupTestEnvironment>;
+	let dirDirect: string;
+	let dirBridge: string;
+	let fileDirect: string;
+	let fileBridge: string;
+	let runtimeDirect: RuntimeCoordinator;
+	let runtimeBridge: RuntimeCoordinator;
+	let cacheManagerDirect: CacheManager;
+	let cacheManagerBridge: CacheManager;
+
+	beforeEach(() => {
+		base = setupTestEnvironment("pi-lens-2450-equiv-");
+		previousDataDir = process.env.PILENS_DATA_DIR;
 		process.env.PILENS_DATA_DIR = path.join(base.tmpDir, "data");
-		const dirDirect = fs.mkdtempSync(
+		dirDirect = fs.mkdtempSync(
 			path.join(os.tmpdir(), "pi-lens-2450-equiv-direct-"),
 		);
-		const dirBridge = fs.mkdtempSync(
+		dirBridge = fs.mkdtempSync(
 			path.join(os.tmpdir(), "pi-lens-2450-equiv-bridge-"),
 		);
-		try {
-			// --- Direct branch: runtime + cacheManager threaded, matching how
-			// tools/lsp-navigation.ts builds its context. ---
-			const fileDirect = writeFixture(dirDirect, "target.ts");
-			const runtimeDirect = new RuntimeCoordinator();
-			runtimeDirect.projectRoot = dirDirect;
-			runtimeDirect.setTelemetryIdentity({ sessionId: "s-2450-equiv-direct" });
-			runtimeDirect.beginTurn();
-			const cacheManagerDirect = new CacheManager(false);
-			const directContext: LspMutationContext = {
-				cwd: dirDirect,
-				correlationId: "equiv-direct",
-				tool: "lsp_navigation:executeCommand",
-				source: "lsp-execute-command",
-				runtime: runtimeDirect as never,
-				cacheManager: cacheManagerDirect,
-				// Same shape tools/lsp-navigation.ts threads: the runtime's own
-				// real ReadGuard, not a hand-rolled spy.
-				readGuard: runtimeDirect.readGuard,
-				emitSummary: false,
-			};
-			recordLspMutation(directContext, { results: resultsFor(fileDirect) });
 
-			// --- Bridge-fallback branch: no runtime/cacheManager on the context —
-			// matching clients/lsp/client.ts's synthesized fallback context —
-			// driven against a REAL registered bridge (not a spy). ---
-			const fileBridge = writeFixture(dirBridge, "target.ts");
-			const runtimeBridge = new RuntimeCoordinator();
-			runtimeBridge.projectRoot = dirBridge;
-			runtimeBridge.setTelemetryIdentity({ sessionId: "s-2450-equiv-bridge" });
-			runtimeBridge.beginTurn();
-			const cacheManagerBridge = new CacheManager(false);
-			registerMutationBridge({
-				getRuntime: () => runtimeBridge as never,
-				getCacheManager: () => cacheManagerBridge,
-				getProjectRoot: () => dirBridge,
-				getDispatchCwd: () => dirBridge,
-				countFileLines,
-				isRecordable: () => true,
-				dbg: () => {},
-			});
-			const bridgeContext: LspMutationContext = {
-				cwd: dirBridge,
-				correlationId: "equiv-bridge",
-				tool: "lsp_navigation:executeCommand",
-				source: "lsp-execute-command",
-				// No runtime/cacheManager — this is what forces the bridge
-				// fallback branch, exactly like clients/lsp/client.ts's
-				// synthesized `telemetryContext` for a nested/no-context
-				// server-initiated applyEdit.
-				emitSummary: false,
-			};
-			recordLspMutation(bridgeContext, { results: resultsFor(fileBridge) });
+		// --- Direct branch: runtime + cacheManager threaded, matching how
+		// tools/lsp-navigation.ts builds its context. ---
+		fileDirect = writeFixture(dirDirect, "target.ts");
+		runtimeDirect = new RuntimeCoordinator();
+		runtimeDirect.projectRoot = dirDirect;
+		runtimeDirect.setTelemetryIdentity({ sessionId: "s-2450-equiv-direct" });
+		runtimeDirect.beginTurn();
+		cacheManagerDirect = new CacheManager(false);
+		const directContext: LspMutationContext = {
+			cwd: dirDirect,
+			correlationId: "equiv-direct",
+			tool: "lsp_navigation:executeCommand",
+			source: "lsp-execute-command",
+			runtime: runtimeDirect as never,
+			cacheManager: cacheManagerDirect,
+			// Same shape tools/lsp-navigation.ts threads: the runtime's own real
+			// ReadGuard, not a hand-rolled spy.
+			readGuard: runtimeDirect.readGuard,
+			emitSummary: false,
+		};
+		recordLspMutation(directContext, { results: resultsFor(fileDirect) });
 
-			// --- 1. Turn-state entry: same range, same importsChanged. ---
-			const directFiles =
-				cacheManagerDirect.readTurnState(dirDirect).files ?? {};
-			const bridgeFiles =
-				cacheManagerBridge.readTurnState(dirBridge).files ?? {};
-			const directKeys = Object.keys(directFiles);
-			const bridgeKeys = Object.keys(bridgeFiles);
-			expect(directKeys).toHaveLength(1);
-			expect(bridgeKeys).toHaveLength(1);
-			const directEntry = directFiles[directKeys[0]];
-			const bridgeEntry = bridgeFiles[bridgeKeys[0]];
-			expect(directEntry.modifiedRanges).toEqual([
-				{ start: EDIT_LINE_1BASED, end: EDIT_LINE_1BASED },
-			]);
-			expect(bridgeEntry.modifiedRanges).toEqual(directEntry.modifiedRanges);
-			// F1: the bridge fallback threads the real `importsChanged` value
-			// (from `AppliedWorkspaceEdit.fileDetails[].importsChanged`) instead
-			// of the bridge's own historical hardcoded `false`.
-			expect(directEntry.importsChanged).toBe(true);
-			expect(bridgeEntry.importsChanged).toBe(true);
+		// --- Bridge-fallback branch: no runtime/cacheManager on the context —
+		// matching clients/lsp/client.ts's synthesized fallback context — driven
+		// against a REAL registered bridge (not a spy). ---
+		fileBridge = writeFixture(dirBridge, "target.ts");
+		runtimeBridge = new RuntimeCoordinator();
+		runtimeBridge.projectRoot = dirBridge;
+		runtimeBridge.setTelemetryIdentity({ sessionId: "s-2450-equiv-bridge" });
+		runtimeBridge.beginTurn();
+		cacheManagerBridge = new CacheManager(false);
+		registerMutationBridge({
+			getRuntime: () => runtimeBridge as never,
+			getCacheManager: () => cacheManagerBridge,
+			getProjectRoot: () => dirBridge,
+			getDispatchCwd: () => dirBridge,
+			countFileLines,
+			isRecordable: () => true,
+			dbg: () => {},
+		});
+		const bridgeContext: LspMutationContext = {
+			cwd: dirBridge,
+			correlationId: "equiv-bridge",
+			tool: "lsp_navigation:executeCommand",
+			source: "lsp-execute-command",
+			// No runtime/cacheManager — this is what forces the bridge fallback
+			// branch, exactly like clients/lsp/client.ts's synthesized
+			// `telemetryContext` for a nested/no-context server-initiated
+			// applyEdit.
+			emitSummary: false,
+		};
+		recordLspMutation(bridgeContext, { results: resultsFor(fileBridge) });
+	});
 
-			// --- 2. Change-log receipt: same range, both present. Source is
-			// EXPECTED to differ by design — bookkeepLspMutation's direct path
-			// names the specific LSP operation ("lsp-execute-command"); the
-			// bridge fallback carries the generic "agent-tool:<tool>" tag,
-			// because it is only ever reached when the direct path structurally
-			// cannot run. That is documented, intentional asymmetry, not a bug
-			// under test here. ---
-			const directChanges = readChangesSince(dirDirect, 0);
-			const bridgeChanges = readChangesSince(dirBridge, 0);
-			expect(directChanges).toHaveLength(1);
-			expect(bridgeChanges).toHaveLength(1);
-			expect(directChanges[0].changedRange).toEqual({
-				start: EDIT_LINE_1BASED,
-				end: EDIT_LINE_1BASED,
-			});
-			expect(bridgeChanges[0].changedRange).toEqual(
-				directChanges[0].changedRange,
-			);
-			expect(directChanges[0].source).toBe("lsp-execute-command");
-			expect(bridgeChanges[0].source).toBe(
-				"agent-tool:lsp_navigation:executeCommand",
-			);
+	afterEach(() => {
+		if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+		else process.env.PILENS_DATA_DIR = previousDataDir;
+		removeTempDirSync(dirDirect);
+		removeTempDirSync(dirBridge);
+		base.cleanup();
+	});
 
-			// --- 3. Deferred autofix/format queue: EMPTY on both (F3).
-			// bookkeepLspMutation's direct path never enqueues a deferred pass for
-			// an LSP-applied edit; before this round the bridge fallback always
-			// did (`deferAutofix` unset defaulted to "defer"), an inequivalence
-			// this asserts is gone. ---
-			expect(runtimeDirect.pendingDeferredFormatCount).toBe(0);
-			expect(runtimeBridge.pendingDeferredFormatCount).toBe(0);
+	it("record the same turn-state range and importsChanged on both branches", () => {
+		const directFiles = cacheManagerDirect.readTurnState(dirDirect).files ?? {};
+		const bridgeFiles = cacheManagerBridge.readTurnState(dirBridge).files ?? {};
+		const directKeys = Object.keys(directFiles);
+		const bridgeKeys = Object.keys(bridgeFiles);
+		expect(directKeys).toHaveLength(1);
+		expect(bridgeKeys).toHaveLength(1);
+		const directEntry = directFiles[directKeys[0]];
+		const bridgeEntry = bridgeFiles[bridgeKeys[0]];
+		expect(directEntry.modifiedRanges).toEqual([
+			{ start: EDIT_LINE_1BASED, end: EDIT_LINE_1BASED },
+		]);
+		expect(bridgeEntry.modifiedRanges).toEqual(directEntry.modifiedRanges);
+		// F1: the bridge fallback threads the real `importsChanged` value (from
+		// `AppliedWorkspaceEdit.fileDetails[].importsChanged`) instead of the
+		// bridge's own historical hardcoded `false`.
+		expect(directEntry.importsChanged).toBe(true);
+		expect(bridgeEntry.importsChanged).toBe(true);
+	});
 
-			// --- 4. Read-guard stamp: both mark the file as already covered by
-			// this session's own write, so an immediate re-edit is allowed with
-			// no real Read — same OUTCOME reached via each branch's own real
-			// production mechanism (direct: `context.readGuard` set explicitly;
-			// bridge fallback: the bridge's internal
-			// `deps.getRuntime().readGuard.recordWritten`). ---
-			expect(runtimeDirect.readGuard.checkEdit(fileDirect).action).toBe(
-				"allow",
-			);
-			expect(runtimeBridge.readGuard.checkEdit(fileBridge).action).toBe(
-				"allow",
-			);
-		} finally {
-			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
-			else process.env.PILENS_DATA_DIR = previousDataDir;
-			removeTempDirSync(dirDirect);
-			removeTempDirSync(dirBridge);
-			base.cleanup();
-		}
+	it("record the same change-log receipt range on both branches (source differs by design)", () => {
+		// Source is EXPECTED to differ by design — bookkeepLspMutation's direct
+		// path names the specific LSP operation ("lsp-execute-command"); the
+		// bridge fallback carries the generic "agent-tool:<tool>" tag, because
+		// it is only ever reached when the direct path structurally cannot run.
+		// That is documented, intentional asymmetry, not a bug under test here.
+		const directChanges = readChangesSince(dirDirect, 0);
+		const bridgeChanges = readChangesSince(dirBridge, 0);
+		expect(directChanges).toHaveLength(1);
+		expect(bridgeChanges).toHaveLength(1);
+		expect(directChanges[0].changedRange).toEqual({
+			start: EDIT_LINE_1BASED,
+			end: EDIT_LINE_1BASED,
+		});
+		expect(bridgeChanges[0].changedRange).toEqual(
+			directChanges[0].changedRange,
+		);
+		expect(directChanges[0].source).toBe("lsp-execute-command");
+		expect(bridgeChanges[0].source).toBe(
+			"agent-tool:lsp_navigation:executeCommand",
+		);
+	});
+
+	it("enqueue no deferred autofix/format pass on either branch (F3)", () => {
+		// bookkeepLspMutation's direct path never enqueues a deferred pass for
+		// an LSP-applied edit; before this round the bridge fallback always did
+		// (`deferAutofix` unset defaulted to "defer"), an inequivalence this
+		// asserts is gone.
+		expect(runtimeDirect.pendingDeferredFormatCount).toBe(0);
+		expect(runtimeBridge.pendingDeferredFormatCount).toBe(0);
+	});
+
+	it("stamp the read-guard as written on both branches", () => {
+		// Both mark the file as already covered by this session's own write, so
+		// an immediate re-edit is allowed with no real Read — the same OUTCOME
+		// reached via each branch's own real production mechanism (direct:
+		// `context.readGuard` set explicitly; bridge fallback: the bridge's
+		// internal `deps.getRuntime().readGuard.recordWritten`).
+		expect(runtimeDirect.readGuard.checkEdit(fileDirect).action).toBe("allow");
+		expect(runtimeBridge.readGuard.checkEdit(fileBridge).action).toBe("allow");
 	});
 });
