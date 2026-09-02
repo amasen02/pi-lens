@@ -1288,34 +1288,6 @@ export const EXEMPT_SESSION_STATE_FILES: Readonly<Record<string, string>> = {
 		"diagnostics publisher registration and dirty-path dedupe",
 	"bus-events-logger.ts": "bus event rollup counters, an observability tally",
 	"ndjson-logger.ts": "registered log-file paths",
-
-	// #2506: these ten `*-logger.ts` modules now build their shared NDJSON
-	// writer via `createLazyNdjsonLogger` (ndjson-logger.ts) instead of
-	// constructing it at module-import time — the fix for tests writing into
-	// the maintainer's real `~/.pi-lens/latency.log`. Each gained a
-	// `_reset*LoggerForTests` export so a test can drop the memoized writer
-	// and force re-resolution of `getGlobalPiLensDir()`/`getMaxLogSizeMB()`
-	// against a changed env (the `tests/config/log-path-lazy-resolution.test.ts`
-	// governance seam exercises exactly this). That memo is PROCESS-lifetime
-	// cache state, the same class `ndjson-logger.ts`'s own exemption above
-	// already covers (the writer registry itself) — not a session-scoped
-	// verdict, so a `session_start` reset would just re-pay the first-write
-	// path resolution for no correctness benefit. The scan sees no
-	// module-scope CONTAINER in any of these files (the memo lives inside
-	// `createLazyNdjsonLogger`'s own closure in ndjson-logger.ts, invisible to
-	// a per-FILE container scan) — same "reset with zero containers" shape as
-	// `bootstrap.ts`'s pinned entry below.
-	"actionable-warnings-logger.ts": "lazy NDJSON writer memo (#2506)",
-	"ast-grep-tool-logger.ts": "lazy NDJSON writer memo (#2506)",
-	"cascade-logger.ts": "lazy NDJSON writer memo (#2506)",
-	"dead-code-logger.ts": "lazy NDJSON writer memo (#2506)",
-	"disposition-logger.ts": "lazy NDJSON writer memo (#2506)",
-	"read-guard-logger.ts": "lazy NDJSON writer memo (#2506)",
-	"review-graph-logger.ts": "lazy NDJSON writer memo (#2506)",
-	"sessionstart-logger.ts": "lazy NDJSON writer memo (#2506)",
-	"tree-sitter-logger.ts": "lazy NDJSON writer memo (#2506)",
-	"word-index-logger.ts": "lazy NDJSON writer memo (#2506)",
-
 	"quiet-window.ts": "quiet-window task registration",
 	"quiet-window-config.ts":
 		"the env-derived quiet-window kill switch and wait budget, split out of quiet-window.ts by #1462; a memo of configuration, not of a session verdict",
@@ -1395,20 +1367,6 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"bounded-telemetry.ts": 2,
 	"bus-events-logger.ts": 1,
 	"bus-publish.ts": 0,
-	// #2506: same "reset with zero containers" shape as bootstrap.ts above —
-	// see EXEMPT_SESSION_STATE_FILES' matching #2506 comment block for the
-	// full account. Grouped here rather than at each letter's alphabetical
-	// slot so the shared rationale reads as one unit.
-	"actionable-warnings-logger.ts": 0,
-	"ast-grep-tool-logger.ts": 0,
-	"cascade-logger.ts": 0,
-	"dead-code-logger.ts": 0,
-	"disposition-logger.ts": 0,
-	"read-guard-logger.ts": 0,
-	"review-graph-logger.ts": 0,
-	"sessionstart-logger.ts": 0,
-	"tree-sitter-logger.ts": 0,
-	"word-index-logger.ts": 0,
 	// #1071 added the per-session miss-attribution ledger (1 → 2).
 	"cache-observability.ts": 2,
 	// #2418: the one warn-once latch behind all three config loaders, moved

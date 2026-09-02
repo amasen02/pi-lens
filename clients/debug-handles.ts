@@ -46,21 +46,15 @@ import * as asyncHooks from "node:async_hooks";
 import * as path from "node:path";
 import { getGlobalPiLensDir } from "./file-utils.js";
 import { getMaxLogSizeMB } from "./log-cleanup.js";
-import {
-	createLazyNdjsonLogger,
-	type LazyNdjsonLogger,
-} from "./ndjson-logger.js";
+import { createNdjsonLogger, type NdjsonLogger } from "./ndjson-logger.js";
 
 /** Read once at module load — see module docstring. Not re-read per call. */
 const DEBUG_HANDLES_ENABLED = process.env.PI_LENS_DEBUG_HANDLES === "1";
 
-// #2506: lazy, not a module-top-level `const` — see `createLazyNdjsonLogger`'s
-// doc comment in ndjson-logger.ts. Unlike `DEBUG_HANDLES_ENABLED` above (which
-// the module docstring documents as deliberately frozen at load time), there is
-// no such rationale for the LOG PATH itself.
-function debugHandlesLogFile(): string {
-	return path.join(getGlobalPiLensDir(), "debug-handles.log");
-}
+const DEBUG_HANDLES_LOG_FILE = path.join(
+	getGlobalPiLensDir(),
+	"debug-handles.log",
+);
 
 /** Cap on tracked in-flight creation sites (bounded past this). */
 export const TRACKER_MAX_ENTRIES = 500;
@@ -155,11 +149,11 @@ function installHandleTracker(): Map<number, TrackedResource> {
 const trackedResources: Map<number, TrackedResource> | null =
 	DEBUG_HANDLES_ENABLED ? installHandleTracker() : null;
 
-const writer: LazyNdjsonLogger | null = DEBUG_HANDLES_ENABLED
-	? createLazyNdjsonLogger(() => ({
-			filePath: debugHandlesLogFile(),
+const writer: NdjsonLogger | null = DEBUG_HANDLES_ENABLED
+	? createNdjsonLogger({
+			filePath: DEBUG_HANDLES_LOG_FILE,
 			maxBytes: getMaxLogSizeMB() * 1024 * 1024,
-		}))
+		})
 	: null;
 
 /** True iff `PI_LENS_DEBUG_HANDLES=1` was set when this module first loaded. */
@@ -168,7 +162,7 @@ export function isDebugHandlesEnabled(): boolean {
 }
 
 export function getDebugHandlesLogPath(): string {
-	return writer ? writer.getFilePath() : debugHandlesLogFile();
+	return DEBUG_HANDLES_LOG_FILE;
 }
 
 /** Resolve once all enqueued debug-handles writes are on disk (tests). */

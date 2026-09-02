@@ -1,18 +1,17 @@
 import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
 import { getGlobalPiLensDir } from "./file-utils.js";
-import { createLazyNdjsonLogger } from "./ndjson-logger.js";
+import { createNdjsonLogger } from "./ndjson-logger.js";
 import { getMaxLogSizeMB } from "./log-cleanup.js";
 import { normalizeLoggedPath } from "./path-utils.js";
 
-// #2506: resolved lazily (first real write), not at module-import time — see
-// `createLazyNdjsonLogger`'s doc comment for why a top-level `getGlobalPiLensDir()`
-// call here froze every write to whichever `PI_LENS_HOME` was live at the
-// FIRST process that imported this module (vitest's `globalSetup` among them).
-const writer = createLazyNdjsonLogger(() => ({
-	filePath: path.join(getGlobalPiLensDir(), "latency.log"),
+const LATENCY_LOG_DIR = getGlobalPiLensDir();
+const LATENCY_LOG_FILE = path.join(LATENCY_LOG_DIR, "latency.log");
+
+const writer = createNdjsonLogger({
+	filePath: LATENCY_LOG_FILE,
 	maxBytes: getMaxLogSizeMB() * 1024 * 1024,
-}));
+});
 
 export interface LatencyEntry {
 	type: "runner" | "tool_result" | "phase";
@@ -661,7 +660,7 @@ export function logLatency(entry: LatencyEntry): void {
 }
 
 export function getLatencyLogPath(): string {
-	return writer.getFilePath();
+	return LATENCY_LOG_FILE;
 }
 
 /** Resolve once all enqueued latency writes are on disk (tests/shutdown). */
@@ -673,14 +672,4 @@ export function clearLatencyLog(): void {
 	// Enqueue the truncate in the same serialized queue so a clear cannot race a
 	// pending drain. Await flushLatencyLog() if you need the file empty on disk.
 	writer.truncate();
-}
-
-/**
- * Test-only: drop the memoized writer so the next call re-resolves
- * `getGlobalPiLensDir()`/`getMaxLogSizeMB()` against the CURRENT env (#2506).
- * Governance/regression seam for the lazy-resolution invariant this module
- * now depends on instead of a module-load-time freeze.
- */
-export function _resetLatencyLoggerForTests(): void {
-	writer._resetForTests();
 }

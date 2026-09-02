@@ -14,30 +14,25 @@
 import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
 import { getGlobalPiLensDir } from "./file-utils.js";
-import { createLazyNdjsonLogger } from "./ndjson-logger.js";
+import { createNdjsonLogger } from "./ndjson-logger.js";
 
-// #2506: resolved lazily (first real write), not at module-import time — see
-// `createLazyNdjsonLogger`'s doc comment for why a top-level `getGlobalPiLensDir()`
-// call here froze every write to whichever `PI_LENS_HOME` was live at the
-// FIRST process that imported this module — confirmed for `latency-logger.ts`/
-// `extension-log.ts` via vitest's `globalSetup`, which imports them
-// transitively (`grammar-source.ts` -> `degradation-ledger.ts`) before
-// `vitest-setup.ts`'s per-worker `PI_LENS_HOME` pin is ever set; the same
-// import-order hazard applies to any other process that reaches this module
-// first, test or otherwise.
-const writer = createLazyNdjsonLogger(() => {
-	const dir = getGlobalPiLensDir();
-	return {
-		filePath: path.join(dir, "dispositions.log"),
-		maxBytes: Math.max(
-			128 * 1024,
-			Number.parseInt(
-				process.env.PI_LENS_DISPOSITION_LOG_MAX_BYTES ?? "1048576",
-				10,
-			) || 1048576,
-		),
-		backupPath: path.join(dir, "dispositions.log.1"),
-	};
+const DISPOSITION_LOG_DIR = getGlobalPiLensDir();
+const DISPOSITION_LOG_FILE = path.join(DISPOSITION_LOG_DIR, "dispositions.log");
+const DISPOSITION_LOG_BACKUP_FILE = path.join(
+	DISPOSITION_LOG_DIR,
+	"dispositions.log.1",
+);
+const MAX_LOG_BYTES = Math.max(
+	128 * 1024,
+	Number.parseInt(
+		process.env.PI_LENS_DISPOSITION_LOG_MAX_BYTES ?? "1048576",
+		10,
+	) || 1048576,
+);
+const writer = createNdjsonLogger({
+	filePath: DISPOSITION_LOG_FILE,
+	maxBytes: MAX_LOG_BYTES,
+	backupPath: DISPOSITION_LOG_BACKUP_FILE,
 });
 
 export interface DispositionLogEntry {
@@ -69,18 +64,10 @@ export function logDispositionEvent(entry: DispositionLogEntry): void {
 }
 
 export function getDispositionLogPath(): string {
-	return writer.getFilePath();
+	return DISPOSITION_LOG_FILE;
 }
 
 /** Resolve once all enqueued disposition writes are on disk. */
 export function flushDispositionLog(): Promise<void> {
 	return writer.flush();
-}
-
-/**
- * Test-only: drop the memoized writer so the next call re-resolves
- * `getGlobalPiLensDir()` against the CURRENT env (#2506).
- */
-export function _resetDispositionLoggerForTests(): void {
-	writer._resetForTests();
 }

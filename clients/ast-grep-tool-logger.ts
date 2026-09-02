@@ -13,30 +13,22 @@
 import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
 import { getGlobalPiLensDir } from "./file-utils.js";
-import { createLazyNdjsonLogger } from "./ndjson-logger.js";
+import { createNdjsonLogger } from "./ndjson-logger.js";
 
-// #2506: resolved lazily (first real write), not at module-import time — see
-// `createLazyNdjsonLogger`'s doc comment for why a top-level `getGlobalPiLensDir()`
-// call here froze every write to whichever `PI_LENS_HOME` was live at the
-// FIRST process that imported this module — confirmed for `latency-logger.ts`/
-// `extension-log.ts` via vitest's `globalSetup`, which imports them
-// transitively (`grammar-source.ts` -> `degradation-ledger.ts`) before
-// `vitest-setup.ts`'s per-worker `PI_LENS_HOME` pin is ever set; the same
-// import-order hazard applies to any other process that reaches this module
-// first, test or otherwise.
-const writer = createLazyNdjsonLogger(() => {
-	const dir = getGlobalPiLensDir();
-	return {
-		filePath: path.join(dir, "ast-grep-tools.log"),
-		maxBytes: Math.max(
-			128 * 1024,
-			Number.parseInt(
-				process.env.PI_LENS_AST_GREP_LOG_MAX_BYTES ?? "1048576",
-				10,
-			) || 1048576,
-		),
-		backupPath: path.join(dir, "ast-grep-tools.log.1"),
-	};
+const AG_LOG_DIR = getGlobalPiLensDir();
+const AG_LOG_FILE = path.join(AG_LOG_DIR, "ast-grep-tools.log");
+const AG_LOG_BACKUP_FILE = path.join(AG_LOG_DIR, "ast-grep-tools.log.1");
+const MAX_LOG_BYTES = Math.max(
+	128 * 1024,
+	Number.parseInt(
+		process.env.PI_LENS_AST_GREP_LOG_MAX_BYTES ?? "1048576",
+		10,
+	) || 1048576,
+);
+const writer = createNdjsonLogger({
+	filePath: AG_LOG_FILE,
+	maxBytes: MAX_LOG_BYTES,
+	backupPath: AG_LOG_BACKUP_FILE,
 });
 
 export type AstGrepToolName = "ast_grep_search" | "ast_grep_replace";
@@ -176,20 +168,12 @@ export function logAstGrepToolEvent(
 }
 
 export function getAstGrepToolLogPath(): string {
-	return writer.getFilePath();
+	return AG_LOG_FILE;
 }
 
 /** Resolve once all enqueued ast-grep-tool writes are on disk. */
 export function flushAstGrepToolLog(): Promise<void> {
 	return writer.flush();
-}
-
-/**
- * Test-only: drop the memoized writer so the next call re-resolves
- * `getGlobalPiLensDir()` against the CURRENT env (#2506).
- */
-export function _resetAstGrepToolLoggerForTests(): void {
-	writer._resetForTests();
 }
 
 export { countLines as _countLinesForTest };

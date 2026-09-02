@@ -51,23 +51,6 @@ process.env.PI_LENS_HOME = fs.mkdtempSync(
 );
 installGitFixtureEnv(process.env.PI_LENS_HOME);
 
-// #2506: same hermeticity as PI_LENS_HOME above, for the PROJECT-scoped
-// sibling. `getProjectDataDir(cwd)` (clients/file-utils.ts) already falls
-// back to a subdirectory of `getGlobalPiLensDir()` (i.e. PI_LENS_HOME, just
-// pinned above) whenever `PILENS_DATA_DIR` is unset AND `<cwd>/.pi-lens`
-// doesn't already exist — which covers every test today, since this repo's
-// own `.pi-lens/` is gitignored and normally absent. Pinning it explicitly
-// closes the ONE gap that fallback chain leaves open: a `.pi-lens/` a live
-// dogfooding session left at the repo root (or any other real `cwd` a test
-// happens to resolve against) would make `getProjectDataDir` take the
-// `<cwd>/.pi-lens` branch directly, bypassing PI_LENS_HOME entirely and
-// resolving under a REAL project directory instead of this worker's temp
-// root. A dedicated temp dir removes that dependency on the checkout's
-// ambient state.
-process.env.PILENS_DATA_DIR = fs.mkdtempSync(
-	path.join(os.tmpdir(), "pi-lens-test-data-"),
-);
-
 // Hand this worker the suite-wide tool template's probe cache (built once by
 // prewarm-tool-home.ts globalSetup). ensureTool's probe-cache fast path then
 // resolves the template's already-installed binaries instead of paying a cold

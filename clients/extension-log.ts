@@ -26,16 +26,17 @@ import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
 import { getGlobalPiLensDir } from "./file-utils.js";
 import { getMaxLogSizeMB } from "./log-cleanup.js";
-import { createLazyNdjsonLogger } from "./ndjson-logger.js";
+import { createNdjsonLogger } from "./ndjson-logger.js";
 
-// #2506: resolved lazily (first real write), not at module-import time — see
-// `createLazyNdjsonLogger`'s doc comment for why a top-level `getGlobalPiLensDir()`
-// call here froze every write to whichever `PI_LENS_HOME` was live at the
-// FIRST process that imported this module (vitest's `globalSetup` among them).
-const writer = createLazyNdjsonLogger(() => ({
-	filePath: path.join(getGlobalPiLensDir(), "extension.log"),
+export const EXTENSION_LOG_FILE = path.join(
+	getGlobalPiLensDir(),
+	"extension.log",
+);
+
+const writer = createNdjsonLogger({
+	filePath: EXTENSION_LOG_FILE,
 	maxBytes: getMaxLogSizeMB() * 1024 * 1024,
-}));
+});
 
 /**
  * `error`/`warn` mirror the console methods they replaced; `debug` is the level
@@ -113,7 +114,7 @@ export function noopSubsystemLogger(): SubsystemLogger {
 }
 
 export function getExtensionLogPath(): string {
-	return writer.getFilePath();
+	return EXTENSION_LOG_FILE;
 }
 
 /** Resolve once all enqueued extension-log writes are on disk (tests/shutdown). */
@@ -124,14 +125,6 @@ export function flushExtensionLog(): Promise<void> {
 /** Teardown-only: force queued entries to disk before the process exits. */
 export function flushExtensionLogSync(): void {
 	writer.flushSync();
-}
-
-/**
- * Test-only: drop the memoized writer so the next call re-resolves
- * `getGlobalPiLensDir()`/`getMaxLogSizeMB()` against the CURRENT env (#2506).
- */
-export function _resetExtensionLogForTests(): void {
-	writer._resetForTests();
 }
 
 // --- Defense in depth: the console reroute -----------------------------------

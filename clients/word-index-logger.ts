@@ -23,22 +23,15 @@ import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
 import { getGlobalPiLensDir } from "./file-utils.js";
 import { getMaxLogSizeMB } from "./log-cleanup.js";
-import { createLazyNdjsonLogger } from "./ndjson-logger.js";
+import { createNdjsonLogger } from "./ndjson-logger.js";
 import { normalizeFilePath } from "./path-utils.js";
 
-// #2506: resolved lazily (first real write), not at module-import time — see
-// `createLazyNdjsonLogger`'s doc comment for why a top-level `getGlobalPiLensDir()`
-// call here froze every write to whichever `PI_LENS_HOME` was live at the
-// FIRST process that imported this module — confirmed for `latency-logger.ts`/
-// `extension-log.ts` via vitest's `globalSetup`, which imports them
-// transitively (`grammar-source.ts` -> `degradation-ledger.ts`) before
-// `vitest-setup.ts`'s per-worker `PI_LENS_HOME` pin is ever set; the same
-// import-order hazard applies to any other process that reaches this module
-// first, test or otherwise.
-const writer = createLazyNdjsonLogger(() => ({
-	filePath: path.join(getGlobalPiLensDir(), "word-index.log"),
+const WORD_INDEX_LOG_FILE = path.join(getGlobalPiLensDir(), "word-index.log");
+
+const writer = createNdjsonLogger({
+	filePath: WORD_INDEX_LOG_FILE,
 	maxBytes: getMaxLogSizeMB() * 1024 * 1024,
-}));
+});
 
 export type WordIndexLogPhase =
 	/** Full rebuild from a fresh file-walk-and-read (absent/stale/churned index). */
@@ -141,18 +134,10 @@ export function logWordIndex(entry: WordIndexLogEntry): void {
 }
 
 export function getWordIndexLogPath(): string {
-	return writer.getFilePath();
+	return WORD_INDEX_LOG_FILE;
 }
 
 /** Resolve once all enqueued word-index writes are on disk (tests/shutdown). */
 export function flushWordIndexLog(): Promise<void> {
 	return writer.flush();
-}
-
-/**
- * Test-only: drop the memoized writer so the next call re-resolves
- * `getGlobalPiLensDir()` against the CURRENT env (#2506).
- */
-export function _resetWordIndexLoggerForTests(): void {
-	writer._resetForTests();
 }

@@ -22,20 +22,6 @@ vi.mock("../../clients/ndjson-logger.js", () => ({
 		flush: vi.fn().mockResolvedValue(undefined),
 		flushSync: vi.fn(),
 	}),
-	// #2506: actionable-warnings-logger.ts now builds its writer via
-	// createLazyNdjsonLogger (deferred first-call construction, not a
-	// module-import-time freeze) — this mock must cover both factories or
-	// importing actionable-warnings-logger.js throws "No
-	// createLazyNdjsonLogger export" before any test body runs.
-	createLazyNdjsonLogger: (resolveOptions: () => { filePath: string }) => ({
-		log: writerLog,
-		append: vi.fn(),
-		truncate: vi.fn(),
-		flush: vi.fn().mockResolvedValue(undefined),
-		flushSync: vi.fn(),
-		getFilePath: () => resolveOptions().filePath,
-		_resetForTests: vi.fn(),
-	}),
 }));
 
 import { logActionableWarningsEvent } from "../../clients/actionable-warnings-logger.js";
