@@ -61,6 +61,18 @@
  * reads distinctly from #1944's "retired, unrecoverable" — a capped record
  * COULD still resolve a fresh dispatch; it just stopped being handed one for
  * free.
+ *
+ * Widget-footer sibling (#2275). The turn-end blocker channel above is not
+ * the only surface that demotes on dependency drift — `widget-state.ts`'s
+ * own `files` map carries the identical demotion shape
+ * (`markWidgetFileBlockersStale`) through a completely separate store, with
+ * its own `WidgetDiagnostic.staleDeliveryCount` and its own retire helpers
+ * (`incrementWidgetDependencyDriftDelivery`,
+ * `retireWidgetDependencyDriftBlockers`). It shares this module's
+ * `DEPENDENCY_DRIFT_MAX_DELIVERIES` cap and `isDependencyDriftDeliveryCapReached`
+ * decision rather than inventing a second number or a second comparison —
+ * only the storage (which map, which record shape) differs; the "has this
+ * been delivered enough times" question is asked in exactly one place.
  */
 import * as fs from "node:fs";
 import { normalizeEphemeralMapKey } from "./path-utils.js";
@@ -74,6 +86,23 @@ import { TreeSitterSymbolExtractor } from "./tree-sitter-symbol-extractor.js";
 
 /** See the module doc's "Delivery cap (#1950)" section above. */
 export const DEPENDENCY_DRIFT_MAX_DELIVERIES = 3;
+
+/**
+ * #2275: the shared retire DECISION for the dependency-drift delivery cap —
+ * "has this record been delivered enough times to retire" asked in exactly
+ * ONE place. #1950's inline-blocker cap and #2275's widget-footer cap are
+ * two independent stores (`RuntimeCoordinator`'s `_pendingInlineBlockers`
+ * vs. the widget store's `files` map) tracking two independent
+ * `staleDeliveryCount`s, but both retire against the SAME cap — this helper
+ * is the one seam both call sites (`runtime-turn.ts`) compare through,
+ * rather than two hand-written `>= DEPENDENCY_DRIFT_MAX_DELIVERIES`
+ * comparisons that could silently drift apart.
+ */
+export function isDependencyDriftDeliveryCapReached(
+	deliveryCount: number,
+): boolean {
+	return deliveryCount >= DEPENDENCY_DRIFT_MAX_DELIVERIES;
+}
 
 /**
  * Per-turn result of the freshness sweep over the cached inline blockers.

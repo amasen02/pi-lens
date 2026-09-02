@@ -94,7 +94,7 @@ import {
 	snapshotAdvisoryProvenance,
 } from "./advisory-provenance.js";
 import {
-	DEPENDENCY_DRIFT_MAX_DELIVERIES,
+	isDependencyDriftDeliveryCapReached,
 	sweepInlineBlockerFreshness,
 } from "./blocker-freshness.js";
 import { sweepInlineBlockerPastEof } from "./blocker-past-eof.js";
@@ -130,8 +130,11 @@ import { getActiveSessionId } from "./session-lifecycle.js";
 
 import {
 	getWidgetBlockingFilesForSweep,
+	getWidgetStaleDependencyDriftFilePaths,
+	incrementWidgetDependencyDriftDelivery,
 	markWidgetFileBlockersStale,
 	recordRunner,
+	retireWidgetDependencyDriftBlockers,
 } from "./widget-state.js";
 import type { TestRunnerFindingsCache } from "./project-diagnostics/runner-adapters/runner-findings.js";
 
@@ -637,6 +640,37 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	/** #1944/#1950: demotions retired after their delivery limit. */
 	let demotedFindingsRetired = 0;
 	/**
+	 * #2275: widget-footer sibling of #1950's inline-blocker cap, for the
+	 * widget store's OWN dependency-drift demotion
+	 * (`markWidgetFileBlockersStale`, driven by the sweep above) — a
+	 * completely separate store from `RuntimeCoordinator`'s inline-blocker
+	 * map, so it needed its own delivery count
+	 * (`WidgetDiagnostic.staleDeliveryCount`) rather than inheriting one.
+	 * Unlike the inline-blocker loop below, there is no
+	 * `turn-end-findings-last` signature dedupe over the footer to defer
+	 * against: the footer is not an agent-facing turn-end text delivery, it
+	 * just renders current state, so every turn end IS a delivery and the
+	 * count advances directly, once per turn, for every file the widget
+	 * store currently holds a stale dependency-drift diagnostic on —
+	 * including one the sweep above demoted for the first time THIS turn,
+	 * mirroring the inline-blocker loop's same-turn delivery-1 behavior.
+	 */
+	let widgetDemotedFindingsRetired = 0;
+	for (const wPath of getWidgetStaleDependencyDriftFilePaths()) {
+		const deliveryCount = incrementWidgetDependencyDriftDelivery(wPath);
+		if (isDependencyDriftDeliveryCapReached(deliveryCount)) {
+			const capRetired = retireWidgetDependencyDriftBlockers(wPath);
+			if (capRetired) {
+				widgetDemotedFindingsRetired += 1;
+				incrementDegradationCount({
+					kind: "demoted-finding-retired",
+					subject: `widget-blocker:${toRunnerDisplayPath(cwd, wPath)}`,
+					reason: `capped after ${deliveryCount} deliveries with no re-run; re-run can still confirm`,
+				});
+			}
+		}
+	}
+	/**
 	 * #1950 fix-round F1: dependency-drift delivery-count commits, deferred
 	 * until this turn's content is confirmed NOT suppressed by the
 	 * `turn-end-findings-last` signature dedupe further down. That dedupe
@@ -695,13 +729,13 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				// stored count.
 				const tentativeCount =
 					runtime.peekInlineBlockerStaleDeliveryCount(bPath) + 1;
-				if (tentativeCount >= DEPENDENCY_DRIFT_MAX_DELIVERIES) {
+				if (isDependencyDriftDeliveryCapReached(tentativeCount)) {
 					retirementNote = formatDeliveryCapNote(tentativeCount);
 				}
 				pendingDependencyDriftDeliveries.push(() => {
 					const deliveryCount =
 						runtime.incrementInlineBlockerStaleDelivery(bPath);
-					if (deliveryCount >= DEPENDENCY_DRIFT_MAX_DELIVERIES) {
+					if (isDependencyDriftDeliveryCapReached(deliveryCount)) {
 						const capRetired =
 							runtime.retireDemotedDependencyDriftBlocker(bPath);
 						if (capRetired) {
@@ -3026,6 +3060,11 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			// answers that from latency.log even when the payload is empty, and
 			// the payload itself carries the retirement note when it is not.
 			demotedFindingsRetired,
+			// #2275: the widget-footer store's own dependency-drift retirements —
+			// a separate surface/counter from `demotedFindingsRetired` above,
+			// since a widget retirement never touches `advisoryParts` or the
+			// `turn-end-findings-last` suppression cache the block below clears.
+			widgetDemotedFindingsRetired,
 		},
 	});
 	resetFormatService();

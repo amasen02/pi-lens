@@ -97,6 +97,20 @@ export interface WidgetDiagnostic {
 	/** Which freshness gate demoted this entry: "past-eof" (#1641) or
 	 * "dependency-drift" (#1631). Each gate heals only its own demotions. */
 	staleReason?: string;
+	/**
+	 * #2275: how many turn ends have re-served this diagnostic while
+	 * `stale && staleReason === "dependency-drift"`. Sibling of
+	 * `InlineBlockerRecord.staleDeliveryCount` (#1950) — same cap
+	 * (`DEPENDENCY_DRIFT_MAX_DELIVERIES`, `clients/blocker-freshness.ts`),
+	 * same "capped, re-run can still confirm" semantics, but tracked in THIS
+	 * completely separate store (the widget footer's own `files` map, not
+	 * `RuntimeCoordinator`'s inline-blocker map) because the two surfaces
+	 * demote independently — see `markWidgetFileBlockersStale`'s doc. Only
+	 * ever set for the `"dependency-drift"` reason; the widget's past-EOF
+	 * demotion re-derives per render (`applyPastEofGate`) rather than
+	 * latching, so it has no equivalent delivery count to cap.
+	 */
+	staleDeliveryCount?: number;
 }
 
 /**
@@ -306,7 +320,15 @@ function migrateEntryStamps(
 	recordTouchedAt: number,
 ): WidgetDiagnostic[] {
 	return (entries ?? []).map((d) => {
-		const { stale: _stale, ...rest } = d;
+		// #2275: strip staleDeliveryCount alongside stale — a delivery count
+		// without the demotion it counts is meaningless, and a resumed session
+		// re-evaluates dependency-drift from scratch (#1631 review F3) same as
+		// the `stale` bit itself.
+		const {
+			stale: _stale,
+			staleDeliveryCount: _staleDeliveryCount,
+			...rest
+		} = d;
 		return rest.observedAt == null
 			? { ...rest, observedAt: recordTouchedAt }
 			: rest;
@@ -1166,6 +1188,77 @@ export function markWidgetFileBlockersStale(
 		requestRenderFn?.();
 	}
 	return changed;
+}
+
+/**
+ * #2275: sibling of `RuntimeCoordinator`'s #1950 delivery-cap query, for the
+ * widget store's OWN dependency-drift demotion. Files with at least one
+ * CURRENTLY stale, `"dependency-drift"`-demoted diagnostic — the population
+ * `runtime-turn.ts`'s per-turn delivery-cap step walks each turn end.
+ *
+ * Deliberately NOT derived from `getWidgetBlockingFilesForSweep` — that
+ * function emits only NON-stale rows (the sweep's input population for
+ * detecting NEW drift this turn); this is the mirror query over rows
+ * ALREADY demoted, whose delivery count needs advancing toward the cap.
+ */
+export function getWidgetStaleDependencyDriftFilePaths(): string[] {
+	const out: string[] = [];
+	for (const rec of files.values()) {
+		if (
+			rec.allDiagnostics.some(
+				(d) => d.stale && d.staleReason === "dependency-drift",
+			)
+		) {
+			out.push(rec.filePath);
+		}
+	}
+	return out;
+}
+
+/**
+ * #2275: commit one more turn end that re-served `filePath`'s
+ * dependency-drift-demoted diagnostics. Every qualifying entry on the record
+ * advances together — `markWidgetFileBlockersStale` demotes them as one
+ * batch per file, so they share one delivery history, mirroring that
+ * write's own file-level scope. Returns the new count, or 0 when the file
+ * has no recorded entry (already retired, or never demoted).
+ */
+export function incrementWidgetDependencyDriftDelivery(
+	filePath: string,
+): number {
+	const rec = files.get(fileMapKey(filePath));
+	if (!rec) return 0;
+	let next = 0;
+	for (const d of rec.allDiagnostics) {
+		if (d.stale && d.staleReason === "dependency-drift") {
+			next = (d.staleDeliveryCount ?? 0) + 1;
+			d.staleDeliveryCount = next;
+		}
+	}
+	return next;
+}
+
+/**
+ * #2275: retire (drop, not just mark) every dependency-drift-demoted
+ * diagnostic on `filePath` once its delivery cap is reached. Unlike
+ * `RuntimeCoordinator.retireDemotedDependencyDriftBlocker`, which deletes a
+ * whole `_pendingInlineBlockers` record, a widget `FileRecord` can hold
+ * OTHER diagnostics too (a different tool's finding, a still-live blocker on
+ * the same file) that must survive the cap — only the entries this gate
+ * governs are removed. Returns true iff something changed.
+ */
+export function retireWidgetDependencyDriftBlockers(filePath: string): boolean {
+	const rec = files.get(fileMapKey(filePath));
+	if (!rec) return false;
+	const before = rec.allDiagnostics.length;
+	rec.allDiagnostics = rec.allDiagnostics.filter(
+		(d) => !(d.stale && d.staleReason === "dependency-drift"),
+	);
+	if (rec.allDiagnostics.length === before) return false;
+	rec.diagnostics = capStoredDiagnostics(rec.allDiagnostics);
+	rec.diagnosticCounts = countDiagnostics(rec.allDiagnostics);
+	requestRenderFn?.();
+	return true;
 }
 
 /**

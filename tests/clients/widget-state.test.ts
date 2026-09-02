@@ -12,8 +12,11 @@ import {
 	getFileDiagnostics,
 	getFileDiagnosticSummaries,
 	getSessionLanguages,
+	getWidgetStaleDependencyDriftFilePaths,
 	importWidgetState,
+	incrementWidgetDependencyDriftDelivery,
 	isBlocking,
+	markWidgetFileBlockersStale,
 	reconcileCascadeNeighborLspErrors,
 	reconcileCorrelatedScanDiagnostics,
 	reconcileScanDiagnostics,
@@ -22,6 +25,7 @@ import {
 	recordDiagnostics,
 	recordFormatter,
 	recordLsp,
+	retireWidgetDependencyDriftBlockers,
 	scheduleStaleReconcile,
 	STALE_RECONCILE_DEBOUNCE_MS,
 	recordRunner,
@@ -779,6 +783,29 @@ describe("widget-state renderWidget", () => {
 		}
 	});
 
+	// #2275: a delivery count without the demotion it counts is meaningless —
+	// same reasoning as `stale` itself not surviving a restore, one field over.
+	it("a dependency-drift delivery count does not survive a session restore", () => {
+		const filePath = `${process.cwd()}/restore-delivery-count.ts`;
+		recordDiagnostics(
+			filePath,
+			[{ severity: "error", semantic: "blocking", tool: "lsp" }],
+			1,
+		);
+		markWidgetFileBlockersStale(filePath, "dependency-drift");
+		expect(incrementWidgetDependencyDriftDelivery(filePath)).toBe(1);
+		expect(incrementWidgetDependencyDriftDelivery(filePath)).toBe(2);
+
+		const snapshot = exportWidgetState();
+		clearWidgetState();
+		expect(importWidgetState(snapshot)).toBe(true);
+
+		const restored = getFileDiagnostics(filePath) ?? [];
+		expect(restored).toHaveLength(1);
+		expect(restored[0]?.stale).toBeUndefined();
+		expect(restored[0]?.staleDeliveryCount).toBeUndefined();
+	});
+
 	// #1631 review F10: `isBlocking` answers false for a demoted finding by design
 	// (#1419 demote-not-drop) — but the footer's detail-line render loop used that
 	// SAME predicate to pick what to SHOW, so a demoted finding vanished from the
@@ -825,6 +852,100 @@ describe("widget-state renderWidget", () => {
 		} finally {
 			await fs.rm(tmpDir, { recursive: true, force: true });
 		}
+	});
+
+	// #2275: direct unit coverage for the widget store's own dependency-drift
+	// delivery-cap primitives, mirroring #1950's
+	// `runtime-coordinator-dependency-drift-cap.test.ts` — the same shape one
+	// store over.
+	describe("widget dependency-drift delivery-cap primitives (#2275)", () => {
+		it("getWidgetStaleDependencyDriftFilePaths only reports files with a CURRENTLY stale, dependency-drift-demoted diagnostic", () => {
+			const blockingPath = `${process.cwd()}/blocking.ts`;
+			const demotedPath = `${process.cwd()}/demoted.ts`;
+			recordDiagnostics(
+				blockingPath,
+				[{ severity: "error", semantic: "blocking", tool: "lsp" }],
+				1,
+			);
+			recordDiagnostics(
+				demotedPath,
+				[{ severity: "error", semantic: "blocking", tool: "lsp" }],
+				1,
+			);
+			expect(getWidgetStaleDependencyDriftFilePaths()).toEqual([]);
+
+			expect(markWidgetFileBlockersStale(demotedPath, "dependency-drift")).toBe(
+				true,
+			);
+			expect(getWidgetStaleDependencyDriftFilePaths()).toEqual([demotedPath]);
+		});
+
+		it("incrementWidgetDependencyDriftDelivery advances every qualifying entry on the file together, and returns 0 for a file with no demotion", () => {
+			const filePath = `${process.cwd()}/increment.ts`;
+			expect(incrementWidgetDependencyDriftDelivery(filePath)).toBe(0);
+
+			recordDiagnostics(
+				filePath,
+				[{ severity: "error", semantic: "blocking", tool: "lsp" }],
+				1,
+			);
+			// Not yet demoted — nothing to count against.
+			expect(incrementWidgetDependencyDriftDelivery(filePath)).toBe(0);
+
+			markWidgetFileBlockersStale(filePath, "dependency-drift");
+			expect(incrementWidgetDependencyDriftDelivery(filePath)).toBe(1);
+			expect(incrementWidgetDependencyDriftDelivery(filePath)).toBe(2);
+			const stored = getFileDiagnostics(filePath) ?? [];
+			expect(stored[0]?.staleDeliveryCount).toBe(2);
+		});
+
+		it("retireWidgetDependencyDriftBlockers drops only the dependency-drift-demoted entries, leaving an unrelated finding on the same file untouched", () => {
+			const filePath = `${process.cwd()}/mixed-retire.ts`;
+			recordDiagnostics(
+				filePath,
+				[
+					{
+						severity: "error",
+						semantic: "blocking",
+						message: "drift finding",
+						tool: "lsp",
+						line: 1,
+					},
+					// A non-blocking warning on the SAME file: `markWidgetFileBlockersStale`
+					// never touches it (not blocking), so it must survive the drift
+					// cap's retirement — the cap governs only ITS OWN demoted entries,
+					// not the whole record.
+					{
+						severity: "warning",
+						semantic: "warning",
+						message: "unrelated warning",
+						tool: "lsp",
+						line: 2,
+					},
+				],
+				1,
+			);
+			expect(markWidgetFileBlockersStale(filePath, "dependency-drift")).toBe(
+				true,
+			);
+
+			expect(retireWidgetDependencyDriftBlockers(filePath)).toBe(true);
+			const remaining = getFileDiagnostics(filePath) ?? [];
+			expect(remaining).toHaveLength(1);
+			expect(remaining[0]?.message).toBe("unrelated warning");
+			expect(remaining[0]?.stale).toBeFalsy();
+
+			// A second call has nothing left of ITS kind to retire.
+			expect(retireWidgetDependencyDriftBlockers(filePath)).toBe(false);
+		});
+
+		it("retireWidgetDependencyDriftBlockers refuses a file with no record", () => {
+			expect(
+				retireWidgetDependencyDriftBlockers(
+					`${process.cwd()}/never-recorded.ts`,
+				),
+			).toBe(false);
+		});
 	});
 
 	it("clears a formatter failure after a subsequent success", () => {
