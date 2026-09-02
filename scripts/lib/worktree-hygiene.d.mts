@@ -202,7 +202,10 @@ export function formatScanRecord(input: {
 		| "self-missing"
 		| "chain-incomplete";
 	budgetMs: number;
+	/** What was left of the SWEEP budget when the degradation was recorded. */
 	remainingMs?: number;
+	/** The bound the listing was actually given, `min(ceiling, remaining)`. */
+	ceilingMs?: number;
 	rows?: number;
 	nowIso?: string;
 }): string;
@@ -219,6 +222,8 @@ export function formatRunRecord(input: {
 	outcome: "fired" | "skipped";
 	reason?: string | null;
 	worktree?: string | null;
+	/** Why the run's single scoped tree is still on disk; null if removed. */
+	keptReason?: string | null;
 	removed?: number;
 	orphans?: number;
 	rows?: number;

@@ -23,6 +23,7 @@ import {
 	collectAncestorPids,
 	enclosingAgentWorktree,
 	formatKillRecord,
+	formatRunRecord,
 	formatScanRecord,
 	formatWorktreeRecord,
 	isAgentBranchCandidate,
@@ -713,6 +714,61 @@ describe("bounded ledger records", () => {
 			remainingMs: 0,
 			rows: 0,
 		});
+	});
+
+	it("keeps the listing ceiling and the remaining budget apart", () => {
+		// PR #2493 review round 2, T3. `remainingMs` used to carry the CEILING
+		// on a skipped scan, so the record said the sweep had 1ms of budget
+		// left when it had thousands — the reading #2486's investigation
+		// needed and could not do. They are two facts and two fields now.
+		const record = JSON.parse(
+			formatScanRecord({
+				reason: "skipped",
+				budgetMs: 5000,
+				remainingMs: 4400,
+				ceilingMs: 1,
+				rows: 0,
+			}),
+		);
+		expect(record).toMatchObject({ remainingMs: 4400, ceilingMs: 1 });
+		// An omitted ceiling is null, never a silent 0 that reads as "no
+		// ceiling was given".
+		expect(
+			JSON.parse(formatScanRecord({ reason: "empty", budgetMs: 5000 })),
+		).toMatchObject({ remainingMs: null, ceilingMs: null });
+	});
+
+	it("names the rail that kept a scoped run's tree", () => {
+		// The other half of the same absence (review round 2, S2): `fired,
+		// removed: 0` cannot tell a protected dirty tree from a hook that
+		// reaped nothing for no stated reason.
+		expect(
+			JSON.parse(
+				formatRunRecord({
+					hook: "subagent-stop",
+					outcome: "fired",
+					worktree: "/repo/.claude/worktrees/agent-a1",
+					keptReason: "dirty",
+					removed: 0,
+				}),
+			),
+		).toMatchObject({
+			event: "hygiene.run",
+			outcome: "fired",
+			removed: 0,
+			keptReason: "dirty",
+		});
+		// A run that removed its tree carries no reason, spelled null rather
+		// than absent so every hygiene.run line has the same shape.
+		expect(
+			JSON.parse(
+				formatRunRecord({
+					hook: "subagent-stop",
+					outcome: "fired",
+					removed: 1,
+				}),
+			),
+		).toMatchObject({ removed: 1, keptReason: null });
 	});
 
 	it("keeps only the newest maxLines records", () => {

@@ -1024,19 +1024,26 @@ export function formatWorktreeRecord(input) {
  * spawned), `self-missing` and `chain-incomplete` (the listing came back
  * TRUNCATED, so absence cannot be read as death -- review S5).
  *
- * @param {{ reason: "skipped"|"empty"|"listing-failed"|"self-missing"|"chain-incomplete", budgetMs: number, remainingMs?: number, rows?: number, nowIso?: string }} input
+ * `remainingMs` and `ceilingMs` are DIFFERENT facts and were conflated until
+ * PR #2493's second review round (T3): `remainingMs` is what was left of the
+ * sweep budget when the degradation was recorded, `ceilingMs` is the bound the
+ * listing was actually given (`min(--scan-timeout-ms, remaining)`). Writing the
+ * ceiling into `remainingMs` made a skipped scan report a budget it never had,
+ * which is precisely the reading #2486's investigation needed and could not do.
+ *
+ * @param {{ reason: "skipped"|"empty"|"listing-failed"|"self-missing"|"chain-incomplete", budgetMs: number, remainingMs?: number, ceilingMs?: number, rows?: number, nowIso?: string }} input
  * @returns {string}
  */
 export function formatScanRecord(input) {
+	const optional = (value) =>
+		value === undefined ? null : Math.round(Number(value) || 0);
 	return JSON.stringify({
 		ts: input.nowIso ?? new Date().toISOString(),
 		event: "hygiene.scan-degraded",
 		reason: input.reason,
 		budgetMs: Math.round(Number(input.budgetMs) || 0),
-		remainingMs:
-			input.remainingMs === undefined
-				? null
-				: Math.round(Number(input.remainingMs) || 0),
+		remainingMs: optional(input.remainingMs),
+		ceilingMs: optional(input.ceilingMs),
 		rows: Math.round(Number(input.rows) || 0),
 	});
 }
@@ -1074,7 +1081,15 @@ export const RUN_SKIP_REASONS = Object.freeze({
  * ledger. Defect shape 10 — an absence that cannot distinguish clean from
  * unavailable.
  *
- * @param {{ hook?: string|null, outcome: "fired"|"skipped", reason?: string|null, worktree?: string|null, removed?: number, orphans?: number, rows?: number, dryRun?: boolean, budgetMs?: number, durationMs?: number, nowIso?: string }} input
+ * `keptReason` closes the other half (PR #2493 review round 2, S2). A hook that
+ * FIRED, identified its tree and then refused it — because the tree is dirty,
+ * or its HEAD is in no `origin/*` ref — is indistinguishable in the ledger from
+ * a hook that fired and had nothing to reap: both read `fired, removed: 0`. It
+ * carries the `planWorktreePrune` keep reason for the ONE tree the run was
+ * scoped to, and is null for a run that removed that tree or was scoped to no
+ * single tree at all.
+ *
+ * @param {{ hook?: string|null, outcome: "fired"|"skipped", reason?: string|null, worktree?: string|null, keptReason?: string|null, removed?: number, orphans?: number, rows?: number, dryRun?: boolean, budgetMs?: number, durationMs?: number, nowIso?: string }} input
  * @returns {string}
  */
 export function formatRunRecord(input) {
@@ -1088,6 +1103,7 @@ export function formatRunRecord(input) {
 		worktree: input.worktree
 			? String(input.worktree).slice(0, MAX_RECORDED_COMMAND_CHARS)
 			: null,
+		keptReason: input.keptReason ?? null,
 		removed: count(input.removed),
 		orphans: count(input.orphans),
 		rows: count(input.rows),

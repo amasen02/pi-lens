@@ -20,13 +20,19 @@ import {
 	DEFAULT_HOOK_BUDGET_MS,
 	DEFAULT_MANUAL_BUDGET_MS,
 	DEFAULT_SCAN_TIMEOUT_MS,
+	HOOK_POLICIES,
+	HOOK_REMOVE_RESERVE_MS,
 	HOOK_TIMEOUT_MARGIN_MS,
 	HOOK_TIMEOUT_MS,
+	MIN_SCAN_BUDGET_MS,
 	REMOVE_TIMEOUT_MS,
 	getHygieneLogPath,
 	hookBudgetMs,
+	keptReasonFor,
 	parseArgs,
+	removeBoundMs,
 	resolveHookPolicy,
+	scanReserveMs,
 	worktreeActivityMs,
 	worktreePathFromHookPayload,
 } from "../../scripts/prune-agent-worktrees.mjs";
@@ -46,7 +52,18 @@ describe("parseArgs", () => {
 			scanTimeoutMs: null,
 			only: null,
 			hook: null,
+			keepAgentTree: false,
 			orphanSweep: true,
+			errors: [],
+		});
+	});
+
+	it("parses --keep-agent-tree, the SubagentStop reap opt-out", () => {
+		// The registered hook reaps the stopped agent's tree; an operator who
+		// resumes agents by SendMessage turns that off with this flag (or the
+		// PILENS_HYGIENE_KEEP_AGENT_TREES env spelling, folded in by main()).
+		expect(parseArgs(["--keep-agent-tree"])).toMatchObject({
+			keepAgentTree: true,
 			errors: [],
 		});
 	});
@@ -207,35 +224,59 @@ describe("getHygieneLogPath", () => {
 // ---------------------------------------------------------------------------
 
 describe("resolveHookPolicy (review S1/S8)", () => {
-	it("never removes a worktree on SubagentStop", () => {
-		// Resume-by-SendMessage happens AFTER SubagentStop, and
-		// .claude/skills/merge-train/SKILL.md keeps fixer worktrees until the
-		// PR merges. So the subagent-stop hook only reaps that agent's own
-		// dead-parent fixture helpers; removal is the session-start sweep's job.
+	it("reaps the stopped agent's own tree on SubagentStop (#2486)", () => {
+		// Maintainer decision, 2026-09-02, reversing PR #2438's review S1. S1
+		// forbade removal here because resume-by-SendMessage lands after the
+		// hook fires; the cost was #2486 — the REGISTERED line passes no
+		// --only, so it removed nothing, only SessionStart's one-tree cap
+		// drained anything, and ten trees accumulated in an afternoon.
 		expect(resolveHookPolicy("subagent-stop")).toMatchObject({
+			removeWorktrees: true,
+			deleteBranches: true,
+			orphanSweep: true,
+			// Still scoped: the tree comes from the payload's agent_id, and
+			// the orphan sweep never reaches a sibling agent's helpers.
+			scopedToAgentTree: true,
+			// One payload names one tree.
+			maxRemovals: 1,
+			budgetSource: "hook",
+		});
+	});
+
+	it("honors the --keep-agent-tree opt-out without widening anything else", () => {
+		// The trade-off the opt-out exists for: an agent resumed by
+		// SendMessage after its tree was reaped must recreate the checkout.
+		const kept = resolveHookPolicy("subagent-stop", { keepAgentTree: true });
+		expect(kept).toMatchObject({
 			removeWorktrees: false,
 			deleteBranches: false,
+			// The orphan-fixture sweep under that agent's tree still runs.
 			orphanSweep: true,
 			scopedToAgentTree: true,
 			maxRemovals: 0,
 		});
+		// ...and it is only ever consulted for this event.
+		expect(resolveHookPolicy("session-start", { keepAgentTree: true })).toBe(
+			resolveHookPolicy("session-start"),
+		);
+		expect(resolveHookPolicy(null, { keepAgentTree: true })).toBe(
+			HOOK_POLICIES.manual,
+		);
 	});
 
-	it("removes the trees a SubagentStop run explicitly names (#2486)", () => {
-		// The bare hook still removes nothing (above) — the settings.json line
-		// passes no --only. But #2486 found `--only` SILENTLY DROPPED here:
-		// the run printed "worktrees are never removed here" and exited 0, so
-		// ten finished agents' trees had to be cleared by hand. Naming a tree
-		// is an explicit act; the dirty/unpushed rails still apply.
-		const policy = resolveHookPolicy("subagent-stop", { only: ["/a", "/b"] });
-		expect(policy).toMatchObject({
-			removeWorktrees: true,
-			deleteBranches: true,
-			orphanSweep: true,
-			scopedToAgentTree: false,
-			maxRemovals: Number.POSITIVE_INFINITY,
-		});
-		// An empty or absent --only is NOT "named a tree".
+	it("treats `--hook subagent-stop --only` as exactly the manual policy", () => {
+		// PR #2493 review round 2, T1. This form used to be its own
+		// `subagent-stop-only` table entry whose six fields were identical to
+		// `manual` — a hand-maintained mirror of another value, which is the
+		// duplication this repo's single-source-of-truth rule exists to stop.
+		// It is a caller at a terminal naming trees by hand: it IS a manual
+		// run, and now returns the very same frozen object.
+		expect(resolveHookPolicy("subagent-stop", { only: ["/a", "/b"] })).toBe(
+			HOOK_POLICIES.manual,
+		);
+		expect(HOOK_POLICIES["subagent-stop-only"]).toBeUndefined();
+		// An empty or absent --only is NOT "named a tree", so it stays the
+		// reaping hook policy.
 		expect(resolveHookPolicy("subagent-stop", { only: [] })).toBe(
 			resolveHookPolicy("subagent-stop"),
 		);
@@ -317,12 +358,28 @@ describe(".claude/settings.json hook registration (review S8/S9)", () => {
 		}
 	});
 
-	it("keeps SubagentStop short, because it never removes a tree", () => {
-		const timeoutS = settings.hooks.SubagentStop[0].hooks[0].timeout;
-		expect(timeoutS).toBeLessThanOrEqual(15);
-		expect(settings.hooks.SubagentStop[0].hooks[0].command).toContain(
-			"--hook subagent-stop",
-		);
+	it("registers the SubagentStop line that actually reaps (#2486)", () => {
+		// The whole of #2486 is that the REGISTERED line removed nothing: the
+		// only removing form was `--only`, which no caller passed. So this
+		// asserts the argv itself — what it must carry, and what it must NOT.
+		const entry = settings.hooks.SubagentStop[0].hooks[0];
+		const command = String(entry.command);
+		expect(command).toContain("scripts/prune-agent-worktrees.mjs");
+		expect(command).toContain("--hook subagent-stop");
+		expect(command).toContain("--quiet");
+		// If the registered line ever needs `--only` to remove anything, the
+		// reap is back to being unreachable from the hook — which is the bug.
+		expect(command).not.toContain("--only");
+		// ...and it must not ship with the operator opt-out baked in.
+		expect(command).not.toContain("--keep-agent-tree");
+		// The reap has to FIT: budget + one bounded removal + margin.
+		const policy = resolveHookPolicy("subagent-stop");
+		expect(policy.removeWorktrees).toBe(true);
+		expect(
+			hookBudgetMs("subagent-stop", policy) +
+				removeBoundMs("subagent-stop", policy) +
+				HOOK_TIMEOUT_MARGIN_MS,
+		).toBeLessThanOrEqual(entry.timeout * 1000);
 	});
 });
 
@@ -540,22 +597,85 @@ describe("hookBudgetMs (#2486)", () => {
 				REMOVE_TIMEOUT_MS -
 				HOOK_TIMEOUT_MARGIN_MS,
 		);
-		// A hook that removes must still fit its own removal inside the hook
-		// timeout: budget + one bounded removal + margin <= timeout.
-		expect(
-			hookBudgetMs("session-start", sessionStart) +
-				REMOVE_TIMEOUT_MS +
-				HOOK_TIMEOUT_MARGIN_MS,
-		).toBeLessThanOrEqual(HOOK_TIMEOUT_MS["session-start"]);
-
 		const subagentStop = resolveHookPolicy("subagent-stop");
 		expect(hookBudgetMs("subagent-stop", subagentStop)).toBe(
-			HOOK_TIMEOUT_MS["subagent-stop"] - HOOK_TIMEOUT_MARGIN_MS,
+			HOOK_TIMEOUT_MS["subagent-stop"] -
+				HOOK_REMOVE_RESERVE_MS["subagent-stop"] -
+				HOOK_TIMEOUT_MARGIN_MS,
 		);
-		// ...and it must leave room for the listing it is there to run.
-		expect(hookBudgetMs("subagent-stop", subagentStop)).toBeGreaterThan(
-			DEFAULT_SCAN_TIMEOUT_MS,
+
+		// THE invariant, for every hook that can remove: the sweep budget, the
+		// bound put on the one removal it may start, and the margin together
+		// fit inside the timeout Claude Code will kill it at. It is only an
+		// invariant because `removeBoundMs` is the SAME number the removal is
+		// actually given — a reserve that no `git()` call honors is a claim,
+		// not a bound.
+		for (const hook of ["subagent-stop", "session-start"] as const) {
+			const policy = resolveHookPolicy(hook);
+			expect(policy.removeWorktrees).toBe(true);
+			expect(
+				hookBudgetMs(hook, policy) +
+					removeBoundMs(hook, policy) +
+					HOOK_TIMEOUT_MARGIN_MS,
+			).toBeLessThanOrEqual(HOOK_TIMEOUT_MS[hook]);
+			// ...and the budget must not be the 2s FLOOR, which is what a 60s
+			// removal reserve against a 15s timeout collapses to.
+			expect(hookBudgetMs(hook, policy)).toBeGreaterThan(
+				DEFAULT_HOOK_BUDGET_MS,
+			);
+		}
+	});
+
+	it("bounds a removal by the reserve its own hook budget subtracted", () => {
+		// Measured on this box 2026-09-02: `git worktree remove --force
+		// --force` over a 4000-file worktree cost min 956ms / median 1049ms /
+		// max 1171ms across 5 runs (300-file tree: 146/181/755ms). Reserving
+		// the comfortable 60s inside a 15s hook timeout is arithmetically
+		// impossible; reserving 5s is ~4.8x the measured median.
+		expect(HOOK_REMOVE_RESERVE_MS["subagent-stop"]).toBeGreaterThanOrEqual(
+			4_000,
 		);
+		expect(HOOK_REMOVE_RESERVE_MS["session-start"]).toBe(REMOVE_TIMEOUT_MS);
+		expect(
+			removeBoundMs("subagent-stop", resolveHookPolicy("subagent-stop")),
+		).toBe(HOOK_REMOVE_RESERVE_MS["subagent-stop"]);
+		// A mode that cannot remove reserves nothing...
+		expect(
+			removeBoundMs(
+				"subagent-stop",
+				resolveHookPolicy("subagent-stop", { keepAgentTree: true }),
+			),
+		).toBe(0);
+		// ...and a manual run, which no hook timeout kills, keeps the generous
+		// bound: SIGKILLing git mid-delete leaves a half-removed tree.
+		expect(removeBoundMs("subagent-stop", resolveHookPolicy(null))).toBe(
+			REMOVE_TIMEOUT_MS,
+		);
+	});
+
+	it("never lets the listing reserve starve the enrichment (#2486)", () => {
+		// The enrichment runs FIRST and decides whether a tree is removable at
+		// all; the listing only decides what gets killed. Reserving the whole
+		// 4s ceiling out of SubagentStop's 5s budget left enrichment 1s, and
+		// every `git` call then drops to its 250ms floor — which `isDirty`
+		// reads as "unreadable => dirty" and keeps the very tree the hook
+		// fired to reap.
+		expect(scanReserveMs(5_000, 4_000)).toBe(2_500);
+		// Where there is room, the ceiling is the reserve unchanged.
+		expect(scanReserveMs(25_000, 4_000)).toBe(4_000);
+		expect(scanReserveMs(60_000, 4_000)).toBe(4_000);
+		// Degenerate inputs stay non-negative rather than producing a deadline
+		// in the future of the budget.
+		expect(scanReserveMs(0, 4_000)).toBe(0);
+		expect(scanReserveMs(5_000, -1)).toBe(0);
+		// On every registered hook the reserve is still enough for a listing
+		// to be attempted at all rather than skipped outright.
+		for (const hook of ["subagent-stop", "session-start"] as const) {
+			const budget = hookBudgetMs(hook, resolveHookPolicy(hook));
+			const reserve = scanReserveMs(budget, DEFAULT_SCAN_TIMEOUT_MS);
+			expect(reserve).toBeGreaterThanOrEqual(MIN_SCAN_BUDGET_MS);
+			expect(reserve).toBeLessThanOrEqual(budget / 2);
+		}
 	});
 
 	it("gives an --only run the manual budget, not a floored hook budget", () => {
@@ -585,16 +705,89 @@ describe("hookBudgetMs (#2486)", () => {
 	});
 });
 
+describe("keptReasonFor (#2486 / PR #2493 review round 2, S2)", () => {
+	const policy = resolveHookPolicy("subagent-stop");
+	const target = path.resolve("/repo/.claude/worktrees/agent-a1");
+
+	it("names the rail that refused the run's one tree", () => {
+		// `fired, removed: 0` alone cannot tell "the tree was dirty, so work
+		// was protected" from "the hook reaped nothing and nobody knows why".
+		for (const reason of ["dirty", "unpushed", "self", "locked-live"]) {
+			expect(
+				keptReasonFor({
+					targetPath: target,
+					plan: { keep: [{ path: target, reason }] },
+					deferred: [],
+					policy,
+				}),
+			).toBe(reason);
+		}
+		// Path form must not matter: the hook derives a native path, git
+		// reports forward slashes.
+		expect(
+			keptReasonFor({
+				targetPath: target,
+				plan: {
+					keep: [{ path: target.replace(/\\/g, "/"), reason: "dirty" }],
+				},
+				deferred: [],
+				policy,
+			}),
+		).toBe("dirty");
+	});
+
+	it("is null when the tree was removed, or when no single tree was in scope", () => {
+		expect(
+			keptReasonFor({
+				targetPath: target,
+				plan: { keep: [] },
+				deferred: [],
+				policy,
+			}),
+		).toBeNull();
+		expect(
+			keptReasonFor({
+				targetPath: null,
+				plan: { keep: [{ path: target, reason: "dirty" }] },
+				deferred: [],
+				policy,
+			}),
+		).toBeNull();
+	});
+
+	it("distinguishes the opt-out from a per-run removal cap", () => {
+		const deferred = [{ path: target }];
+		expect(
+			keptReasonFor({
+				targetPath: target,
+				plan: { keep: [] },
+				deferred,
+				policy,
+			}),
+		).toBe("deferred");
+		expect(
+			keptReasonFor({
+				targetPath: target,
+				plan: { keep: [] },
+				deferred,
+				policy: resolveHookPolicy("subagent-stop", { keepAgentTree: true }),
+			}),
+		).toBe("removal-not-permitted");
+	});
+});
+
 /**
  * #2486 end to end: the hook, its payload, the rails and the ledger, driven
  * through the REAL CLI against a throwaway repo.
  *
- * These have to be end-to-end. The bug was not in any pure seam — every one
- * of them was already right (`planWorktreePrune` has always honoured `--only`
- * over the age and lock rails). It was in the wiring: `main()` short-circuited
- * to the scoped orphan sweep before `--only` was ever consulted, and returned
- * without writing a ledger line at all when it could not derive a tree. Only a
- * run of the whole program can catch that shape.
+ * These have to be end-to-end, and they have to drive the REGISTERED argv. The
+ * bug was not in any pure seam — every one of them was already right
+ * (`planWorktreePrune` has always honoured a named tree over the age and lock
+ * rails). It was in the wiring: `main()` short-circuited to a scoped orphan
+ * sweep that had no removal step in it, and returned without writing a ledger
+ * line at all when it could not derive a tree. A policy test proves the table
+ * says "remove"; only a run of the whole program with the argv Claude Code
+ * actually issues proves the wiring reaches it.
  *
  * The sandbox carries its own copy of the sweep under `<repo>/scripts/`,
  * because the script derives REPO_ROOT from its own location: run from the
@@ -656,6 +849,30 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 		fs.rmSync(root, { recursive: true, force: true });
 	});
 
+	/**
+	 * The argv the SubagentStop hook is REGISTERED with, read out of the
+	 * tracked `.claude/settings.json` rather than retyped here. #2486 was
+	 * entirely a gap between "a form of this CLI removes trees" and "the form
+	 * Claude Code actually runs removes trees", so every reap assertion below
+	 * drives this exact list.
+	 */
+	function registeredArgv(): string[] {
+		const settings = JSON.parse(
+			fs.readFileSync(
+				path.resolve(__dirname, "../../.claude/settings.json"),
+				"utf8",
+			),
+		);
+		const tokens = String(settings.hooks.SubagentStop[0].hooks[0].command)
+			.trim()
+			.split(/\s+/);
+		const scriptAt = tokens.findIndex((token) =>
+			token.endsWith("prune-agent-worktrees.mjs"),
+		);
+		expect(scriptAt).toBeGreaterThanOrEqual(0);
+		return tokens.slice(scriptAt + 1);
+	}
+
 	/** The payload Claude Code actually sends (schema read from the shipped binary). */
 	function subagentStopPayload(agentId: string | null): string {
 		return JSON.stringify({
@@ -707,46 +924,13 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 		records.map((record) => record.event);
 
 	it(
-		"removes the named tree even when the process scan is degraded",
+		"still removes the trees --only names, on the manual policy",
 		{ timeout: 90_000 },
 		() => {
-			// THE #2486 regression. `--scan-timeout-ms 1` drives the real
-			// `skipped` branch of readProcessTable: listingOk false, an empty
-			// table, and a scan-degraded ledger record — the same downstream
-			// state a `listing-failed` timeout produces. The removal must still
-			// happen, and both facts must be on the record.
-			runCli(
-				[
-					"--hook",
-					"subagent-stop",
-					"--only",
-					worktree,
-					"--scan-timeout-ms",
-					"1",
-				],
-				subagentStopPayload(AGENT_ID),
-			);
-
-			expect(fs.existsSync(worktree)).toBe(false);
-			const records = ledgerRecords();
-			expect(eventsOf(records)).toContain("hygiene.scan-degraded");
-			expect(
-				records.find((record) => record.event === "hygiene.worktree-removed"),
-			).toMatchObject({ removed: true });
-			expect(
-				records.find((record) => record.event === "hygiene.run"),
-			).toMatchObject({ hook: "subagent-stop", outcome: "fired", removed: 1 });
-		},
-	);
-
-	it(
-		"removes the named tree on a healthy scan too",
-		{ timeout: 90_000 },
-		() => {
-			// The control for the case above: with the listing working, the
-			// same invocation removes the same tree and records NO degradation.
-			// Without it, "removes while degraded" could pass on a build that
-			// never scanned at all.
+			// The manual form kept for a caller at a terminal. It is now
+			// field-for-field the `manual` policy (review round 2, T1), so this
+			// is the e2e half of that: `--only` still reaches removal, with a
+			// working listing and no degradation on the record.
 			runCli(
 				["--hook", "subagent-stop", "--only", worktree],
 				subagentStopPayload(AGENT_ID),
@@ -764,7 +948,7 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 	);
 
 	it.skipIf(process.platform !== "win32")(
-		"removes the named tree when the listing itself fails (#2486's own reason)",
+		"reaps under the registered argv when the listing itself fails (#2486's own reason)",
 		{ timeout: 90_000 },
 		() => {
 			// The exact reason string from the reported hygiene.log, driven by
@@ -777,14 +961,7 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 			// `skipped` branch instead (both yield listingOk=false and an
 			// empty table; only the reason string differs).
 			runCli(
-				[
-					"--hook",
-					"subagent-stop",
-					"--only",
-					worktree,
-					"--scan-timeout-ms",
-					"400",
-				],
+				[...registeredArgv(), "--scan-timeout-ms", "400"],
 				subagentStopPayload(AGENT_ID),
 			);
 
@@ -792,7 +969,7 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 			const records = ledgerRecords();
 			expect(
 				records.find((record) => record.event === "hygiene.scan-degraded"),
-			).toMatchObject({ reason: "listing-failed" });
+			).toMatchObject({ reason: "listing-failed", ceilingMs: 400 });
 			expect(
 				records.find((record) => record.event === "hygiene.worktree-removed"),
 			).toMatchObject({ removed: true });
@@ -800,65 +977,16 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 	);
 
 	it(
-		"still refuses a dirty tree that --only names",
+		"still refuses a dirty tree, and the ledger says which rail refused it",
 		{ timeout: 90_000 },
 		() => {
-			// The rail --only never overrides. #2435's contract, unchanged.
+			// The rail nothing overrides. #2435's contract, unchanged — and
+			// now VISIBLE (review round 2, S2): a hook that fired, found its
+			// tree and protected uncommitted work used to be indistinguishable
+			// in the ledger from one that fired and reaped nothing.
 			fs.writeFileSync(path.join(worktree, "wip.txt"), "uncommitted\n");
 			runCli(
-				[
-					"--hook",
-					"subagent-stop",
-					"--only",
-					worktree,
-					"--scan-timeout-ms",
-					"1",
-				],
-				subagentStopPayload(AGENT_ID),
-			);
-
-			expect(fs.existsSync(worktree)).toBe(true);
-			expect(
-				ledgerRecords().find((record) => record.event === "hygiene.run"),
-			).toMatchObject({ outcome: "fired", removed: 0 });
-		},
-	);
-
-	it(
-		"still refuses an unpushed tree that --only names",
-		{ timeout: 90_000 },
-		() => {
-			fs.writeFileSync(path.join(worktree, "b.txt"), "local only\n");
-			git(["add", "b.txt"], worktree);
-			git(["commit", "-qm", "local"], worktree);
-			runCli(
-				[
-					"--hook",
-					"subagent-stop",
-					"--only",
-					worktree,
-					"--scan-timeout-ms",
-					"1",
-				],
-				subagentStopPayload(AGENT_ID),
-			);
-
-			expect(fs.existsSync(worktree)).toBe(true);
-			expect(
-				ledgerRecords().find((record) => record.event === "hygiene.run"),
-			).toMatchObject({ removed: 0 });
-		},
-	);
-
-	it(
-		"removes nothing when the hook fires without --only (review S1)",
-		{ timeout: 90_000 },
-		() => {
-			// Resume-by-SendMessage happens after SubagentStop, so the
-			// registered hook line — which passes no --only — must keep the
-			// tree. It still leaves a record saying it ran.
-			runCli(
-				["--hook", "subagent-stop", "--scan-timeout-ms", "1", "--quiet"],
+				[...registeredArgv(), "--scan-timeout-ms", "1"],
 				subagentStopPayload(AGENT_ID),
 			);
 
@@ -870,7 +998,184 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 				outcome: "fired",
 				removed: 0,
 				worktree,
+				keptReason: "dirty",
 			});
+			// The branch survives too, so the resumed agent loses nothing.
+			expect(git(["branch", "--list", "pr-9001"], repo)).toContain("pr-9001");
+		},
+	);
+
+	it(
+		"still refuses an unpushed tree, and the ledger says so",
+		{ timeout: 90_000 },
+		() => {
+			fs.writeFileSync(path.join(worktree, "b.txt"), "local only\n");
+			git(["add", "b.txt"], worktree);
+			git(["commit", "-qm", "local"], worktree);
+			runCli(
+				[...registeredArgv(), "--scan-timeout-ms", "1"],
+				subagentStopPayload(AGENT_ID),
+			);
+
+			expect(fs.existsSync(worktree)).toBe(true);
+			expect(
+				ledgerRecords().find((record) => record.event === "hygiene.run"),
+			).toMatchObject({ removed: 0, keptReason: "unpushed" });
+		},
+	);
+
+	it(
+		"reaps the stopped agent's tree through the REGISTERED argv (#2486)",
+		{ timeout: 90_000 },
+		() => {
+			// THE headline. `node scripts/prune-agent-worktrees.mjs --hook
+			// subagent-stop --quiet` — the literal registered line, no --only —
+			// derives the tree from agent_id and removes it. Before this the
+			// same argv printed "worktrees are never removed here" and exited 0,
+			// so only SessionStart's one-tree-per-run cap drained anything and
+			// N stale trees needed N sessions.
+			expect(registeredArgv()).not.toContain("--only");
+			runCli(registeredArgv(), subagentStopPayload(AGENT_ID));
+
+			expect(fs.existsSync(worktree)).toBe(false);
+			const records = ledgerRecords();
+			expect(
+				records.find((record) => record.event === "hygiene.worktree-removed"),
+			).toMatchObject({ removed: true });
+			const runs = records.filter((record) => record.event === "hygiene.run");
+			// Exactly one hygiene.run line per invocation, still.
+			expect(runs).toHaveLength(1);
+			expect(runs[0]).toMatchObject({
+				hook: "subagent-stop",
+				outcome: "fired",
+				removed: 1,
+				worktree,
+				keptReason: null,
+			});
+			// The listing really ran, so the reap is not riding on a scan that
+			// never happened.
+			expect(Number(runs[0]?.rows ?? 0)).toBeGreaterThan(0);
+			// The branch the removal orphaned is gone too; nothing committed is
+			// lost, because it was contained in origin/* before the rails let
+			// the tree go at all.
+			expect(git(["branch", "--list", "pr-9001"], repo).trim()).toBe("");
+		},
+	);
+
+	it(
+		"leaves the tree alone under --keep-agent-tree, and says so",
+		{ timeout: 90_000 },
+		() => {
+			// The documented opt-out for operators who resume agents by
+			// SendMessage. The scoped orphan sweep still runs; only the removal
+			// is off, and the ledger says which of the two it was.
+			runCli(
+				[...registeredArgv(), "--keep-agent-tree"],
+				subagentStopPayload(AGENT_ID),
+			);
+
+			expect(fs.existsSync(worktree)).toBe(true);
+			expect(
+				ledgerRecords().find((record) => record.event === "hygiene.run"),
+			).toMatchObject({
+				hook: "subagent-stop",
+				outcome: "fired",
+				removed: 0,
+				worktree,
+				keptReason: "removal-not-permitted",
+			});
+		},
+	);
+
+	it(
+		"honors PILENS_HYGIENE_KEEP_AGENT_TREES on the unchanged registered argv",
+		{ timeout: 90_000 },
+		() => {
+			// An operator cannot always edit the registered hook line, so the
+			// opt-out has an environment spelling that reaches the same policy.
+			runCli(registeredArgv(), subagentStopPayload(AGENT_ID), {
+				PILENS_HYGIENE_KEEP_AGENT_TREES: "1",
+			});
+
+			expect(fs.existsSync(worktree)).toBe(true);
+			expect(
+				ledgerRecords().find((record) => record.event === "hygiene.run"),
+			).toMatchObject({ removed: 0, keptReason: "removal-not-permitted" });
+		},
+	);
+
+	it(
+		"reaps under the registered argv even when the process scan is degraded",
+		{ timeout: 90_000 },
+		() => {
+			// #2486's own shape, now on the path that actually fires: a
+			// scan-degraded line and a removal line in the SAME run. The
+			// reported log had the first three times and never the second.
+			runCli(
+				[...registeredArgv(), "--scan-timeout-ms", "1"],
+				subagentStopPayload(AGENT_ID),
+			);
+
+			expect(fs.existsSync(worktree)).toBe(false);
+			const records = ledgerRecords();
+			const degraded = records.find(
+				(record) => record.event === "hygiene.scan-degraded",
+			);
+			expect(degraded).toMatchObject({ reason: "skipped", rows: 0 });
+			// review round 2, T3: the ceiling the listing was given and what was
+			// left of the sweep budget are different facts and different fields.
+			// `remainingMs` used to hold the ceiling, which made a skipped scan
+			// report a budget it never had.
+			expect(degraded?.ceilingMs).toBe(1);
+			expect(Number(degraded?.remainingMs)).toBeGreaterThan(1);
+			expect(
+				records.find((record) => record.event === "hygiene.worktree-removed"),
+			).toMatchObject({ removed: true });
+			expect(
+				records.find((record) => record.event === "hygiene.run"),
+			).toMatchObject({ outcome: "fired", removed: 1 });
+		},
+	);
+
+	it(
+		"evaluates every --only tree even past the enrich deadline",
+		{ timeout: 90_000 },
+		() => {
+			// PR #2493 review round 2, S3: the `!selectedKeys.has(...)` clause in
+			// the enrich-deadline skip was untested. A caller that ENUMERATED
+			// its trees must have every one of them read; dropping the second
+			// for budget is a silent refusal to do the one job it asked for.
+			// `--budget-ms 1` puts the deadline in the past before the first
+			// tree is even reached, so only that clause keeps the second tree
+			// out of `not-evaluated`.
+			const second = path.join(
+				repo,
+				".claude",
+				"worktrees",
+				"agent-a0000000000000002",
+			);
+			git(["worktree", "add", "-q", "-b", "pr-9002", second], repo);
+			const out = runCli(
+				[
+					"--only",
+					worktree,
+					"--only",
+					second,
+					"--budget-ms",
+					"1",
+					"--scan-timeout-ms",
+					"1",
+					"--dry-run",
+					"--json",
+				],
+				"",
+			);
+			const plan = JSON.parse(out) as {
+				keep: { path: string; reason: string }[];
+			};
+			expect(plan.keep.map((entry) => entry.reason)).not.toContain(
+				"not-evaluated",
+			);
 		},
 	);
 
@@ -881,7 +1186,7 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 			// #2486: "agents finishing after 14:41 produced NO log line at
 			// all". The hooks run --quiet and Claude Code discards their
 			// stderr, so an early return left nothing to read.
-			runCli(["--hook", "subagent-stop", "--quiet"], subagentStopPayload(null));
+			runCli(registeredArgv(), subagentStopPayload(null));
 
 			expect(ledgerRecords()).toMatchObject([
 				{
@@ -902,10 +1207,7 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 			// `.claude/worktrees/agent-<id>` simply does not exist. Reporting
 			// that as "no usable agent_id" is what made the empty ledger
 			// unreadable during the #2486 investigation.
-			runCli(
-				["--hook", "subagent-stop", "--quiet"],
-				subagentStopPayload("affffffffffffffff"),
-			);
+			runCli(registeredArgv(), subagentStopPayload("affffffffffffffff"));
 
 			expect(ledgerRecords()).toMatchObject([
 				{

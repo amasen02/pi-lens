@@ -36,18 +36,26 @@
  * index made every tree `age 0ms` the moment the dirty rail looked at it, and
  * the sweep removed nothing at all for its whole first life.
  *
- * WHO REMOVES WHAT (PR #2438 review S1 -- see resolveHookPolicy):
- *   `--hook subagent-stop` with no `--only` NEVER removes a worktree.
- *   Resume-by-SendMessage happens after SubagentStop, and
- *   .claude/skills/merge-train/SKILL.md keeps a fixer's worktree until its PR
- *   merges -- removing it there would break the fix round. It runs the
- *   orphan-fixture sweep SCOPED to that agent's tree.
- *   `--hook subagent-stop --only <tree>` DOES remove the named tree (#2486):
- *   naming it is an explicit act, and until #2486 the flag was silently
- *   dropped in this mode. Removal belongs otherwise to
- *   `--hook session-start` (default --min-age, clean + pushed rails, never
- *   --only, at most ONE tree per run) and to a manual `npm run hygiene`
- *   (same rails, --min-age overridable, uncapped).
+ * WHO REMOVES WHAT (see resolveHookPolicy):
+ *   `--hook subagent-stop` REAPS the tree of the agent that just stopped,
+ *   derived from the payload's `agent_id`. This reverses PR #2438's review S1
+ *   (maintainer decision, 2026-09-02). S1 forbade removal here because
+ *   resume-by-SendMessage lands after the hook fires; the cost was #2486 --
+ *   the registered line passes no `--only`, so it removed nothing, only
+ *   SessionStart's one-tree-per-run cap drained anything, and N stale trees
+ *   needed N sessions. Ten accumulated in one afternoon.
+ *   THE TRADE-OFF: an agent resumed by SendMessage after its tree was reaped
+ *   must recreate the checkout. Its BRANCH survives (branches are deleted only
+ *   for a removal that succeeded, and only the ref that removal orphaned), so
+ *   nothing committed is lost -- only the working copy. `--keep-agent-tree`,
+ *   or PILENS_HYGIENE_KEEP_AGENT_TREES=1, turns the removal off and leaves the
+ *   scoped orphan sweep. Merge-train worktrees are not `agent-*` trees, so
+ *   `isAgentWorktreePath` never selects them either way.
+ *   `--hook subagent-stop --only <tree>` is the MANUAL form: a caller at a
+ *   terminal naming trees by hand, with the manual budget.
+ *   Removal belongs otherwise to `--hook session-start` (default --min-age,
+ *   clean + pushed rails, never --only, at most ONE tree per run) and to a
+ *   manual `npm run hygiene` (same rails, --min-age overridable, uncapped).
  *
  * REMOVAL IS INDEPENDENT OF THE PROCESS SCAN (#2486). The scan feeds two
  * things -- the orphan-fixture sweep and the "kill what is holding this tree"
@@ -81,8 +89,10 @@
  * Usage:
  *   node scripts/prune-agent-worktrees.mjs [--dry-run] [--min-age 30m]
  *        [--only <path>]... [--json] [--quiet]
- *   node scripts/prune-agent-worktrees.mjs --hook subagent-stop   (reads the
- *        hook JSON payload on stdin and scopes the orphan sweep by `agent_id`)
+ *   node scripts/prune-agent-worktrees.mjs --hook subagent-stop
+ *        [--keep-agent-tree]   (reads the hook JSON payload on stdin, derives
+ *        the stopped agent's worktree from `agent_id`, scopes the orphan
+ *        sweep to it, and removes it unless --keep-agent-tree)
  *   node scripts/prune-agent-worktrees.mjs --hook session-start
  *
  * Exit code is ALWAYS 0. This is a hygiene sweep wired to Claude Code hooks
@@ -197,6 +207,18 @@ export const MIN_GIT_TIMEOUT_MS = 250;
  * review round 3 F7 for the comment that used to claim no bound at all).
  */
 export const REMOVE_TIMEOUT_MS = 60_000;
+/**
+ * Per-hook override of `REMOVE_TIMEOUT_MS`, because a hook cannot reserve more
+ * removal time than its own timeout allows. See `removeBoundMs` for the
+ * measurement this is sized from; the invariant
+ * `hookBudgetMs + removeBoundMs + HOOK_TIMEOUT_MARGIN_MS <= HOOK_TIMEOUT_MS`
+ * is asserted for every registered hook in
+ * tests/scripts/prune-agent-worktrees.test.ts.
+ */
+export const HOOK_REMOVE_RESERVE_MS = Object.freeze({
+	"subagent-stop": 5_000,
+	"session-start": REMOVE_TIMEOUT_MS,
+});
 /** Grace period between SIGTERM and the hard kill (ms). */
 const KILL_GRACE_MS = 300;
 
@@ -216,17 +238,24 @@ const USAGE = `Usage: node scripts/prune-agent-worktrees.mjs [options]
                         worktree removals still run.
   --only <path>         Restrict the sweep to this worktree; repeatable.
                         Overrides --min-age and the live-lock rail for the
-                        named tree — never the dirty/unpushed rails. Also
-                        unlocks removal under --hook subagent-stop.
+                        named tree — never the dirty/unpushed rails. On
+                        --hook subagent-stop it replaces the payload-derived
+                        tree and takes the manual budget.
+  --keep-agent-tree     --hook subagent-stop only: reap orphaned fixture
+                        helpers under the stopped agent's tree but LEAVE the
+                        tree itself. For operators who resume agents by
+                        SendMessage; a resumed agent whose tree was reaped
+                        must recreate the checkout (its branch survives).
+                        Also settable with PILENS_HYGIENE_KEEP_AGENT_TREES=1.
   --hook <event>        subagent-stop | session-start. Reads the hook JSON
-                        payload on stdin. subagent-stop reaps orphaned
-                        test-fixture helpers under the tree named by the
-                        payload's agent_id and, on its own, removes NO
-                        worktree; with --only it removes exactly the named
-                        trees under the usual dirty/unpushed rails.
-                        session-start removes at most ONE tree (the oldest
-                        eligible) per run. Either way one hygiene.run record
-                        is written, fired or skipped-with-reason.
+                        payload on stdin. subagent-stop derives the stopped
+                        agent's worktree from the payload's agent_id, reaps
+                        orphaned test-fixture helpers under it, and REMOVES
+                        it under the unchanged dirty/unpushed rails unless
+                        --keep-agent-tree says otherwise. session-start
+                        removes at most ONE tree (the oldest eligible) per
+                        run. Either way one hygiene.run record is written,
+                        fired or skipped-with-reason.
   --no-orphan-sweep     Skip the fixture-orphan sweep.
   --json                Emit the plan as one JSON object instead of text.
   --quiet               Only print lines about work actually done.
@@ -250,6 +279,7 @@ export function parseArgs(argv) {
 		scanTimeoutMs: null,
 		only: null,
 		hook: null,
+		keepAgentTree: false,
 		orphanSweep: true,
 		json: false,
 		quiet: false,
@@ -315,6 +345,9 @@ export function parseArgs(argv) {
 				}
 				break;
 			}
+			case "--keep-agent-tree":
+				options.keepAgentTree = true;
+				break;
 			case "--no-orphan-sweep":
 				options.orphanSweep = false;
 				break;
@@ -349,38 +382,57 @@ export function parseArgs(argv) {
  * into a "non-positive means uncapped" branch that said the opposite.
  */
 export const HOOK_POLICIES = Object.freeze({
+	/**
+	 * The REGISTERED SubagentStop line: it reaps the tree of the agent that
+	 * just stopped, derived from the payload's `agent_id`.
+	 *
+	 * This is a deliberate reversal of PR #2438's review S1 (maintainer
+	 * decision, 2026-09-02). S1 said SubagentStop must never remove, because
+	 * resume-by-SendMessage lands after the hook fires. The cost of that rule
+	 * was #2486: the registered line — which passes no `--only` — removed
+	 * NOTHING, so the only draining path left was SessionStart's one-tree cap,
+	 * and N stale trees needed N sessions. Ten of them accumulated in an
+	 * afternoon and were cleared by hand.
+	 *
+	 * THE TRADE-OFF, stated plainly: an agent resumed by SendMessage after its
+	 * tree was reaped must recreate the checkout. Its BRANCH survives — the
+	 * branch is only deleted when the removal succeeded, and only for the ref
+	 * that removal orphaned — so nothing committed is lost; only the working
+	 * copy goes. Operators who resume agents routinely turn this off with
+	 * `--keep-agent-tree` / `PILENS_HYGIENE_KEEP_AGENT_TREES=1`. Merge-train
+	 * worktrees are never `agent-*` trees, so `isAgentWorktreePath` excludes
+	 * them and they are untouched either way.
+	 *
+	 * The rails that protect WORK are unchanged: `planWorktreePrune` still
+	 * refuses a dirty tree and a tree whose HEAD is in no `origin/*` ref, with
+	 * no flag able to override either. Naming the derived tree only overrides
+	 * the two SOFT rails — minimum age (the agent stopped seconds ago) and the
+	 * live git lock (that lock names the session that just ended).
+	 */
 	"subagent-stop": Object.freeze({
+		removeWorktrees: true,
+		deleteBranches: true,
+		orphanSweep: true,
+		scopedToAgentTree: true,
+		// Exactly one tree can be derived from one payload; the cap says so
+		// rather than leaving it implicit.
+		maxRemovals: 1,
+		budgetSource: "hook",
+	}),
+	/**
+	 * `--hook subagent-stop --keep-agent-tree` (or
+	 * `PILENS_HYGIENE_KEEP_AGENT_TREES=1`): the opt-out for an operator who
+	 * resumes agents by SendMessage. Identical scoping, no removal — the
+	 * orphan-fixture sweep under that agent's tree still runs, and the run is
+	 * still on the record with `keptReason: "removal-not-permitted"`.
+	 */
+	"subagent-stop-keep": Object.freeze({
 		removeWorktrees: false,
 		deleteBranches: false,
 		orphanSweep: true,
 		scopedToAgentTree: true,
 		maxRemovals: 0,
 		budgetSource: "hook",
-	}),
-	/**
-	 * `--hook subagent-stop --only <tree>`: a caller that NAMED the tree.
-	 *
-	 * The bare hook still removes nothing (above) — resume-by-SendMessage
-	 * happens after SubagentStop, and merge-train keeps a fixer's worktree
-	 * until its PR merges, so an automatic removal there would break a fix
-	 * round. But `--only` is an explicit act by whoever is driving the
-	 * session, and #2486 found it SILENTLY IGNORED here: the run printed
-	 * "worktrees are never removed here" and exited, so ten finished agents'
-	 * trees had to be cleared by hand. The rails that protect work are
-	 * unchanged — `planWorktreePrune` lets `--only` override the age and
-	 * live-lock rails and NEVER the dirty/unpushed ones.
-	 */
-	"subagent-stop-only": Object.freeze({
-		removeWorktrees: true,
-		deleteBranches: true,
-		orphanSweep: true,
-		scopedToAgentTree: false,
-		maxRemovals: Number.POSITIVE_INFINITY,
-		// The registered hook line never passes --only, so this form is always
-		// a human or an orchestrator at a terminal: it gets the manual budget,
-		// not 15s minus a 60s removal reserve (which floors at 2s and would
-		// leave every enrichment `git` call on its 250ms minimum).
-		budgetSource: "manual",
 	}),
 	"session-start": Object.freeze({
 		removeWorktrees: true,
@@ -402,13 +454,20 @@ export const HOOK_POLICIES = Object.freeze({
 
 /**
  * @param {string|null|undefined} hook
- * @param {{ only?: string[]|null }} [invocation] The parsed argv, so the one
- *   table above can answer for `--hook subagent-stop --only <tree>` too.
+ * @param {{ only?: string[]|null, keepAgentTree?: boolean }} [invocation] The
+ *   parsed argv, so the one table above can answer for the two SubagentStop
+ *   variants too.
  * @returns {(typeof HOOK_POLICIES)["manual"]}
  */
 export function resolveHookPolicy(hook, invocation = {}) {
-	if (hook === "subagent-stop" && (invocation.only?.length ?? 0) > 0) {
-		return HOOK_POLICIES["subagent-stop-only"];
+	if (hook === "subagent-stop") {
+		// `--only` on this event is a caller at a terminal naming trees by
+		// hand. That is field-for-field a MANUAL run (PR #2493 review round 2,
+		// T1) -- it was spelled as its own `subagent-stop-only` entry whose
+		// six fields were identical to `manual`, which is the hand-maintained
+		// mirror this repo's single-source-of-truth rule forbids.
+		if ((invocation.only?.length ?? 0) > 0) return HOOK_POLICIES.manual;
+		if (invocation.keepAgentTree) return HOOK_POLICIES["subagent-stop-keep"];
 	}
 	return HOOK_POLICIES[hook ?? "manual"] ?? HOOK_POLICIES.manual;
 }
@@ -424,9 +483,8 @@ export function resolveHookPolicy(hook, invocation = {}) {
  * `timeout - (removal reserve) - margin`, floored at DEFAULT_HOOK_BUDGET_MS.
  *
  * Today that gives session-start 25s (90 - 60 - 5) instead of the 2s that let
- * 6 of 12 trees go `not-evaluated` on the #2486 box, and a bare subagent-stop
- * 10s (15 - 0 - 5, since it never removes) instead of a 2s budget its process
- * listing could not fit inside. Which arithmetic applies is the policy's own
+ * 6 of 12 trees go `not-evaluated` on the #2486 box, and the reaping
+ * subagent-stop 5s (15 - 5 - 5). Which arithmetic applies is the policy's own
  * `budgetSource`, so the one table stays the single place the question is
  * answered.
  *
@@ -438,11 +496,103 @@ export function hookBudgetMs(hook, policy) {
 	if (policy.budgetSource === "manual") return DEFAULT_MANUAL_BUDGET_MS;
 	const timeoutMs = HOOK_TIMEOUT_MS[hook ?? ""];
 	if (!timeoutMs) return DEFAULT_HOOK_BUDGET_MS;
-	const reserveMs = policy.removeWorktrees ? REMOVE_TIMEOUT_MS : 0;
 	return Math.max(
 		DEFAULT_HOOK_BUDGET_MS,
-		timeoutMs - reserveMs - HOOK_TIMEOUT_MARGIN_MS,
+		timeoutMs - removeBoundMs(hook, policy) - HOOK_TIMEOUT_MARGIN_MS,
 	);
+}
+
+/**
+ * The wall-clock bound put on ONE `git worktree remove` for this invocation,
+ * and — for a hook — the removal reserve `hookBudgetMs` subtracts from the hook
+ * timeout. The two must be the same number or the invariant
+ * `budget + removal + margin <= hook timeout` is a claim nothing enforces.
+ *
+ * `REMOVE_TIMEOUT_MS` (60s) is the right bound where there is room for it: a
+ * SIGKILLed recursive delete leaves a half-removed tree, so the bound should
+ * only ever fire on a wedged git. SubagentStop has no room for it — 15s total —
+ * so it takes a tighter one, sized from measurement rather than from the
+ * comfortable number: `git worktree remove --force --force` over a 4000-file
+ * worktree on the #2486 box (2026-09-02, 5 runs) cost min 956ms / median
+ * 1049ms / max 1171ms, and over a 300-file tree min 146ms / median 181ms /
+ * max 755ms. `HOOK_REMOVE_RESERVE_MS["subagent-stop"]` is 5s, ~4.8x the
+ * measured median, and leaves the sweep 5s with a 5s margin.
+ *
+ * @param {string|null|undefined} hook
+ * @param {(typeof HOOK_POLICIES)["manual"]} policy
+ * @returns {number}
+ */
+export function removeBoundMs(hook, policy) {
+	if (policy.budgetSource === "manual") return REMOVE_TIMEOUT_MS;
+	if (!policy.removeWorktrees) return 0;
+	return HOOK_REMOVE_RESERVE_MS[hook ?? ""] ?? REMOVE_TIMEOUT_MS;
+}
+
+/**
+ * How much of a sweep budget is held back for the process listing.
+ *
+ * The enrichment (`git worktree list`, then a `git status` and a containment
+ * revwalk per tree) runs FIRST and would otherwise spend the whole budget,
+ * leaving the listing under `MIN_SCAN_BUDGET_MS` and the removal without its
+ * kill-what-holds-the-tree step — which on Windows is what makes a tree
+ * unremovable in the first place (#2435). The reserve is therefore
+ * `--scan-timeout-ms`, CAPPED AT HALF the budget: with SubagentStop's 5s
+ * budget and the 4s default ceiling the uncapped form left enrichment 1s, and
+ * every `git` call then drops to its 250ms floor — which `isDirty` reads as
+ * "unreadable => dirty" and keeps the very tree the hook fired to reap. At
+ * SessionStart's 25s and a manual run's 60s the cap never binds.
+ *
+ * @param {number} budgetMs
+ * @param {number} scanTimeoutMs
+ * @returns {number}
+ */
+export function scanReserveMs(budgetMs, scanTimeoutMs) {
+	const budget = Math.max(0, Number(budgetMs) || 0);
+	const ceiling = Math.max(0, Number(scanTimeoutMs) || 0);
+	return Math.min(ceiling, Math.floor(budget / 2));
+}
+
+/**
+ * Why the ONE tree this run was scoped to is still on disk, for the
+ * `hygiene.run` record (PR #2493 review round 2, S2). Null when the run
+ * removed it, and null when the run had no single tree in scope.
+ *
+ * Three distinguishable outcomes, all previously spelled `removed: 0`:
+ *   - a `planWorktreePrune` keep reason (`dirty`, `unpushed`, `self`, ...)
+ *     — the rails refused it, which is the answer an operator needs;
+ *   - `removal-not-permitted` — `--keep-agent-tree` / the env opt-out;
+ *   - `deferred` — the policy's per-run removal cap took it next sweep.
+ *
+ * @param {{ targetPath: string|null, plan: { keep: {path: string, reason: string}[] }, deferred: {path: string}[], policy: (typeof HOOK_POLICIES)["manual"] }} input
+ * @returns {string|null}
+ */
+export function keptReasonFor({ targetPath, plan, deferred, policy }) {
+	if (!targetPath) return null;
+	const key = toComparablePath(targetPath);
+	const kept = (plan?.keep ?? []).find(
+		(entry) => toComparablePath(entry.path) === key,
+	);
+	if (kept) return kept.reason;
+	const wasDeferred = (deferred ?? []).some(
+		(entry) => toComparablePath(entry.path) === key,
+	);
+	if (!wasDeferred) return null;
+	return policy?.removeWorktrees ? "deferred" : "removal-not-permitted";
+}
+
+/**
+ * The environment spelling of `--keep-agent-tree`, for operators who resume
+ * agents by SendMessage and cannot edit the registered hook line. Any value
+ * other than the explicit falsy spellings turns it on: an operator who set
+ * this at all meant to keep their trees.
+ *
+ * @returns {boolean}
+ */
+function envKeepAgentTrees() {
+	const raw = process.env.PILENS_HYGIENE_KEEP_AGENT_TREES;
+	if (raw === undefined) return false;
+	const value = raw.trim().toLowerCase();
+	return value !== "" && value !== "0" && value !== "false" && value !== "no";
 }
 
 /**
@@ -955,7 +1105,11 @@ async function readProcessTable({ budgetMs, budgetLeft, scanTimeoutMs }) {
 				formatScanRecord({
 					reason: "skipped",
 					budgetMs,
-					remainingMs: scanBudgetMs,
+					// The two are DIFFERENT facts and used to be the same field
+					// (review round 2, T3): `remainingMs` is what is left of the
+					// sweep budget, `ceilingMs` the bound the listing was given.
+					remainingMs: budgetLeft(),
+					ceilingMs: scanBudgetMs,
 					rows: 0,
 				}),
 			],
@@ -978,7 +1132,8 @@ async function readProcessTable({ budgetMs, budgetLeft, scanTimeoutMs }) {
 			formatScanRecord({
 				reason: "listing-failed",
 				budgetMs,
-				remainingMs: scanBudgetMs,
+				remainingMs: budgetLeft(),
+				ceilingMs: scanBudgetMs,
 				rows: table.length,
 			}),
 		);
@@ -991,142 +1146,13 @@ async function readProcessTable({ budgetMs, budgetLeft, scanTimeoutMs }) {
 			formatScanRecord({
 				reason: "empty",
 				budgetMs,
-				remainingMs: scanBudgetMs,
+				remainingMs: budgetLeft(),
+				ceilingMs: scanBudgetMs,
 				rows: 0,
 			}),
 		);
 	}
 	return { table, listingOk: ok, scanBudgetMs, records };
-}
-
-/**
- * The SubagentStop hook: reap this agent's own orphaned fixture helpers, and
- * NOTHING else. It never removes a worktree (see the file header / review S1)
- * and never touches a sibling agent's tree.
- *
- * @param {{ options: ReturnType<typeof parseArgs>, worktreePath: string, budgetMs: number, budgetLeft: () => number, say: (m: string) => void, startedAt: number, nowIso: string }} context
- */
-async function runScopedOrphanSweep({
-	options,
-	worktreePath,
-	budgetMs,
-	budgetLeft,
-	say,
-	startedAt,
-	nowIso,
-}) {
-	const scan = await readProcessTable({
-		budgetMs,
-		budgetLeft,
-		scanTimeoutMs: options.scanTimeoutMs ?? DEFAULT_SCAN_TIMEOUT_MS,
-	});
-	const records = [...scan.records];
-	const protectedPids = collectAncestorPids(scan.table, process.pid);
-	protectedPids.add(process.pid);
-
-	const { orphans, degraded } = planOrphanSweep({
-		rows: scan.table,
-		selfPid: process.pid,
-		protectedPids,
-		restrictToPath: worktreePath,
-		listingOk: scan.listingOk,
-		isPidAlive,
-	});
-	// "listing-failed" and the empty case were already reported by
-	// readProcessTable; a TRUNCATED listing is a distinct degradation and is
-	// reported here.
-	if (degraded && degraded.reason !== "listing-failed") {
-		console.error(
-			`[hygiene] process snapshot could not be verified ` +
-				`(${degraded.reason}); no orphan sweep this run`,
-		);
-		records.push(
-			formatScanRecord({
-				reason: degraded.reason,
-				budgetMs,
-				remainingMs: scan.scanBudgetMs,
-				rows: scan.table.length,
-			}),
-		);
-	}
-
-	for (const { row, reason } of orphans) {
-		say(
-			`${options.dryRun ? "WOULD KILL  " : "kill    "} pid ${row.pid}  ${reason}  ${row.command}`,
-		);
-	}
-	for (const { row, reason } of orphans) {
-		if (options.dryRun) {
-			records.push(
-				formatKillRecord({
-					pid: row.pid,
-					command: row.command,
-					reason,
-					worktree: worktreePath,
-					dryRun: true,
-					nowIso,
-				}),
-			);
-			continue;
-		}
-		const { killed, error } = await terminatePid(row.pid);
-		records.push(
-			formatKillRecord({
-				pid: row.pid,
-				command: row.command,
-				reason,
-				worktree: worktreePath,
-				killed,
-				error,
-				nowIso,
-			}),
-		);
-	}
-	records.push(
-		formatRunRecord({
-			hook: "subagent-stop",
-			outcome: "fired",
-			worktree: worktreePath,
-			removed: 0,
-			orphans: orphans.length,
-			rows: scan.table.length,
-			dryRun: options.dryRun,
-			budgetMs,
-			durationMs: Date.now() - startedAt,
-			nowIso,
-		}),
-	);
-	appendLedger(records);
-
-	if (options.json) {
-		console.log(
-			JSON.stringify(
-				{
-					hook: "subagent-stop",
-					worktree: worktreePath,
-					dryRun: options.dryRun,
-					remove: [],
-					keep: [],
-					orphans: orphans.map(({ row, reason }) => ({
-						pid: row.pid,
-						ppid: row.ppid,
-						reason,
-						command: row.command,
-					})),
-					processTableRows: scan.table.length,
-				},
-				null,
-				2,
-			),
-		);
-	} else {
-		say(
-			`${options.dryRun ? "dry-run: " : ""}subagent-stop: ` +
-				`${orphans.length} orphan process(es) under ${worktreePath} ` +
-				`(worktrees are never removed here), ` +
-				`${scan.table.length} process rows, ${Date.now() - startedAt}ms`,
-		);
-	}
 }
 
 async function main(argv) {
@@ -1154,16 +1180,32 @@ async function main(argv) {
 	const say = (message) => {
 		if (!options.quiet && !options.json) console.log(`[hygiene] ${message}`);
 	};
-	// The policy reads the whole invocation, not just the event name: a
-	// `--hook subagent-stop --only <tree>` run is allowed to remove that tree
-	// where the bare hook is not (#2486).
+	// The environment opt-out is folded in HERE rather than inside parseArgs,
+	// which stays a pure argv -> options function. Either spelling reaches the
+	// policy table the same way.
+	if (envKeepAgentTrees()) options.keepAgentTree = true;
+	// The policy reads the whole invocation, not just the event name: the
+	// registered `--hook subagent-stop` reaps the stopped agent's own tree,
+	// `--keep-agent-tree` turns that off, and `--only` makes it a manual run
+	// over the trees the caller named (#2486).
 	const policy = resolveHookPolicy(options.hook, options);
 	const budgetMs = options.budgetMs ?? hookBudgetMs(options.hook, policy);
 	const scanTimeoutMs = options.scanTimeoutMs ?? DEFAULT_SCAN_TIMEOUT_MS;
+	const removeBound = removeBoundMs(options.hook, policy);
 	const budgetLeft = () => Math.max(0, budgetMs - (Date.now() - startedAt));
 	// Read once, whichever path runs: stdin is a one-shot stream, and the
 	// ordinary path now serves `--hook subagent-stop --only` too.
 	const payload = options.hook ? readHookPayload() : null;
+
+	/**
+	 * The stopped agent's own worktree, when this invocation is scoped to one.
+	 * It becomes both the removal SELECTION (so the age and live-lock rails
+	 * give way for it, exactly as `--only` does) and the orphan sweep's
+	 * `restrictToPath` (so a SubagentStop never kills a sibling agent's
+	 * helpers). Null for every other mode.
+	 * @type {string|null}
+	 */
+	let agentTree = null;
 
 	if (policy.scopedToAgentTree) {
 		const worktreesBase =
@@ -1207,16 +1249,7 @@ async function main(argv) {
 			]);
 			return;
 		}
-		await runScopedOrphanSweep({
-			options,
-			worktreePath: derived,
-			budgetMs,
-			budgetLeft,
-			say,
-			startedAt,
-			nowIso,
-		});
-		return;
+		agentTree = derived;
 	}
 
 	if (options.hook === "session-start" && options.only) {
@@ -1225,11 +1258,15 @@ async function main(argv) {
 				"narrows to a single tree",
 		);
 	}
-	// `--only` belongs to a human at a terminal, or to the `--hook
-	// subagent-stop --only <tree>` invocation that names a finished agent's
-	// tree (#2486). The session sweep runs the ordinary rails over every tree
-	// (review S1).
-	const only = options.hook === "session-start" ? null : options.only;
+	// What this run is allowed to touch. `--only` belongs to a human at a
+	// terminal; the SubagentStop hook selects the one tree it derived from its
+	// payload; the session sweep runs the ordinary rails over every tree
+	// (review S1). Selection is the SAME mechanism in all three cases, so
+	// there is one removal path, not a scoped copy of it that quietly lost the
+	// removal step — which is how #2486 shipped.
+	let only = options.only;
+	if (options.hook === "session-start") only = null;
+	else if (agentTree) only = [agentTree];
 	const minAgeMs = options.minAgeMs;
 
 	// Every git call is bounded by whatever is LEFT of the sweep's budget, not
@@ -1241,7 +1278,9 @@ async function main(argv) {
 	// Reserve room for the process snapshot so a long enrichment pass cannot
 	// starve the orphan sweep entirely: reading the worktree table and every
 	// per-tree query is bounded by the ENRICH deadline, not the total budget.
-	const enrichDeadline = startedAt + Math.max(0, budgetMs - scanTimeoutMs);
+	// The reserve is capped at half the budget — see `scanReserveMs`.
+	const enrichDeadline =
+		startedAt + Math.max(0, budgetMs - scanReserveMs(budgetMs, scanTimeoutMs));
 	const enrichBudget = () => boundedTo(enrichDeadline - Date.now());
 
 	const porcelain = git(
@@ -1275,7 +1314,10 @@ async function main(argv) {
 	// status` outlasted the enrich deadline, which for a caller that
 	// ENUMERATED its trees is a silent refusal to do the one job it asked for
 	// (#2486). The bound that matters is still enforced: every git call the
-	// enrichment makes is capped by `enrichBudget()`.
+	// enrichment makes is capped by `enrichBudget()`. Pinned by the e2e case
+	// "evaluates every --only tree even past the enrich deadline" -- review
+	// round 2 (S3) flagged this branch as untested, and deleting it is exactly
+	// the mutation that case reds on.
 	const selectedKeys = only ? new Set(only.map(toComparablePath)) : null;
 
 	let evaluated = 0;
@@ -1363,14 +1405,10 @@ async function main(argv) {
 	// else. The removals below run regardless: `git worktree remove --force
 	// --force` needs no process table, and #2486's ledger (three
 	// scan-degraded lines, zero removal lines) is what the opposite looks
-	// like. Say so, so a removal that ran WITHOUT its holder-kill is on the
-	// record rather than looking like a clean one.
-	if (removals.length > 0 && !scan.listingOk) {
-		console.error(
-			`[hygiene] process listing unavailable; removing ${removals.length} ` +
-				"worktree(s) anyway, without the kill-what-holds-it step",
-		);
-	}
+	// like. The degradation is on the record as a `hygiene.scan-degraded`
+	// line in the SAME run as the removal, which is the readable form of the
+	// pair; an extra stderr notice here said the same thing down a channel
+	// both hooks discard, and nothing tested it (PR #2493 review round 2, S3).
 
 	const protectedPids = collectAncestorPids(table, process.pid);
 	protectedPids.add(process.pid);
@@ -1381,6 +1419,9 @@ async function main(argv) {
 					rows: table,
 					selfPid: process.pid,
 					protectedPids,
+					// A SubagentStop run reaps ONLY under the tree of the agent
+					// that stopped; it never touches a sibling agent's helpers.
+					restrictToPath: agentTree,
 					listingOk: scan.listingOk,
 					isPidAlive,
 				})
@@ -1395,7 +1436,8 @@ async function main(argv) {
 			formatScanRecord({
 				reason: orphanPlan.degraded.reason,
 				budgetMs,
-				remainingMs: scan.scanBudgetMs,
+				remainingMs: budgetLeft(),
+				ceilingMs: scan.scanBudgetMs,
 				rows: table.length,
 			}),
 		);
@@ -1445,8 +1487,10 @@ async function main(argv) {
 		}
 		for (const removal of deferred) {
 			say(
-				`defer   ${removal.path}  (removal cap ${policy.maxRemovals} per run; ` +
-					`the next sweep takes it)`,
+				policy.removeWorktrees
+					? `defer   ${removal.path}  (removal cap ${policy.maxRemovals} per ` +
+							`run; the next sweep takes it)`
+					: `keep    ${removal.path}  (removal is not permitted in this mode)`,
 			);
 		}
 		for (const removal of removals) {
@@ -1492,21 +1536,23 @@ async function main(argv) {
 			// A locked worktree needs --force twice; passing it unconditionally
 			// is harmless for the unlocked case.
 			// Outside the SWEEP budget, but not unbounded: `git()` applies
-			// REMOVE_TIMEOUT_MS (60s) with killSignal SIGKILL, so a wedged
-			// removal is eventually killed rather than hanging the hook
-			// forever (review round 3, F7 — the comment here used to claim
-			// otherwise). The tradeoff that 60s buys, inside the 90s
-			// SessionStart hook timeout: SIGKILLing git partway through a
-			// recursive delete leaves a half-removed worktree plus a stale
-			// admin directory, so the bound is set generously enough that a
-			// normal removal never reaches it, and the hook timeout is sized
-			// to cover one full 60s removal with 30s to spare (review S8).
-			// The sweep's own enrichment budget gates whether a removal
-			// STARTS, never how long it may take once it has.
+			// `removeBound` with killSignal SIGKILL, so a wedged removal is
+			// eventually killed rather than hanging the hook forever (review
+			// round 3, F7 — the comment here used to claim otherwise). The
+			// bound is the SAME number `hookBudgetMs` reserved out of the hook
+			// timeout (`removeBoundMs`), so the invariant
+			// `budget + removal + margin <= timeout` is enforced rather than
+			// merely asserted: 60s inside SessionStart's 90s, 5s inside
+			// SubagentStop's 15s against a measured 1049ms median. SIGKILLing
+			// git partway through a recursive delete leaves a half-removed
+			// worktree plus a stale admin directory, so each bound is set well
+			// above its measured cost and only ever fires on a wedged git. The
+			// sweep's own enrichment budget gates whether a removal STARTS,
+			// never how long it may take once it has.
 			const removed = git(
 				["worktree", "remove", "--force", "--force", removal.path],
 				REPO_ROOT,
-				REMOVE_TIMEOUT_MS,
+				removeBound,
 			);
 			if (removed === null) {
 				console.error(`[hygiene] could not remove ${removal.path}`);
@@ -1525,8 +1571,7 @@ async function main(argv) {
 				}),
 			);
 		}
-		if (removals.length > 0)
-			git(["worktree", "prune"], REPO_ROOT, REMOVE_TIMEOUT_MS);
+		if (removals.length > 0) git(["worktree", "prune"], REPO_ROOT, removeBound);
 
 		for (const { row, reason } of orphans) {
 			const { killed, error } = await terminatePid(row.pid);
@@ -1590,11 +1635,19 @@ async function main(argv) {
 	// One record per invocation, whatever happened (#2486): the hooks run
 	// --quiet and their stderr is discarded, so an unrecorded run and a hook
 	// that never fired are the same observation.
+	//
+	// And when the run had exactly ONE tree in scope and did not remove it,
+	// the record says WHY (PR #2493 review round 2, S2). `fired, removed: 0`
+	// alone cannot tell "the tree was dirty, so work was protected" from "the
+	// hook reaped nothing and nobody knows why", which is the same
+	// indistinguishable-absence shape #2486 was about one level up.
+	const targetPath = only?.length === 1 ? only[0] : null;
 	records.push(
 		formatRunRecord({
 			hook: options.hook,
 			outcome: "fired",
-			worktree: only?.length === 1 ? only[0] : null,
+			worktree: targetPath,
+			keptReason: keptReasonFor({ targetPath, plan, deferred, policy }),
 			removed: removedCount,
 			orphans: orphans.length,
 			rows: table.length,

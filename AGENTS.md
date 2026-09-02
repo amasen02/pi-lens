@@ -1756,15 +1756,30 @@ activity signal must be proven unchanged across a `git status` before it is
 added to that list; the reflog is read for its recorded ENTRY time, not its
 mtime, so copying a tree cannot forge freshness.
 
-**Who removes what.** `SubagentStop` as REGISTERED never removes a worktree:
-resume-by-SendMessage happens after that hook fires, and a fixer's worktree
-has to survive until its PR merges (`.claude/skills/merge-train/SKILL.md`). It
-runs only the orphan-fixture sweep, scoped to that agent's own tree. The one
-exception is an explicit `--hook subagent-stop --only <tree>`, which removes
-exactly the trees it names under the unchanged dirty/unpushed rails (#2486);
-the registered hook line passes no `--only`, so the rule above still holds for
-every automatic run, and an `--only` run gets the manual budget because it is
-always a human or an orchestrator at a terminal. Removal belongs otherwise to
+**Who removes what.** `SubagentStop` as REGISTERED **reaps the tree of the
+agent that just stopped** — derived from the payload's `agent_id`, under the
+unchanged dirty/unpushed rails (#2486). This reverses PR #2438's review S1
+(maintainer decision, 2026-09-02). S1 forbade removal here because
+resume-by-SendMessage lands after the hook fires; the cost was #2486 — the
+registered line passes no `--only`, so it removed nothing, only
+`SessionStart`'s one-tree-per-run cap drained anything, and ten stale trees
+accumulated in a single afternoon and were cleared by hand.
+
+**The trade-off, stated plainly.** An agent resumed by SendMessage after its
+tree was reaped must recreate the checkout. Its BRANCH survives — branches are
+deleted only for a removal that succeeded, and only the ref that removal
+orphaned, and a tree is never removed unless its HEAD is already contained in
+an `origin/*` ref — so nothing committed is lost; only the working copy goes.
+Operators who routinely resume agents turn the removal off with
+`--keep-agent-tree`, or `PILENS_HYGIENE_KEEP_AGENT_TREES=1` when the
+registered hook line cannot be edited; the scoped orphan-fixture sweep still
+runs and the ledger records `keptReason: "removal-not-permitted"`.
+Merge-train worktrees are never `agent-*` trees, so `isAgentWorktreePath`
+never selects them either way. `--hook subagent-stop --only <tree>` stays the
+manual form for a caller at a terminal and resolves to exactly the `manual`
+policy (it was a separate table entry whose six fields were identical — a
+hand-maintained mirror, which this repo's single-source-of-truth rule forbids).
+Removal belongs otherwise to
 `SessionStart` (default 30m min-age, at most ONE tree per run so the removal
 fits inside the 90s hook timeout — `git worktree remove` is itself bounded at
 60s with SIGKILL) and to a manual `npm run hygiene`. The `SessionStart`
@@ -1792,19 +1807,41 @@ agents' trees accumulated behind a ledger that said nothing at all. The two
 skip reasons are kept apart on purpose — `no-agent-id` (no `agent_id` on
 stdin) versus `agent-worktree-missing` (a perfectly good `agent_id` whose
 `.claude/worktrees/agent-<id>` does not exist, which is the ORDINARY case
-because most subagents are not worktree-isolated).
+because most subagents are not worktree-isolated). A run that FIRED, found its
+one tree and then refused it carries `keptReason` — the `planWorktreePrune`
+rail that refused it (`dirty`, `unpushed`, `self`, `locked-live`),
+`removal-not-permitted` for the opt-out, or `deferred` for a per-run cap.
+Without it a protected dirty tree and a hook that reaped nothing for no stated
+reason are the same line, which is #2486's own shape one level down.
+`hygiene.scan-degraded` likewise separates `remainingMs` (what was left of the
+sweep budget) from `ceilingMs` (the bound the listing was actually given);
+writing the ceiling into `remainingMs` made a skipped scan report a budget it
+never had.
 
 A worktree removal is INDEPENDENT of the process listing. The listing feeds
 only the orphan sweep and the kill-what-holds-the-tree step; when it fails or
 is skipped, both degrade visibly and the removal still runs. Budgets come from
 the timeouts registered in `.claude/settings.json` (`HOOK_TIMEOUT_MS`, pinned
 to that file by a conformance test): `hookBudgetMs` gives SessionStart
-`90s - 60s removal reserve - 5s margin = 25s` and a bare SubagentStop
-`15s - 5s = 10s`, floored at `DEFAULT_HOOK_BUDGET_MS` (2s) for an unregistered
-event. The process listing has its own ceiling, `DEFAULT_SCAN_TIMEOUT_MS` =
-4000ms against a measured 584/651/707ms min/median/max for a 467-row Windows
-listing, overridable with `--scan-timeout-ms` so a short listing ceiling can
-never squeeze the `git` calls that decide whether a tree is removable.
+`90s - 60s removal reserve - 5s margin = 25s` and SubagentStop
+`15s - 5s removal reserve - 5s margin = 5s`, floored at
+`DEFAULT_HOOK_BUDGET_MS` (2s) for an unregistered event. The removal reserve is
+per hook (`HOOK_REMOVE_RESERVE_MS`) and is the SAME number `git()` bounds the
+removal with (`removeBoundMs`), so `budget + removal + margin <= hook timeout`
+is enforced rather than asserted — a reserve no call honors is a claim, not a
+bound. 60s is right where there is room (SIGKILLing git mid-delete leaves a
+half-removed tree); SubagentStop has none, so it takes 5s against a measured
+`git worktree remove --force --force` cost of 956/1049/1171ms min/median/max
+over a 4000-file worktree (146/181/755ms over a 300-file one), 2026-09-02 on
+the #2435 box. The process listing has its own ceiling,
+`DEFAULT_SCAN_TIMEOUT_MS` = 4000ms against a measured 584/651/707ms
+min/median/max for a 467-row Windows listing, overridable with
+`--scan-timeout-ms` so a short listing ceiling can never squeeze the `git`
+calls that decide whether a tree is removable — and the enrichment reserves
+that ceiling only up to HALF the sweep budget (`scanReserveMs`), because
+reserving all 4s out of SubagentStop's 5s left every enrichment `git` call on
+its 250ms floor, which `isDirty` reads as "unreadable => dirty" and keeps the
+very tree the hook fired to reap.
 
 The SubagentStop payload is Claude Code's contract, not ours: `agent_id` is
 required on that event and a managed agent worktree is named `agent-<agentId>`
