@@ -796,7 +796,17 @@ function planWorkspaceEdit(
 	};
 	const flushSubtree = (uri: string): void => {
 		const key = indexKey(uri);
-		for (const candidate of [...(descendants.get(key) ?? [])]) {
+		// flushUri -> removeIndex deletes `candidate` from this very Set (`key`
+		// is one of `candidate`'s ancestors by construction). No defensive copy
+		// needed: Set iterators reflect deletions safely — deleting the current
+		// or a not-yet-visited entry during iteration removes it from the
+		// remaining traversal without skipping or duplicating any other member
+		// (verified: https://tc39.es/ecma262/#sec-set.prototype.values, same
+		// guarantee already relied on for the Map iteration below and at
+		// clients/lsp/client.ts / clients/persist-debounce.ts /
+		// clients/review-graph/builder.ts). Nothing adds to `descendants`
+		// during this loop (only `addIndex` does, and it isn't called here).
+		for (const candidate of descendants.get(key) ?? []) {
 			const item = pending.get(candidate);
 			if (item) flushUri(item.uri);
 		}
@@ -842,7 +852,10 @@ function planWorkspaceEdit(
 		} else flushSubtree(resource.uri);
 		ops.push(resource);
 	}
-	for (const item of [...pending.values()]) flushUri(item.uri);
+	// flushUri deletes from `pending` — the same Map being iterated here — but
+	// Map iterators reflect deletions safely (see flushSubtree above), so no
+	// defensive copy is needed.
+	for (const item of pending.values()) flushUri(item.uri);
 	return ops;
 }
 

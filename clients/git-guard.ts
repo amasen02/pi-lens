@@ -755,7 +755,7 @@ export function writeGitGuardRecord(
 		Array.isArray(record.affectedFiles) ? record.affectedFiles : [],
 		cwd,
 	);
-	const fileSeqByPath = { ...(record.fileSeqByPath ?? {}) };
+	const fileSeqByPath = { ...record.fileSeqByPath };
 	for (const file of capped.files) {
 		const key = guardPathKey(file, cwd);
 		if (fileSeqByPath[key] === undefined) {

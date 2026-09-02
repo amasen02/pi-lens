@@ -288,7 +288,8 @@ function nextZeroBit(bits: Uint32Array, start: number): number {
 export function computeHashlineAnchors(content: string): string[] | undefined {
 	const lines = splitLines(content);
 	if (lines.length > HASH_SPACE) return undefined;
-	const anchors = new Array<string>(lines.length);
+	const anchors: string[] = [];
+	anchors.length = lines.length;
 	const used = new Uint32Array(BITSET_WORDS);
 	let hint = 0;
 	const sourceCache = new Map<string, number>();
@@ -458,7 +459,8 @@ function buildAnchorIndex(
 	// Content multiplicity, keyed exactly as upstream keys it. A line whose key
 	// repeats is unanswerable: see the module header.
 	const lines = splitLines(normalized);
-	const keys = new Array<string>(lines.length);
+	const keys: string[] = [];
+	keys.length = lines.length;
 	const keyCounts = new Map<string, number>();
 	const keyCache = new Map<string, string>();
 	for (let i = 0; i < lines.length; i += 1) {

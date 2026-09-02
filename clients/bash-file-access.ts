@@ -19,6 +19,7 @@ import * as path from "node:path";
 import { isReadableSourceFile } from "./file-kinds.js";
 import { countFileLines } from "./read-guard-tool-lines.js";
 import type { SearchReadLocation } from "./search-read-registration.js";
+import { stripAnsi } from "./sanitize.js";
 
 /** A contiguous range of lines a bash command showed the agent. */
 export interface ReadSpan {
@@ -38,10 +39,6 @@ function stripQuotes(token: string): string {
 		}
 	}
 	return token;
-}
-
-function stripAnsi(value: string): string {
-	return value.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
 }
 
 /** Small conservative shell lexer shared by command-analysis consumers. */
