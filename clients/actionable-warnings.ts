@@ -11,7 +11,8 @@ import {
 import type { LSPCodeAction, LSPDiagnostic } from "./lsp/client.js";
 import { applyWorkspaceEdit } from "./lsp/edits.js";
 import { getLSPService } from "./lsp/index.js";
-import { normalizeMapKey } from "./path-utils.js";
+import { isUnderDir, normalizeMapKey } from "./path-utils.js";
+import { recordDegradationOnce } from "./degradation-ledger.js";
 import {
 	recordLspMutationBatch,
 	type LspMutationContext,
@@ -496,7 +497,22 @@ function mergeWarnings(
 	);
 }
 
-export async function buildActionableWarningsReport(args: {
+/**
+ * #2504 — bounds on the LSP enrichment loop.
+ *
+ * This function runs on the AWAITED turn_end hook. With `includeLspCodeActions`
+ * on and a cold LSP cache it opened every file it was handed and pulled fresh
+ * per-file diagnostics serially at ~880 ms each: 147 files, 187 891 ms, for
+ * `warnings: 0`. Three bounds, plus a project-root filter (it had opened
+ * `~/.claude/plans/*.md` in an LSP client), plus a deferral: when the turn
+ * primed NO cache, every file would be a fresh pull, so the whole loop moves
+ * off the hook and delivers through the cached channel instead.
+ */
+export const ACTIONABLE_WARNINGS_LSP_FILE_CAP = 25;
+export const ACTIONABLE_WARNINGS_LSP_BUDGET_MS = 2_500;
+export const ACTIONABLE_WARNINGS_DEFERRED_BUDGET_MS = 60_000;
+
+export interface BuildActionableWarningsArgs {
 	cwd: string;
 	sessionId: string;
 	turnIndex: number;
@@ -509,7 +525,47 @@ export async function buildActionableWarningsReport(args: {
 	fileSeqByPath?: Map<string, number>;
 	deltaOnly?: boolean;
 	dbg?: (msg: string) => void;
-}): Promise<ActionableWarningsReport> {
+	/** #2504: max files the LSP enrichment loop may touch in one turn. */
+	lspFileCap?: number;
+	/** #2504: total wall budget for the in-band LSP enrichment loop. */
+	lspBudgetMs?: number;
+	/** #2504: turn abort signal, raced against the wall budgets. */
+	signal?: AbortSignal;
+	/**
+	 * #2504: receives the completed report when the cold fresh-pull loop was
+	 * moved off the awaited hook. The caller writes it to the same
+	 * `actionable-warnings` cache the in-band report goes to.
+	 */
+	onDeferredReport?: (report: ActionableWarningsReport) => void;
+}
+
+/** One file's LSP enrichment plan, resolved before any fresh pull happens. */
+interface LspEnrichmentTarget {
+	filePath: string;
+	content?: string;
+	cached?: LSPDiagnostic[];
+}
+
+/**
+ * The in-flight deferred fresh-pull, if any. Exposed for tests only: the
+ * deferral is fire-and-forget by design, and a test asserting that the work
+ * still happens off-hook needs a handle to await.
+ */
+let deferredLspPull: Promise<void> | undefined;
+export function _awaitDeferredLspPullForTest(): Promise<void> {
+	return deferredLspPull ?? Promise.resolve();
+}
+
+/** Positive finite bound, else the default. Guards NaN from env/config. */
+function boundedNumber(value: number | undefined, fallback: number): number {
+	return value !== undefined && Number.isFinite(value) && value > 0
+		? value
+		: fallback;
+}
+
+export async function buildActionableWarningsReport(
+	args: BuildActionableWarningsArgs,
+): Promise<ActionableWarningsReport> {
 	const cwd = path.resolve(args.cwd);
 	const records: ActionableWarningRecord[] = [...args.dispatchWarnings];
 	const lspService = getLSPService();
@@ -527,8 +583,35 @@ export async function buildActionableWarningsReport(args: {
 	});
 
 	if (args.includeLspCodeActions) {
+		const fileCap = Math.floor(
+			boundedNumber(args.lspFileCap, ACTIONABLE_WARNINGS_LSP_FILE_CAP),
+		);
+		const budgetMs = boundedNumber(
+			args.lspBudgetMs,
+			ACTIONABLE_WARNINGS_LSP_BUDGET_MS,
+		);
+
+		// #2504 (1) project-root filter. The worklist this loop is handed had
+		// accumulated paths from two other agents' scratchpads, `~/.claude/plans`
+		// and `~/.plegma/work` — none of which belong to an LSP client rooted at
+		// this project. Rejected before any file read.
+		const eligible: string[] = [];
+		let outsideRoot = 0;
 		for (const file of args.files) {
 			const filePath = path.resolve(cwd, file);
+			if (
+				normalizeMapKey(filePath) === normalizeMapKey(cwd) ||
+				!isUnderDir(filePath, cwd)
+			) {
+				outsideRoot++;
+				logActionableWarningsEvent({
+					event: "lsp_file_skipped",
+					sessionId: args.sessionId,
+					filePath,
+					metadata: { reason: "outside_project_root" },
+				});
+				continue;
+			}
 			if (!lspService.supportsLSP(filePath)) {
 				logActionableWarningsEvent({
 					event: "lsp_file_skipped",
@@ -538,94 +621,237 @@ export async function buildActionableWarningsReport(args: {
 				});
 				continue;
 			}
-			// Reuse the cache primed by the dispatch pipeline's touchFile earlier in
-			// this turn — but only when it is verified current. A second open+wait
-			// here costs ~1 s/file with the LSP cold, so we pass the hash of the
-			// current file bytes: getLastKnownDiagnostics returns the entry only if
-			// it was primed for the SAME content, so a previous turn's diagnostics
-			// are never served as current. On any miss (no entry, content drift, or
-			// an entry written without content) we fall through to a fresh read.
-			let diags: LSPDiagnostic[] | undefined;
-			let lspSource: "cache" | "fresh" = "cache";
-			const currentContent = fs.existsSync(filePath)
+			eligible.push(filePath);
+		}
+		if (outsideRoot > 0) {
+			args.dbg?.(
+				`actionable_warnings: skipped ${outsideRoot} file(s) outside the project root`,
+			);
+		}
+
+		// #2504 (2) file cap.
+		const capped = eligible.slice(0, fileCap);
+		if (capped.length < eligible.length) {
+			recordDegradationOnce({
+				kind: "actionable-warnings-cap",
+				subject: `${cwd}:file-cap`,
+				reason: `LSP enrichment capped at ${fileCap} file(s); ${eligible.length - capped.length} modified file(s) were not checked for code actions this turn`,
+			});
+		}
+
+		// Resolve every file's cache state BEFORE doing any LSP work. This is a
+		// read + a sha256 per file (sub-millisecond) and it is what tells us
+		// whether the turn primed the cache at all — the difference between a
+		// loop that costs nothing and one that costs ~880 ms per file.
+		const primed: LspEnrichmentTarget[] = [];
+		const cold: LspEnrichmentTarget[] = [];
+		for (const filePath of capped) {
+			// Reuse the cache primed by the dispatch pipeline's touchFile earlier
+			// in this turn — but only when it is verified current. A second
+			// open+wait here costs ~1 s/file with the LSP cold, so we pass the
+			// hash of the current file bytes: getLastKnownDiagnostics returns the
+			// entry only if it was primed for the SAME content, so a previous
+			// turn's diagnostics are never served as current. On any miss (no
+			// entry, content drift, or an entry written without content) the file
+			// needs a fresh read.
+			const content = fs.existsSync(filePath)
 				? fs.readFileSync(filePath, "utf-8")
 				: undefined;
 			const contentHash =
-				currentContent !== undefined
-					? createHash("sha256").update(currentContent).digest("hex")
+				content !== undefined
+					? createHash("sha256").update(content).digest("hex")
 					: undefined;
 			const cached =
 				contentHash !== undefined
 					? lspService.getLastKnownDiagnostics(filePath, contentHash)
 					: undefined;
-			if (cached !== undefined) {
-				diags = cached;
-			} else {
-				try {
-					if (currentContent)
-						await lspService.openFile(filePath, currentContent);
-					diags = await lspService.getDiagnostics(filePath);
-					lspSource = "fresh";
-				} catch (err) {
-					args.dbg?.(
-						`actionable_warnings: LSP diagnostics failed for ${filePath}: ${err}`,
-					);
-					logActionableWarningsEvent({
-						event: "lsp_file_skipped",
-						sessionId: args.sessionId,
-						filePath,
-						metadata: { reason: "lsp_error", error: String(err) },
-					});
-					continue;
-				}
-			}
-			const ranges =
-				args.modifiedRangesByFile.get(normalizeMapKey(filePath)) ?? [];
-			const diagsWarning = diags.filter((d) => d.severity === 2);
-			let deltaFiltered = 0;
-			let enriched = 0;
-			for (const diag of diagsWarning) {
-				const line = diag.range.start.line + 1;
-				if (args.deltaOnly !== false && !lineInModifiedRanges(line, ranges)) {
-					deltaFiltered++;
-					continue;
-				}
-				const record = recordFromLspDiagnostic(diag, filePath, cwd);
-				try {
-					const actions = await lspService.codeAction(
-						filePath,
-						diag.range.start.line,
-						diag.range.start.character,
-						diag.range.end.line,
-						diag.range.end.character,
-					);
-					record.actions = actions.map(serializeAction).slice(0, 5);
-				} catch (err) {
-					args.dbg?.(
-						`actionable_warnings: LSP codeAction failed for ${filePath}: ${err}`,
-					);
-				}
-				if (record.actions.length > 0) {
-					records.push(record);
-					enriched++;
-				}
-			}
-			logActionableWarningsEvent({
-				event: "lsp_file_checked",
-				sessionId: args.sessionId,
+			(cached !== undefined ? primed : cold).push({
 				filePath,
-				metadata: {
-					diagsTotal: diags.length,
-					diagsWarning: diagsWarning.length,
-					deltaFiltered,
-					enriched,
-					modifiedRangesCount: ranges.length,
-					lspSource,
-				},
+				content,
+				cached,
+			});
+		}
+
+		// #2504 (3) wall budget, raced against the turn's abort signal. Both
+		// bounds, per AGENTS.md: neither a cap nor a deadline alone stops a
+		// cancelled turn from paying for work nobody is waiting for.
+		const deadline = Date.now() + budgetMs;
+		const exhausted = (): boolean =>
+			args.signal?.aborted === true || Date.now() >= deadline;
+
+		let unchecked = 0;
+		const runInBand = async (targets: LspEnrichmentTarget[]): Promise<void> => {
+			for (const target of targets) {
+				if (exhausted()) {
+					unchecked += targets.length - targets.indexOf(target);
+					break;
+				}
+				records.push(...(await enrichFileFromLsp(cwd, args, target)));
+			}
+		};
+
+		// Cached files first: they are free, and whether ANY of them exist is
+		// what decides the cold set's fate below.
+		await runInBand(primed);
+
+		// #2504 (4) cold-cache deferral. When the turn primed nothing, every
+		// remaining file is a full open + diagnostic wait; that whole loop is
+		// what held the terminal for 187 s. It still runs — off the awaited
+		// hook — and lands in the same `actionable-warnings` cache the in-band
+		// report goes to, so the findings reach the agent by the same channel,
+		// one turn later at worst.
+		if (cold.length > 0 && primed.length === 0) {
+			const carried = [...records];
+			const deferredArgs = args;
+			deferredLspPull = (async () => {
+				// Yield a full macrotask first. Without this the loop would run
+				// its first open+pull inside the awaited call's own microtask
+				// drain — "deferred" only on paper, and still on the hook.
+				await new Promise((resolve) => setTimeout(resolve, 0));
+				const deferredRecords = [...carried];
+				const deferredDeadline =
+					Date.now() + ACTIONABLE_WARNINGS_DEFERRED_BUDGET_MS;
+				let deferredUnchecked = 0;
+				for (const target of cold) {
+					if (
+						deferredArgs.signal?.aborted === true ||
+						Date.now() >= deferredDeadline
+					) {
+						deferredUnchecked += cold.length - cold.indexOf(target);
+						break;
+					}
+					deferredRecords.push(
+						...(await enrichFileFromLsp(cwd, deferredArgs, target)),
+					);
+				}
+				if (deferredUnchecked > 0) {
+					recordDegradationOnce({
+						kind: "actionable-warnings-cap",
+						subject: `${cwd}:deferred-budget`,
+						reason: `deferred LSP enrichment stopped early; ${deferredUnchecked} file(s) were not checked for code actions`,
+					});
+				}
+				deferredArgs.onDeferredReport?.(
+					assembleReport(cwd, deferredArgs, deferredRecords),
+				);
+			})().catch((err) => {
+				args.dbg?.(`actionable_warnings: deferred LSP pull failed: ${err}`);
+			});
+			logActionableWarningsEvent({
+				event: "lsp_pull_deferred",
+				sessionId: args.sessionId,
+				metadata: { turnIndex: args.turnIndex, files: cold.length },
+			});
+			args.dbg?.(
+				`actionable_warnings: no LSP cache primed this turn — deferring ${cold.length} fresh pull(s) off the turn_end hook`,
+			);
+		} else {
+			await runInBand(cold);
+		}
+
+		if (unchecked > 0) {
+			recordDegradationOnce({
+				kind: "actionable-warnings-cap",
+				subject: `${cwd}:wall-budget`,
+				reason: `LSP enrichment hit its ${Math.round(budgetMs)}ms turn budget; ${unchecked} file(s) were not checked for code actions this turn`,
 			});
 		}
 	}
 
+	return assembleReport(cwd, args, records);
+}
+
+/**
+ * Enrich one file's LSP warnings into records. Split out of
+ * `buildActionableWarningsReport` (#2504) so the in-band loop and the deferred
+ * off-hook loop run byte-identical logic — the deferral must not become a
+ * second, drifting copy of the enrichment.
+ */
+async function enrichFileFromLsp(
+	cwd: string,
+	args: BuildActionableWarningsArgs,
+	target: LspEnrichmentTarget,
+): Promise<ActionableWarningRecord[]> {
+	const lspService = getLSPService();
+	const { filePath } = target;
+	const out: ActionableWarningRecord[] = [];
+	let diags: LSPDiagnostic[];
+	let lspSource: "cache" | "fresh" = "cache";
+	if (target.cached !== undefined) {
+		diags = target.cached;
+	} else {
+		try {
+			if (target.content) await lspService.openFile(filePath, target.content);
+			diags = await lspService.getDiagnostics(filePath);
+			lspSource = "fresh";
+		} catch (err) {
+			args.dbg?.(
+				`actionable_warnings: LSP diagnostics failed for ${filePath}: ${err}`,
+			);
+			logActionableWarningsEvent({
+				event: "lsp_file_skipped",
+				sessionId: args.sessionId,
+				filePath,
+				metadata: { reason: "lsp_error", error: String(err) },
+			});
+			return out;
+		}
+	}
+	const ranges = args.modifiedRangesByFile.get(normalizeMapKey(filePath)) ?? [];
+	const diagsWarning = diags.filter((d) => d.severity === 2);
+	let deltaFiltered = 0;
+	let enriched = 0;
+	for (const diag of diagsWarning) {
+		const line = diag.range.start.line + 1;
+		if (args.deltaOnly !== false && !lineInModifiedRanges(line, ranges)) {
+			deltaFiltered++;
+			continue;
+		}
+		const record = recordFromLspDiagnostic(diag, filePath, cwd);
+		try {
+			const actions = await lspService.codeAction(
+				filePath,
+				diag.range.start.line,
+				diag.range.start.character,
+				diag.range.end.line,
+				diag.range.end.character,
+			);
+			record.actions = actions.map(serializeAction).slice(0, 5);
+		} catch (err) {
+			args.dbg?.(
+				`actionable_warnings: LSP codeAction failed for ${filePath}: ${err}`,
+			);
+		}
+		if (record.actions.length > 0) {
+			out.push(record);
+			enriched++;
+		}
+	}
+	logActionableWarningsEvent({
+		event: "lsp_file_checked",
+		sessionId: args.sessionId,
+		filePath,
+		metadata: {
+			diagsTotal: diags.length,
+			diagsWarning: diagsWarning.length,
+			deltaFiltered,
+			enriched,
+			modifiedRangesCount: ranges.length,
+			lspSource,
+		},
+	});
+	return out;
+}
+
+/**
+ * Assemble the report from a record set. Called once for the in-band report
+ * and again, off-hook, when the deferred fresh pull completes (#2504).
+ */
+function assembleReport(
+	cwd: string,
+	args: BuildActionableWarningsArgs,
+	records: ActionableWarningRecord[],
+): ActionableWarningsReport {
 	const merged = mergeWarnings(records);
 	updateWarningState(cwd, merged);
 	// legacyId is #1816 migration bookkeeping for updateWarningState above —

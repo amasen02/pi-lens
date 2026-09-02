@@ -15,7 +15,7 @@ import * as path from "node:path";
 import { getProjectDataDir } from "./file-utils.js";
 import { writeFileAtomic } from "./atomic-write.js";
 import { readJsonCache } from "./json-cache-read.js";
-import { normalizeMapKey } from "./path-utils.js";
+import { isUnderDir, normalizeMapKey } from "./path-utils.js";
 
 // --- Types ---
 
@@ -55,6 +55,14 @@ export interface TurnStateOwner {
 	id: string;
 	pid: number;
 	lastSeen: string;
+	/**
+	 * #2504: epoch ms this writer's SESSION began. Read by
+	 * `getTurnStateAccess` to date an ownerless persisted worklist against the
+	 * asking session — a worklist last written before this session started
+	 * cannot be this session's work, however recently the file was touched.
+	 * Optional: a caller that cannot supply it keeps the pre-#2504 gate.
+	 */
+	sessionStartedAt?: number;
 }
 
 export type TurnStateAccess = "owned" | "available" | "foreign-live";
@@ -122,6 +130,22 @@ export class CacheManager {
 	/**
 	 * Get turn-state entry for a file path using normalized lookup.
 	 */
+	/**
+	 * #2504: is this path inside the project the worklist belongs to?
+	 *
+	 * Routed through `isUnderDir` (which normalises via `normalizeFilePath`) so
+	 * the answer is separator- and case-form independent, the same key rule
+	 * every other turn-state map obeys. `toTurnStateKey` encodes "outside" by
+	 * falling back to the absolute path; this is the same predicate stated
+	 * positively, so the two cannot drift.
+	 */
+	isTurnStatePathWithinCwd(filePath: string, cwd: string): boolean {
+		const root = path.resolve(cwd);
+		const abs = path.resolve(root, filePath);
+		if (normalizeMapKey(abs) === normalizeMapKey(root)) return false;
+		return isUnderDir(abs, root);
+	}
+
 	getTurnFileState(filePath: string, cwd: string): TurnFileState | undefined {
 		const state = this.readTurnState(cwd);
 		const key = this.toTurnStateKey(filePath, cwd);
@@ -328,11 +352,25 @@ export class CacheManager {
 	/** Return whether a writer may read/write this workspace worklist. */
 	getTurnStateAccess(
 		cwd: string,
-		owner: Pick<TurnStateOwner, "kind" | "id">,
+		owner: Pick<TurnStateOwner, "kind" | "id"> & { sessionStartedAt?: number },
 	): TurnStateAccess {
 		const state = this.readTurnState(cwd);
+		const hasFiles = Object.keys(state.files ?? {}).length > 0;
 		if (!state.owner) {
-			if (!state.sessionId || state.sessionId === owner.id) return "owned";
+			if (!state.sessionId || state.sessionId === owner.id) {
+				// #2504: an OWNERLESS state was unconditionally "owned" here, and
+				// ownerless was the resting shape (pre-#2504 `clearTurnState`
+				// dropped the owner and `addModifiedRange` only stamps one when a
+				// sessionId is supplied). A worklist persisted by a session that
+				// has since exited was therefore adopted wholesale by the next
+				// session — 154 historical paths reported as "modified this turn"
+				// on a turn that made no tool calls at all. A worklist whose last
+				// write predates this session's start is not this session's work.
+				if (hasFiles && this.turnStatePredatesSession(state, owner)) {
+					return "available";
+				}
+				return "owned";
+			}
 			// Pre-owner files have no liveness information. Preserve the existing
 			// stale-session eviction behavior for this legacy shape.
 			return "available";
@@ -340,9 +378,35 @@ export class CacheManager {
 		if (state.owner.kind === owner.kind && state.owner.id === owner.id) {
 			return "owned";
 		}
+		// #2504: an EMPTY worklist carries nothing to protect, so it never
+		// latches a foreign writer out. This keeps the new `clearTurnState`
+		// owner stamp from turning a cleared worklist into a cross-process lock:
+		// an MCP writer in another process must still be able to register work
+		// against a worklist a pi session just cleared, exactly as it could when
+		// clearing left the state ownerless.
+		if (!hasFiles) return "owned";
 		return this.isTurnStateOwnerStale(state.owner)
 			? "available"
 			: "foreign-live";
+	}
+
+	/**
+	 * #2504: true when this worklist was last written before the asking
+	 * session began. `lastUpdated` is restamped by `writeTurnState` on EVERY
+	 * write (add/clear/cycle), so a live session's own worklist is always
+	 * newer than its start; only a carried-over file can be older. An
+	 * unparseable stamp is treated as stale — a worklist we cannot date is
+	 * exactly the legacy shape this gate exists to evict.
+	 */
+	private turnStatePredatesSession(
+		state: TurnState,
+		owner: { sessionStartedAt?: number },
+	): boolean {
+		const startedAt = owner.sessionStartedAt;
+		if (startedAt === undefined || !Number.isFinite(startedAt)) return false;
+		const lastUpdated = Date.parse(state.lastUpdated ?? "");
+		if (!Number.isFinite(lastUpdated)) return true;
+		return lastUpdated < startedAt;
 	}
 
 	private isTurnStateOwnerStale(owner: TurnStateOwner): boolean {
@@ -374,6 +438,18 @@ export class CacheManager {
 		sessionId?: string | null,
 		ownerKind: TurnStateOwnerKind = "pi",
 	): TurnState {
+		// #2504: the worklist is a PROJECT worklist. A path outside `cwd` was
+		// accepted and keyed by its absolute path, so a prior session's
+		// scratchpad, `~/.claude/plans/*.md` and `~/.plegma/work/.../TASK.md`
+		// all became "modified files" that turn_end then fed to the test runner
+		// and opened in an LSP client. Reject before the owner stamp below, so
+		// an out-of-project write cannot claim the worklist either.
+		if (!this.isTurnStatePathWithinCwd(filePath, cwd)) {
+			this.log(
+				`turn-state: rejected out-of-project path ${filePath} (cwd ${cwd})`,
+			);
+			return this.readTurnState(cwd);
+		}
 		const state = this.readTurnState(cwd);
 		if (sessionId) {
 			const owner: TurnStateOwner = {
@@ -414,17 +490,32 @@ export class CacheManager {
 	 */
 	clearTurnState(
 		cwd: string,
-		owner: Pick<TurnStateOwner, "kind" | "id">,
+		owner: Pick<TurnStateOwner, "kind" | "id"> & { sessionStartedAt?: number },
 	): boolean {
 		const currentState = this.readTurnState(cwd);
 		const isCurrentOwner =
 			this.getTurnStateAccess(cwd, owner) !== "foreign-live";
 		if (!isCurrentOwner && process.pid !== currentState.owner?.pid)
 			return false;
+		// #2504: stamp the CLEARING owner. Dropping `owner`/`sessionId` here made
+		// ownerless the resting shape of turn-state.json, which is what let the
+		// next session read a carried-over worklist as its own. A cleared state
+		// now says who cleared it and when, so `getTurnStateAccess` can judge it
+		// by liveness like any other owned state — and, since the worklist is
+		// empty, the stamp never latches another writer out (see the
+		// empty-worklist branch there).
 		const state: TurnState = {
 			...DEFAULT_TURN_STATE,
 			files: {}, // fresh object — DEFAULT_TURN_STATE.files can be polluted by addModifiedRange
 			lastUpdated: new Date().toISOString(),
+			sessionId: owner.id,
+			owner: {
+				kind: owner.kind,
+				id: owner.id,
+				pid: process.pid,
+				lastSeen: new Date().toISOString(),
+				sessionStartedAt: owner.sessionStartedAt,
+			},
 		};
 		this.writeTurnState(state, cwd);
 		return true;

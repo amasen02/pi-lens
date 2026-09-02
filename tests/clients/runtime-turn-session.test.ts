@@ -41,6 +41,18 @@ import {
 import { RUNNERS, TestRunnerClient } from "../../clients/test-runner-client.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
+/**
+ * #2504: turn_end no longer spawns a runner for a target that is not on disk
+ * (9 of the reported turn's 59 spawns were deleted files that came straight
+ * back as "Test file not found"). A double that names a test file production
+ * would have to find must therefore actually create it.
+ */
+function materializeTestFile(filePath: string): string {
+	fs.mkdirSync(path.dirname(filePath), { recursive: true });
+	fs.writeFileSync(filePath, "export {};\n");
+	return filePath;
+}
+
 const EMPTY_KNIP_RESULT = {
 	success: true,
 	issues: [],
@@ -1870,7 +1882,9 @@ describe("turn_end test runner — stale results are cached, not discarded", () 
 				resolveRun = resolve;
 			});
 
-			const testFile = path.join(env.tmpDir, "src/foo.test.ts");
+			const testFile = materializeTestFile(
+				path.join(env.tmpDir, "src/foo.test.ts"),
+			);
 			const testRunnerClient = {
 				getTestRunTarget: () => ({
 					testFile,
@@ -1933,7 +1947,9 @@ describe("turn_end test runner — stale results are cached, not discarded", () 
 			runtime.setTelemetryIdentity({ sessionId: "rewrite-session" });
 			const cacheManager = new CacheManager(false);
 			const srcFile = path.join(env.tmpDir, "src/foo.ts");
-			const testFile = path.join(env.tmpDir, "src/foo.test.ts");
+			const testFile = materializeTestFile(
+				path.join(env.tmpDir, "src/foo.test.ts"),
+			);
 			fs.mkdirSync(path.dirname(srcFile), { recursive: true });
 			fs.writeFileSync(srcFile, "export const x = 1;\n");
 			fs.writeFileSync(testFile, "test('x', () => {});\n");
@@ -1996,7 +2012,9 @@ describe("turn_end test runner — stale results are cached, not discarded", () 
 			runtime.setTelemetryIdentity({ sessionId: "generation-session" });
 			const cacheManager = new CacheManager(false);
 			const srcFile = path.join(env.tmpDir, "src/foo.ts");
-			const testFile = path.join(env.tmpDir, "src/foo.test.ts");
+			const testFile = materializeTestFile(
+				path.join(env.tmpDir, "src/foo.test.ts"),
+			);
 			fs.mkdirSync(path.dirname(srcFile), { recursive: true });
 			fs.writeFileSync(srcFile, "export const x = 1;\n");
 			fs.writeFileSync(testFile, "test('x', () => {});\n");
@@ -2072,7 +2090,9 @@ describe("turn_end test runner — stale results are cached, not discarded", () 
 			runtime.setTelemetryIdentity({ sessionId: "empty-consume-session" });
 			const cacheManager = new CacheManager(false);
 			const srcFile = path.join(env.tmpDir, "src/foo.ts");
-			const testFile = path.join(env.tmpDir, "src/foo.test.ts");
+			const testFile = materializeTestFile(
+				path.join(env.tmpDir, "src/foo.test.ts"),
+			);
 			fs.mkdirSync(path.dirname(srcFile), { recursive: true });
 			fs.writeFileSync(srcFile, "export const x = 1;\n");
 			fs.writeFileSync(testFile, "test('x', () => {});\n");
@@ -2145,7 +2165,9 @@ describe("turn_end test runner — stale results are cached, not discarded", () 
 				"nonstale-session",
 			);
 
-			const testFile = path.join(env.tmpDir, "src/foo.test.ts");
+			const testFile = materializeTestFile(
+				path.join(env.tmpDir, "src/foo.test.ts"),
+			);
 			const testRunnerClient = {
 				getTestRunTarget: () => ({
 					testFile,
@@ -2303,7 +2325,9 @@ describe("turn_end test runner — unmeasured duration is not printed as 0ms", (
 			const cacheManager = new CacheManager(false);
 
 			const srcFile = path.join(env.tmpDir, "src/foo.ts");
-			const testFile = path.join(env.tmpDir, "src/foo.test.ts");
+			const testFile = materializeTestFile(
+				path.join(env.tmpDir, "src/foo.test.ts"),
+			);
 			fs.mkdirSync(path.dirname(srcFile), { recursive: true });
 			fs.writeFileSync(srcFile, "export const x = 1;\n");
 			fs.writeFileSync(testFile, "test('x', () => {});\n");
@@ -2429,8 +2453,12 @@ describe("turn_end test runner — cascade neighbors get their own test companio
 				diagnosticCount: 0,
 			});
 
-			const fooTestFile = path.join(env.tmpDir, "src/foo.test.ts");
-			const barTestFile = path.join(env.tmpDir, "src/bar.test.ts");
+			const fooTestFile = materializeTestFile(
+				path.join(env.tmpDir, "src/foo.test.ts"),
+			);
+			const barTestFile = materializeTestFile(
+				path.join(env.tmpDir, "src/bar.test.ts"),
+			);
 			const getTestRunTarget = vi.fn((absPath: string) => {
 				if (path.basename(absPath) === path.basename(editedFile)) {
 					return {

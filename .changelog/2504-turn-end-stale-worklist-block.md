@@ -1,0 +1,5 @@
+---
+section: Fixed
+---
+
+- **`turn_end` no longer blocks the terminal on a stale worklist (closes #2504)** — a persisted ownerless `.pi-lens/turn-state.json` was adopted by the next session as "modified this turn", so a model-switch turn with zero tool calls fired 59 concurrent test-runner spawns and a 188 s LSP warning sweep over 154 historical paths. `getTurnStateAccess` now evicts an ownerless worklist last written before this session started, `clearTurnState` stamps the clearing owner, and `addModifiedRange` rejects paths outside the project root. The test fan-out gained a concurrency cap of 4, a per-turn target cap, a batch wall budget raced against the ambient abort signal, and skips targets whose test file no longer exists. `buildActionableWarningsReport` gained a project-root filter, a file cap and a wall budget, and defers its fresh LSP pulls off the awaited hook when the turn primed no cache — delivering them through the same cached channel. Truncation is reported through the degradation ledger, and the `turn_end: N file(s) modified` debug line now carries the resolved access and owner.

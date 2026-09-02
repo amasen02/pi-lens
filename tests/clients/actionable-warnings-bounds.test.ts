@@ -18,9 +18,11 @@ import {
 } from "../../clients/degradation-ledger.js";
 import { removeTempDirSync } from "./test-utils.js";
 
-const openFile = vi.fn(async () => undefined);
+const openFile = vi.fn(
+	async (_filePath: string, _content?: string) => undefined,
+);
 let getDiagnosticsDelayMs = 0;
-const getDiagnostics = vi.fn(async () => {
+const getDiagnostics = vi.fn(async (_filePath: string) => {
 	if (getDiagnosticsDelayMs > 0) {
 		await new Promise((resolve) => setTimeout(resolve, getDiagnosticsDelayMs));
 	}
@@ -30,9 +32,7 @@ const codeAction = vi.fn(async (): Promise<LSPCodeAction[]> => []);
 /** Files whose diagnostics the dispatch pipeline primed this turn. */
 let primedFiles = new Set<string>();
 const getLastKnownDiagnostics = vi.fn((filePath: string) =>
-	primedFiles.has(filePath.replace(/\\/g, "/").toLowerCase())
-		? []
-		: undefined,
+	primedFiles.has(filePath.replace(/\\/g, "/").toLowerCase()) ? [] : undefined,
 );
 
 vi.mock("../../clients/lsp/index.js", () => ({

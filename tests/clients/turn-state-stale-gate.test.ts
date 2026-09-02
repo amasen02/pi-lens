@@ -247,6 +247,8 @@ describe("#2504 AC1 — a zero-tool-call turn does no work", () => {
 			[],
 		);
 		expect(getTestRunTarget).not.toHaveBeenCalled();
-		expect(cacheManager.readCache("actionable-warnings", env.tmpDir)).toBeNull();
+		expect(
+			cacheManager.readCache("actionable-warnings", env.tmpDir),
+		).toBeNull();
 	});
 });

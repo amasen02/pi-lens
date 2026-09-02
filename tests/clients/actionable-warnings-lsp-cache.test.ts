@@ -62,6 +62,13 @@ afterEach(() => {
 	removeTempDirSync(tmpDir);
 });
 
+/** #2504: settle the off-hook fresh-pull loop, if this call deferred one. */
+async function awaitDeferred(): Promise<void> {
+	const { _awaitDeferredLspPullForTest } =
+		await import("../../clients/actionable-warnings.js");
+	await _awaitDeferredLspPullForTest();
+}
+
 async function buildReport(args: { dispatchWarnings?: never[] } = {}) {
 	const { buildActionableWarningsReport } =
 		await import("../../clients/actionable-warnings.js");
@@ -108,6 +115,11 @@ describe("actionable-warnings LSP cache short-circuit (#fix-1)", () => {
 		lastKnownReturn = undefined; // cache miss — dispatch never touched this file
 		await buildReport();
 		expect(getLastKnownDiagnostics).toHaveBeenCalledTimes(1);
+		// #2504: the fresh pull still happens, but a turn that primed NO cache
+		// runs it OFF the awaited turn_end hook — 147 serial ~880 ms pulls on
+		// the hook is what blocked the terminal for 187 s. Await the deferral to
+		// assert the slow path still runs.
+		await awaitDeferred();
 		expect(openFile).toHaveBeenCalledTimes(1);
 		expect(getDiagnostics).toHaveBeenCalledTimes(1);
 	});
@@ -158,6 +170,9 @@ describe("actionable-warnings LSP cache short-circuit (#fix-1)", () => {
 		cachedForHash = "hash-of-some-older-content";
 		await buildReport();
 		expect(getLastKnownDiagnostics).toHaveBeenCalledTimes(1);
+		// A hash mismatch is a cache MISS, so this turn primed nothing and the
+		// fresh read is deferred off the hook (#2504) — it still happens.
+		await awaitDeferred();
 		expect(openFile).toHaveBeenCalledTimes(1);
 		expect(getDiagnostics).toHaveBeenCalledTimes(1);
 	});

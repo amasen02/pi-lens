@@ -12,6 +12,7 @@
 import { createSubsystemLogger } from "./extension-log.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { mapWithConcurrency } from "./map-with-concurrency.js";
 import { findNodeToolBinary } from "./package-manager.js";
 import { isFullyQualified } from "./path-utils.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
@@ -239,30 +240,16 @@ async function resolvedCommandIsStale(
 
 /**
  * Run `mapper` over `items` with at most `concurrency` in flight at once.
+ *
  * Exported (#1810 review F6) so `clients/dispatch/runners/biome-check.ts`'s
  * `resolveBiomeFixKinds` can reuse this exact worker-pool shape for its
- * `biome explain` fan-out instead of carrying a second copy — this file
- * predates that need but is otherwise unrelated to it; a shared home for
- * this one helper wasn't worth a whole new module for two call sites.
+ * `biome explain` fan-out instead of carrying a second copy. #2504 moved the
+ * VALUE to the zero-dependency `map-with-concurrency.js` leaf — a third caller
+ * (`runtime-turn.ts`) needs the pool without pulling this analyzer client into
+ * the eager startup graph — and re-exports it here so every existing importer
+ * keeps its specifier. This stays the helper's documented home.
  */
-export async function mapWithConcurrency<T>(
-	items: T[],
-	concurrency: number,
-	mapper: (item: T) => Promise<void>,
-): Promise<void> {
-	if (items.length === 0) return;
-	let nextIndex = 0;
-	const workerCount = Math.max(1, Math.min(concurrency, items.length));
-	const worker = async (): Promise<void> => {
-		while (true) {
-			const index = nextIndex++;
-			if (index >= items.length) return;
-			await mapper(items[index]);
-		}
-	};
-	const workers = Array.from({ length: workerCount }, () => worker());
-	await Promise.all(workers);
-}
+export { mapWithConcurrency };
 
 // --- Client ---
 
