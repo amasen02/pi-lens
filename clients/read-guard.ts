@@ -1199,6 +1199,27 @@ export class ReadGuard {
 	}
 
 	/**
+	 * Every path this guard has a read or a write record for, as normalized keys
+	 * (#2430).
+	 *
+	 * This is the read-guard half of the observational net's TRACKED-FILE SET:
+	 * the files pi-lens has actually seen this session, which the `agent_settled`
+	 * sweep hash-checks instead of walking the workspace. It reads state already
+	 * held in memory and stats nothing; both backing containers are capped
+	 * (`READ_GUARD_MAX_UNCONSUMED_FILES`), so the result is bounded by
+	 * construction.
+	 *
+	 * `touchFile` is deliberately NOT called: enumerating is not using, and
+	 * refreshing every entry's idle clock on each sweep would make the idle
+	 * eviction unreachable.
+	 */
+	getTrackedPaths(): string[] {
+		const tracked = new Set<string>(this.reads.keys());
+		for (const written of this.writtenThisSession) tracked.add(written);
+		return [...tracked];
+	}
+
+	/**
 	 * Drop all record of a path pi-lens confirmed no longer exists on disk
 	 * (#1668, external delete). Without this a later write reusing the same
 	 * path would inherit a stale writtenThisSession/reads entry from before
