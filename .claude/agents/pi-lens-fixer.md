@@ -62,15 +62,13 @@ instructions say so.
    same behavior), PLUS every directory-scanning governance suite: those walk
    `clients/` and fire on any new or edited file, so a symbol grep structurally
    cannot find them (PR #2107 lesson — two sweeps fired in CI that the symbol
-   grep missed). The set today: `delivery-surface-ratchet`,
-   `finding-delivery-gate`, `session-state-conformance`,
-   `bounded-telemetry-sweep`, `bus-producer-coverage`, `deps-centralization`,
-   `freshness-sweep`, `managed-tool-seam-coverage`, `profiling-coverage`,
-   `module-instance-coverage`, `sweep-floor-coverage` — and that list is a
-   floor, not the set: run EVERY `tests/config/*.test.ts` sweep regardless of
-   which tree it walks (`git-fixture-governance` and `lsp-spawn-heavy-coverage`
-   walk `scripts/` and `tests/`; #2438 shipped red because a scripts-only PR
-   read the clients/-walking list as not applying). The full suite is CI's
+   grep missed). Do NOT hand-pick them from memory — #2470 round 3 shipped
+   with Unit tests red because its "governance set" of eleven files omitted
+   `generation-guard-sweep`. Select them mechanically, every time:
+   `ls tests/clients/*-{sweep,ratchet,conformance,coverage,gate,governance}*.test.ts`
+   plus EVERY `tests/config/*.test.ts` (those walk `scripts/` and `tests/`
+   too; #2438 shipped red because a scripts-only PR read the clients/-walking
+   list as not applying). Quote the file count you ran in the PR body. The full suite is CI's
    job.
 6. If the issue asks for a class sweep, run it and report coverage honestly:
    what you searched, what you found, what you deliberately left.
