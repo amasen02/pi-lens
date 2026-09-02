@@ -8,6 +8,7 @@
  */
 
 import * as fs from "node:fs";
+import { extname } from "node:path";
 import { withBudget } from "./deadline-utils.js";
 import type { TreeSitterClient } from "./tree-sitter-client.js";
 
@@ -68,6 +69,16 @@ const EXT_TO_LANG: Record<string, string> = {
  * supported language instead of a hardcoded subset (#262).
  */
 export const CODE_FILE_EXTENSIONS: readonly string[] = Object.keys(EXT_TO_LANG);
+
+/**
+ * The grammar this module would parse `filePath` with, or undefined when read
+ * expansion does not understand the extension. The single read of
+ * {@link EXT_TO_LANG} outside this module's own expansion path; exported so the
+ * language-identity golden snapshot can record this consumer's answer.
+ */
+export function readExpansionLanguage(filePath: string): string | undefined {
+	return EXT_TO_LANG[extname(filePath).toLowerCase()];
+}
 
 /** AST node types considered "enclosing symbols" for coverage purposes. */
 const ENCLOSING_TYPES: Record<string, string[]> = {
@@ -307,7 +318,7 @@ export async function tryExpandRead(
 			return { ...result, durationMs: Date.now() - startedAt };
 		}
 
-		const languageId = EXT_TO_LANG[ext];
+		const languageId = readExpansionLanguage(filePath);
 		if (!languageId) return undefined;
 
 		const enclosingTypes = ENCLOSING_TYPES[languageId];

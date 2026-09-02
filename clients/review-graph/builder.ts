@@ -3979,7 +3979,10 @@ function addJsTsFile(
 	}
 }
 
-function mapKindToTreeSitterLanguage(
+// Exported for the language-identity golden snapshot
+// (scripts/gen-language-snapshot.mjs), which records the review graph's
+// answer for every extension in the union of the language tables.
+export function mapKindToTreeSitterLanguage(
 	kind: string | undefined,
 	filePath?: string,
 ): string | undefined {
