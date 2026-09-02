@@ -10,6 +10,10 @@ export type ProjectChangeSource =
 	| "autofix"
 	| "partial-apply"
 	| "lsp-edit"
+	/** An LSP `textDocument/rename` or `workspace/willRenameFiles` resource rename (#2450). */
+	| "lsp-rename"
+	/** A `workspace/executeCommand` (allowlisted) or the `workspace/applyEdit` it solicited (#2450). */
+	| "lsp-execute-command"
 	| "opaque-script"
 	| "external"
 	/**

@@ -2565,7 +2565,29 @@ autofix pass, the safe timing, and its changes get their own
 The write-side counterpart of the read bridge is `clients/mutation-bridge.ts`:
 an in-process producer that writes a file outside the tool-event path calls
 `recordMutation` at `Symbol.for("pi-lens:mutation-bridge")` and gets the same
-bookkeeping; `ast_grep_replace apply:true` is the in-repo consumer.
+bookkeeping; `ast_grep_replace apply:true` is the in-repo consumer. The entry
+carries three optional producer-stated fields the seam otherwise cannot infer:
+`importsChanged` (gates the madge re-scan filter, default `false` — the safe
+prior behavior every existing producer keeps), `deferAutofix` (queues a
+deferred autofix/format pass at `agent_settled`, default `true`) and
+`provenance` (the #2430 net's `"observed"`/`"settled-sweep"`, default
+`"bridge"`). A second in-repo consumer, `clients/lsp-mutation.ts`'s
+`bookkeepLspMutation`, calls the bridge as ITS OWN internal fallback (never a
+parallel seam other code reaches for) when its own caller could not thread
+`runtime`/`cacheManager` — it passes the real `importsChanged` value and
+`deferAutofix: false`, since the LSP direct path never defers a format pass
+either (#2450).
+
+**`noteMutationHandled` is not gated on `deferAutofix` (#2465).** Inside
+`recordMutationThroughSeam` the `noteMutationHandled(filePath)` call sits
+BEFORE — outside — the `if (entry.deferAutofix !== false)` guard, and
+`bookkeepLspMutation`'s DIRECT branch calls it too, right after
+`cacheManager.addModifiedRange`. "pi-lens accounted for this write" and
+"pi-lens will format this file later" are different questions: an LSP-applied
+edit answers yes to the first and no to the second. Fold either one into the
+other and the `agent_settled` sweep re-reads every `lsp_navigation` rename and
+every `workspace/applyEdit` fallback write as drift no tool call explains —
+the exact false report the net exists to avoid.
 
 **OBSERVATIONAL MUTATION NET (#2430):** the name table and the shape registry
 are finite and the population of third-party edit tools is not, so a fourth
@@ -2662,6 +2684,7 @@ Steady-state cost is zero for a classified `write`/`edit` (the net is gated on
 `classifyMutatingTool` having returned `undefined` or the attribution still
 being provisional) and ~1.3ms for one armed observation of a file target, paid
 at most a handful of times per tool name per session.
+
 `tests/clients/mutating-tool-classification.test.ts` greps `clients/`, `tools/`
 and `index.ts` and fails when a mutation decision reappears outside the seam —
 `===`/`!==`/`==`/`!=` against `"write"`/`"edit"`/`"multiedit"` (any

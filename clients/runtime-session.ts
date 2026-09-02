@@ -126,6 +126,7 @@ import { resetWorkspaceTopology } from "./workspace-topology.js";
 import { resetZizmorTokenAvailability } from "./zizmor-config.js";
 import { resetSpawnTimeoutCooldowns } from "./spawn-timeout-cooldown.js";
 import { resetTestRunnerDelivery } from "./test-runner-delivery.js";
+import { resetLspMutationNoBridgeDbgLatch } from "./lsp-mutation.js";
 import type { SessionStartClassification } from "./session-lifecycle.js";
 
 /** Durable root-identity value on `session_start_total` records. */
@@ -1778,6 +1779,13 @@ export async function handleSessionStart(
 ): Promise<void> {
 	resetDegradationLedger();
 	resetTestRunnerDelivery();
+	// #2450 fix round 3, catalog shape 17: the "bridge unavailable" dbg latch
+	// (`clients/lsp-mutation.ts`) is a process-lifetime once-per-session flag,
+	// same shape as the ledger's own once-per-subject bookkeeping above, but
+	// kept as its own reset (not folded into `resetDegradationLedger`) to
+	// avoid that module reaching back into this one — see the latch's own
+	// comment for why.
+	resetLspMutationNoBridgeDbgLatch();
 	// #1743: the bounded-telemetry per-turn counters. The rising-edge state is
 	// NOT here — it is the ledger's own tally, reset on the line above. These
 	// counters are keyed by turn index, and a new session restarts turn
