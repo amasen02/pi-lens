@@ -1088,7 +1088,9 @@ describe("#2464 review round 3 — F1: the observed dispatch shares the classifi
 
 			// A classified edit for a genuinely NEW state: it must run.
 			fs.writeFileSync(filePath, `${SOURCE}const d = 4;\nconst e = 5;\n`);
-			const classifiedEvent = (toolCallId: string): Record<string, unknown> => ({
+			const classifiedEvent = (
+				toolCallId: string,
+			): Record<string, unknown> => ({
 				toolName: "edit",
 				toolCallId,
 				input: { path: filePath },
@@ -1303,9 +1305,7 @@ describe("#2464 review round 3 — F2: the observed dispatch targets a RECORDED 
 			);
 			// The tool writes a file INSIDE the directory it named.
 			fs.writeFileSync(insideDir, `${SOURCE}const d = 4;\n`);
-			await handleToolResult(
-				toolResultDeps({ event, runtime, cacheManager }),
-			);
+			await handleToolResult(toolResultDeps({ event, runtime, cacheManager }));
 
 			const dispatchedPaths = vi
 				.mocked(runPipeline)
