@@ -71,6 +71,12 @@ instructions say so.
    `Refs #<N>` and the session trailers; push; open the PR with the issue ref
    in the TITLE — `closes` only if every acceptance criterion is met,
    otherwise `refs` plus an issue comment naming the remainder.
+   The PR BODY is built from `.github/PULL_REQUEST_TEMPLATE.md` — copy it and
+   fill EVERY section (`Summary`, `Type of change`, `Area`, `Checklist`,
+   `Tests`, `Blast radius`, `Observability`, `Class sweep`, plus
+   `Test assessment` whenever `tests/` is touched). Free-form bodies fail the
+   `PR body (advisory)` check (`scripts/check-pr-body.mjs`); a red on that
+   check is a fix-before-review item, not advisory to you.
 8. After the push: verify with `gh pr checks` that Unit tests and Lint
    actually EXECUTE on your head. A DIRTY PR silently skips them.
 9. Expect an adversarial review round. When findings come back, fix on the
