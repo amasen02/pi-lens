@@ -1674,7 +1674,7 @@ function retirePullSource(state: LSPClientState, identifier: string): void {
 	const suffix = `${PULL_SOURCE_KEY_SEPARATOR}${identifier}`;
 	for (const source of [state.pullResultIds, state.pullRequestSequences]) {
 		if (!source) continue;
-		for (const key of [...source.keys()]) {
+		for (const key of source.keys()) {
 			if (key.endsWith(suffix)) source.delete(key);
 		}
 	}

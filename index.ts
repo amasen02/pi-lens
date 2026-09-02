@@ -2183,7 +2183,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 						resetDispatchBaselines,
 						resetLSPService,
 					});
-					ctx.ui && updateLspStatus(ctx.ui.setStatus, ctx.ui.theme);
+					if (ctx.ui) updateLspStatus(ctx.ui.setStatus, ctx.ui.theme);
 
 					// Pin the stable identity + reason AFTER handleSessionStart (which ran
 					// resetForSession → a fresh random id); the stable id now wins (#190).
@@ -2672,7 +2672,7 @@ function activateExtension(hostPi: ExtensionAPI) {
 			// `agent_settled` below, since — unlike this flush — running it here
 			// can fire mid-run, between auto-retries).
 			await flushDebouncedToolResults();
-			ctx.ui && updateLspStatus(ctx.ui.setStatus, ctx.ui.theme);
+			if (ctx.ui) updateLspStatus(ctx.ui.setStatus, ctx.ui.theme);
 		} catch (agentEndErr) {
 			// The stale-ctx class has ONE classifier and one record, in
 			// clients/session-event-guard.ts. Rethrow so the wrapper around this

@@ -657,7 +657,7 @@ export function normalizeHostToolPath(
 	) {
 		return path.join(os.homedir(), normalized.slice(2));
 	}
-	if (/^file:\/\//.test(normalized)) {
+	if (normalized.startsWith("file://")) {
 		try {
 			return fileURLToPath(normalized);
 		} catch {
