@@ -34,7 +34,13 @@ import { readChangesSince } from "../../clients/project-changes.js";
 import { countFileLines } from "../../clients/read-guard-tool-lines.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { handleToolCall } from "../../clients/runtime-tool-call.js";
-import { handleToolResult } from "../../clients/runtime-tool-result.js";
+import {
+	claimPipelineDispatch,
+	clearLastAnalyzedStateCache,
+	handleToolResult,
+	registerInFlightPipeline,
+	releaseInFlightPipeline,
+} from "../../clients/runtime-tool-result.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
 vi.mock("../../clients/pipeline.js", () => ({
@@ -70,6 +76,69 @@ vi.mock("../../clients/bootstrap.js", () => ({
 }));
 
 const SOURCE = ["const a = 1;", "const b = 2;", "const c = 3;", ""].join("\n");
+
+/** What the mocked `runPipeline` resolves to once its gate is released. */
+const PIPELINE_RESULT = {
+	output: "",
+	hasBlockers: false,
+	isError: false,
+	fileModified: false,
+};
+
+/**
+ * Let every pending settle/IO turn finish. The observational settle is async
+ * filesystem work, so a case that starts two `handleToolResult` calls without
+ * awaiting them needs the event loop to actually drain before it can read how
+ * many pipelines registered.
+ */
+async function flushAsyncWork(ticks = 25): Promise<void> {
+	for (let index = 0; index < ticks; index += 1) {
+		await new Promise((resolve) => setTimeout(resolve, 0));
+	}
+}
+
+/**
+ * A `runPipeline` double whose every call parks on its own gate until the case
+ * releases it. Production-faithful on the axis these cases test: a real
+ * pipeline is in flight for a while, and it is exactly that window in which
+ * `inFlightPipelines` has to dedup a concurrent duplicate.
+ */
+function gatePipeline(runPipelineMock: {
+	mockReset: () => void;
+	mockImplementation: (impl: never) => void;
+}): {
+	gates: Array<() => void>;
+	contexts: Array<Record<string, unknown>>;
+	release: (from: number, to: number) => void;
+} {
+	const gates: Array<() => void> = [];
+	const contexts: Array<Record<string, unknown>> = [];
+	runPipelineMock.mockReset();
+	runPipelineMock.mockImplementation((async (ctx: unknown) => {
+		contexts.push(ctx as Record<string, unknown>);
+		await new Promise<void>((resolve) => {
+			gates.push(resolve);
+		});
+		return PIPELINE_RESULT;
+	}) as never);
+	return {
+		gates,
+		contexts,
+		release: (from: number, to: number) => {
+			for (let index = from; index < Math.min(to, gates.length); index += 1) {
+				gates[index]();
+			}
+		},
+	};
+}
+
+function ungatePipeline(runPipelineMock: {
+	mockReset: () => void;
+	mockImplementation: (impl: never) => void;
+}): void {
+	runPipelineMock.mockReset();
+	runPipelineMock.mockImplementation((async () => PIPELINE_RESULT) as never);
+}
 
 /**
  * The bridge is a process-global, first-wins singleton, so it is mounted once
@@ -904,6 +973,342 @@ describe("#2464 — the observed-settle path also dispatches pipeline analysis",
 				isError: false,
 				fileModified: false,
 			})) as never);
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+});
+
+describe("#2464 review round 3 — F1: the observed dispatch shares the classified pre-conditions", () => {
+	it("dispatches ONE pipeline for two concurrent observed tool_results on the same state", async () => {
+		// The observed call site shipped in round 2 with NO in-flight check and no
+		// already-analysed latch check, so two tool_results that settle
+		// observationally against the same file+hash both reached
+		// `dispatchPipelineAnalysis`. That is two `runPipeline` runs — under
+		// `--immediate-format`, two autofix/format writers racing on one file —
+		// where the classified chain has deduped since #1086.
+		const env = setupTestEnvironment("pi-lens-2464-f1-concurrent-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		const previousDebounce = process.env.PI_LENS_TOOL_RESULT_DEBOUNCE_MS;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		// Route through inFlightPipelines rather than the debounce coalescer.
+		delete process.env.PI_LENS_TOOL_RESULT_DEBOUNCE_MS;
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		try {
+			const filePath = path.join(env.tmpDir, "concurrent.ts");
+			fs.writeFileSync(filePath, SOURCE);
+			const { runtime, cacheManager } = newSession(env.tmpDir);
+			const gated = gatePipeline(vi.mocked(runPipeline));
+
+			// Two calls of the SAME unknown tool, both armed against the same
+			// pre-write baseline, both settling on the same post-write bytes.
+			const eventA = patchEvent(filePath, "call-2464-f1-a");
+			const eventB = patchEvent(filePath, "call-2464-f1-b");
+			for (const event of [eventA, eventB]) {
+				expect(classifyMutatingTool(event as never)).toBeUndefined();
+				await handleToolCall(
+					toolCallDeps({ event, cwd: env.tmpDir, runtime, cacheManager }),
+				);
+			}
+			fs.writeFileSync(filePath, `${SOURCE}const d = 4;\n`);
+
+			// Started back to back, so neither has resumed from its settle when the
+			// other starts — the exact interleave the classified chain's atomic
+			// check-then-act is built for.
+			const first = handleToolResult(
+				toolResultDeps({ event: eventA, runtime, cacheManager }),
+			);
+			const second = handleToolResult(
+				toolResultDeps({ event: eventB, runtime, cacheManager }),
+			);
+			await flushAsyncWork();
+
+			expect(gated.gates.length).toBe(1);
+			expect(vi.mocked(runPipeline)).toHaveBeenCalledTimes(1);
+
+			gated.release(0, gated.gates.length);
+			await Promise.all([first, second]);
+			// The joiner is still counted: the duplicate rides the live pipeline's
+			// telemetry instead of opening a second one.
+			expect(vi.mocked(runPipeline)).toHaveBeenCalledTimes(1);
+		} finally {
+			ungatePipeline(vi.mocked(runPipeline));
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			if (previousDebounce === undefined)
+				delete process.env.PI_LENS_TOOL_RESULT_DEBOUNCE_MS;
+			else process.env.PI_LENS_TOOL_RESULT_DEBOUNCE_MS = previousDebounce;
+			env.cleanup();
+		}
+	});
+
+	it("keeps a later classified pipeline deduping after two observed calls settle", async () => {
+		// The reviewer's round-3 choreography, end to end. Two concurrent observed
+		// calls A and B on one file+hash; A resolves; a classified call C for a
+		// NEW state registers; B settles last; an exact duplicate D of C arrives
+		// while C is still in flight.
+		//
+		// Round 2's head ran FOUR pipelines here. B registered under A's key and
+		// overwrote it, A's release emptied the map and deleted the OUTER entry,
+		// C re-created a fresh inner map under the same path, and B's release —
+		// holding a stale reference to the FIRST inner map — deleted the outer
+		// entry again, evicting live C. D then found nothing to dedup against.
+		const env = setupTestEnvironment("pi-lens-2464-f1-eviction-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		const previousDebounce = process.env.PI_LENS_TOOL_RESULT_DEBOUNCE_MS;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		delete process.env.PI_LENS_TOOL_RESULT_DEBOUNCE_MS;
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		try {
+			const filePath = path.join(env.tmpDir, "eviction.ts");
+			fs.writeFileSync(filePath, SOURCE);
+			const { runtime, cacheManager } = newSession(env.tmpDir);
+			const gated = gatePipeline(vi.mocked(runPipeline));
+
+			const eventA = patchEvent(filePath, "call-2464-f1-evict-a");
+			const eventB = patchEvent(filePath, "call-2464-f1-evict-b");
+			for (const event of [eventA, eventB]) {
+				await handleToolCall(
+					toolCallDeps({ event, cwd: env.tmpDir, runtime, cacheManager }),
+				);
+			}
+			fs.writeFileSync(filePath, `${SOURCE}const d = 4;\n`);
+
+			const first = handleToolResult(
+				toolResultDeps({ event: eventA, runtime, cacheManager }),
+			);
+			const second = handleToolResult(
+				toolResultDeps({ event: eventB, runtime, cacheManager }),
+			);
+			await flushAsyncWork();
+			// Not asserted — the sibling case above owns that red. Captured so the
+			// releases below name A's gate and B's gate under BOTH behaviours.
+			const observedGateCount = gated.gates.length;
+
+			gated.release(0, 1);
+			await first;
+
+			// A classified edit for a genuinely NEW state: it must run.
+			fs.writeFileSync(filePath, `${SOURCE}const d = 4;\nconst e = 5;\n`);
+			const classifiedEvent = (toolCallId: string): Record<string, unknown> => ({
+				toolName: "edit",
+				toolCallId,
+				input: { path: filePath },
+				content: [{ type: "text", text: "edited" }],
+			});
+			const third = handleToolResult(
+				toolResultDeps({
+					event: classifiedEvent("call-2464-f1-evict-c"),
+					runtime,
+					cacheManager,
+				}),
+			);
+			await flushAsyncWork();
+
+			// Now B settles, holding whatever registry reference it captured.
+			gated.release(1, observedGateCount);
+			await second;
+
+			// An exact duplicate of C, while C is still in flight.
+			const fourth = handleToolResult(
+				toolResultDeps({
+					event: classifiedEvent("call-2464-f1-evict-d"),
+					runtime,
+					cacheManager,
+				}),
+			);
+			await flushAsyncWork();
+
+			// Two physical states, two pipelines: A's observed dispatch and C's
+			// classified one. B joined A; D deduped against live C.
+			expect(vi.mocked(runPipeline)).toHaveBeenCalledTimes(2);
+			expect(gated.contexts.map((ctx) => ctx.toolName)).toEqual([
+				"patch_file",
+				"edit",
+			]);
+
+			gated.release(0, gated.gates.length);
+			await Promise.all([third, fourth]);
+		} finally {
+			ungatePipeline(vi.mocked(runPipeline));
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			if (previousDebounce === undefined)
+				delete process.env.PI_LENS_TOOL_RESULT_DEBOUNCE_MS;
+			else process.env.PI_LENS_TOOL_RESULT_DEBOUNCE_MS = previousDebounce;
+			env.cleanup();
+		}
+	});
+
+	it("does not re-analyse an observed mutation whose state a classified call already analysed", async () => {
+		// The sequential half of the same gap: the already-analysed latch. A
+		// classified call analyses a state and stamps the latch; an armed
+		// observation for the SAME bytes then settles and, in round 2's head,
+		// dispatched a second pipeline for a state nothing had changed since.
+		const env = setupTestEnvironment("pi-lens-2464-f1-latch-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		const previousDebounce = process.env.PI_LENS_TOOL_RESULT_DEBOUNCE_MS;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		delete process.env.PI_LENS_TOOL_RESULT_DEBOUNCE_MS;
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		try {
+			const filePath = path.join(env.tmpDir, "latched.ts");
+			fs.writeFileSync(filePath, SOURCE);
+			const { runtime, cacheManager } = newSession(env.tmpDir);
+			vi.mocked(runPipeline).mockClear();
+
+			// Armed BEFORE the classified write, so the settle below sees the same
+			// bytes the classified call just analysed.
+			const observedEvent = patchEvent(filePath, "call-2464-f1-latch-obs");
+			await handleToolCall(
+				toolCallDeps({
+					event: observedEvent,
+					cwd: env.tmpDir,
+					runtime,
+					cacheManager,
+				}),
+			);
+
+			fs.writeFileSync(filePath, `${SOURCE}const d = 4;\n`);
+			await handleToolResult(
+				toolResultDeps({
+					event: {
+						toolName: "edit",
+						toolCallId: "call-2464-f1-latch-cls",
+						input: { path: filePath },
+						content: [{ type: "text", text: "edited" }],
+					},
+					runtime,
+					cacheManager,
+				}),
+			);
+			expect(vi.mocked(runPipeline)).toHaveBeenCalledTimes(1);
+
+			await handleToolResult(
+				toolResultDeps({ event: observedEvent, runtime, cacheManager }),
+			);
+
+			// Same turn, same bytes, nothing to re-analyse.
+			expect(vi.mocked(runPipeline)).toHaveBeenCalledTimes(1);
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			if (previousDebounce === undefined)
+				delete process.env.PI_LENS_TOOL_RESULT_DEBOUNCE_MS;
+			else process.env.PI_LENS_TOOL_RESULT_DEBOUNCE_MS = previousDebounce;
+			env.cleanup();
+		}
+	});
+
+	it("never evicts a live registration when a stale release names the same file", async () => {
+		// The identity guard in `releaseInFlightPipeline`, in isolation. With the
+		// shared claim now consulted by both dispatch call sites, no production
+		// path can register the same file+hash twice any more — so the guard's
+		// trigger is unreachable end to end, and driving the registry seam
+		// directly is the only honest way to prove the guard is doing work.
+		// Delete the `inFlightPipelines.get(filePath) === registered` conjunct and
+		// the last assertion goes red.
+		clearLastAnalyzedStateCache();
+		const filePath = path.join(
+			process.cwd(),
+			"tests",
+			"__identity-guard-2464.ts",
+		);
+		const settled = Promise.resolve();
+		const liveClassified = {
+			promise: settled,
+			participantIds: ["c"],
+			participantTotal: 1,
+		};
+
+		// Two registrations for one state, the shape round 2's observed path
+		// could produce: the second overwrites the first inside one inner map.
+		const firstMap = registerInFlightPipeline(filePath, "hash-1", {
+			promise: settled,
+			participantIds: ["a"],
+			participantTotal: 1,
+		});
+		const secondMap = registerInFlightPipeline(filePath, "hash-1", {
+			promise: settled,
+			participantIds: ["b"],
+			participantTotal: 1,
+		});
+		expect(secondMap).toBe(firstMap);
+
+		// A releases: the map empties and the outer entry goes with it.
+		releaseInFlightPipeline(filePath, "hash-1", firstMap);
+		// A live, unrelated pipeline re-creates the outer entry under a FRESH map.
+		const classifiedMap = registerInFlightPipeline(
+			filePath,
+			"hash-2",
+			liveClassified,
+		);
+		expect(classifiedMap).not.toBe(firstMap);
+		// B releases last, holding the stale reference.
+		releaseInFlightPipeline(filePath, "hash-1", secondMap);
+
+		const claim = claimPipelineDispatch({
+			filePath,
+			stateHash: "hash-2",
+			turnIndex: 7,
+			participantId: "d",
+			dbg: () => {},
+		});
+		expect(claim.proceed).toBe(false);
+		expect(liveClassified.participantTotal).toBe(2);
+
+		releaseInFlightPipeline(filePath, "hash-2", classifiedMap);
+	});
+});
+
+describe("#2464 review round 3 — F2: the observed dispatch targets a RECORDED path", () => {
+	it("never dispatches the directory an unknown directory-target tool named", async () => {
+		// `collectObservationUniverse` explicitly supports a DIRECTORY target (its
+		// own entries, non-recursively), so a codemod armed on a directory is a
+		// real production shape, not a contrived one. The membership guard is what
+		// stops the directory itself from reaching `runPipeline`: neutralize it to
+		// `pathsEqual(candidate, candidate)` and this case goes red, where a call
+		// count alone stays green.
+		const env = setupTestEnvironment("pi-lens-2464-f2-dir-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		try {
+			const targetDir = path.join(env.tmpDir, "codemod-target");
+			fs.mkdirSync(targetDir, { recursive: true });
+			const insideDir = path.join(targetDir, "touched.ts");
+			fs.writeFileSync(insideDir, SOURCE);
+			const { runtime, cacheManager } = newSession(env.tmpDir);
+			vi.mocked(runPipeline).mockClear();
+
+			// An unknown tool whose only path-shaped field names the DIRECTORY.
+			const event = {
+				toolName: "dir_codemod",
+				toolCallId: "call-2464-f2-dir",
+				input: { path: targetDir, rule: "rename" },
+				content: [{ type: "text", text: "rewrote 1 file" }],
+			};
+			expect(classifyMutatingTool(event as never)).toBeUndefined();
+			await handleToolCall(
+				toolCallDeps({ event, cwd: env.tmpDir, runtime, cacheManager }),
+			);
+			// The tool writes a file INSIDE the directory it named.
+			fs.writeFileSync(insideDir, `${SOURCE}const d = 4;\n`);
+			await handleToolResult(
+				toolResultDeps({ event, runtime, cacheManager }),
+			);
+
+			const dispatchedPaths = vi
+				.mocked(runPipeline)
+				.mock.calls.map(
+					(call) => (call[0] as unknown as { filePath?: string }).filePath,
+				);
+			// `runPipeline` on a directory is meaningless — every runner it fans out
+			// to reads the path as a file.
+			expect(dispatchedPaths).not.toContain(targetDir);
+			expect(dispatchedPaths).toEqual([]);
+		} finally {
 			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
 			else process.env.PILENS_DATA_DIR = previousDataDir;
 			env.cleanup();

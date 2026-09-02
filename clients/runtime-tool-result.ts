@@ -292,6 +292,137 @@ export function clearLastAnalyzedStateCache(): void {
 	lastAnalyzedStateByFile.clear();
 }
 
+/**
+ * Register one in-flight pipeline and hand back the inner map it landed in.
+ *
+ * Paired with {@link releaseInFlightPipeline}; split out of
+ * `dispatchPipelineAnalysis` so registration and deregistration are one seam
+ * with one owner (#2464 review round 3, F1) rather than two open-coded blocks
+ * ~80 lines apart whose invariants only line up if a reader checks both.
+ *
+ * Exported for the isolation red in
+ * `tests/clients/observed-mutation-integration.test.ts`: with
+ * `claimPipelineDispatch` below now consulted by BOTH dispatch call sites, the
+ * identity guard in the release has no reachable production trigger left, so
+ * the only honest way to prove it is to drive the seam directly.
+ */
+export function registerInFlightPipeline(
+	filePath: string,
+	stateHash: string,
+	pipeline: InFlightPipeline,
+): Map<string, InFlightPipeline> {
+	let filePipelines = inFlightPipelines.get(filePath);
+	if (!filePipelines) {
+		filePipelines = new Map<string, InFlightPipeline>();
+		inFlightPipelines.set(filePath, filePipelines);
+	}
+	filePipelines.set(stateHash, pipeline);
+	return filePipelines;
+}
+
+/**
+ * Release one in-flight pipeline, pruning the per-file inner map once it is
+ * empty so a file touched once this session doesn't leave a permanent empty
+ * entry in the outer map.
+ *
+ * The IDENTITY check on the outer delete is load-bearing (#2464 review round 3,
+ * F1). `registered` is a reference captured BEFORE the pipeline await. Deleting
+ * by path alone assumes the outer entry still IS that map, and when it is not —
+ * anything that replaced it while this pipeline ran — the delete evicts a LIVE,
+ * unrelated pipeline's registration: its concurrent duplicates then stop
+ * deduping and its `participantIds`/`participantTotal` under-count. Delete only
+ * when the outer map still points at the very map this registration went into.
+ */
+export function releaseInFlightPipeline(
+	filePath: string,
+	stateHash: string,
+	registered: Map<string, InFlightPipeline>,
+): void {
+	registered.delete(stateHash);
+	if (registered.size === 0 && inFlightPipelines.get(filePath) === registered) {
+		inFlightPipelines.delete(filePath);
+	}
+}
+
+export type PipelineDispatchClaim =
+	| { proceed: true }
+	| {
+			proceed: false;
+			/**
+			 * The live pipeline this call joined, when it deduped against one.
+			 * `undefined` when the already-analysed latch was what stopped it —
+			 * there is nothing still running to wait for.
+			 */
+			joined: Promise<unknown> | undefined;
+	  };
+
+/**
+ * The two pre-conditions EVERY pipeline dispatch shares (#2464 review round 3,
+ * F1): the in-flight dedup for a concurrent call on the same post-write state,
+ * and the already-analysed latch for a sequential duplicate in the same turn.
+ *
+ * Both call sites of {@link dispatchPipelineAnalysis} consult this, so the
+ * PRE-conditions are as by-construction as the post-conditions that helper
+ * already owns. The observed-mutation path shipped without either check in
+ * round 2: two concurrent observed `tool_result`s for one file+hash both
+ * registered, the second overwrote the first's entry in the per-file map, and
+ * the first's release then evicted the whole outer entry — taking a live,
+ * unrelated classified pipeline's registration with it.
+ *
+ * ## Why this is SYNCHRONOUS and hands the join promise back
+ *
+ * Check-then-act here has to be atomic against the microtask queue.
+ * `dispatchPipelineAnalysis` registers synchronously before its own first
+ * await, so a caller that claims and then dispatches with no `await` in between
+ * cannot be interleaved. An `async` pre-check would reintroduce exactly that
+ * interleave — both racers see an empty registry, both resume, both dispatch —
+ * so the join's `await` is deliberately left to the caller.
+ *
+ * ## Why this is NOT folded into `dispatchPipelineAnalysis`
+ *
+ * On the classified chain the latch check sits ABOVE `addModifiedRange` and
+ * `recordProjectChange`. Moving it down into the helper would write
+ * `turn-state.json` ranges and an attributed change-log receipt for a state
+ * already analysed this turn — the duplicate-recording inversion #2464 exists
+ * to remove.
+ */
+export function claimPipelineDispatch(args: {
+	filePath: string;
+	stateHash: string;
+	turnIndex: number;
+	participantId: string;
+	dbg: (message: string) => void;
+}): PipelineDispatchClaim {
+	const { filePath, stateHash, turnIndex, participantId, dbg } = args;
+	// Deduplicate concurrent calls for the same final file state (pi can fire one
+	// tool_result per edit hunk). Do not dedupe by file alone: a distinct later
+	// same-turn edit to this file must still be analyzed.
+	const inFlight = inFlightPipelines.get(filePath)?.get(stateHash);
+	if (inFlight) {
+		dbg(`tool_result: skipping duplicate concurrent state for ${filePath}`);
+		if (inFlight.participantIds.length < 100) {
+			inFlight.participantIds.push(participantId);
+		}
+		inFlight.participantTotal += 1;
+		return { proceed: false, joined: inFlight.promise };
+	}
+
+	// Deduplicate sequential duplicate events for the same post-write state in
+	// the same turn while allowing later same-file edits whose content changed.
+	const lastAnalyzed = lastAnalyzedStateByFile.get(filePath);
+	if (
+		lastAnalyzed?.turnIndex === turnIndex &&
+		lastAnalyzed.stateHash === stateHash
+	) {
+		dbg(
+			`tool_result: skipping already-analyzed file state this turn for ${filePath}`,
+		);
+		return { proceed: false, joined: undefined };
+	}
+
+	return { proceed: true };
+}
+
 // ── Coalesce sequential edits via debounce window (#115) ────────────────────
 
 type ToolResultReturn = {
@@ -726,12 +857,14 @@ async function dispatchPipelineAnalysis(args: {
 		participantIds: [...new Set(args.participantIds)].slice(0, 100),
 		participantTotal: args.participantTotal,
 	};
-	let filePipelines = inFlightPipelines.get(filePath);
-	if (!filePipelines) {
-		filePipelines = new Map<string, InFlightPipeline>();
-		inFlightPipelines.set(filePath, filePipelines);
-	}
-	filePipelines.set(initialStateHash, pipelineTelemetry);
+	// Synchronous, and the FIRST thing after `runPipeline` handed back its
+	// promise: `claimPipelineDispatch` at each call site is only atomic because
+	// nothing awaits between the claim and this registration.
+	const registeredPipelines = registerInFlightPipeline(
+		filePath,
+		initialStateHash,
+		pipelineTelemetry,
+	);
 	let result: PipelineResult;
 	try {
 		result = await pipelinePromise;
@@ -804,12 +937,7 @@ async function dispatchPipelineAnalysis(args: {
 			},
 		};
 	} finally {
-		// Prune the per-file inner map once it's empty so a file touched once
-		// this session doesn't leave a permanent empty entry in the outer map.
-		filePipelines.delete(initialStateHash);
-		if (filePipelines.size === 0) {
-			inFlightPipelines.delete(filePath);
-		}
+		releaseInFlightPipeline(filePath, initialStateHash, registeredPipelines);
 	}
 
 	if (!isPartialApplyResult) {
@@ -1489,6 +1617,32 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 				)
 			) {
 				const observedReadGuardCorrelationId = getReadGuardCorrelationId(event);
+				// #2464 review round 3 (F1): the SAME two pre-conditions the
+				// classified site consults, through the same shared claim. Round 2
+				// dispatched here with neither, so two concurrent observed
+				// `tool_result`s for one file+hash both registered and both ran
+				// `runPipeline` — two autofix/format writers racing on one file — the
+				// second overwrote the first's registry entry, and the first's
+				// release then evicted the outer entry a live, unrelated classified
+				// pipeline had since re-created under it.
+				const observedClaim = claimPipelineDispatch({
+					filePath,
+					stateHash: observedStateHash,
+					turnIndex: runtime.turnIndex,
+					participantId: observedReadGuardCorrelationId,
+					dbg,
+				});
+				if (!observedClaim.proceed) {
+					if (observedClaim.joined) {
+						await observedClaim.joined;
+					}
+					// Same terminal value as the block's own exit below: the bridge
+					// already recorded this edit, and the analysis it would have asked
+					// for is either running or already done.
+					return syntheticWriteContent.length > 0
+						? { content: [...event.content, ...syntheticWriteContent] }
+						: undefined;
+				}
 				const observedDispatchOutcome = await dispatchPipelineAnalysis({
 					deps,
 					runtime,
@@ -1664,31 +1818,25 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	// unchanged between that read and here, so this is byte-identical.
 	const initialStateHash = postWriteStateHash;
 
-	// Deduplicate concurrent calls for the same final file state (pi can fire one
-	// tool_result per edit hunk). Do not dedupe by file alone: a distinct later
-	// same-turn edit to this file must still be analyzed.
-	const inFlight = inFlightPipelines.get(filePath)?.get(initialStateHash);
-	if (inFlight) {
-		dbg(`tool_result: skipping duplicate concurrent state for ${filePath}`);
-		const duplicateId = readGuardCorrelationId;
-		if (inFlight.participantIds.length < 100) {
-			inFlight.participantIds.push(duplicateId);
+	// #2464 review round 3 (F1): the in-flight dedup and the already-analysed
+	// latch moved into `claimPipelineDispatch`, shared verbatim with the observed
+	// call site, which shipped round 2 with NEITHER check. The position is
+	// unchanged — still ABOVE `addModifiedRange`/`recordProjectChange`, so a
+	// duplicate state still writes no turn-state range and no change-log
+	// receipt. Nothing may await between this claim and the dispatch below: the
+	// claim is only atomic because `dispatchPipelineAnalysis` registers before
+	// its own first await.
+	const classifiedClaim = claimPipelineDispatch({
+		filePath,
+		stateHash: initialStateHash,
+		turnIndex: runtime.turnIndex,
+		participantId: readGuardCorrelationId,
+		dbg,
+	});
+	if (!classifiedClaim.proceed) {
+		if (classifiedClaim.joined) {
+			await classifiedClaim.joined;
 		}
-		inFlight.participantTotal += 1;
-		await inFlight.promise;
-		return;
-	}
-
-	// Deduplicate sequential duplicate events for the same post-write state in the
-	// same turn while allowing later same-file edits whose content changed.
-	const lastAnalyzed = lastAnalyzedStateByFile.get(filePath);
-	if (
-		lastAnalyzed?.turnIndex === runtime.turnIndex &&
-		lastAnalyzed.stateHash === initialStateHash
-	) {
-		dbg(
-			`tool_result: skipping already-analyzed file state this turn for ${filePath}`,
-		);
 		return;
 	}
 
