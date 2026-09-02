@@ -35,6 +35,14 @@ vi.mock("../../clients/latency-logger.js", async (importOriginal) => {
 });
 
 describe("review graph service", () => {
+	afterEach(() => {
+		// Backstop for the Date.prototype.toISOString spy used below: if a
+		// test's awaited build rejects before its own try/finally restore
+		// runs, this still clears the pin before the next test in the file
+		// (#2446 F1).
+		vi.restoreAllMocks();
+	});
+
 	it("builds a TS graph and surfaces importers/callers without duplicate edges", async () => {
 		const env = setupTestEnvironment("pi-lens-review-graph-");
 		try {
@@ -739,12 +747,32 @@ describe("review graph service", () => {
 			);
 			await new Promise((resolve) => setTimeout(resolve, 5));
 
-			const graph = await buildOrUpdateGraph(env.tmpDir, [aPath], facts);
-			expect(getLastGraphBuildInfo()).toMatchObject({ mode: "incremental" });
-			expect(graph.builtAt).not.toBe(initialGraph.builtAt);
-			const impact = computeImpactCascade(graph, aPath);
-			expect(impact.directImporters).toContain(normalizeMapKey(bPath));
-			expect(impact.directCallers).toContain(normalizeMapKey(bPath));
+			// #2441: pin the clock so this rebuild's `builtAt` lands in the SAME
+			// millisecond as `initialGraph.builtAt`, deterministically — wall-clock
+			// ISO strings are allowed to collide between two builds (the `setTimeout`
+			// above only nudges mtime, it never guaranteed a distinct ms).
+			// `buildGeneration` (`builder.ts`'s process-wide `_graphGenerationCounter`)
+			// is bumped only on a real re-extract (#459) and is the field that must
+			// move here.
+			// #2446 F1: try/finally so a rejecting build still restores the
+			// process-global Date.prototype spy instead of leaking it to later
+			// tests in this file.
+			const isoSpy = vi
+				.spyOn(Date.prototype, "toISOString")
+				.mockReturnValue(initialGraph.builtAt);
+			try {
+				const graph = await buildOrUpdateGraph(env.tmpDir, [aPath], facts);
+				expect(getLastGraphBuildInfo()).toMatchObject({ mode: "incremental" });
+				// #2446 F2: assert the pin fired rather than the mocked artifact
+				// (`graph.builtAt`), so a future clock refactor doesn't red this.
+				expect(isoSpy).toHaveBeenCalled();
+				expect(graph.buildGeneration).not.toBe(initialGraph.buildGeneration);
+				const impact = computeImpactCascade(graph, aPath);
+				expect(impact.directImporters).toContain(normalizeMapKey(bPath));
+				expect(impact.directCallers).toContain(normalizeMapKey(bPath));
+			} finally {
+				vi.restoreAllMocks();
+			}
 		} finally {
 			env.cleanup();
 		}

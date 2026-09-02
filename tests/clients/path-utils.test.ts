@@ -1,10 +1,12 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
 	findLocalToolConfig,
 	findNearestContaining,
 	findNearestMarkerRoot,
+	homeRelativePath,
 	isFullyQualified,
 	isFullyQualifiedPosix,
 	isFullyQualifiedWin32,
@@ -688,5 +690,47 @@ describe("normalizeLoggedPath (#2219, #2229 review round 1)", () => {
 	it("pins current behavior for a drive-rooted command WITH arguments (no live caller does this)", () => {
 		const withArgs = String.raw`C:\tools\rg.exe --files`;
 		expect(normalizeLoggedPath(withArgs)).toBe(normalizeFilePath(withArgs));
+	});
+});
+
+describe("homeRelativePath (#2440 F5)", () => {
+	const home = os.homedir();
+
+	it("rewrites a $HOME-anchored path to its ~ form", () => {
+		expect(homeRelativePath(path.join(home, ".pi-lens", "config.json"))).toBe(
+			"~/.pi-lens/config.json",
+		);
+	});
+
+	it("returns a bare ~ for the home directory itself", () => {
+		expect(homeRelativePath(home)).toBe("~");
+	});
+
+	it("leaves a path outside home untouched, separators included", () => {
+		const outside = path.join(path.sep, "etc", "pi-lens.json");
+		expect(homeRelativePath(outside)).toBe(outside);
+		expect(homeRelativePath("relative/a.ts")).toBe("relative/a.ts");
+		expect(homeRelativePath("")).toBe("");
+	});
+
+	it("does not rewrite a SIBLING whose name merely starts with home's", () => {
+		// `/home/jane-backup` is not under `/home/jane`. A prefix test without
+		// the separator would have claimed it.
+		expect(homeRelativePath(`${home}-backup/config.json`)).toBe(
+			`${home}-backup/config.json`,
+		);
+	});
+
+	it("takes the home directory as an argument, so no assertion depends on the box", () => {
+		expect(
+			homeRelativePath("/home/jane/.pi-lens/config.json", "/home/jane"),
+		).toBe("~/.pi-lens/config.json");
+		// A trailing separator on home must not produce `~//...`.
+		expect(homeRelativePath("/home/jane/a.json", "/home/jane/")).toBe(
+			"~/a.json",
+		);
+		expect(homeRelativePath("/home/janet/a.json", "/home/jane")).toBe(
+			"/home/janet/a.json",
+		);
 	});
 });

@@ -1,13 +1,22 @@
 /**
- * Tests for scripts/lib/process-scan.mjs — the pure process-table matching
- * used by scripts/compat-smoke-behavioral.mjs (#476, Layer B assertion 3:
- * zero surviving LSP-server processes after pi exits, the #472 orphan class).
+ * Tests for scripts/lib/process-scan.mjs — the LSP-marker matching used by
+ * scripts/compat-smoke-behavioral.mjs (#476, Layer B assertion 3: zero
+ * surviving LSP-server processes after pi exits, the #472 orphan class), and
+ * the one platform process listing both that script and
+ * scripts/prune-agent-worktrees.mjs now share (PR #2438 review round 3, F2).
  */
 
 import { describe, expect, it } from "vitest";
 import {
 	diffSurvivingLspProcesses,
+	evaluateNoSurvivingLspProcesses,
 	isLspServerCommand,
+	normalizeProcessFields,
+	parseProcessTable,
+	posixPsPath,
+	snapshotProcesses,
+	windowsExe,
+	ALL_PROCESS_FIELDS,
 	LSP_PROCESS_MARKERS,
 } from "../../scripts/lib/process-scan.mjs";
 
@@ -95,4 +104,216 @@ describe("diffSurvivingLspProcesses", () => {
 	it("returns [] when nothing survived", () => {
 		expect(diffSurvivingLspProcesses([], [])).toEqual([]);
 	});
+});
+
+describe("evaluateNoSurvivingLspProcesses", () => {
+	// PR #2438 review round 4, F-A: a failed/timed-out listing must never
+	// read as "no leak" just because its (empty) table diffed clean.
+	it("fails when the before-listing did not complete, even with an empty after diff", () => {
+		const result = evaluateNoSurvivingLspProcesses(
+			{ rows: [], ok: false },
+			{ rows: [{ pid: 1, command: "bash" }], ok: true },
+		);
+		expect(result.pass).toBe(false);
+		expect(result.detail).toMatch(/before\.ok=false/);
+	});
+
+	it("fails when the after-listing did not complete, even though it reported no rows", () => {
+		// The exact shape of reviewer probe C2/C3: a live leaked LSP process
+		// exists, but the after-listing times out and reports [] — an
+		// unverified table must not be read as proof nothing survived.
+		const result = evaluateNoSurvivingLspProcesses(
+			{ rows: [], ok: true },
+			{ rows: [], ok: false },
+		);
+		expect(result.pass).toBe(false);
+		expect(result.id).toBe("no-surviving-lsp-processes");
+		expect(result.detail).toMatch(/after\.ok=false/);
+	});
+
+	it("passes when both listings completed and nothing new survived", () => {
+		const result = evaluateNoSurvivingLspProcesses(
+			{ rows: [{ pid: 1, command: "bash" }], ok: true },
+			{ rows: [{ pid: 1, command: "bash" }], ok: true },
+		);
+		expect(result.pass).toBe(true);
+	});
+
+	it("fails when both listings completed and a new LSP process survived", () => {
+		const result = evaluateNoSurvivingLspProcesses(
+			{ rows: [], ok: true },
+			{
+				rows: [
+					{ pid: 2, command: "node .../typescript-language-server/cli.mjs" },
+				],
+				ok: true,
+			},
+		);
+		expect(result.pass).toBe(false);
+		expect(result.detail).toContain("pid=2");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// The shared platform listing (PR #2438 review round 3, F2)
+// ---------------------------------------------------------------------------
+//
+// scripts/prune-agent-worktrees.mjs and scripts/compat-smoke-behavioral.mjs
+// each carried their own windowsExe + snapshotProcesses pair, differing only
+// in which columns they asked for — so the exit-code hardening review S5 added
+// to one never reached the other. These pin the single implementation.
+
+describe("normalizeProcessFields", () => {
+	it("always includes pid, whatever the caller asked for", () => {
+		expect(normalizeProcessFields(["command"])).toEqual(["pid", "command"]);
+		expect(normalizeProcessFields([])).toEqual(["pid"]);
+	});
+
+	it("returns fields in the canonical order, not the caller's", () => {
+		expect(normalizeProcessFields(["command", "ppid", "pid"])).toEqual([
+			"pid",
+			"ppid",
+			"command",
+		]);
+	});
+
+	it("defaults to the full projection and drops unknown names", () => {
+		expect(normalizeProcessFields(undefined)).toEqual([...ALL_PROCESS_FIELDS]);
+		expect(normalizeProcessFields(null)).toEqual([...ALL_PROCESS_FIELDS]);
+		expect(normalizeProcessFields(["pid", "elapsed" as never])).toEqual([
+			"pid",
+		]);
+	});
+});
+
+describe("windowsExe", () => {
+	it("resolves through System32 rather than PATH", () => {
+		// The sweep spawns this interpreter to decide what to KILL; a bare
+		// `powershell.exe` is resolvable through a PATH the caller controls.
+		const resolved = windowsExe("WindowsPowerShell\\v1.0\\powershell.exe");
+		expect(resolved).toContain("System32");
+		expect(resolved.endsWith("powershell.exe")).toBe(true);
+	});
+});
+
+describe("posixPsPath", () => {
+	it("prefers the absolute /bin/ps when present, falling back to the bare name otherwise", async () => {
+		// The listing decides what the sweep KILLS, so it must not resolve
+		// through a PATH a caller can shadow — mirrors windowsExe's reasoning
+		// (PR #2438 review round 4, F-D). Whichever branch this box takes, the
+		// two are the only allowed answers.
+		const fs = await import("node:fs");
+		const resolved = posixPsPath();
+		if (fs.existsSync("/bin/ps")) {
+			expect(resolved).toBe("/bin/ps");
+		} else {
+			expect(resolved).toBe("ps");
+		}
+	});
+});
+
+describe("parseProcessTable", () => {
+	it("parses the Windows CIM tab-joined layout, command lines with tabs included", () => {
+		const rows = parseProcessTable(
+			[
+				"1234\t5678\tnode C:\\repo\\tests\\fixtures\\fake-lsp-server.mjs",
+				"4\t0\tSystem",
+				"", // trailing blank line
+			].join("\n"),
+			true,
+		);
+		expect(rows).toEqual([
+			{
+				pid: 1234,
+				ppid: 5678,
+				command: "node C:\\repo\\tests\\fixtures\\fake-lsp-server.mjs",
+			},
+			{ pid: 4, ppid: 0, command: "System" },
+		]);
+	});
+
+	it("parses the POSIX `ps -eo pid,ppid,args` layout, keeping spaces in args", () => {
+		const rows = parseProcessTable(
+			[
+				"  1234  5678 node /repo/tests/fixtures/fake-lsp-server.mjs --port 0",
+			].join("\n"),
+			false,
+		);
+		expect(rows).toEqual([
+			{
+				pid: 1234,
+				ppid: 5678,
+				command: "node /repo/tests/fixtures/fake-lsp-server.mjs --port 0",
+			},
+		]);
+	});
+
+	it("drops unparseable lines rather than inventing pid 0 or NaN", () => {
+		// A row with a bogus pid that survived here would be handed to
+		// process.kill.
+		expect(parseProcessTable("header line\n\nnot-a-pid\tx\ty", true)).toEqual(
+			[],
+		);
+		expect(parseProcessTable("", true)).toEqual([]);
+	});
+
+	it("parses the two-column projection compat-smoke asks for", () => {
+		// No ppid column at all: the command must still be taken whole, and the
+		// absent field must read 0 rather than swallowing the command's head.
+		expect(
+			parseProcessTable("1234\tnode /repo/x.mjs --port 0", true, [
+				"pid",
+				"command",
+			]),
+		).toEqual([{ pid: 1234, ppid: 0, command: "node /repo/x.mjs --port 0" }]);
+		expect(
+			parseProcessTable("  1234 node /repo/x.mjs --port 0", false, [
+				"pid",
+				"command",
+			]),
+		).toEqual([{ pid: 1234, ppid: 0, command: "node /repo/x.mjs --port 0" }]);
+	});
+
+	it("keeps one row shape regardless of the projection", () => {
+		for (const row of parseProcessTable("1234\tnode x", true, [
+			"pid",
+			"command",
+		])) {
+			expect(Object.keys(row).sort()).toEqual(["command", "pid", "ppid"]);
+		}
+	});
+});
+
+describe("snapshotProcesses", () => {
+	it("lists this process, with a usable parent pid and command line", async () => {
+		const { rows, ok } = await snapshotProcesses();
+		expect(ok, "the platform listing must exit 0").toBe(true);
+		const self = rows.find((row) => row.pid === process.pid);
+		expect(
+			self,
+			`pid ${process.pid} missing from a ${rows.length}-row listing`,
+		).toBeTruthy();
+		expect(self?.ppid).toBeGreaterThan(0);
+		expect(self?.command.length).toBeGreaterThan(0);
+	}, 30_000);
+
+	it("honors the projection: no ppid asked for, no ppid reported", async () => {
+		// The axis F2 is about. A shared listing that ignored `fields` would
+		// still make both callers pass while quietly costing compat-smoke a
+		// column it never wanted.
+		const { rows, ok } = await snapshotProcesses(["pid", "command"]);
+		expect(ok).toBe(true);
+		expect(rows.length).toBeGreaterThan(0);
+		expect(rows.every((row) => row.ppid === 0)).toBe(true);
+		expect(rows.some((row) => row.command.length > 0)).toBe(true);
+	}, 30_000);
+
+	it("reports not-ok rather than an empty table when the listing cannot finish", async () => {
+		// `ok: false` is the only evidence a caller has that an ABSENCE from
+		// the table means nothing — the orphan predicate reads absence as
+		// "parent exited".
+		const { rows, ok } = await snapshotProcesses(ALL_PROCESS_FIELDS, 1);
+		expect(ok).toBe(false);
+		expect(rows).toEqual([]);
+	}, 30_000);
 });

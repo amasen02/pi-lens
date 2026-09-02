@@ -166,6 +166,13 @@ const SPAWN_EXEMPTIONS: Readonly<Record<string, string>> = {
 		"one real handshake proving lsp client byte attribution; asserts the memory table, never a contended wire transaction",
 	"tests/clients/memory-sampler-root-discriminator.test.ts":
 		"real handshakes at two roots proving per-root client attribution; the assertion is the side table, not a timing budget",
+	// NB: these reasons must NOT spell the fixture's own name — this file
+	// self-excludes by splitting that literal at runtime, so writing it out
+	// here would make the sweep flag itself.
+	"tests/scripts/worktree-hygiene.test.ts":
+		"names the fake LSP fixture only inside synthetic process-table command strings feeding the #2435 orphan-reaper predicate; spawns nothing at all, LSP or otherwise",
+	"tests/scripts/process-scan.test.ts":
+		"names the fake LSP fixture only inside synthetic `ps`/CIM listing text used to pin the #2435 process-table parsers (moved here from the prune-agent-worktrees suite by PR #2438 review round 3, F2); it does list the real process table, but spawns no LSP child and asserts no wire timing",
 };
 
 describe("lsp-spawn-heavy Vitest project coverage", () => {

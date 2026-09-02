@@ -174,6 +174,10 @@ export interface ProjectReport {
 		when: string;
 		outcome: "running" | "succeeded" | "skipped" | "failed";
 		reason?: string;
+		/** Process-wide monotonic build identity (#2441). `when` is wall-clock
+		 * ISO and two attempts can land in the same millisecond — this is the
+		 * one field that always distinguishes attempts; compare it, not `when`. */
+		buildId?: number;
 	};
 	view?: "compact";
 	trust?: ProjectReportTrust;

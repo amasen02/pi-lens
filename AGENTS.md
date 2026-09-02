@@ -86,6 +86,25 @@ Message-end stale attribution anchors the session id when a live ctx is handled,
   reserved-but-inert schema keys (documented, validated, unimplemented) over
   premature implementation; prefer no knob at all over a reserved one when no
   concrete consumer exists. Name the forcing function in the PR body.
+- **`clients/config-core/` is THE config seam.** Every loader, catalog, and
+  selector validates, merges, and explains its configuration through it (#2425)
+  — a fourth hand-written merge is a defect, not a design choice. It owns the
+  pipeline (`RawConfig` -> `validate(schema)` -> `NormalizedConfig` ->
+  `merge(sources)` -> `Resolved<T>`, with `resolveConfig` as the front door),
+  per-leaf provenance on the seven source tiers, monotonic deny precedence
+  (an operator-tier denial is never lifted; a repo-tier denial is lifted only by
+  a higher operator tier), per-node `x-merge-strategy`
+  (`replace`/`append`/`keyed:<field>`), the trust-gated `ProcessSpec` whose
+  `toSpawnArgs` refuses a `project`/`nested-project` command unless the spec's
+  recorded trust AND the host's live decision are both `trusted`, and bounded
+  redacted `MigrationRecord`s that reach the user only through
+  `warnIgnoredConfigOnce`. Schemas are plain JSON-Schema-shaped objects, so the
+  published artifact and the runtime validator are the same object. Semantics
+  are written down in `docs/public-api-stability.md` section 5. Migration
+  targets still on their own merge semantics: `clients/lsp/config.ts`
+  (`loadLSPConfig`), `clients/lens-config.ts` (`loadPiLensGlobalConfig`),
+  `clients/project-lens-config.ts` (`loadPiLensProjectConfig`) — #2426 adopts
+  them.
 - **Design the state space before coding.** For stateful, ordered, resource-mutating, or security-sensitive work, write the invariants, supported transitions, explicit deferrals, and a cross-product test matrix before implementation. Examples are not enough: cover operation order, preview/apply, validation/normalization/execution seams, failure atomicity, observability bounds, and OS/path/encoding axes. If adversarial review finds repeated cross-product defects, stop patching one symptom at a time and return to the model.
 - **Concurrency tests wait on the right clock.** Use `tests/clients/interleaving-kit.ts` for suspension and polling: every suspension belongs in `try/finally` with `release()` plus `restore()`, and waits on worker-thread or child-process progress must use the wall-time default. A custom tick yield is only valid for progress guaranteed to occur on the current event loop. Prefer a suspended call's `completed` promise over draining unrelated global work, and reset in-memory mirrors before asserting on durable disk state.
 - **Prove filesystem isolation before coding subagents touch Git.** A
@@ -1638,19 +1657,85 @@ mtime bound (`scripts/lib/suite-lock.mjs`'s `staleMaxAgeMs`) — but unlike
 test-suite run has no bounded duration for a timeout to be sized against (an
 install does). See that file's header for the PID-reuse tradeoff this
 implies. Opt out with `PI_LENS_TEST_NO_LOCK=1` (CI sets this — runners are
-isolated, one job per box, nothing to serialize against). Only `npm test` /
-`test:unit` / `test:integration` acquire the lock; a targeted single-file run
-via `npx vitest run <file>` directly stays unlocked (cheap, and serializing
-it would hurt iteration) — `npm test -- <file>` still goes through the
-wrapper and queues, since it's the same npm script.
+isolated, one job per box, nothing to serialize against).
+
+**Targeted runs go through `npm run test:targeted` (#2435).** That is
+`with-test-lock.mjs --shared -- vitest run`, which takes one of N concurrent
+SHARED slots (default 2, `PI_LENS_TEST_SHARED_SLOTS`) instead of the
+exclusive lock: `npm run test:targeted -- tests/a.test.ts tests/b.test.ts`.
+It REQUIRES at least one path or glob and exits 2 otherwise: with no
+arguments it would collect the whole suite while holding a *shared* slot,
+which is the contention the exclusive lock exists to prevent, reached through
+the mechanism added to relieve it. A full run is `npm test`.
+Targeted batches used to bypass the lock entirely by design — cheap
+individually, but 4-6 agents running them at once saturate the box and
+manufacture exactly the timeout/spawn-budget flake class the exclusive lock
+exists to prevent (the #2435 evidence: 27-69 such failures per local full
+run, none reproducible in isolation). The two modes compose: an exclusive
+acquisition now waits until every shared slot has drained, and a shared
+acquisition waits while the exclusive lock is held, so a full run still gets
+the machine to itself. `npx vitest run <file>` invoked directly still
+bypasses everything — use it only for a single file you are iterating on.
 Companion policy for agents running tests concurrently: run touched-file
-tests freely (unlocked, cheap, iterate fast); at most ONE full-suite run per
+tests through `test:targeted`; at most ONE full-suite run per
 agent at the end, with `PI_LENS_TEST_MAX_WORKERS=4` (not the default 50%) to
 keep that one run's own footprint bounded; GitHub CI is the authoritative
 full-suite green, not a local run under load; and under load, crash-cascade
 failures (the classic pattern: edits.test occupancy dragging down
 unrelated siblings) must be re-run in isolation before being treated as
 real regressions.
+
+**Agent worktree + orphan-process hygiene (#2435).**
+`scripts/prune-agent-worktrees.mjs` (`npm run hygiene`, `--dry-run` first)
+removes `.claude/worktrees/agent-*` trees that are clean, whose HEAD is
+contained in an `origin/*` ref, and that have been IDLE for at least 30m — and
+kills `tests/fixtures/*` / `tests/support/*` helper processes whose parent has
+exited (the leak that left a `fake-lsp-server.mjs` running for an hour and
+made one worktree unremovable; the fixture's own missing teardown is #2436).
+Rails: never a dirty tree, never an unpushed one — no flag overrides either;
+`--only` overrides only the age and live-lock rails; a fixture helper with a
+LIVE parent, or with no readable parent pid at all, is never killed; a kill
+needs a STRUCTURAL signal (the process's cwd inside the tree, or the
+executable/script it is actually running inside it) — a mention of the path
+anywhere else on a command line is a reader, not an occupant; kills are by
+pid, never `taskkill`-by-name. All of that is pure and unit-tested in
+`scripts/lib/worktree-hygiene.mjs`.
+
+**Idle is measured from signals the sweep does not write.** A worktree's age
+comes from `WORKTREE_ACTIVITY_SIGNALS` — the checkout directory's mtime, the
+worktree's `<admin>/HEAD` mtime, and the last entry timestamp in
+`<admin>/logs/HEAD` — and NEVER from `<admin>` or `<admin>/index`. The sweep
+asks `git status --porcelain` whether a tree is dirty, and that rewrites the
+index and bumps the directory holding it: reading either made every candidate
+`age 0ms` the instant it was inspected, so `too-young` rejected all of them
+and the sweep silently removed nothing for its whole first life. Any new
+activity signal must be proven unchanged across a `git status` before it is
+added to that list; the reflog is read for its recorded ENTRY time, not its
+mtime, so copying a tree cannot forge freshness.
+
+**Who removes what.** `SubagentStop` NEVER removes a worktree: resume-by-
+SendMessage happens after that hook fires, and a fixer's worktree has to
+survive until its PR merges (`.claude/skills/merge-train/SKILL.md`). It runs
+only the orphan-fixture sweep, scoped to that agent's own tree, and does
+nothing at all without a usable `agent_id`. Removal belongs to `SessionStart`
+(default 30m min-age, at most ONE tree per run so the removal fits inside the
+90s hook timeout — `git worktree remove` is itself bounded at 60s with
+SIGKILL) and to a manual `npm run hygiene`. The `SessionStart` registration
+carries `"matcher": "startup|resume"`, so the sweep runs when a session begins
+or resumes and NOT on `/clear`, compaction or a fork — without it a long
+session re-ran the whole sweep every time it auto-compacted, roughly every
+20 minutes. Both hooks are registered in
+`.claude/settings.json` — the one project-level Claude Code settings file this
+repo tracks, hooks and nothing else; `settings.local.json` stays ignored as
+per-developer permission state. Both are `--quiet` and always exit 0.
+
+Kills, removals and DEGRADATIONS are recorded as bounded JSONL in
+`<PILENS_DATA_DIR | PI_LENS_HOME | ~/.pi-lens>/hygiene.log`. The orphan
+predicate reads "parent absent from the snapshot" as "parent exited", so a
+truncated listing would read every live helper as an orphan: the sweep
+refuses to run unless the listing exited 0 and contains this process plus
+every ancestor that is still alive, and records `hygiene.scan-degraded`
+instead of quietly killing nothing.
 
 Whole-project loops that reuse one `FactStore` must delete `file.content` after
 that file's consumers finish (in a `finally` so abort/error exits release it).

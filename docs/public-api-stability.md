@@ -102,6 +102,9 @@ this policy explicitly reserves the right to change.
 | `PILENS_CFG_0001` | A config file exists but could not be read or parsed, so it is ignored. | `warnIgnoredConfigOnce` (`clients/config-warn.ts`), the single choke point behind the LSP, global, and project config loaders. |
 | `PILENS_CFG_0002` | A deprecated config **key** was accepted inside its deprecation window. | Reserved. No emitter yet; #2416 slice 1 wires it when the migration path lands. |
 | `PILENS_CFG_0003` | A deprecated config **file location** was read inside its window. | Reserved. No emitter yet; same slice. |
+| `PILENS_CFG_0004` | A config field no schema property claims was dropped. | `validate()` (`clients/config-core/normalize.ts`) produces the record; `reportMigrationRecords` delivers it through `warnIgnoredConfigOnce` once a loader adopts the core (#2426). |
+| `PILENS_CFG_0005` | A config field's value did not match its schema and was dropped. | Same producer and same delivery path as `PILENS_CFG_0004`. |
+| `PILENS_CFG_0006` | A config key that would modify an object's prototype (`__proto__`, `constructor`, `prototype`) was refused. | Both halves of the config core, through the shared policy in `clients/config-core/safe-object.ts`. |
 
 A reserved code is registered and referenced by the deprecation registry, but
 nothing emits it today. That is deliberate: the number must be pinned before the
@@ -188,6 +191,142 @@ Removing a row from `DEPRECATED_CONFIG_SURFACES` while the reader still exists,
 or removing the reader while the row still exists, fails the registry test. The
 two move together or not at all.
 
+## 5. The config core
+
+`clients/config-core/` is the one place a pi-lens configuration is validated,
+merged, and explained. Every loader, catalog, and selector resolves through it
+(#2425); a fourth merge semantics is a defect, not a design choice.
+
+The pipeline is `RawConfig -> validate(schema) -> NormalizedConfig ->
+merge(sources) -> Resolved<T>`, and `resolveConfig` runs both halves. It is
+pure: no file reads, no logging, no ledger writes. Reporting is the separate,
+explicit `reportMigrationRecords` step, so the warn-once latch stays with the
+loader that owns the file.
+
+### Source tiers
+
+Seven tiers, lowest value-precedence first. A later tier's value replaces an
+earlier one for the same leaf.
+
+| Tier | Class | Meaning |
+| --- | --- | --- |
+| `builtin` | **default** | pi-lens's own shipped defaults. |
+| `global` | operator | The user's machine-global config. |
+| `project` | **repo** | A config file inside the checkout. |
+| `nested-project` | **repo** | A config file in a nested package. |
+| `env` | operator | Environment variables. |
+| `cli` | operator | Command-line arguments. |
+| `host` | operator | The host application's decision. |
+
+The class column is a second, independent axis, and it has **three** values, not
+two. `repo` tiers carry content that arrived with a checkout — content a user
+may never have read. `operator` tiers are a deliberate act by the person running
+pi-lens. `default` is pi-lens's own shipped opinion, which nobody chose. Only the
+class decides who may lift a denial; `builtin` being its own class is what keeps
+a shipped default overridable by the operator while still out of reach of
+repository content.
+
+### Monotonic deny precedence
+
+A schema node marked `x-deny` resolves by denial rules instead of
+last-tier-wins:
+
+- `x-deny: "boolean-false"` — a `false` from an **operator** tier is never
+  lifted, by anything. A `false` from a `default` or `repo` tier is lifted only
+  by an explicit `true` from an **operator** tier of higher precedence. A repo
+  tier never lifts a denial at all, its own class included.
+- `x-deny: "array-union"` — the resolved list is the union of every tier's
+  members. There is no vocabulary for un-denying a member, so a nearer tier that
+  omits one is expressing nothing. This outranks the node's own
+  `x-merge-strategy`: a denial a merge strategy could erase would not be
+  monotonic.
+
+Provenance for a denied leaf names the tier that **made** the denial, not the
+last tier to restate it — the answer to "why can I not turn this back on".
+
+Two consequences are deliberate rulings rather than accidents of the algorithm,
+and both are load-bearing:
+
+**A built-in denial is a default, not a law.** `builtin: false` plus
+`global: true` resolves to `true`, attributed to `global`; `builtin: false` plus
+`project: true` stays `false`, attributed to `builtin`. When `builtin` sat in the
+operator class, a conservative default pi-lens shipped — an `enabled: false`, or
+any member of a built-in deny list — could never be lifted by anyone, including
+the person who installed pi-lens, and the only escape was editing pi-lens's
+source. A default the operator cannot override is not a default.
+
+**An operator denial is not liftable by a nearer operator tier.** `global: false`
+plus `cli: true` stays `false`. This is the spec letter and it is kept on
+purpose: a denial is a security decision, and letting one operator surface
+out-shout another would make the guarantee depend on which surface an attacker
+could reach (an inherited `PILENS_*` environment variable, a wrapper script's
+argv) rather than on what the operator decided. The escape hatch is an
+operator-tier **change** — edit the global config, unset the variable — never a
+repo-tier one.
+
+### Prototype-safe keys
+
+`__proto__`, `constructor`, and `prototype` are refused wherever a config
+supplies a key, in both halves of the pipeline, with a `PILENS_CFG_0006` record
+naming the key. No pi-lens setting is spelled that way, so there is nothing to
+preserve, and assigning one would change an object's behavior rather than its
+contents — a document that serializes as `{}` while answering an attacker's
+value on every field read.
+
+Both halves also bound their own recursion at `MAX_CONFIG_DEPTH` (32) and
+`resolveConfig` never throws: a config that cannot be resolved degrades to
+absent with records, never to a failed session.
+
+A schema node that declares no `type` — or a `type` keyword the core does not
+recognize — is **opaque**, and an opaque node is walked by the value's own
+shape rather than passed through. Its children are kept (that is what an opaque
+node means), but they are copied, depth-counted, key-checked, and recorded like
+any other. A schema that wants a genuinely free-form subtree should still say
+`additionalProperties: true`, which states the intent instead of relying on an
+omission.
+
+### Merge strategies
+
+Objects are always merged field-wise; a nearer tier setting one key never erases
+its siblings. Arrays follow the node's `x-merge-strategy`:
+
+| Value | Behavior |
+| --- | --- |
+| `replace` (default) | The highest-precedence tier that sets the array supplies all of it. |
+| `append` | Every tier's entries, concatenated lowest precedence first. |
+| `keyed:<field>` | Entries matched across tiers by `<field>` and merged field-wise; unmatched entries appended. |
+
+### The trust-gated `ProcessSpec`
+
+A `ProcessSpec` carries a non-empty argv, a bounded env (count and bytes), a
+closed `cwdMode`/`inputMode`, a timeout, its provenance, and the trust decision
+that applied when it was read. `toSpawnArgs(spec)` is the only way to get
+spawnable arguments out of one, and for a `project` or `nested-project` spec it
+refuses unless **both** the spec's recorded trust and the host's current
+`isProjectTrusted()` decision are `"trusted"`. Two conditions, because a session
+can revoke trust after the config was read; one condition would make a spec a
+permanent capability token.
+
+`unknown` fails closed here, unlike `isToolInstallAllowedByTrust`. That gate
+governs pi-lens's own managed tools; this one governs a command string a
+repository wrote.
+
+Refusals record under the existing `trust-refusal` degradation kind through
+`incrementDegradationCount`, carrying the tier, `argv[0]`, and the trust
+generation — never an argument or an env value.
+
+### Redaction
+
+`redactProcessSpec` is the only projection of a spec for a diagnostic or
+telemetry surface. It strips every env **value** and every argv entry after
+`argv[0]`; env names survive, because a name is a label and "which variables did
+this server get" is the question an operator asks.
+
+`provenanceView(resolved)` is redacted by construction: it is built from the
+provenance map alone and never reads the resolved value, so no un-redacted view
+exists. Validation records are bounded and structural — a reason names a key, a
+type, and a count, never a value or a source snippet.
+
 ## Where each policy point is enforced
 
 | Policy point | Data | Test |
@@ -196,6 +335,7 @@ two move together or not at all.
 | 2. Append-only `PILENS_CFG_*` codes | `CONFIG_DIAGNOSTIC_CODES` | `tests/clients/config-diagnostic-codes.test.ts` |
 | 3. Reserved `$schema` identity anchor | `CONFIG_SCHEMA_ID`, `CONFIG_SCHEMA_ANCHOR_KEY` | `assertSchemaIdentityAnchor` |
 | 4. Deprecation window + removal checklist | `DEPRECATED_CONFIG_SURFACES` | `tests/clients/config-deprecation-registry.test.ts` |
+| 5. Config core: tiers, deny precedence, ProcessSpec trust | `clients/config-core/` | `tests/clients/config-core/*.test.ts`, `tests/config/config-core-schema-stability.test.ts` |
 
 ## Related
 

@@ -17,7 +17,16 @@ const OWN_IMPLEMENTATION_FILES = [
 	"tests/support/git-fixture-env.ts",
 	"scripts/lib/git-fixture-env.mjs",
 ] as const;
-const NOT_A_FIXTURE = ["scripts/pre-push-targeted-tests.mjs"] as const;
+// Scripts that drive the developer's REAL repository rather than a throwaway
+// fixture repo. git-fixture-env exists to scrub GIT_* and pin
+// GIT_CONFIG_GLOBAL at `<cwd>/gitconfig` so a fixture never reads the
+// developer's config — exactly the wrong environment for a script whose whole
+// job is to operate on this checkout (#2435: safe.directory, credential and
+// alias config all have to apply).
+const NOT_A_FIXTURE = [
+	"scripts/pre-push-targeted-tests.mjs",
+	"scripts/prune-agent-worktrees.mjs",
+] as const;
 
 const REPO_ROOT = path.resolve(__dirname, "../..");
 

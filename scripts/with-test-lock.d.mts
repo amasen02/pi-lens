@@ -5,3 +5,12 @@
 export function quoteForWindowsCmd(arg: string): string;
 
 export function resolveVitestEntry(): string | null;
+
+export function sharedModeRequiresPaths(commandArgs: string[]): boolean;
+
+export function parseWrapperArgs(argv: string[]): {
+	shared: boolean;
+	slots: number | null;
+	commandArgs: string[];
+	errors: string[];
+};
