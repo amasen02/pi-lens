@@ -33,7 +33,13 @@ import {
 	type HostPorts,
 } from "./clients/host-ports.js";
 import { AstGrepClient } from "./clients/ast-grep-client.js";
-import { loadBootstrapClients } from "./clients/bootstrap.js";
+import {
+	loadBootstrapClients,
+	markAnalyzerBootstrapShutdown,
+	peekBootstrapClients,
+	requestBootstrapClients,
+	type SessionBootstrapAccess,
+} from "./clients/bootstrap.js";
 import { CacheManager } from "./clients/cache-manager.js";
 // #1561 F2: the retire hook re-syncs the gate latch and the persisted record
 // the same way the per-dispatch path does, so a retired blocker stops gating
@@ -185,7 +191,10 @@ import {
 	registerQuietWindowTask,
 	runQuietWindow,
 } from "./clients/quiet-window.js";
-import { setAmbientAbortSignal } from "./clients/safe-spawn.js";
+import {
+	getAmbientAbortSignal,
+	setAmbientAbortSignal,
+} from "./clients/safe-spawn.js";
 import { initI18n, t } from "./i18n.js";
 import { createAstGrepDumpTool } from "./tools/ast-dump.js";
 import {
@@ -276,6 +285,25 @@ import { warmFormatters } from "./clients/formatters-lazy.js";
 
 type DispatchIntegration = Awaited<ReturnType<typeof loadDispatchIntegration>>;
 let loadedDispatchIntegration: DispatchIntegration | undefined;
+
+/**
+ * The session-start view of the analyzer bootstrap (#2467).
+ *
+ * Activation binds this and nothing more: no `import()` of the seventeen
+ * analyzer modules runs until a consumer asks. `peek` serves the two
+ * session-start resets, which are vacuous when nothing is loaded;
+ * `request` serves the deferred scans and probes, folding the ambient turn
+ * abort signal in beside the loader's own wall-clock ceiling so Escape
+ * unblocks a wait on a slow load.
+ */
+const sessionBootstrapAccess: SessionBootstrapAccess = {
+	peek: () => peekBootstrapClients(),
+	request: (reason, signal) =>
+		requestBootstrapClients({
+			reason,
+			signal: signal ?? getAmbientAbortSignal(),
+		}),
+};
 
 function warmDispatchAtSessionStart(): void {
 	void warmDispatchIntegration()
@@ -2103,26 +2131,13 @@ function activateExtension(hostPi: ExtensionAPI) {
 						dbg(`lsp config init failed: ${cfgErr}`);
 					}
 
-					const bootstrapClientsStartedAt = Date.now();
-					const {
-						metricsClient,
-						todoScanner,
-						biomeClient,
-						ruffClient,
-						knipClient,
-						jscpdClient,
-						govulncheckClient,
-						gitleaksClient,
-						trivyClient,
-						opengrepClient,
-						depChecker,
-						testRunnerClient,
-						goClient,
-						rustClient,
-						deadCodeClients,
-					} = await loadBootstrapClients();
-					const bootstrapClientsDurationMs =
-						Date.now() - bootstrapClientsStartedAt;
+					// #2467: no eager analyzer-bootstrap load here. This await used to
+					// sit between the host's session_start and `handleSessionStart`,
+					// paying the whole seventeen-module graph on the interactive path —
+					// and the process's FIRST session runs in quick mode, which uses
+					// none of those clients, so it was paid for nothing on exactly the
+					// start the user is waiting on. The handler now takes the on-demand
+					// seam and its consumers load what they need, off this path.
 					const handlerEnteredAt = Date.now();
 					// Consume the process-lifetime measurement at the first real session
 					// start. Concurrent secondary starts never reach this handler.
@@ -2139,8 +2154,6 @@ function activateExtension(hostPi: ExtensionAPI) {
 						emitHostReadyDelay,
 						sessionReason,
 						handlerEnteredAt,
-						bootstrapClientsStartedAt,
-						bootstrapClientsDurationMs,
 						// #2129: this call site is only reached for "primary"/
 						// "sequential-replacement" — a declined start returned above.
 						sessionStartClassification: sessionStartDecision.classification,
@@ -2150,23 +2163,9 @@ function activateExtension(hostPi: ExtensionAPI) {
 						dbg,
 						log,
 						runtime,
-						metricsClient,
 						cacheManager,
-						todoScanner,
 						astGrepClient,
-						biomeClient,
-						ruffClient,
-						knipClient,
-						jscpdClient,
-						deadCodeClients,
-						govulncheckClient,
-						gitleaksClient,
-						trivyClient,
-						opengrepClient,
-						depChecker,
-						testRunnerClient,
-						goClient,
-						rustClient,
+						bootstrap: sessionBootstrapAccess,
 						ensureTool: async (name: string) =>
 							(await import("./clients/installer/index.js")).ensureTool(name),
 						cleanStaleTsBuildInfo,
@@ -3201,6 +3200,12 @@ function activateExtension(hostPi: ExtensionAPI) {
 		// the catalog names. Only the PRIMARY path reaches here; a secondary
 		// returned above precisely because the primary is still live.
 		releasePrimarySession();
+		// #2467: no analyzer bootstrap may START loading from here on. A demand
+		// already in flight keeps its promise and still settles — the gate is
+		// checked only when no flight exists. Nothing is spawned, which is what
+		// AGENTS.md's #234 teardown rule requires of a session_shutdown-time
+		// call; a replacement session re-arms the gate at its session_start.
+		markAnalyzerBootstrapShutdown();
 		// processExiting: the loop is closing here — killing LSP servers must NOT
 		// spawn taskkill, or libuv aborts on uv_async_send to the closing loop
 		// (Assertion !(handle->flags & UV_HANDLE_CLOSING), src\win\async.c) — seen

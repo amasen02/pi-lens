@@ -28,15 +28,16 @@ vi.mock("../clients/smells-rollup.js", async (importActual) => {
 });
 
 // Heavy turn_end tail is separately tested; stub to keep this a wiring check.
-vi.mock("../clients/bootstrap.js", () => ({
-	loadBootstrapClients: async () => ({
+vi.mock("../clients/bootstrap.js", async () => {
+	const { bootstrapSeamMock } = await import("./support/bootstrap-mock.js");
+	return bootstrapSeamMock(async () => ({
 		metricsClient: { reset: () => {} },
 		knipClient: { isAvailable: () => false },
 		depChecker: { isAvailable: () => false },
 		testRunnerClient: { detectRunner: () => null },
 		deadCodeClients: [],
-	}),
-}));
+	}));
+});
 vi.mock("../clients/runtime-turn.js", () => ({
 	handleTurnEnd: vi.fn(async () => undefined),
 	cancelLSPIdleReset: vi.fn(),

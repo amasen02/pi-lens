@@ -562,6 +562,21 @@ export type DegradationKind =
 	 * observability question, the fact of the ignore is. This is the only kind
 	 * that carries a `code` (`PILENS_CFG_0001`) into the durable row.
 	 */
+	/**
+	 * A demand for the analyzer bootstrap clients (`clients/bootstrap.ts`)
+	 * could not be served, so the caller PROCEEDED WITHOUT them (#2467). The
+	 * subject is the demand reason — `session-start-scans`,
+	 * `tool-call-complexity-baseline`, … — so the ledger still answers WHICH
+	 * consumer degraded after the bounded records stop; `unavailableReason` in
+	 * the record says which of the four causes fired (the primary session was
+	 * shutting down, the caller's wall-clock ceiling elapsed, the caller
+	 * aborted, or the load itself rejected). Counted rather than
+	 * once-per-session: the load is retried on the next demand, so the number
+	 * of failed demands is the observability question. Fail-open is the whole
+	 * point — without this kind, an analyzer silently not running and an
+	 * analyzer finding nothing read identically (AGENTS.md shape 10).
+	 */
+	| "analyzer-bootstrap-unavailable"
 	| "config-ignored";
 
 export interface DegradationRecord {

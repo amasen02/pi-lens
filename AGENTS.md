@@ -965,6 +965,23 @@ The LSP service follows it through `clients/lsp-lazy.ts` for async pipeline,
 session, and warm-attach consumers. The `index.ts` status/reset adapter remains
 eager because its synchronous shutdown/status contracts are host-visible; do
 not make those callbacks async without updating their ordering contract/tests.
+The seventeen analyzer clients follow it through `clients/bootstrap.ts` (#2467).
+Activation binds only the `SessionBootstrapAccess` seam; `handleSessionStart`
+receives that seam instead of constructed clients and its two client resets go
+through `peekBootstrapClients()`, which never starts a load — an unconstructed
+client has no session state to re-arm. Demand goes through
+`requestBootstrapClients()`, which is bounded on BOTH axes (a wall-clock
+ceiling and the caller's abort signal) and fails OPEN: `null` means the caller
+proceeds without those analyzers, counted once per demand reason under the
+`analyzer-bootstrap-unavailable` ledger kind. `loadBootstrapClients()` stays
+the strict form for callers that cannot proceed without the clients. Concurrent
+demands share one `createSingleFlight` flight, a rejected load is retried by
+the next demand, and `markAnalyzerBootstrapShutdown()` (primary
+`session_shutdown`) refuses NEW loads without invalidating a waiter already in
+flight; `resetAnalyzerBootstrapSessionState()` re-arms that gate at
+`session_start`. `bootstrap_clients_load` is emitted by `clients/bootstrap.ts`
+where the load actually runs, stamped with the attempt number, NOT by
+`handleSessionStart`.
 
 **Multi-formatter extension policies resolve to one formatter (#1306):** explicit project configuration wins, and every policy with multiple candidates must name one unique `defaultFormatter` as its deterministic overlap tie-break. Kotlin Spotless selection is parsed from `build.gradle{.kts}` and `settings.gradle{.kts}` `spotless { kotlin { ... } }` blocks through `getSpotlessKotlinFormatter`; never add independent ktlint/ktfmt detection at a caller. Its small lexical pre-pass blanks comments and quoted strings before brace scanning (disabled `if (false)` blocks remain an explicit non-goal), and Gradle reads are memoized by path plus `mtimeMs` so repeated per-file selection does not repeat config I/O while mid-session edits invalidate naturally.
 

@@ -1,6 +1,7 @@
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
-import { loadBootstrapClients } from "./bootstrap.js";
+import { loadBootstrapClients, requestBootstrapClients } from "./bootstrap.js";
+import { getAmbientAbortSignal } from "./safe-spawn.js";
 import type { CacheManager } from "./cache-manager.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
 import { detectFileKind } from "./file-kinds.js";
@@ -962,15 +963,33 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 		});
 	}
 
-	const { complexityClient } = await loadBootstrapClients();
 	// Record complexity baseline for historical tracking (booboo/tdi).
 	// Not shown inline - just captured for delta analysis.
+	//
+	// #2467: the client-free guards run FIRST, so a tool call that cannot
+	// produce a baseline never loads the analyzer graph. This await used to sit
+	// above them and fire on EVERY tool_call — a bash command, a grep, a read
+	// of a vendored file, a second read of an already-baselined file all paid
+	// the seventeen-module load. `isSupportedFile` still decides support (it is
+	// the client's own answer and there is no second copy of it here), but it
+	// is now asked only once the cheap guards have admitted the call.
 	if (
 		!isExternalOrVendor &&
-		complexityClient.isSupportedFile(filePath) &&
+		filePath &&
 		!runtime.complexityBaselines.has(filePath)
 	) {
-		const baseline = await complexityClient.analyzeFile(filePath);
+		// Fail open: no clients means no baseline for this call, counted once in
+		// the ledger. A complexity baseline is delta-analysis bookkeeping — it
+		// must never be the reason a user's tool call fails or stalls.
+		const complexityClient = (
+			await requestBootstrapClients({
+				reason: "tool-call-complexity-baseline",
+				signal: getAmbientAbortSignal(),
+			})
+		)?.complexityClient;
+		const baseline = complexityClient?.isSupportedFile(filePath)
+			? await complexityClient.analyzeFile(filePath)
+			: null;
 		if (baseline) {
 			runtime.complexityBaselines.set(filePath, baseline);
 			const { captureSnapshot } = await import("./metrics-history.js");

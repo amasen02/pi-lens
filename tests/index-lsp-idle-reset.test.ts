@@ -92,13 +92,15 @@ describe("index.ts LSP idle reset", () => {
 				}),
 				resetLSPService,
 			}));
-			vi.doMock("../clients/bootstrap.js", () => ({
-				loadBootstrapClients: async () => ({
+			vi.doMock("../clients/bootstrap.js", async () => {
+				const { bootstrapSeamMock } =
+					await import("./support/bootstrap-mock.js");
+				return bootstrapSeamMock(async () => ({
 					knipClient: { isAvailable: () => false },
 					depChecker: { isAvailable: () => false },
 					testRunnerClient: { detectRunner: () => null },
-				}),
-			}));
+				}));
+			});
 
 			const { default: registerExtension } = await import("../index.js");
 			const { pi, handlers } = createMockPi({ "no-lsp": false });
@@ -173,13 +175,15 @@ describe("index.ts LSP idle reset", () => {
 					}),
 					resetLSPService,
 				}));
-				vi.doMock("../clients/bootstrap.js", () => ({
-					loadBootstrapClients: async () => ({
+				vi.doMock("../clients/bootstrap.js", async () => {
+					const { bootstrapSeamMock } =
+						await import("./support/bootstrap-mock.js");
+					return bootstrapSeamMock(async () => ({
 						knipClient: { isAvailable: () => false },
 						depChecker: { isAvailable: () => false },
 						testRunnerClient: { detectRunner: () => null },
-					}),
-				}));
+					}));
+				});
 
 				const { default: registerExtension } = await import("../index.js");
 				const { pi, handlers } = createMockPi({ "no-lsp": false });
@@ -242,13 +246,15 @@ describe("index.ts LSP idle reset", () => {
 				}),
 				resetLSPService,
 			}));
-			vi.doMock("../clients/bootstrap.js", () => ({
-				loadBootstrapClients: async () => ({
+			vi.doMock("../clients/bootstrap.js", async () => {
+				const { bootstrapSeamMock } =
+					await import("./support/bootstrap-mock.js");
+				return bootstrapSeamMock(async () => ({
 					knipClient: { isAvailable: () => false },
 					depChecker: { isAvailable: () => false },
 					testRunnerClient: { detectRunner: () => null },
-				}),
-			}));
+				}));
+			});
 
 			const { default: registerExtension } = await import("../index.js");
 			const { pi, handlers } = createMockPi({ "no-lsp": false });
@@ -307,13 +313,15 @@ describe("index.ts LSP idle reset", () => {
 					}),
 					resetLSPService,
 				}));
-				vi.doMock("../clients/bootstrap.js", () => ({
-					loadBootstrapClients: async () => ({
+				vi.doMock("../clients/bootstrap.js", async () => {
+					const { bootstrapSeamMock } =
+						await import("./support/bootstrap-mock.js");
+					return bootstrapSeamMock(async () => ({
 						knipClient: { isAvailable: () => false },
 						depChecker: { isAvailable: () => false },
 						testRunnerClient: { detectRunner: () => null },
-					}),
-				}));
+					}));
+				});
 
 				const { default: registerExtension } = await import("../index.js");
 				const { pi, handlers } = createMockPi({ "no-lsp": false });
