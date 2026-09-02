@@ -347,7 +347,7 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 		id: "observed-mutation:pending+ledger+handled",
 		module: "observed-mutation.ts",
 		state:
-			"pending Map (toolCallId -> baseline), ledger Map (path -> content stamp), handled Set, per-turn budget counters",
+			"pending BoundedFifoMap (toolCallId -> baseline), ledger BoundedFifoMap (path -> content stamp), handled Set, per-turn budget counters",
 		policy: "session_start",
 		resetName: "resetObservedMutationNet",
 		reason:
@@ -365,7 +365,8 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 	{
 		id: "mutation-attribution:session+fromDisk",
 		module: "mutation-attribution.ts",
-		state: "session Map (toolName -> observations), fromDisk Set, primedCwd",
+		state:
+			"session BoundedFifoMap (toolName -> observations), fromDisk Set, primedCwd",
 		policy: "session_start",
 		resetName: "resetMutationAttribution",
 		reason:

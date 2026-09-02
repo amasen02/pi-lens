@@ -101,6 +101,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { createHash } from "node:crypto";
 
+import { BoundedFifoMap } from "./bounded-cache.js";
 import { emitBounded } from "./bounded-telemetry.js";
 import { freshnessFromMtime } from "./freshness.js";
 import { logLatency } from "./latency-logger.js";
@@ -194,10 +195,12 @@ export const OBSERVED_LEDGER_SETTLE_MS = 150;
 /**
  * Path keys the "pi-lens already recorded this" set may hold.
  *
- * The set is normally cleared once per settle by
- * {@link refreshObservedMutationLedger}. Since round 3 (S5) that clear is
- * conditional on the refresh actually completing, so the set needs a bound of
- * its own for the case where it keeps not completing.
+ * Marks are normally retired per file by {@link refreshObservedMutationLedger},
+ * as it re-baselines each one. A refresh that keeps parking before it reaches
+ * the tail leaves the tail's marks standing indefinitely, so the set still needs
+ * a bound of its own — and, because dropping a mark is not free (it makes the
+ * next sweep read pi-lens's own bytes as third-party drift), the drop emits
+ * `observed_handled_evicted` naming the path (#2449 review round 4, S2).
  */
 export const OBSERVED_HANDLED_MAX = 1000;
 
@@ -304,8 +307,8 @@ interface LedgerEntry {
 }
 
 interface ObservedNetState {
-	pending: Map<string, PendingObservation>;
-	ledger: Map<string, LedgerEntry>;
+	pending: BoundedFifoMap<string, PendingObservation>;
+	ledger: BoundedFifoMap<string, LedgerEntry>;
 	/** Path keys already recorded through the pipeline this run. */
 	handled: Set<string>;
 	turnIndex: number;
@@ -315,15 +318,15 @@ interface ObservedNetState {
 }
 
 const OBSERVED_FAMILY = "observed-mutation-net";
-const OBSERVED_VERSION = 2;
+const OBSERVED_VERSION = 3;
 
 function state(): ObservedNetState {
 	return getProcessSingleton<ObservedNetState>(
 		OBSERVED_FAMILY,
 		OBSERVED_VERSION,
 		() => ({
-			pending: new Map(),
-			ledger: new Map(),
+			pending: new BoundedFifoMap(OBSERVED_PENDING_MAX),
+			ledger: new BoundedFifoMap(OBSERVED_LEDGER_MAX),
 			handled: new Set(),
 			turnIndex: -1,
 			turnSpentMs: 0,
@@ -378,11 +381,41 @@ export function noteMutationHandled(filePath: string): void {
 		const key = normalizeMapKey(path.resolve(filePath));
 		if (!handled.has(key) && handled.size >= OBSERVED_HANDLED_MAX) {
 			// FIFO: a Set iterates in insertion order, so the first key is the
-			// oldest. Dropping it costs one duplicate sweep report at worst.
-			// Hand-rolled like this module's other two evictions, and an adoption
-			// site for #2442's bounded-FIFO primitive when it lands.
+			// oldest. `handled` is membership-only, so this stays a hand-rolled
+			// eviction over a `Set` rather than a `BoundedFifoMap` carrying a
+			// dummy value — see this occurrence's entry in
+			// `tests/config/bounded-eviction-idiom-sweep.test.ts`, and #2460, the
+			// `BoundedSet` follow-up that would clear all four Set-shaped sites.
+			//
+			// The drop is NOT silent (#2449 review round 4, S2). Dropping a mark
+			// reinstates exactly the defect round 3 (S5) fixed: the ledger still
+			// holds the PRE-drain bytes for this file while the only record that
+			// those bytes were pi-lens's own has just been thrown away, so the
+			// next settled sweep replays our own formatter output as third-party
+			// drift. Naming the victim makes that a traceable record rather than a
+			// mystery re-format (catalog shape 10).
 			const oldest = handled.keys().next().value;
-			if (oldest !== undefined) handled.delete(oldest);
+			if (oldest !== undefined) {
+				handled.delete(oldest);
+				emitBounded(
+					"observed_handled_evicted",
+					// Identity is the DROPPED PATH, not a constant label: the ledger
+					// entry is keyed by subject and survives the per-turn cap on the
+					// detailed record, so it is what still names WHICH file lost its
+					// mark after a turn that overflowed the set many times.
+					oldest,
+					{
+						filePath: oldest,
+						durationMs: 0,
+						result: `cap:${OBSERVED_HANDLED_MAX}`,
+					},
+					{
+						ledgerKind: "observed-mutation-budget",
+						reason: `the handled set is full at ${OBSERVED_HANDLED_MAX}; the oldest pi-lens-authored file lost its mark, so its next drift is reported as third-party`,
+						capPerTurn: { limit: 2, turnIndex: state().turnIndex },
+					},
+				);
+			}
 		}
 		handled.add(key);
 	} catch {
@@ -613,22 +646,19 @@ function boundingBox(ranges: [number, number][]): [number, number] {
 	];
 }
 
+/**
+ * Both of these are one-liners over {@link BoundedFifoMap} (#2442, adopted in
+ * #2449 review round 4, B2). They stay as named functions because the CAP each
+ * map carries is part of this module's contract and the call sites read
+ * better naming the map than the container; the eviction block itself is the
+ * primitive's.
+ */
 function putPending(key: string, value: PendingObservation): void {
-	const pending = state().pending;
-	if (!pending.has(key) && pending.size >= OBSERVED_PENDING_MAX) {
-		const oldest = pending.keys().next().value;
-		if (oldest !== undefined) pending.delete(oldest);
-	}
-	pending.set(key, value);
+	state().pending.set(key, value);
 }
 
 function putLedger(key: string, value: LedgerEntry): void {
-	const ledger = state().ledger;
-	if (!ledger.has(key) && ledger.size >= OBSERVED_LEDGER_MAX) {
-		const oldest = ledger.keys().next().value;
-		if (oldest !== undefined) ledger.delete(oldest);
-	}
-	ledger.set(key, value);
+	state().ledger.set(key, value);
 }
 
 function seedLedger(snapshot: FileStatsSnapshot): void {
@@ -719,10 +749,20 @@ export async function armObservedMutation(
 				withHashes: true,
 				hashBudgetBytes: OBSERVED_HASH_BUDGET_BYTES,
 			});
+			// INSIDE the bounds, and therefore inside the turn charge below
+			// (#2449 review round 4, S3). This reads and per-line-hashes the target
+			// up to OBSERVED_LINE_HASH_MAX_BYTES — half a megabyte, and the
+			// dominant cost of arming a large target. The first cut awaited it
+			// AFTER `chargeTurnBudget` and outside `withBounds`, so the majority of
+			// the arm was charged to nobody and covered by neither the timeout nor
+			// the abort race — both halves of AGENTS.md's two-bounds rule missing on
+			// the single most expensive step.
+			const lineHashes = await captureLineHashes(args.targetPath);
 			return {
 				paths: universe.paths,
 				capped: universe.capped,
 				stats: captured.snapshot,
+				lineHashes,
 			};
 		},
 		timeoutMs,
@@ -777,7 +817,7 @@ export async function armObservedMutation(
 		paths: outcome.value.paths,
 		stats: outcome.value.stats,
 		targetKey,
-		targetLineHashes: await captureLineHashes(args.targetPath),
+		targetLineHashes: outcome.value.lineHashes,
 		targetDirCapped: outcome.value.capped,
 	});
 	const durationMs = Date.now() - started;
@@ -1175,6 +1215,24 @@ async function scanTrackedIncrementally(
 	let stoppedEarly = false;
 	let steps = 0;
 
+	/**
+	 * Re-baseline one file, and on the POST-DRAIN pass (`report: false`) retire its
+	 * `handled` mark at the same moment (#2449 review round 4, S2).
+	 *
+	 * Per FILE, not all-or-nothing. The mark exists to stop pi-lens's own drain
+	 * output being read as third-party drift, and it is safe to drop exactly when
+	 * the ledger has been moved onto the post-drain bytes for THAT file — which is
+	 * here. The previous cut cleared the whole set after the fact and only when
+	 * the pass completed, which was wrong in both directions: a parked pass kept
+	 * marks for files it HAD re-baselined (suppressing a real third-party change
+	 * to them until some later pass completed), and a completed pass dropped marks
+	 * for files it had skipped over.
+	 */
+	const rebaseline = (ledgerKey: string, entry: LedgerEntry): void => {
+		putLedger(ledgerKey, entry);
+		if (!options.report) current.handled.delete(ledgerKey);
+	};
+
 	for (; steps < window; steps += 1) {
 		if (args.signal?.aborted === true) {
 			stoppedEarly = true;
@@ -1227,7 +1285,7 @@ async function scanTrackedIncrementally(
 					next.hashKind = "content";
 				}
 			}
-			putLedger(key, next);
+			rebaseline(key, next);
 			continue;
 		}
 
@@ -1250,7 +1308,7 @@ async function scanTrackedIncrementally(
 			previous.mtimeMs === stat.mtimeMs &&
 			baselineSettled
 		) {
-			putLedger(key, next);
+			rebaseline(key, next);
 			continue;
 		}
 
@@ -1281,7 +1339,7 @@ async function scanTrackedIncrementally(
 				next.hashKind = "content";
 			}
 		}
-		putLedger(key, next);
+		rebaseline(key, next);
 
 		if (!options.report) continue;
 		if (current.handled.has(key)) continue;
@@ -1418,18 +1476,32 @@ export async function runObservedSettledSweep(
  *
  * Same traversal as the sweep, so the same "stat first, read only on change"
  * cost applies: the drain touches a handful of files, and only those are read.
- * Clearing `handled` is this function's job and not the sweep's — the sweep
- * runs BEFORE the drain, so a set cleared there would not cover the drain's own
- * writes.
+ * Retiring `handled` marks is this function's job and not the sweep's — the
+ * sweep runs BEFORE the drain, so marks retired there would not cover the
+ * drain's own writes.
  *
- * And the clear is CONDITIONAL on the re-baseline having actually happened
- * (#2449 review round 3, S5). The first cut cleared unconditionally, including
- * when the refresh aborted or timed out: the ledger then still held the
- * PRE-drain bytes while the only record that those bytes were pi-lens's own had
- * just been thrown away, so the next settled sweep reported pi-lens's own
- * formatter output as third-party drift and queued it for another format. A
- * kept `handled` set costs at most one skipped report of a file we did write;
- * a cleared one costs a fabricated mutation every turn.
+ * ## The retirement is per FILE (#2449 review rounds 3 (S5) and 4 (S2))
+ *
+ * A mark may be dropped exactly when the ledger has been moved onto the
+ * POST-drain bytes for that same file, so it is dropped there — inside the
+ * scan, one file at a time (see `rebaseline`). Two earlier cuts got this wrong
+ * in opposite directions and both cost a fabricated mutation:
+ *
+ * - the FIRST cut cleared the whole set unconditionally, including when the
+ *   refresh aborted or timed out. The ledger then still held the PRE-drain
+ *   bytes while the only record that those bytes were pi-lens's own had just
+ *   been thrown away, so the next settled sweep reported pi-lens's own
+ *   formatter output as third-party drift and queued it for another format.
+ * - the SECOND cut fixed that by clearing only on a COMPLETE pass, which
+ *   over-corrected: a pass that parked kept marks even for the files it had
+ *   already re-baselined, so a genuine third-party change to one of those was
+ *   suppressed until some later pass happened to complete.
+ *
+ * Per-file retirement has neither failure: the covered prefix loses its marks
+ * because its ledger entries are current, and the tail keeps its marks because
+ * its ledger entries are not. The incompleteness is still REPORTED
+ * (`observed_refresh_incomplete`), because a tail carrying stale baselines and
+ * standing marks is a coverage gap, not a clean pass.
  */
 export async function refreshObservedMutationLedger(
 	args: Pick<
@@ -1447,12 +1519,18 @@ export async function refreshObservedMutationLedger(
 		OBSERVED_CAPTURE_BUDGET_MS * 2,
 		args.signal,
 	);
-	// `stoppedEarly` matters as much as `ok`: a pass that parked at its deadline
-	// re-baselined a PREFIX of the tracked set, and the drain's writes may be in
-	// the tail it never reached.
+	// The marks themselves are retired per FILE inside the scan (see
+	// `rebaseline` in `scanTrackedIncrementally`), so a parked pass leaves the
+	// tail's marks standing rather than clearing marks for files it never reached.
+	//
+	// `stoppedEarly` still matters as much as `ok`, and it is what this record
+	// reports: a pass that parked at its deadline covered a PREFIX of the tracked
+	// set, so the drain's writes may be in the tail, and the NEXT settled sweep
+	// will see them with the ledger still holding the pre-drain bytes. It is the
+	// kept mark that stops those being replayed, and a coverage gap that reports
+	// itself is the only kind that gets fixed (catalog shape 10).
 	const complete = outcome.ok && !outcome.value.stoppedEarly;
 	if (complete) {
-		state().handled.clear();
 		return outcome.value.scanned;
 	}
 	emitBounded(
@@ -1465,7 +1543,7 @@ export async function refreshObservedMutationLedger(
 		{
 			ledgerKind: "observed-mutation-budget",
 			reason:
-				"post-drain ledger refresh did not cover the tracked set; the already-recorded set was kept rather than cleared",
+				"post-drain ledger refresh did not cover the tracked set; the files it never reached keep their already-recorded mark",
 			capPerTurn: { limit: 2, turnIndex: args.turnIndex ?? 0 },
 		},
 	);

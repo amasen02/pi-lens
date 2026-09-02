@@ -29,6 +29,7 @@ import {
 	type LineHashReadBudget,
 	noteMutationHandled,
 	type ObservedReplayEntry,
+	OBSERVED_HANDLED_MAX,
 	OBSERVED_SWEEP_HASH_BUDGET_BYTES,
 	OBSERVED_SWEEP_STAT_WINDOW,
 	OBSERVED_TARGET_DIR_MAX_ENTRIES,
@@ -1161,11 +1162,22 @@ describe("#2449 review round 2 — the settled sweep is incremental and honest",
 			fs.writeFileSync(filePath, SOURCE);
 			const tracked = [filePath];
 			// Pin the file's mtime to a whole millisecond BEFORE the baseline is
-			// taken. `utimesSync` only carries millisecond precision, so without
-			// this the restore below cannot reproduce a stat the ledger recorded
-			// and the case silently stops testing the short-circuit (round 3, T1).
+			// taken, so the restore below can reproduce the stat the ledger
+			// recorded; without it the case silently stops testing the
+			// short-circuit (round 3, T1).
+			//
+			// The reference value is what the FILESYSTEM stored, read back, never
+			// the JS number handed to `utimesSync` (round 4, B1). On ext4 the stamp
+			// is nanoseconds and `mtimeMs` is that count divided into a double, so
+			// a whole-millisecond request comes back as 1788362498611.999 and the
+			// round-trip assertion failed in CI on a filesystem this repo actually
+			// runs on. The production guard was right either way: both the ledger
+			// and the sweep compare `stat.mtimeMs` against `stat.mtimeMs`, so what
+			// matters is that the two stats agree — which is exactly what this
+			// pins.
 			const pinned = Math.floor(Date.now());
 			fs.utimesSync(filePath, new Date(pinned), new Date(pinned));
+			const storedMtimeMs = fs.statSync(filePath).mtimeMs;
 
 			await runObservedSettledSweep({
 				turnIndex: 0,
@@ -1191,7 +1203,7 @@ describe("#2449 review round 2 — the settled sweep is incremental and honest",
 			fs.utimesSync(filePath, new Date(pinned), new Date(pinned));
 			const restored = fs.statSync(filePath);
 			expect(restored.size).toBe(SOURCE.length);
-			expect(restored.mtimeMs).toBe(pinned);
+			expect(restored.mtimeMs).toBe(storedMtimeMs);
 
 			const sink = recorder();
 			const swept = await runObservedSettledSweep({
@@ -1298,6 +1310,262 @@ describe("#2449 review round 2 — the settled sweep is incremental and honest",
 				record: recorder().record,
 			});
 			expect(swept.drifted).toHaveLength(1);
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+describe("#2449 review round 4 — handled marks, bounds and budget honesty", () => {
+	const sleep = (ms: number): Promise<void> =>
+		new Promise((resolve) => setTimeout(resolve, ms));
+
+	function budgetSubjects(): string[] {
+		return getDegradationSummary()
+			.filter((group) => group.kind === "observed-mutation-budget")
+			.flatMap((group) => group.latestReasons.map((entry) => entry.subject));
+	}
+
+	it("retires a handled mark per FILE, so a parked refresh keeps only the tail's", async () => {
+		// Round 4, S1 + S2. Two properties in one run, because they are two
+		// halves of the same rule: a mark may be dropped exactly when the ledger
+		// has been moved onto the post-drain bytes for THAT file.
+		//
+		// The round-3 cut cleared the whole set, and only on a COMPLETE pass. The
+		// existing sibling test drives the ABORT case, which reaches
+		// `outcome.ok === false` and therefore never exercises the `!stoppedEarly`
+		// half of the completeness test at all. This one PARKS instead: a full
+		// tracked set with a slow stat cannot finish inside
+		// OBSERVED_CAPTURE_BUDGET_MS, so the pass covers a prefix and stops.
+		const env = setupTestEnvironment("pi-lens-2449-park-");
+		try {
+			const tracked: string[] = [];
+			for (let index = 0; index < OBSERVED_TRACKED_MAX_FILES; index += 1) {
+				const filePath = path.join(env.tmpDir, `tracked-${index}.ts`);
+				fs.writeFileSync(filePath, SOURCE);
+				tracked.push(filePath);
+			}
+			const prefixFile = tracked[0];
+			const tailFile = tracked[tracked.length - 1];
+
+			// Give every file a content baseline. The FIRST pass reads each one to
+			// hash it and can hit its own deadline on a slow box, so this loops
+			// until the whole set is covered rather than assuming one pass is
+			// enough — later passes are stat-only for the files already settled.
+			let seeded = 0;
+			for (
+				let attempt = 0;
+				attempt < 25 && seeded < tracked.length;
+				attempt++
+			) {
+				seeded = await refreshObservedMutationLedger({
+					turnIndex: 0,
+					getTrackedPaths: () => tracked,
+				});
+			}
+			expect(seeded).toBe(tracked.length);
+
+			// The deferred drain formats two of them — pi-lens's own bytes, one at
+			// each end of the rotation.
+			for (const filePath of [prefixFile, tailFile]) {
+				noteMutationHandled(filePath);
+				fs.writeFileSync(filePath, `${SOURCE}const formatted = 1;\n`);
+			}
+
+			// Those seeding passes may themselves have reported incompleteness. The
+			// assertion below is about the PARKED pass, so it starts from a clean
+			// ledger — otherwise it would pass on a record it did not produce.
+			resetDegradationLedger();
+
+			// Slow the stat down so the post-drain refresh PARKS deterministically
+			// rather than depending on how fast this box walks the tracked set.
+			const realStat = fs.promises.stat;
+			const statSpy = vi
+				.spyOn(fs.promises, "stat")
+				.mockImplementation(async (target: Parameters<typeof realStat>[0]) => {
+					await sleep(2);
+					return realStat(target);
+				});
+			const scanned = await refreshObservedMutationLedger({
+				turnIndex: 1,
+				getTrackedPaths: () => tracked,
+			});
+			statSpy.mockRestore();
+
+			// It really did park: a prefix, not the whole set.
+			expect(scanned).toBeGreaterThan(0);
+			expect(scanned).toBeLessThan(tracked.length);
+
+			// S1: the `!stoppedEarly` half is what turns a parked pass into a
+			// reported one. Without it a parked refresh looks like a clean pass.
+			expect(budgetSubjects()).toContain("post-drain-refresh");
+
+			// S2: the covered prefix lost its mark because its ledger entry is now
+			// current; the unreached tail kept its mark because its ledger entry is
+			// still the PRE-drain one.
+			const marks = _observedMutationStateForTests().handled;
+			expect(marks.some((key) => key.includes("tracked-0."))).toBe(false);
+			expect(
+				marks.some((key) =>
+					key.includes(`tracked-${OBSERVED_TRACKED_MAX_FILES - 1}.`),
+				),
+			).toBe(true);
+
+			// And the marks mean what they say. A THIRD-PARTY change to the covered
+			// prefix file is reported, because its mark was retired — the
+			// all-or-nothing cut suppressed exactly this until some later pass
+			// happened to complete.
+			fs.writeFileSync(prefixFile, `${SOURCE}const third_party = 2;\n`);
+			const prefixSink = recorder();
+			await runObservedSettledSweep({
+				turnIndex: 2,
+				getTrackedPaths: () => [prefixFile],
+				record: prefixSink.record,
+			});
+			expect(prefixSink.entries).toHaveLength(1);
+
+			// While the tail's kept mark still suppresses pi-lens's own drain output,
+			// which is the round-3 (S5) property this must not regress.
+			const tailSink = recorder();
+			await runObservedSettledSweep({
+				turnIndex: 3,
+				getTrackedPaths: () => [tailFile],
+				record: tailSink.record,
+			});
+			expect(tailSink.entries).toEqual([]);
+		} finally {
+			env.cleanup();
+		}
+	}, 30_000);
+
+	it("names the handled mark it drops at the cap instead of dropping it silently", () => {
+		// Round 4, S2, second half (the reviewer's PROBE-H). The cap is a real
+		// bound and it must stay, but dropping a mark silently reinstates the
+		// round-3 (S5) defect for that file: the ledger still holds the PRE-drain
+		// bytes while the only record that those bytes were pi-lens's own is gone,
+		// so the next settled sweep replays our own formatter output as
+		// third-party drift. The replay is accepted; the SILENCE is not.
+		const env = setupTestEnvironment("pi-lens-2449-handled-cap-");
+		try {
+			const victim = path.join(env.tmpDir, "victim-own-output.ts");
+			noteMutationHandled(victim);
+			expect(
+				_observedMutationStateForTests().handled.some((key) =>
+					key.includes("victim-own-output"),
+				),
+			).toBe(true);
+
+			// Push the set past its cap. The victim was inserted first, so FIFO
+			// order makes it the one dropped.
+			for (let index = 0; index < OBSERVED_HANDLED_MAX; index += 1) {
+				noteMutationHandled(path.join(env.tmpDir, `filler-${index}.ts`));
+			}
+
+			const marks = _observedMutationStateForTests().handled;
+			expect(marks).toHaveLength(OBSERVED_HANDLED_MAX);
+			expect(marks.some((key) => key.includes("victim-own-output"))).toBe(
+				false,
+			);
+
+			// The record NAMES the victim. Identity is the dropped path, not a
+			// constant label, so the ledger answers WHICH file will be re-reported
+			// — a count alone would not (catalog shape 10).
+			expect(
+				budgetSubjects().some((subject) =>
+					subject.includes("victim-own-output"),
+				),
+			).toBe(true);
+		} finally {
+			env.cleanup();
+		}
+	});
+	it("charges the target line-hash read to the per-turn budget", async () => {
+		// Round 4, S3. `captureLineHashes` reads and per-line-hashes the target,
+		// up to OBSERVED_LINE_HASH_MAX_BYTES. It used to be awaited AFTER
+		// `chargeTurnBudget`, so on a large target most of the arm's wall clock was
+		// charged to nobody and OBSERVED_TURN_BUDGET_MS bounded far less work than
+		// it claimed to.
+		//
+		// The delay is injected at `fs.promises.readFile` rather than inferred from
+		// a large fixture, so the split is the same on any box: the stats capture
+		// takes one read and the line-hash capture takes the other.
+		const env = setupTestEnvironment("pi-lens-2449-charge-");
+		try {
+			const filePath = path.join(env.tmpDir, "charged.ts");
+			fs.writeFileSync(filePath, SOURCE);
+			_setObservedTurnBudgetForTests(7, 0);
+
+			const realRead = fs.promises.readFile;
+			const readSpy = vi
+				.spyOn(fs.promises, "readFile")
+				.mockImplementation(async (...args: Parameters<typeof realRead>) => {
+					await sleep(40);
+					return realRead(...args);
+				});
+			const startedAt = Date.now();
+			const armed = await armObservedMutation(
+				armArgs(filePath, env.tmpDir, { turnIndex: 7 }),
+			);
+			const wallMs = Date.now() - startedAt;
+			// Read the call count BEFORE restoring: mockRestore clears it.
+			const readCalls = readSpy.mock.calls.length;
+			readSpy.mockRestore();
+
+			expect(armed.armed).toBe(true);
+			// Both reads really happened — otherwise the delay proves nothing.
+			expect(readCalls).toBeGreaterThanOrEqual(2);
+			// Charged ≈ wall. Pre-fix the line-hash read (one whole 40ms delay) sat
+			// outside the charge, so this gap was the size of a read.
+			expect(
+				_observedMutationStateForTests().turnSpentMs,
+			).toBeGreaterThanOrEqual(wallMs - 10);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("aborts an arm that is still inside the target line-hash read", async () => {
+		// Round 4, S3, the other half of AGENTS.md's two-bounds rule. The step was
+		// outside `withBounds` as well as outside the charge, so an abort raised
+		// while it ran was simply not observed and the arm completed anyway.
+		//
+		// The abort is raised FROM the second read rather than on a timer, so the
+		// test does not depend on how fast this box gets there.
+		const env = setupTestEnvironment("pi-lens-2449-linehash-abort-");
+		try {
+			const filePath = path.join(env.tmpDir, "aborted.ts");
+			fs.writeFileSync(filePath, SOURCE);
+			_setObservedTurnBudgetForTests(8, 0);
+
+			const controller = new AbortController();
+			const realRead = fs.promises.readFile;
+			let reads = 0;
+			const readSpy = vi
+				.spyOn(fs.promises, "readFile")
+				.mockImplementation(async (...args: Parameters<typeof realRead>) => {
+					reads += 1;
+					// Read 1 is the stats capture; read 2 is the line-hash capture, so
+					// by here the arm is inside the step under test.
+					if (reads === 2) controller.abort();
+					await sleep(10);
+					return realRead(...args);
+				});
+			const armed = await armObservedMutation(
+				armArgs(filePath, env.tmpDir, {
+					turnIndex: 8,
+					signal: controller.signal,
+				}),
+			);
+			readSpy.mockRestore();
+
+			expect(reads).toBeGreaterThanOrEqual(2);
+			expect(armed.armed).toBe(false);
+			// Narrowing for the discriminated result; the assertion above is the
+			// one that fails first on pre-fix code.
+			if (armed.armed) throw new Error("expected the arm to be aborted");
+			expect(armed.reason).toBe("aborted");
+			// And nothing was left armed for a settle that can never be honest.
+			expect(_observedMutationStateForTests().pending).toEqual([]);
 		} finally {
 			env.cleanup();
 		}

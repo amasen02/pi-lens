@@ -42,6 +42,7 @@ import * as path from "node:path";
 
 import { writeFileAtomic } from "./atomic-write.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
+import { BoundedFifoMap } from "./bounded-cache.js";
 import { getProjectDataDir } from "./file-utils.js";
 import { getProcessSingleton } from "./process-singletons.js";
 
@@ -124,7 +125,7 @@ interface ToolObservation {
 
 interface AttributionState {
 	/** toolName -> counts. FIFO-bounded; see `MUTATION_ATTRIBUTION_MAX_TOOLS`. */
-	session: Map<string, ToolObservation>;
+	session: BoundedFifoMap<string, ToolObservation>;
 	/** Tool names adopted from disk at `session_start`, or `undefined` until primed. */
 	fromDisk: Set<string> | undefined;
 	/** Project root the persisted set was primed for, for the write-back path. */
@@ -138,27 +139,12 @@ function state(): AttributionState {
 	return getProcessSingleton<AttributionState>(
 		ATTRIBUTION_FAMILY,
 		ATTRIBUTION_VERSION,
-		() => ({ session: new Map(), fromDisk: undefined, primedCwd: undefined }),
+		() => ({
+			session: new BoundedFifoMap(MUTATION_ATTRIBUTION_MAX_TOOLS),
+			fromDisk: undefined,
+			primedCwd: undefined,
+		}),
 	);
-}
-
-/**
- * FIFO insert with a hard cap. A local `Map` rather than
- * `clients/bounded-cache.ts` on purpose: that module is being reworked under
- * #2442 and this is a sixty-four-entry name map, not a cache with a hit/miss
- * story. If #2442 lands a FIFO map primitive, this is one of its adoption
- * sites.
- */
-function put(
-	map: Map<string, ToolObservation>,
-	key: string,
-	value: ToolObservation,
-): void {
-	if (!map.has(key) && map.size >= MUTATION_ATTRIBUTION_MAX_TOOLS) {
-		const oldest = map.keys().next().value;
-		if (oldest !== undefined) map.delete(oldest);
-	}
-	map.set(key, value);
 }
 
 function observationFor(toolName: string): ToolObservation {
@@ -171,7 +157,7 @@ function observationFor(toolName: string): ToolObservation {
 		unverifiable: 0,
 		persisted: false,
 	};
-	put(state().session, toolName, created);
+	state().session.set(toolName, created);
 	return created;
 }
 
@@ -455,10 +441,9 @@ export function _mutationAttributionSnapshotForTests(): {
 } {
 	const current = state();
 	return {
-		session: [...current.session.entries()].map(([name, obs]) => [
-			name,
-			{ ...obs },
-		]),
+		session: current.session
+			.entriesArray()
+			.map(([name, obs]) => [name, { ...obs }]),
 		fromDisk: current.fromDisk ? [...current.fromDisk] : undefined,
 	};
 }

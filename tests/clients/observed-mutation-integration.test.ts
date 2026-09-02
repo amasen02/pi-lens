@@ -111,6 +111,31 @@ function patchEvent(
 	};
 }
 
+/**
+ * An unknown tool that also states the text it replaced. The NAME is unknown
+ * and the SHAPE is not one an adapter shipped in `MUTATION_SHAPE_ADAPTERS`
+ * recognizes, so the call is unclassified until the observational net
+ * attributes it — but its input carries the `oldText`/`newText` pair the
+ * #2402 applied-edit records are built from, which is what makes the skip
+ * path's partial-apply step observable (#2449 review round 4, S4).
+ */
+function retryEvent(
+	filePath: string,
+	toolCallId: string,
+): Record<string, unknown> {
+	return {
+		toolName: "patch_retry",
+		toolCallId,
+		input: {
+			path: filePath,
+			patch: "@@ -2 +2 @@",
+			oldText: "const a = 1;",
+			newText: "const a = 9;",
+		},
+		content: [{ type: "text", text: "patched" }],
+	};
+}
+
 function toolCallDeps(args: {
 	event: Record<string, unknown>;
 	cwd: string;
@@ -502,5 +527,94 @@ describe("#2430 item 3 — the settled sweep is wired ahead of the deferred drai
 		expect(sweepAt).toBeGreaterThan(-1);
 		expect(drainAt).toBeGreaterThan(sweepAt);
 		expect(refreshAt).toBeGreaterThan(drainAt);
+	});
+});
+
+describe("#2449 review round 4 — the observed-settle return skips only duplicates", () => {
+	it("keeps the applied-edit records, mutation receipt and cachedExports refresh", async () => {
+		// S4. Round 3 (S2) added an early return so a provisionally-learned tool
+		// did not record the same physical edit twice. It was labelled "skipped turn
+		// tracking" and skipped considerably more than that. Three of the steps
+		// below it have NO counterpart in `recordMutationThroughSeam`, so nothing
+		// else ran them:
+		//
+		//   - the #2402 applied-edit records, so an identical retry escalated
+		//     through the oldText-not-found ladder instead of being recognized;
+		//   - `recordMutationToolReceipt`, the write→edit ordering state;
+		//   - the `cachedExports` refresh, so the pre-write STOP check kept firing
+		//     on names the edit had just removed.
+		const env = setupTestEnvironment("pi-lens-2449-narrow-skip-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		try {
+			const filePath = path.join(env.tmpDir, "narrowed.ts");
+			const withStale = `export const staleName = 1;\n${SOURCE}`;
+			fs.writeFileSync(filePath, withStale);
+			const { runtime, cacheManager } = newSession(env.tmpDir);
+
+			// Non-vacuity: neither the NAME tier nor the SHAPE tier can classify
+			// this call, so the observational net is the only thing that reaches the
+			// bookkeeping chain — which is what makes the skip path reachable at all.
+			const firstEvent = retryEvent(filePath, "call-2449-narrow-0");
+			expect(
+				classifyMutatingTool(firstEvent as never, {
+					filePath,
+					recognizeOnly: true,
+				}),
+			).toBeUndefined();
+
+			// Call 1 arms, observes and attributes the tool.
+			await handleToolCall(
+				toolCallDeps({
+					event: firstEvent,
+					cwd: env.tmpDir,
+					runtime,
+					cacheManager,
+				}),
+			);
+			fs.writeFileSync(filePath, `${withStale}const d = 4;\n`);
+			await handleToolResult(
+				toolResultDeps({ event: firstEvent, runtime, cacheManager }),
+			);
+
+			// Call 2 is classified BY NAME from the attribution and is still armed,
+			// so its tool_result takes the early return under test.
+			runtime.cachedExports.set("staleName", filePath);
+			const receiptSpy = vi.spyOn(runtime, "recordMutationToolReceipt");
+			const appliedSpy = vi.spyOn(runtime.partialApplyRecords, "record");
+
+			const secondEvent = retryEvent(filePath, "call-2449-narrow-1");
+			await handleToolCall(
+				toolCallDeps({
+					event: secondEvent,
+					cwd: env.tmpDir,
+					runtime,
+					cacheManager,
+				}),
+			);
+			// The edit removes the exported name cachedExports is holding.
+			fs.writeFileSync(filePath, `${SOURCE}const d = 4;\nconst e = 5;\n`);
+			await handleToolResult(
+				toolResultDeps({ event: secondEvent, runtime, cacheManager }),
+			);
+
+			// The skip really happened: one change-log receipt per physical edit,
+			// which is the round-3 property the early return exists for.
+			expect(
+				readChangesSince(env.tmpDir, 0).map((change) => change.source),
+			).toEqual(["agent-tool:patch_retry", "agent-tool:patch_retry"]);
+
+			// And the three non-duplicated steps ran anyway.
+			expect(receiptSpy).toHaveBeenCalledWith(filePath, "edit");
+			expect(appliedSpy).toHaveBeenCalled();
+			expect(runtime.cachedExports.has("staleName")).toBe(false);
+
+			receiptSpy.mockRestore();
+			appliedSpy.mockRestore();
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
 	});
 });

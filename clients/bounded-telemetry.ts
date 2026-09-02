@@ -161,6 +161,18 @@ export const BOUNDED_TELEMETRY_PHASES = [
 	 * (#2449 review round 3).
 	 */
 	"observed_refresh_incomplete",
+	/**
+	 * #2430: the "pi-lens wrote these bytes itself" set hit
+	 * `OBSERVED_HANDLED_MAX` and dropped its oldest entry. The dropped file is
+	 * NAMED, because the eviction silently reintroduces the exact defect
+	 * #2449 round 3 (S5) fixed: the ledger still holds the pre-drain bytes
+	 * while the only record that those bytes were ours is gone, so the next
+	 * settled sweep replays pi-lens's own formatter output as third-party
+	 * drift. A cap that drops a mark has to say which one (catalog shape 10);
+	 * capped per turn because a turn that overflows the set overflows it many
+	 * times (#2449 review round 4, S2).
+	 */
+	"observed_handled_evicted",
 ] as const;
 
 export type BoundedPhase = (typeof BOUNDED_TELEMETRY_PHASES)[number];
