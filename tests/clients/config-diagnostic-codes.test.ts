@@ -325,6 +325,17 @@ export function auditNotifyCall(
  * A test that only checked the file exists on disk would still have passed, so
  * this one asks git: every `docs/*.md` a policy surface names must be TRACKED.
  */
+/** Every `docs/*.md` path referenced anywhere across a set of texts. */
+function docRefsIn(texts: string[]): string[] {
+	const referenced = new Set<string>();
+	for (const text of texts) {
+		for (const match of text.matchAll(/docs\/[A-Za-z0-9._-]+\.md/g)) {
+			referenced.add(match[0]);
+		}
+	}
+	return [...referenced].sort();
+}
+
 function referencedDocPaths(
 	sources: ReadonlyArray<ConfigSurfaceSource>,
 ): string[] {
@@ -339,13 +350,7 @@ function referencedDocPaths(
 		if (!name.endsWith(".md") || name === "README.md") continue;
 		texts.push(fs.readFileSync(path.join(fragmentDir, name), "utf-8"));
 	}
-	const referenced = new Set<string>();
-	for (const text of texts) {
-		for (const match of text.matchAll(/docs\/[A-Za-z0-9._-]+\.md/g)) {
-			referenced.add(match[0]);
-		}
-	}
-	return [...referenced].sort();
+	return docRefsIn(texts);
 }
 
 describe("referenced policy docs are actually in the repo (#2418)", () => {
@@ -364,6 +369,22 @@ describe("referenced policy docs are actually in the repo (#2418)", () => {
 		// Declared floor: a scan that finds nothing must FAIL, not read as clean.
 		assertNonEmptyScan("referenced docs", referenced.length, 1);
 		assertNonEmptyScan("tracked docs", tracked.size, 1);
+	});
+
+	it("finds doc references from config sources on their own", () => {
+		// Round-4 gap: the corpus-property check below (comment-only doc refs
+		// exist somewhere) holds no matter which field referencedDocPaths reads,
+		// because AGENTS.md and the changelog fragments carry the same
+		// references too -- reverting its `entry.raw` read to `entry.source`
+		// stayed green. This asks the narrower question directly: scanning ONLY
+		// the config sources' raw text must itself surface at least one
+		// `docs/*.md` reference, since all three live in doc comments that
+		// `source` (comments stripped) cannot see.
+		assertNonEmptyScan(
+			"doc references from config sources",
+			docRefsIn(sources.map((s) => s.raw)).length,
+			1,
+		);
 	});
 
 	it("reads references out of doc comments, not only out of code", () => {

@@ -84,7 +84,7 @@ The trailing ` [PILENS_CFG_NNNN]` marker is appended by
 
 ```sh
 # every ignored-config warning this session, from the durable degradation log
-grep 'PILENS_CFG_0001' ~/.pi-lens/logs/latency.log
+grep 'PILENS_CFG_0001' ~/.pi-lens/latency.log
 
 # suppress one code while keeping every other pi-lens warning
 pi ... 2>&1 | grep -v 'PILENS_CFG_0001'
