@@ -12,10 +12,10 @@
 
 import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
-import { getGlobalPiLensDir } from "./file-utils.js";
+import { getGlobalPiLensLogDir } from "./file-utils.js";
 import { createNdjsonLogger } from "./ndjson-logger.js";
 
-const AG_LOG_DIR = getGlobalPiLensDir();
+const AG_LOG_DIR = getGlobalPiLensLogDir();
 const AG_LOG_FILE = path.join(AG_LOG_DIR, "ast-grep-tools.log");
 const AG_LOG_BACKUP_FILE = path.join(AG_LOG_DIR, "ast-grep-tools.log.1");
 const MAX_LOG_BYTES = Math.max(

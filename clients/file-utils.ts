@@ -31,7 +31,6 @@ import {
 	loadPiLensConfigInDir,
 	loadPiLensProjectConfig,
 } from "./project-lens-config.js";
-import { recordProbeHomeRedirectEvent } from "./probe-home-state.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
 
 /**
@@ -69,114 +68,223 @@ export function getProjectDataDir(cwd: string): string {
 /**
  * Machine-global pi-lens directory: `~/.pi-lens/` by default.
  *
- * Used for logs (latency, cascade, read-guard, tree-sitter, actionable-warnings,
- * sessionstart), tool binaries (`~/.pi-lens/tools/`, `~/.pi-lens/bin/`), the
- * cross-process instance registry (`instances.json`, #449/#525), the
- * auto-install probe cache, and other state that is intentionally NOT
- * project-scoped — it spans every project pi-lens has touched.
+ * Used for tool binaries (`~/.pi-lens/tools/`, `~/.pi-lens/bin/`), the
+ * cross-process instance registry (`instances.json`, #449/#525) and the
+ * orphan-backstop lease beside it, the auto-install probe cache, the
+ * canonical global config (`config.json`), LSP server storage (intelephense's
+ * index, PSES's per-PID session dir) and JVM runtimes — state that is
+ * intentionally NOT project-scoped, because it spans every project pi-lens
+ * has touched.
  *
  * Override: set `PI_LENS_HOME=/some/path` to relocate this ENTIRE root (every
- * caller below routes through this one function, so one env var covers all of
+ * caller routes through this one function, so one env var covers all of
  * them — see #525). Tests MUST set this to a per-worker temp dir in
  * `tests/support/vitest-setup.ts` rather than mocking each caller separately;
  * otherwise a test that exercises `registerInstance`/`sweepOrphans` or any
  * logger writes into the developer's REAL `~/.pi-lens` (dogfooded live: a
  * test-fixture instance survived in the real `instances.json` for 17h).
  *
+ * DELIBERATELY cwd-INDEPENDENT (#2506 round 3). Its sibling
+ * `getGlobalPiLensLogDir()` below carries the probe-home redirect; this one
+ * must not, because the things resolved here are shared machine state a
+ * session needs to KEEP: a pi session running from an agent worktree or a
+ * throwaway temp project must still find the tools it already installed and
+ * must still register in the one `instances.json` every other pi-lens process
+ * on the box reads. Redirecting THIS function (as round 2 of #2506 did) would
+ * silently give every worktree its own empty tool tree and its own private
+ * registry, so the reaper could never see across them — a worse defect than
+ * the telemetry pollution the redirect exists to stop.
+ *
  * Distinct from `getProjectDataDir(cwd)`, which respects `PILENS_DATA_DIR`
  * (project-scoped) and produces per-project subdirectories. Callers writing
  * project caches, snapshots, or worklogs should use `getProjectDataDir(cwd)`
  * instead — `PI_LENS_HOME` is the MACHINE-scoped sibling of that override.
- *
- * Probe-hygiene redirect (#2506): an ad-hoc probe against the BUILT
- * `clients/*.js` (a bare `node -e`, a throwaway `.mjs`, a harness script run
- * outside vitest — vitest itself already gets a real `PI_LENS_HOME` pin from
- * `tests/support/vitest-setup.ts`) has no test-mode gate and no home pin, so
- * every logger/ledger/cache it touches writes into the maintainer's REAL
- * `~/.pi-lens` — confirmed live on 2026-09-02 (two review probes wrote 42
- * rows of fixture garbage into real telemetry). When `PI_LENS_HOME` is unset,
- * `isTestMode()` is false, and `process.cwd()` sits under a `.claude/worktrees/`
- * segment or under `os.tmpdir()` — the two shapes an agent worktree or a
- * throwaway probe script actually runs from — every writer routed through
- * this function is redirected to `<cwd>/.pi-lens-probe-home` instead, never
- * the real home directory. `PILENS_PROBE=1` forces the same redirect
- * regardless of cwd, for a probe run from an ordinary project checkout.
- * `getProjectDataDir(cwd)`'s default branch composes through this function,
- * so it inherits the same redirect for free; see the "Data directory
- * conventions" section below for the account of why this only guards the
- * DEFAULT resolution and not an explicit `PILENS_DATA_DIR` override.
+ * `getProjectDataDir` composes through THIS function, not the log one: a
+ * probe's project caches are already isolated by its own path slug, and a
+ * worktree session keeping its warm caches is the same "do not break the
+ * session" argument as the tools above.
  */
 export function getGlobalPiLensDir(): string {
 	const override = process.env.PI_LENS_HOME?.trim();
 	if (override) return path.resolve(override);
-	const cwd = process.cwd();
-	if (shouldRedirectGlobalDirToProbeHome(cwd)) {
-		return redirectGlobalDirToProbeHome(cwd);
-	}
 	return path.join(os.homedir(), ".pi-lens");
 }
 
-// A REGEX LITERAL, not a module-scope `const`: `file-utils.ts` sits on a
-// pre-existing import cycle (`file-utils.js -> ... -> log-cleanup.js ->
-// file-utils.js`, already in `.dependency-cruiser-known-violations.json`),
-// so `log-cleanup.ts`'s own top-level `getGlobalPiLensDir()` call can reach
-// this function WHILE `file-utils.ts`'s own module body is still mid-init —
-// any `const`/`let` declared below this function would still be in the TDZ
-// at that moment and throw `ReferenceError` (caught live: exactly this
-// crashed `log-cleanup.js` on import before the fix below). A literal
-// re-evaluated per call has no such ordering dependency.
-function shouldRedirectGlobalDirToProbeHome(cwd: string): boolean {
-	if (process.env.PILENS_PROBE === "1") return true;
-	if (isTestMode()) return false;
-	if (/(^|\/)\.claude\/worktrees(\/|$)/.test(normalizeFilePath(cwd))) {
-		return true;
-	}
-	return isUnderDir(cwd, os.tmpdir());
+/**
+ * Where pi-lens writes its LOGS, ledger rows and debug dumps: `~/.pi-lens/`
+ * by default, exactly like `getGlobalPiLensDir()` above — but redirectable to
+ * a per-probe directory when the process looks like an ad-hoc probe rather
+ * than a real pi session (#2506).
+ *
+ * Every log-family writer routes here: `latency.log`, `extension.log`,
+ * `sessionstart.log`, `cascade.log`, `read-guard.log`, `tree-sitter.log`,
+ * `word-index.log`, `bus-events.log`, `dispositions.log`, `dead-code.log`,
+ * `ast-grep-tools.log`, `actionable-warnings.log`, `review-graph.log`, the
+ * `logs/*.jsonl` diagnostic dir, the debug handle/heap dumps,
+ * `log-cleanup.ts`'s sweep over all of the above, and `smells-rollup.ts`'s
+ * read-side tail of `latency.log`/`bus-events.log` (a reader, but it must
+ * follow the same root or it tails a file nobody is writing).
+ *
+ * WHY the redirect exists: an ad-hoc probe against the BUILT `clients/*.js` —
+ * a bare `node -e`, a throwaway `.mjs`, a harness script run OUTSIDE vitest —
+ * has no test-mode gate and no `PI_LENS_HOME` pin, so every logger and ledger
+ * it touches used to write into the maintainer's REAL `~/.pi-lens`. Confirmed
+ * live on 2026-09-02: two review probes left 42 rows of `/p/.pi-lens.json`
+ * fixture garbage in real telemetry. vitest itself is already hermetic
+ * (`tests/support/vitest-setup.ts` pins `PI_LENS_HOME`); this guard is for
+ * everything that runs outside it.
+ *
+ * WHEN it fires (see `computeProbeHomeDir` below): `PI_LENS_HOME` unset, and
+ * either `PILENS_PROBE=1` (the explicit force, for a probe run from an
+ * ordinary checkout) or — outside test mode — a `cwd` inside a specific agent
+ * worktree (`.claude/worktrees/<worktree>/...`) or under `os.tmpdir()`. The
+ * decision is made ONCE per process and memoized, so a `process.chdir()`
+ * mid-run cannot scatter one process's logs across several roots (F5).
+ *
+ * Deliberately does NOT write a line to the terminal when it fires. #1333
+ * gives pi sole ownership of the TTY, and
+ * `tests/clients/extension-terminal-silence.test.ts` enforces that nothing
+ * under `clients/` calls `process.std*.write` or `console.*` (round 2 of this
+ * issue shipped a `process.stderr.write` here and was red in CI for exactly
+ * that). Nor can it log through `extension-log.ts`'s `createSubsystemLogger`:
+ * that module already imports THIS one (the `extension-log.ts` to
+ * `file-utils.ts` edge is pinned in
+ * `.dependency-cruiser-known-violations.json`), so an import back the other
+ * way would close a new, unpinned `no-client-cycles` cycle — and
+ * `extension.log` is itself redirected by this very function, so the line
+ * would land in the probe home nobody reads. The durable signal is the
+ * `global-dir-probe-redirect` degradation row instead, recorded once per
+ * process through the zero-import `probe-home-state.ts` leaf and folded into
+ * `getDegradationSummary()` at read time.
+ */
+export function getGlobalPiLensLogDir(): string {
+	const override = process.env.PI_LENS_HOME?.trim();
+	if (override) return path.resolve(override);
+	return resolveProbeHomeDirOnce() ?? path.join(os.homedir(), ".pi-lens");
 }
 
 /**
- * `globalThis`-keyed, not a module-scope `let` OR `const`: same TDZ hazard as
- * the regex above — `Symbol.for(key)` itself is call-time-safe (it's
- * process-wide interned by string, no module-scope binding involved), so the
- * key is recomputed inline rather than cached in a top-level `const`. Same
- * `Symbol.for` shape `clients/ndjson-logger.ts` already uses for its own
- * process-global state, so a re-entrant/hot-reloaded module record can never
- * retain a second, competing copy of this flag.
+ * Resolve the probe-home redirect at most ONCE per process, caching both the
+ * "yes, here" and the "no redirect" answers in the `probe-home-state.ts` leaf
+ * (#2506 round 3, F5). Round 2 read `process.cwd()` live on every call, which
+ * gave a single process up to three different global dirs as it chdir'd, and
+ * re-ran the whole decision on the hot logging path.
+ *
+ * The cache lives in the leaf rather than here so that ONE reset
+ * (`_resetProbeHomeRedirectStateForTests`) clears the memo and the recorded
+ * event together — they are one fact, and a reset clearing only one of them
+ * would leave the pair inconsistent (F6).
  */
-function redirectGlobalDirToProbeHome(cwd: string): string {
-	const probeHome = path.join(cwd, ".pi-lens-probe-home");
-	const warnedKey = Symbol.for("pi-lens.file-utils.probeHomeRedirectWarned");
-	const globalState = globalThis as typeof globalThis &
-		Record<symbol, boolean | undefined>;
-	if (!globalState[warnedKey]) {
-		globalState[warnedKey] = true;
-		process.stderr.write(
-			`[pi-lens] PI_LENS_HOME is unset and cwd (${cwd}) looks like a probe/worktree context; redirecting the global pi-lens dir to ${probeHome} instead of the real home directory. Set PI_LENS_HOME to silence this.\n`,
-		);
-		recordProbeHomeRedirectDegradation(probeHome, cwd);
-	}
+/**
+ * The shape stored in the shared `globalThis` slot. The canonical definition
+ * (and the ledger-facing reader plus the test reset) lives in
+ * `clients/probe-home-state.ts`; it is restated structurally here because
+ * this module must not IMPORT that one — see the note inside the function.
+ */
+interface ProbeHomeResolutionSlot {
+	probeHome: string | undefined;
+	event: { probeHome: string; cwd: string } | undefined;
+}
+
+function resolveProbeHomeDirOnce(): string | undefined {
+	// Storage is a `globalThis` slot keyed by a string that THIS module and
+	// `probe-home-state.ts` each name as a literal. `file-utils.ts`
+	// deliberately does not import that module, even though it is a zero-import
+	// leaf: `log-cleanup.ts` calls `getGlobalPiLensLogDir()` at its OWN module
+	// top level, reaching this function through the pre-existing cycle while
+	// `file-utils.ts`'s module record is still mid-init — and at that moment an
+	// import BINDING is not yet initialized either, so dereferencing one throws
+	// `ReferenceError: Cannot access '...' before initialization` (caught live
+	// TWICE on this issue: once as a module-scope `const`, once as this very
+	// import). A `Symbol.for` property access is process-wide interned by
+	// string and has no such window.
+	//
+	// `tests/config/global-dir-probe-redirect.test.ts` pins the two literals
+	// equal, so the deliberate duplication cannot drift into two silent slots.
+	const slot = globalThis as typeof globalThis &
+		Record<symbol, ProbeHomeResolutionSlot | undefined>;
+	const key = Symbol.for("pi-lens.probe-home-state.resolution");
+	const cached = slot[key];
+	if (cached) return cached.probeHome;
+	const cwd = process.cwd();
+	const probeHome = computeProbeHomeDir(cwd);
+	slot[key] = { probeHome, event: probeHome ? { probeHome, cwd } : undefined };
 	return probeHome;
 }
 
 /**
- * Routed through the zero-import `probe-home-state.ts` leaf, never a direct
- * import of `degradation-ledger.ts` (dynamic or static): `file-utils.ts` and
- * `degradation-ledger.ts` are already mutually reachable through the
- * existing `file-utils.js -> safe-spawn.js -> degradation-ledger.js ->
- * extension-log.js -> file-utils.js` cycle
- * (`.dependency-cruiser-known-violations.json`), so ANY direct edge between
- * them — a dynamic `import()` included, since the `no-client-cycles` rule's
- * dynamic-import exemption only excuses that ONE edge from being flagged,
- * not from closing the cycle other static edges then also get flagged on —
- * adds new, unpinned `no-client-cycles` violations. See `probe-home-state.ts`'s
- * doc comment for the full account (caught live: a first attempt using a
- * dynamic import here failed CI's "Dependency boundaries" gate).
+ * The redirect decision itself. Note every string below is an inline literal
+ * and there is no module-scope `const`/`let` anywhere in this family:
+ * `file-utils.ts` sits on a pre-existing import cycle (`file-utils.js` to
+ * `safe-spawn.js` to `degradation-ledger.js` to `extension-log.js` and back
+ * to `file-utils.js`, plus `log-cleanup.js` to `file-utils.js`), and
+ * `log-cleanup.ts` calls into this file at its OWN module top level — so this
+ * function can run while `file-utils.ts`'s module body is still mid-init,
+ * when any binding declared below it would still be in the TDZ and throw
+ * `ReferenceError` (caught live in round 2).
  */
-function recordProbeHomeRedirectDegradation(
-	probeHome: string,
-	cwd: string,
-): void {
-	recordProbeHomeRedirectEvent({ probeHome, cwd });
+function computeProbeHomeDir(cwd: string): string | undefined {
+	// The explicit force wins first: it is how a probe run from an ordinary
+	// project checkout opts in, and it must work even under a harness that has
+	// set a test-mode marker but no PI_LENS_HOME.
+	if (process.env.PILENS_PROBE === "1") {
+		return path.join(cwd, ".pi-lens-probe-home");
+	}
+	if (isTestMode()) return undefined;
+	const worktreeRoot = findAgentWorktreeRoot(cwd);
+	if (worktreeRoot) return path.join(worktreeRoot, ".pi-lens-probe-home");
+	if (isUnderRealDir(cwd, os.tmpdir())) {
+		return path.join(cwd, ".pi-lens-probe-home");
+	}
+	return undefined;
+}
+
+/**
+ * The directory of the SPECIFIC agent worktree containing `cwd`, or
+ * `undefined` when `cwd` is not inside one.
+ *
+ * Requires at least one path segment AFTER `worktrees/`, and anchors the
+ * probe home at that segment rather than at the live `cwd` (#2506 round 3,
+ * F5). Round 2's trailing `(\/|$)` alternative also matched a `cwd` of
+ * `.claude/worktrees` ITSELF, which would have put the probe home in the
+ * SHARED worktrees parent — every concurrent agent on the box writing into
+ * one directory, the cross-agent collision this redirect is supposed to
+ * prevent. Anchoring at the worktree also means a probe run from a
+ * subdirectory (`<worktree>/clients`) and one run from the worktree root
+ * agree on a single probe home instead of scattering one per cwd.
+ */
+function findAgentWorktreeRoot(cwd: string): string | undefined {
+	const normalized = normalizeFilePath(path.resolve(cwd));
+	const match = /(?:^|\/)\.claude\/worktrees\/[^/]+(?:\/|$)/.exec(normalized);
+	if (!match) return undefined;
+	return normalized.slice(0, match.index + match[0].length).replace(/\/$/, "");
+}
+
+/**
+ * `isUnderDir`, but with both sides resolved through `realpath` first
+ * (#2506 round 3, F7).
+ *
+ * On macOS `os.tmpdir()` reports `/var/folders/...` while a `cwd` created
+ * under it resolves to `/private/var/folders/...` (`/var` is a symlink to
+ * `/private/var`), so the two NEVER prefix-match unresolved and the tmpdir
+ * branch would be dead on every Mac. Windows has the same shape with 8.3
+ * short names and substituted drives. Both sides go through the same
+ * function, so `realpathSync.native`'s canonical Windows casing applies
+ * consistently; the result is used only for this containment test, never to
+ * build the returned path, so no casing change can leak into a log path.
+ * Best-effort by design: a path that does not exist yet (or an EPERM) falls
+ * back to its literal form rather than throwing on the logging hot path.
+ */
+function isUnderRealDir(child: string, parent: string): boolean {
+	return isUnderDir(toRealPath(child), toRealPath(parent));
+}
+
+function toRealPath(target: string): string {
+	try {
+		return fs.realpathSync.native(target);
+	} catch {
+		return target;
+	}
 }
 
 /**

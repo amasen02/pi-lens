@@ -1,10 +1,10 @@
 import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
-import { getGlobalPiLensDir } from "./file-utils.js";
+import { getGlobalPiLensLogDir } from "./file-utils.js";
 import { createNdjsonLogger } from "./ndjson-logger.js";
 import { normalizeFilePath } from "./path-utils.js";
 
-const READ_GUARD_LOG_DIR = getGlobalPiLensDir();
+const READ_GUARD_LOG_DIR = getGlobalPiLensLogDir();
 const READ_GUARD_LOG_FILE = path.join(READ_GUARD_LOG_DIR, "read-guard.log");
 const READ_GUARD_LOG_BACKUP_FILE = path.join(
 	READ_GUARD_LOG_DIR,

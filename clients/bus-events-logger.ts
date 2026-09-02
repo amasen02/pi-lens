@@ -44,12 +44,12 @@
  */
 import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
-import { getGlobalPiLensDir } from "./file-utils.js";
+import { getGlobalPiLensLogDir } from "./file-utils.js";
 import { createNdjsonLogger } from "./ndjson-logger.js";
 import { getMaxLogSizeMB } from "./log-cleanup.js";
 import { logLatency } from "./latency-logger.js";
 
-const BUS_EVENTS_LOG_FILE = path.join(getGlobalPiLensDir(), "bus-events.log");
+const BUS_EVENTS_LOG_FILE = path.join(getGlobalPiLensLogDir(), "bus-events.log");
 
 const writer = createNdjsonLogger({
 	filePath: BUS_EVENTS_LOG_FILE,

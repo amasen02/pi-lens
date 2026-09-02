@@ -1,6 +1,6 @@
 import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
-import { getGlobalPiLensDir } from "./file-utils.js";
+import { getGlobalPiLensLogDir } from "./file-utils.js";
 import { getMaxLogSizeMB } from "./log-cleanup.js";
 import { createNdjsonLogger } from "./ndjson-logger.js";
 import { normalizeFilePath } from "./path-utils.js";
@@ -9,7 +9,7 @@ import type {
 	ReviewGraphPersistCoverage,
 } from "./review-graph/types.js";
 
-const REVIEW_GRAPH_LOG_DIR = getGlobalPiLensDir();
+const REVIEW_GRAPH_LOG_DIR = getGlobalPiLensLogDir();
 const REVIEW_GRAPH_LOG_FILE = path.join(
 	REVIEW_GRAPH_LOG_DIR,
 	"review-graph.log",
