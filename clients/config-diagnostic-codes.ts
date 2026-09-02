@@ -145,21 +145,40 @@ export const CONFIG_DIAGNOSTIC_CODES = {
 	 * Further config notices were suppressed by a per-resolution bound.
 	 *
 	 * The record count a config file can produce is USER INPUT — one key, one
-	 * record — so both the shared resolution (`clients/config-resolve.ts`) and
-	 * the project loader's own unknown-key scan
-	 * (`clients/project-lens-config.ts`) collect into a bounded
-	 * `MigrationRecordCollector` and hold one slot back for this code. It is the
-	 * difference between a bound that is honest and one that drops notices
-	 * silently: a user who sees it knows the list they were shown is partial,
-	 * and how much of it is missing.
+	 * record — so every producer collects into a bounded
+	 * `MigrationRecordCollector` through `finalizeRecords`, which holds one slot
+	 * back for this code. It is the difference between a bound that is honest
+	 * and one that drops notices silently: a user who sees it knows the list
+	 * they were shown is partial, and how much of it is missing. The count is
+	 * the WHOLE truncation, including anything an earlier bound in the same
+	 * pipeline already discarded (#2426 review round 6, F1).
 	 *
 	 * Registered as its own code rather than folded into `PILENS_CFG_0001`
 	 * because the user action differs — nothing about the config is wrong, the
 	 * OUTPUT was truncated, and the fix is to read the file rather than to
-	 * change it.
+	 * change it. For the same reason it is the ONE code `warnIgnoredConfigOnce`
+	 * renders with neither the `ignoring invalid …` prose nor the
+	 * `config-ignored` ledger kind: it records under `config-notice-suppressed`,
+	 * because a file whose every setting applied can still overflow the bound.
 	 */
 	PILENS_CFG_0007:
 		"further config notices suppressed by the per-resolution bound",
+	/**
+	 * A WHOLE configuration was dropped because resolving it failed internally.
+	 *
+	 * PRODUCED by the two guards that stand under the config pipeline —
+	 * `resolveConfig` (`clients/config-core/resolve.ts`) and the global loader's
+	 * post-parse catch (`clients/lens-config.ts`) — each of which degrades a
+	 * failed resolution to "no config" rather than taking the session with it.
+	 * The record carries the error CLASS only, never its message.
+	 *
+	 * Distinct from `PILENS_CFG_0005`, which both guards borrowed until #2426
+	 * review round 6 (S1). 0005 is registered as a per-FIELD rejection: a user
+	 * who matches on it expects one setting to have been dropped and the rest to
+	 * be in effect. Here NOTHING in the file is in effect, so the two need
+	 * different codes to be worth matching on at all.
+	 */
+	PILENS_CFG_0008: "config resolution failed; whole configuration ignored",
 } as const satisfies Record<`PILENS_CFG_${string}`, string>;
 
 export type ConfigDiagnosticCode = keyof typeof CONFIG_DIAGNOSTIC_CODES;

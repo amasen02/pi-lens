@@ -154,11 +154,24 @@ export const UNANCHORED_RECORD_LABEL = "(config resolution)";
  */
 export class MigrationRecordCollector {
 	private readonly kept: MigrationRecord[] = [];
-	private dropped = 0;
+	private dropped: number;
 	private readonly limit: number;
 
-	constructor(limit: number = MAX_MIGRATION_RECORDS) {
+	/**
+	 * `priorDropped` SEEDS the drop count with records an EARLIER bound already
+	 * discarded before this collector saw the list (#2426 review round 6, F1).
+	 *
+	 * The shared resolution is bounded twice by construction: `resolveConfig`
+	 * runs its own collector across every source, and the loader then finalizes
+	 * what survived plus the deprecation records it composes itself. Only the
+	 * second bound used to be counted, so a `.pi-lens.json` whose 40 refused
+	 * keys were truncated to 19 told the user ONE notice had been suppressed
+	 * when 21 had. A suppression count that undercounts is worse than no count:
+	 * it tells the user the list they were shown is almost complete.
+	 */
+	constructor(limit: number = MAX_MIGRATION_RECORDS, priorDropped = 0) {
 		this.limit = Math.max(0, Math.trunc(limit));
+		this.dropped = Math.max(0, Math.trunc(priorDropped));
 	}
 
 	add(record: MigrationRecord): void {
@@ -179,11 +192,6 @@ export class MigrationRecordCollector {
 		return this.dropped;
 	}
 
-	/** Total produced: retained plus dropped. */
-	get totalCount(): number {
-		return this.kept.length + this.dropped;
-	}
-
 	/**
 	 * The retained records plus, when the bound discarded any, ONE record
 	 * counting them.
@@ -195,8 +203,7 @@ export class MigrationRecordCollector {
 	 * defect showed) the project loader's legacy-document enumeration, which
 	 * shipped its records raw and let one file's key count set the
 	 * notification count. A fourth producer must not have to remember any of
-	 * this: it calls `finalizeRecords`, or finalizes a
-	 * `finalizableCollector`, and is bounded.
+	 * this: it calls `finalizeRecords` and is bounded.
 	 *
 	 * Two finalized lists that anchor to the SAME file and suppress the SAME
 	 * number of records render one notice, not two. That is the warn-once
@@ -221,29 +228,34 @@ export class MigrationRecordCollector {
 }
 
 /**
- * A collector for a list that will be FINALIZED: one slot held back so the
- * overflow record fits INSIDE the bound rather than pushing the list past it.
- *
- * The reserved slot is arithmetic, so it is written once here and nowhere at a
- * call site — a producer that streams records (a key-by-key scan, where
- * building the full list first would defeat the point of bounding at the
- * source) constructs one of these instead of doing the subtraction itself.
- */
-export function finalizableCollector(): MigrationRecordCollector {
-	return new MigrationRecordCollector(MAX_MIGRATION_RECORDS - 1);
-}
-
-/**
  * Bound a record list and append the suppression count when it truncates.
  *
- * The list form of `finalizableCollector().finalize()`, for the producers that
- * already hold every record.
+ * The ONE exported shape every producer uses (#2426 review round 6, S2). It
+ * used to have a twin — `finalizableCollector()`, a pre-subtracted collector a
+ * streaming producer filled key by key — and two shapes for one policy is the
+ * thing round 5 collapsed three copies of this bound to avoid. A push-based
+ * producer buffers into an array and calls this; the array it builds is bounded
+ * by the parsed document already in memory, which is a smaller cost than a
+ * second public entry point onto the same arithmetic.
+ *
+ * One slot of the bound is held back for the overflow record, so a finalized
+ * list is never LONGER than `MAX_MIGRATION_RECORDS` however many records went
+ * in. That subtraction is written here and at no call site.
+ *
+ * `priorDropped` is what an earlier bound already discarded — see the
+ * collector's constructor. A caller that finalizes a list some other bound has
+ * already truncated MUST pass it, or the count it publishes is the tail of the
+ * truncation rather than the whole of it.
  */
 export function finalizeRecords(
 	records: Iterable<MigrationRecord>,
 	anchor?: RecordAnchor,
+	priorDropped = 0,
 ): readonly MigrationRecord[] {
-	const collector = finalizableCollector();
+	const collector = new MigrationRecordCollector(
+		MAX_MIGRATION_RECORDS - 1,
+		priorDropped,
+	);
 	for (const record of records) collector.add(record);
 	return collector.finalize(anchor);
 }

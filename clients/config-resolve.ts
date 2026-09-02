@@ -293,6 +293,10 @@ export function resolvePiLensConfig(
 				),
 			],
 			documentAnchor(documents),
+			// The core ALREADY truncated (#2426 review round 6, F1). Its drop count
+			// is seeded here so the one `PILENS_CFG_0007` a user reads names the
+			// whole truncation rather than the part this bound performed.
+			resolution.droppedRecordCount,
 		),
 		documents,
 	};
@@ -324,6 +328,8 @@ export function resolveOnePiLensConfigDocument(
 		records: finalizeRecords(
 			[...resolution.records, ...deprecationRecords([document], homeDir)],
 			documentAnchor([document]),
+			// Same double bound as the multi-document path above (round 6, F1).
+			resolution.droppedRecordCount,
 		),
 	};
 }

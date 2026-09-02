@@ -147,7 +147,11 @@ describe("S-C: a post-parse failure in the global loader is not silent", () => {
 		const rows = ledgerRows.filter((row) => row.kind === "config-ignored");
 		expect(rows, `ledger rows: ${JSON.stringify(ledgerRows)}`).toHaveLength(1);
 		expect(rows[0]?.subject).toBe(file);
-		expect(rows[0]?.code).toBe("PILENS_CFG_0005");
+		// A WHOLE-config failure, so the whole-config code (#2426 review round 6,
+		// S1) — never `PILENS_CFG_0005`, which is registered as a per-FIELD
+		// rejection and would tell a user matching on it that one setting is
+		// missing rather than all of them.
+		expect(rows[0]?.code).toBe("PILENS_CFG_0008");
 	});
 
 	it("leaves a healthy global config unreported", async () => {

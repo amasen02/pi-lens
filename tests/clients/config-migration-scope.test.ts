@@ -114,6 +114,15 @@ const deprecationNotices = (): string[] =>
 	notices.filter((message) => message.startsWith("deprecated "));
 const ignoredNotices = (): string[] =>
 	notices.filter((message) => message.startsWith("ignoring invalid "));
+/**
+ * The truncation summary is its OWN prose shape since #2426 review round 6
+ * (F2): a suppressed-notice count says nothing was ignored and nothing is
+ * deprecated, so it must match neither predicate above.
+ */
+const suppressionNotices = (): string[] =>
+	notices.filter((message) =>
+		message.includes("further config notices were suppressed"),
+	);
 
 describe("F1: a legacy root LSP key in the GLOBAL config is a migration, not a typo", () => {
 	it("gives all four legacy root keys a migration notice and no typo notice", async () => {
@@ -241,12 +250,15 @@ describe("F2/F5: migration advice only for keys the schema recognizes, bounded",
 			JSON.stringify(deprecationNotices()),
 		).toHaveLength(1);
 		// … and the suppression is COUNTED rather than silent. One prose shape for
-		// every producer since round 5, because there is now one producer.
+		// every producer since round 5, because there is now one producer — and
+		// since round 6 it is its own shape, not the ignored-config one.
+		expect(suppressionNotices(), JSON.stringify(notices)).toHaveLength(1);
 		expect(
 			ignoredNotices().filter((message) =>
 				message.includes("further config notices were suppressed"),
 			),
-		).toHaveLength(1);
+			JSON.stringify(ignoredNotices()),
+		).toEqual([]);
 	});
 });
 
@@ -368,8 +380,10 @@ describe("S1: an internal resolution failure names a file and one subsystem", ()
 			schema: PI_LENS_CONFIG_SCHEMA,
 		});
 
+		// `0008`, the whole-config failure code, since round 6's S1 split it off
+		// the per-field `PILENS_CFG_0005`.
 		const failure = resolution.records.find(
-			(record) => record.code === "PILENS_CFG_0005",
+			(record) => record.code === "PILENS_CFG_0008",
 		);
 		expect(failure, JSON.stringify(resolution.records)).toBeDefined();
 		expect(failure?.file).toBe(file);

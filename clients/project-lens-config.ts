@@ -95,7 +95,6 @@ import {
 	resolveOnePiLensConfigDocument,
 } from "./config-resolve.js";
 import {
-	finalizableCollector,
 	finalizeRecords,
 	type MigrationRecord,
 	migrationSubject,
@@ -640,11 +639,17 @@ function bearingDirMtimes(
  * A `NoteIgnored` COLLECTS rather than reports (#2426 review round 4, F3/F5).
  * Two things follow from that. The notice survives into the cache entry, so a
  * warm cache HIT replays it instead of losing the whole `config-ignored` class
- * from session 2 onwards. And the count is bounded at the source: the number
- * of these a file can produce is the number of keys the user typed — a 100-key
- * file emitted 98 unknown-key notifications — so they go through the same
- * `MigrationRecordCollector` bound every other config record obeys, with one
- * slot held back to say how many were suppressed.
+ * from session 2 onwards. And the count is bounded: the number of these a file
+ * can produce is the number of keys the user typed — a 100-key file emitted 98
+ * unknown-key notifications — so the buffered list goes through the same
+ * `finalizeRecords` bound every other config record obeys, with one slot held
+ * back to say how many were suppressed.
+ *
+ * The buffer is a plain array (#2426 review round 6, S2). It used to be a
+ * pre-subtracted `finalizableCollector`, a second exported shape for the one
+ * policy round 5 had just collapsed into one; the notes a single parse can
+ * accumulate are bounded by the document already in memory, which is a smaller
+ * cost than a second public entry point onto the same arithmetic.
  */
 type NoteIgnored = (
 	// A hand-authored string for a validated bad value/wrong type (every call
@@ -659,12 +664,9 @@ function ignoredRecordCollector(configPath: string): {
 	note: NoteIgnored;
 	records: () => readonly MigrationRecord[];
 } {
-	// Streaming, so the bound is spent at the SOURCE rather than on a list built
-	// first and truncated after: the number of these a file can produce is the
-	// number of keys the user typed, and the core puts no ceiling on that.
-	const collector = finalizableCollector();
+	const noted: MigrationRecord[] = [];
 	const note: NoteIgnored = (reason) => {
-		collector.add({
+		noted.push({
 			code: "PILENS_CFG_0001",
 			file: configPath,
 			key: "",
@@ -678,7 +680,8 @@ function ignoredRecordCollector(configPath: string): {
 	};
 	return {
 		note,
-		records: () => collector.finalize({ file: configPath, tier: "project" }),
+		records: () =>
+			finalizeRecords(noted, { file: configPath, tier: "project" }),
 	};
 }
 

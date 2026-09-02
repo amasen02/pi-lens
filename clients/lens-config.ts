@@ -31,6 +31,11 @@ import {
 	resolveOnePiLensConfigDocument,
 } from "./config-resolve.js";
 import {
+	finalizeRecords,
+	type MigrationRecord,
+	migrationSubject,
+} from "./config-core/records.js";
+import {
 	findNestedProjectMutationValue,
 	type PiLensProjectConfig,
 } from "./project-lens-config.js";
@@ -201,15 +206,37 @@ export function loadPiLensGlobalConfig(
 		});
 		return undefined;
 	}
+	// Every notice this projection composes is BUFFERED and bounded once, at the
+	// end, through the same `finalizeRecords` the project loader and the shared
+	// resolution use (#2426 review round 6, F3). It used to report each one the
+	// moment it was composed, with no collector anywhere in this function, so
+	// the unknown-top-level-key scan below — whose count is the number of keys
+	// the user typed — put 100 notifications on screen for a 100-key
+	// `~/.pi-lens/config.json` while the project loader's identical scan of an
+	// identical file produced 19 and a count. Two changelog fragments already
+	// claimed one bound for every producer; this is the producer that did not
+	// have one.
+	//
+	// The flush is in a `finally` so a throw in the projection still delivers
+	// what was composed before it, on top of the whole-config record the catch
+	// adds.
+	const noted: MigrationRecord[] = [];
+	const note = (reason: string): void => {
+		noted.push({
+			code: "PILENS_CFG_0001",
+			file: configPath,
+			key: "",
+			subject: migrationSubject(configPath, ""),
+			reason,
+			tier: "global",
+		});
+	};
 	try {
 		const parsed = outcome.value;
 		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
 			// The other half of the same silence: a file that PARSES but is a list
 			// or a scalar is not a config either, and was dropped without a word.
-			warnInvalidGlobalConfigOnce(
-				configPath,
-				"top-level value must be an object",
-			);
+			note("top-level value must be an object");
 			return undefined;
 		}
 
@@ -234,8 +261,7 @@ export function loadPiLensGlobalConfig(
 		// this same file (it resolves the canonical global too) into one notice.
 		reportPiLensConfigRecords(resolved.records);
 		const raw = resolved.value;
-		const warnInvalid = (reason: string) =>
-			warnInvalidGlobalConfigOnce(configPath, reason);
+		const warnInvalid = note;
 		const config: Record<string, unknown> = {};
 
 		for (const spec of LENS_FLAGS) {
@@ -360,18 +386,25 @@ export function loadPiLensGlobalConfig(
 		// and no notification: pi-lens ran on defaults and said nothing, which is
 		// the exact defect #2445 was filed for.
 		//
-		// `PILENS_CFG_0005` ("resolution failed internally; configuration
+		// `PILENS_CFG_0008` ("config resolution failed; whole configuration
 		// ignored") rather than `0001`, and the ERROR CLASS only, never its
 		// message, which could quote the file — the same rule `resolveConfig`'s
-		// own guard follows for the same reason.
+		// own guard follows for the same reason. Round 5 used `0005` here, which
+		// is registered as a per-FIELD rejection: a user matching on it would
+		// have expected one setting to be missing rather than the whole file
+		// (#2426 review round 6, S1).
 		warnInvalidGlobalConfigOnce(
 			configPath,
 			`global config could not be interpreted (${
 				error instanceof Error ? error.name : "unknown error"
 			}); configuration ignored`,
-			"PILENS_CFG_0005",
+			"PILENS_CFG_0008",
 		);
 		return undefined;
+	} finally {
+		reportPiLensConfigRecords(
+			finalizeRecords(noted, { file: configPath, tier: "global" }),
+		);
 	}
 }
 

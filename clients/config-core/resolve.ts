@@ -113,10 +113,15 @@ export function resolveConfig<T = unknown>(
 		// open — and, naming neither a key nor a tier, was reported by every
 		// config subsystem at once, so one internal failure became three notices.
 		// The sources are right here; nothing downstream can recover them.
+		//
+		// `PILENS_CFG_0008`, not `0005` (#2426 review round 6, S1): 0005 is
+		// registered and documented as a per-FIELD rejection, so a user matching
+		// on it expects to have lost one setting. This record means the WHOLE
+		// configuration was dropped, which is a different thing to do about it.
 		const anchor = anchorSource(options.sources);
 		const file = anchor?.file ?? "";
 		collector.add({
-			code: "PILENS_CFG_0005",
+			code: "PILENS_CFG_0008",
 			file,
 			key: "",
 			subject: migrationSubject(file, ""),

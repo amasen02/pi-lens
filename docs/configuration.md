@@ -127,13 +127,20 @@ A file that cannot be read or parsed is **ignored, never partially applied** —
 pi-lens runs on defaults for it and says so once, with the code
 `PILENS_CFG_0001`. A field whose value does not match its declared type is
 dropped on its own (`PILENS_CFG_0005`), and an unrecognized field is dropped
-with a message naming the key (`PILENS_CFG_0004`). Nothing about your config is
-ever ignored silently.
+with a message naming the key (`PILENS_CFG_0004`). If resolving a file fails
+internally the whole file is ignored and said so under its own code
+(`PILENS_CFG_0008`), so "one field went missing" and "none of this file is in
+effect" are never the same code. Nothing about your config is ever ignored
+silently.
 
-The number of notices one file can produce is bounded, because the number of
-keys in it is not: past the bound the remainder is summarised in a single
-`PILENS_CFG_0007` notice giving the count that was suppressed, so a truncated
-list always says that it is truncated.
+The number of notices one file can produce is bounded PER NOTICE CLASS —
+deprecations, and rejected values — each at 19 notices plus 1 summary, because
+the number of keys in a file is not bounded. Past the bound the remainder is
+summarised in a single `PILENS_CFG_0007` notice giving the count that was
+suppressed, so a truncated list always says that it is truncated. That notice
+is about the LIST, not about the file: a config whose every setting was applied
+can still overflow the bound, so it is worded and recorded as a summary rather
+than as an ignored config.
 
 ## See also
 

@@ -90,7 +90,36 @@ describe("the record bound is counted, never silent (#2425)", () => {
 		}
 		expect(collector.records).toHaveLength(2);
 		expect(collector.droppedCount).toBe(3);
-		expect(collector.totalCount).toBe(5);
+	});
+
+	it("seeds the count with what an earlier bound already dropped", () => {
+		// #2426 review round 6, F1: a list the core's own collector already
+		// truncated is finalized by a SECOND bound, and the count the user reads
+		// is the whole truncation or it is a lie about how partial the list is.
+		const collector = new MigrationRecordCollector(2, 7);
+		collector.add({
+			code: "PILENS_CFG_0004",
+			file: "a.json",
+			key: "/k",
+			subject: `a.json${NUL}/k`,
+			reason: "unknown config field; ignored",
+		});
+		expect(collector.droppedCount).toBe(7);
+		collector.add({
+			code: "PILENS_CFG_0004",
+			file: "a.json",
+			key: "/k2",
+			subject: `a.json${NUL}/k2`,
+			reason: "unknown config field; ignored",
+		});
+		collector.add({
+			code: "PILENS_CFG_0004",
+			file: "a.json",
+			key: "/k3",
+			subject: `a.json${NUL}/k3`,
+			reason: "unknown config field; ignored",
+		});
+		expect(collector.droppedCount).toBe(8);
 	});
 
 	it("accepts a zero limit without throwing", () => {

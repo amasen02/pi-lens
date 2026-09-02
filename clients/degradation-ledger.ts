@@ -603,7 +603,22 @@ export type DegradationKind =
 	 * one row per `(file, key)` per session, carrying `PILENS_CFG_0002`
 	 * (deprecated key) or `PILENS_CFG_0003` (deprecated file location).
 	 */
-	| "config-deprecated";
+	| "config-deprecated"
+	/**
+	 * A config file's NOTICE LIST was truncated by the per-resolution bound, and
+	 * this row carries how many notices were summarised away (#2426 review round
+	 * 6). Written through `warnIgnoredConfigOnce` like the two kinds above,
+	 * under `PILENS_CFG_0007`, with the same `<file>` subject.
+	 *
+	 * Its own kind because it is a fact about the OUTPUT, not about the config:
+	 * a legacy file whose every setting was applied still overflows the bound,
+	 * and recording that under `config-ignored` — which it did before this kind
+	 * existed — both told the user their valid file was being ignored and made
+	 * "how many sessions ran on defaults because a config was rejected"
+	 * unanswerable, since the ledger could no longer tell a rejection from a
+	 * long list. One row per file per session.
+	 */
+	| "config-notice-suppressed";
 
 export interface DegradationRecord {
 	kind: unknown;
