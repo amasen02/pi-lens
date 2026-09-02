@@ -23,7 +23,6 @@ export const LANGUAGES = [
 	"ruby",
 	"rust",
 	"scala",
-	"solidity",
 	"swift",
 	"tsx",
 	"typescript",

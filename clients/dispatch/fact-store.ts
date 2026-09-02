@@ -1,3 +1,4 @@
+import { BoundedLruCache } from "../bounded-cache.js";
 import { normalizeMapKey } from "../path-utils.js";
 
 // #2243 item 4 telemetry sink, INJECTED rather than imported. fact-store must
@@ -106,8 +107,12 @@ export class FactStore implements ReadonlyFactStore {
 	private readonly fileFacts = new Map<string, Map<string, unknown>>();
 	private readonly sessionFacts = new Map<string, unknown>();
 	// Bounded sibling of `sessionFacts` for per-file-keyed session facts (#2282).
-	// Same insertion-order-is-eviction-order convention as `fileFacts`.
-	private readonly boundedSessionFacts = new Map<string, unknown>();
+	// True LRU: every fetch (get or create, see getBoundedSessionFact) refreshes
+	// recency, so the oldest-UNUSED record is evicted first, not merely the
+	// oldest-inserted.
+	private readonly boundedSessionFacts = new BoundedLruCache<string, unknown>(
+		MAX_SESSION_FACT_RECORDS,
+	);
 	// Keys evicted from `boundedSessionFacts` and not written since, so a reader
 	// can tell "evicted" from "never seen" (#2282). Same cap, same FIFO order.
 	private readonly evictedSessionFactKeys = new Set<string>();
@@ -396,12 +401,8 @@ export class FactStore implements ReadonlyFactStore {
 	 *  facts (#2282) — session baselines, cascade baselines, review-graph entity
 	 *  snapshots. LRU touch: a read moves the record off the eviction end. */
 	getBoundedSessionFact<T>(factId: string): T | undefined {
-		const facts = this.boundedSessionFacts;
-		if (!facts.has(factId)) return undefined;
-		const value = facts.get(factId);
-		facts.delete(factId);
-		facts.set(factId, value);
-		return value as T;
+		if (!this.boundedSessionFacts.has(factId)) return undefined;
+		return this.boundedSessionFacts.get(factId) as T;
 	}
 
 	/** Bounded counterpart to {@link setSessionFact}. Callers use this instead
@@ -409,10 +410,23 @@ export class FactStore implements ReadonlyFactStore {
 	 *  touched, so the store's count stays bounded across a large batch instead
 	 *  of retaining one entry per distinct path for the process lifetime. */
 	setBoundedSessionFact(factId: string, value: unknown): void {
-		this.boundedSessionFacts.delete(factId);
-		this.boundedSessionFacts.set(factId, value);
 		this.evictedSessionFactKeys.delete(factId);
-		this.evictColdBoundedSessionFacts();
+		const evicted = this.boundedSessionFacts.set(factId, value);
+		for (const [oldestKey] of evicted) {
+			this.evictedSessionFactKeys.add(oldestKey);
+			while (this.evictedSessionFactKeys.size > MAX_SESSION_FACT_RECORDS) {
+				const oldestTombstone = this.evictedSessionFactKeys
+					.values()
+					.next().value;
+				if (oldestTombstone === undefined) break;
+				this.evictedSessionFactKeys.delete(oldestTombstone);
+			}
+			capacityEvictionReporter?.(
+				this.subject,
+				"session-count",
+				`session-fact store axis=count exceeded ${MAX_SESSION_FACT_RECORDS} records; evicted least-recently-used fact for ${oldestKey}`,
+			);
+		}
 	}
 
 	hasBoundedSessionFact(factId: string): boolean {
@@ -433,27 +447,6 @@ export class FactStore implements ReadonlyFactStore {
 	 *  this store's whole `sessionFacts` footprint in one number. */
 	getSessionFactEntryCount(): number {
 		return this.sessionFacts.size + this.boundedSessionFacts.size;
-	}
-
-	private evictColdBoundedSessionFacts(): void {
-		while (this.boundedSessionFacts.size > MAX_SESSION_FACT_RECORDS) {
-			const oldestKey = this.boundedSessionFacts.keys().next().value;
-			if (oldestKey === undefined) break;
-			this.boundedSessionFacts.delete(oldestKey);
-			this.evictedSessionFactKeys.add(oldestKey);
-			while (this.evictedSessionFactKeys.size > MAX_SESSION_FACT_RECORDS) {
-				const oldestTombstone = this.evictedSessionFactKeys
-					.values()
-					.next().value;
-				if (oldestTombstone === undefined) break;
-				this.evictedSessionFactKeys.delete(oldestTombstone);
-			}
-			capacityEvictionReporter?.(
-				this.subject,
-				"session-count",
-				`session-fact store axis=count exceeded ${MAX_SESSION_FACT_RECORDS} records; evicted least-recently-used fact for ${oldestKey}`,
-			);
-		}
 	}
 
 	/** Call on session reset only. Clears everything including tool cache and baselines. */

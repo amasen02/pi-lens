@@ -200,3 +200,71 @@ describe("scanner to review-graph structural IR (#939)", () => {
 		resetReviewGraphIrStats();
 	});
 });
+
+// #2442 review F9: the three clients/review-graph/* eviction sites were
+// "deferred" on the first draft, citing an in-flight build-latch fix that has
+// since merged (#2446). They are migrated to BoundedFifoMap now; this pins the
+// root-axis bound the hand-rolled block used to enforce.
+describe("shared extraction IR — bounded roots (#2442)", () => {
+	const MAX_ROOTS = 8;
+	const structural = {
+		kind: "tree-sitter" as const,
+		languageId: "python",
+		extracted: { symbols: [], refs: [], imports: [] },
+	};
+
+	function publish(root: string, file: string, hash: string): void {
+		publishReviewGraphFileIr(root, {
+			filePath: file,
+			contentHash: hash,
+			complete: true,
+			structural,
+		});
+	}
+
+	afterEach(() => {
+		clearReviewGraphFileIr();
+		resetReviewGraphIrStats();
+	});
+
+	it("evicts the oldest ROOT once more than MAX_ROOTS are published", () => {
+		const hash = reviewGraphIrContentHash("x");
+		for (let i = 0; i < MAX_ROOTS; i++) publish(`/root-${i}`, "/p/a.py", hash);
+		expect(getFreshReviewGraphFileIr("/root-0", "/p/a.py", hash)).toBeDefined();
+
+		// The read above CONSUMED root-0's only file, so republish to make it
+		// resident again — the root itself is still the oldest.
+		publish("/root-0", "/p/a.py", hash);
+		publish("/root-overflow", "/p/a.py", hash);
+
+		// FIFO on the root axis: root-0 is still the oldest ROOT (republishing a
+		// file into an existing root does not move the root), so it is dropped.
+		expect(
+			getFreshReviewGraphFileIr("/root-0", "/p/a.py", hash),
+		).toBeUndefined();
+		expect(
+			getFreshReviewGraphFileIr("/root-overflow", "/p/a.py", hash),
+		).toBeDefined();
+	});
+
+	it("a read of the oldest root never reorders eviction order (FIFO, not LRU)", () => {
+		const hash = reviewGraphIrContentHash("y");
+		for (let i = 0; i < MAX_ROOTS; i++) publish(`/r-${i}`, "/p/a.py", hash);
+
+		// A read that MISSES on the FILE (wrong hash) still performs the roots
+		// `get` — the reordering access, if that map were an LRU — while
+		// leaving the entry in place for the assertions below.
+		for (let i = 0; i < 5; i++) {
+			expect(
+				getFreshReviewGraphFileIr("/r-0", "/p/a.py", "other-hash"),
+			).toBeUndefined();
+		}
+
+		publish("/r-overflow", "/p/a.py", hash);
+
+		// FIFO: r-0 is still the oldest root, so it is the one evicted. Under an
+		// LRU substitution both assertions flip.
+		expect(getFreshReviewGraphFileIr("/r-0", "/p/a.py", hash)).toBeUndefined();
+		expect(getFreshReviewGraphFileIr("/r-1", "/p/a.py", hash)).toBeDefined();
+	});
+});

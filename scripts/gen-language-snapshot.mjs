@@ -91,6 +91,21 @@ export function describe(samplePath) {
 	};
 }
 
+// #2434's `SCAN_LANGUAGE_PRIORITY` directory-scan decision used to get its
+// own `scanPriority` section here (extension -> first matching id), but that
+// projection is ORDER-BLIND by construction: `extensionUnion()` gives every
+// extension exactly ONE owning id (the registry has no two ids sharing an
+// extension), so nothing in that section could ever depend on which id, or
+// which FAMILY (#2458 fix-round F1), is tried first — the exact property a
+// scan-priority regression changes. It could not have caught F1's coverage
+// bug (or a reordering) and never did; dropped rather than kept as a
+// snapshot that looks like coverage but isn't. The real guard is the
+// dedicated `SCAN_LANGUAGE_PRIORITY (#2434 fold)` describe block in
+// `tests/clients/language-registry-drift.test.ts`, which pins family AND
+// intra-family id order directly, plus the exhaustive family-union
+// regression coverage in
+// `tests/tools/lsp-diagnostics-scan-family.test.ts`.
+
 export function buildSnapshot() {
 	const files = {};
 	for (const extension of extensionUnion()) {

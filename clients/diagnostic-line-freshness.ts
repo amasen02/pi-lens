@@ -62,6 +62,7 @@
  *     healing direction never re-trigger a resync — only the rising edge does.
  */
 import * as fs from "node:fs";
+import { BoundedFifoMap } from "./bounded-cache.js";
 import { logLatency } from "./latency-logger.js";
 import { toProjectRelativePath } from "./path-utils.js";
 import { STALE_LINE_MARKER } from "./stale-marker.js";
@@ -113,7 +114,22 @@ interface LineCountCacheEntry {
  * that wants full isolation (tests) can create its own with
  * {@link createLineCountCache}; production call sites use the shared default.
  */
-export type LineCountCache = Map<string, LineCountCacheEntry>;
+// Structural, not `Map` itself: the shared default is bounded (below), while
+// {@link createLineCountCache}'s test-isolated instances stay plain, unbounded
+// `Map`s — both satisfy this narrow surface.
+export interface LineCountCache {
+	get(filePath: string): LineCountCacheEntry | undefined;
+	has(filePath: string): boolean;
+	// `void`, not the concrete return type: TypeScript's void-return
+	// assignability rule accepts BOTH implementations (`Map#set` returns
+	// `this`, `BoundedFifoMap#set` returns the evicted pairs) while telling
+	// every caller the result is not theirs to read. `unknown` here tripped
+	// the repo's own `no-unknown-returns` ast-grep self-scan, which fails the
+	// whole Unit-tests step (#2442 review F1).
+	set(filePath: string, entry: LineCountCacheEntry): void;
+	readonly size: number;
+	clear(): void;
+}
 
 /** Test-only isolation seam. Production code uses the shared default cache. */
 export function createLineCountCache(): LineCountCache {
@@ -126,22 +142,20 @@ export function createLineCountCache(): LineCountCache {
 // mismatched mtime always recomputes (see the module doc comment). Bounded
 // via FIFO eviction (mirrors `READ_GUARD_MAX_FILES`'s precedent) so a long
 // session's file count cannot grow this without limit.
-const MAX_SHARED_CACHE_ENTRIES = 512;
-const sharedLineCountCache: LineCountCache = new Map();
+export const MAX_SHARED_CACHE_ENTRIES = 512;
+const sharedLineCountCache: LineCountCache = new BoundedFifoMap<
+	string,
+	LineCountCacheEntry
+>(MAX_SHARED_CACHE_ENTRIES);
 
 function rememberInSharedCache(
 	cache: LineCountCache,
 	filePath: string,
 	entry: LineCountCacheEntry,
 ): void {
-	if (
-		cache === sharedLineCountCache &&
-		cache.size >= MAX_SHARED_CACHE_ENTRIES &&
-		!cache.has(filePath)
-	) {
-		const oldest = cache.keys().next().value;
-		if (oldest !== undefined) cache.delete(oldest);
-	}
+	// `cache` is either the shared BoundedFifoMap (bounds itself on `set`) or a
+	// test-isolated plain `Map` (unbounded by design) — either way, this is
+	// just a write.
 	cache.set(filePath, entry);
 }
 
@@ -163,6 +177,13 @@ export function _seedSharedLineCountCacheForTests(
 	entry: LineCountCacheEntry,
 ): void {
 	sharedLineCountCache.set(filePath, entry);
+}
+
+/** #2442 test-only: membership check that bypasses the real-stat requirement
+ *  `getCachedLineCount` imposes on every call — proves capacity eviction
+ *  directly, without needing 513 real files on disk. */
+export function _sharedLineCountCacheHasForTests(filePath: string): boolean {
+	return sharedLineCountCache.has(filePath);
 }
 
 /**

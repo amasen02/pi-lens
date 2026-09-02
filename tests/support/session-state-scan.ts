@@ -396,12 +396,21 @@ export interface SessionStateCandidate {
 
 /**
  * Module-level (column-zero) `const`/`let` bound to a `Map`, `Set`,
- * `WeakMap`, `WeakSet` or the repo's `PathKeyedMap`. Column zero is the
+ * `WeakMap`, `WeakSet` or one of the repo's own container classes
+ * (`PathKeyedMap`, `BoundedFifoMap`, `BoundedLruCache`). Column zero is the
  * signal for "module scope" — a container declared inside a function is
  * per-call state and re-armed by construction.
+ *
+ * A repo container wrapping a `Map` holds session state exactly as a raw
+ * `Map` does; the alternation must therefore name EVERY such class, or a
+ * refactor from `new Map()` to the wrapper silently deletes the file from
+ * this sweep. `PathKeyedMap` is the precedent (#1025); `BoundedFifoMap` /
+ * `BoundedLruCache` were the gap #2442's migration opened and its review
+ * round caught — `cache-observability.ts` went from four recognised
+ * containers to zero without a single test noticing.
  */
 const CONTAINER_DECLARATION =
-	/^(?:const|let)\s+([A-Za-z_$][\w$]*)[^=\n]*=\s*new\s+(?:Map|Set|WeakMap|WeakSet|PathKeyedMap)\b/gm;
+	/^(?:const|let)\s+([A-Za-z_$][\w$]*)[^=\n]*=\s*new\s+(?:Map|Set|WeakMap|WeakSet|PathKeyedMap|BoundedFifoMap|BoundedLruCache)\b/gm;
 
 /** An exported reset-shaped function. */
 const EXPORTED_RESET = /^export function (_?(?:reset|clear)[A-Za-z0-9_]*)/gm;

@@ -13,6 +13,7 @@ import * as nodeFs from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL, URL } from "node:url";
+import { BoundedFifoMap } from "../bounded-cache.js";
 import { getProjectIgnoreMatcher, isExcludedDirName } from "../file-utils.js";
 import { recordLsp } from "../widget-state.js";
 import { applyAuxiliarySuppressions } from "../dispatch/auxiliary-lsp.js";
@@ -1437,8 +1438,10 @@ export class LSPService {
 	 * pending pair until a replacement is published (or its existing bounded
 	 * re-arm ceiling is reached). A successful replacement removes the marker.
 	 */
-	private readonly notifyStallDemotions = new Map<string, number>();
 	private static readonly MAX_NOTIFY_STALL_DEMOTIONS = 50;
+	private readonly notifyStallDemotions = new BoundedFifoMap<string, number>(
+		LSPService.MAX_NOTIFY_STALL_DEMOTIONS,
+	);
 	/** LRU clock for capacity eviction, keyed by the canonical server/root key. */
 	private readonly clientLastUsedAt = new Map<string, number>();
 	/**
@@ -2070,13 +2073,6 @@ export class LSPService {
 		this.auxNotifyInflight.delete(key);
 		this.state.broken.set(key, Date.now() + BROKEN_BASE_COOLDOWN_MS);
 		this.notifyStallDemotions.set(key, Date.now());
-		while (
-			this.notifyStallDemotions.size > LSPService.MAX_NOTIFY_STALL_DEMOTIONS
-		) {
-			const oldest = this.notifyStallDemotions.keys().next().value;
-			if (oldest === undefined) break;
-			this.notifyStallDemotions.delete(oldest);
-		}
 		void entry.client.shutdown().catch(() => {});
 		this.state.clients.delete(key);
 		this.state.clientSpawnedAt.delete(key);

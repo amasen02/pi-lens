@@ -1,7 +1,10 @@
 /** Process-lifetime history of successful LSP spawn plus initialize durations. */
+import { BoundedFifoMap } from "../bounded-cache.js";
 
 const MAX_SERVER_HISTORIES = 64;
-const successfulSpawnDurationMs = new Map<string, number>();
+const successfulSpawnDurationMs = new BoundedFifoMap<string, number>(
+	MAX_SERVER_HISTORIES,
+);
 
 export function recordSuccessfulLspSpawn(
 	serverId: string,
@@ -10,11 +13,6 @@ export function recordSuccessfulLspSpawn(
 	if (!Number.isFinite(durationMs) || durationMs < 0) return;
 	successfulSpawnDurationMs.delete(serverId);
 	successfulSpawnDurationMs.set(serverId, durationMs);
-	while (successfulSpawnDurationMs.size > MAX_SERVER_HISTORIES) {
-		const oldest = successfulSpawnDurationMs.keys().next().value;
-		if (oldest === undefined) break;
-		successfulSpawnDurationMs.delete(oldest);
-	}
 }
 
 export function getSuccessfulLspSpawnDurationMs(

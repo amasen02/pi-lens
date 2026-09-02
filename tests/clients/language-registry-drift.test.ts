@@ -31,10 +31,12 @@ import {
 	grammarExtensionsOf,
 	KIND_TO_GRAMMAR,
 	type LanguageEntry,
+	type LanguageId,
 	LANGUAGES,
 	lspLanguageId,
 	PINNED_LANGUAGE_IDS,
 	resolveLanguage,
+	SCAN_LANGUAGE_PRIORITY,
 } from "../../clients/language-registry.js";
 import { symbolSearchFileMatchesLang } from "../../clients/lens-engine.js";
 import { LANGUAGE_EXTENSIONS } from "../../clients/lsp/language.js";
@@ -534,5 +536,228 @@ describe("language-identity golden snapshot", () => {
 	it("matches the committed fixture", () => {
 		const fixture = JSON.parse(readFileSync(SNAPSHOT_PATH, "utf8"));
 		expect(buildSnapshot()).toEqual(fixture);
+	});
+});
+
+describe("SCAN_LANGUAGE_PRIORITY (#2434 fold)", () => {
+	// The frozen "before": tools/lsp-diagnostics.ts's LANG_EXTENSIONS table as
+	// it stood on master (82c526c2), captured BEFORE the fold so this suite
+	// compares the registry projection against a fixed target rather than
+	// against itself. See tests/fixtures/lsp-diagnostics-lang-extensions.json.
+	const golden = JSON.parse(
+		readFileSync(
+			new URL(
+				"../fixtures/lsp-diagnostics-lang-extensions.json",
+				import.meta.url,
+			),
+			"utf8",
+		),
+	) as { order: string[]; extensions: Record<string, string[]> };
+
+	/**
+	 * Every old key mapped to one or more registry ids, in the SAME relative
+	 * order the old table tried them. Most rows are a single id whose
+	 * `extensionsForLanguage` set equals the old key's value exactly.
+	 *
+	 * Three rows split one old key across two-or-three registry ids, because
+	 * the old table bundled languages #2424 had already separated by grammar
+	 * (`.ts`+`.tsx`, `.js`+`.jsx`) or by dedicated entry (`.css`+`.scss`+
+	 * `.less`): `goldenKeys` names every old key whose value the ids replace
+	 * (`.tsx` duplicated `.ts`'s value verbatim and is folded into the same
+	 * row, not dropped). The UNION of those ids' extensions equals the old
+	 * key's value — a directory containing only ONE side of the split still
+	 * scans exactly as before; a directory mixing BOTH sides (e.g. `.ts` AND
+	 * `.tsx` together) now scans as whichever id is tried first, not the old
+	 * combined set — the one enumerated "Changed" row from the split.
+	 *
+	 * Four rows are a single id whose registry extension set is a SUPERSET of
+	 * the old value: the registry entry is shared with every other consumer
+	 * (grammar routing, LSP id, `resolveLanguage`), so narrowing it here to
+	 * match the old table would mean re-forking a table #2424 just merged.
+	 * `extra` names exactly the additional extensions, each individually
+	 * justified in `.changelog/` under Changed.
+	 */
+	const FAMILIES: Array<{
+		goldenKeys: string[];
+		ids: LanguageId[];
+		extra?: string[];
+	}> = [
+		{ goldenKeys: [".ts", ".tsx"], ids: ["typescript", "typescriptreact"] },
+		{ goldenKeys: [".js"], ids: ["javascript", "javascriptreact"] },
+		{ goldenKeys: [".py"], ids: ["python"] },
+		{ goldenKeys: [".rs"], ids: ["rust"] },
+		{ goldenKeys: [".go"], ids: ["go"] },
+		// Widened: the registry's ruby entry also owns .ru (Rack config), the
+		// same reconciled decision #2424 already made for lens-engine's `lang`
+		// filter (line ~505 above).
+		{ goldenKeys: [".rb"], ids: ["ruby"], extra: [".ru"] },
+		{ goldenKeys: [".java"], ids: ["java"] },
+		{ goldenKeys: [".kt"], ids: ["kotlin"] },
+		{ goldenKeys: [".swift"], ids: ["swift"] },
+		{ goldenKeys: [".cs"], ids: ["csharp"] },
+		// Widened: the registry's cpp entry is the full clang extension table
+		// (module-interface, Objective-C, OpenCL tail) minus the c/cpp split;
+		// the old ad hoc list only ever named 5 of them.
+		{
+			goldenKeys: [".cpp"],
+			ids: ["cpp"],
+			extra: [
+				".c++",
+				".c++m",
+				".cl",
+				".clcpp",
+				".cp",
+				".cppm",
+				".cu",
+				".cxxm",
+				".hh",
+				".hip",
+				".inl",
+				".ipp",
+				".ixx",
+				".m",
+				".mm",
+				".tpp",
+				".txx",
+			],
+		},
+		{ goldenKeys: [".c"], ids: ["c"] },
+		{ goldenKeys: [".zig"], ids: ["zig"] },
+		{ goldenKeys: [".hs"], ids: ["haskell"] },
+		{ goldenKeys: [".ex"], ids: ["elixir"] },
+		{ goldenKeys: [".gleam"], ids: ["gleam"] },
+		{ goldenKeys: [".tf"], ids: ["terraform"] },
+		{ goldenKeys: [".nix"], ids: ["nix"] },
+		{ goldenKeys: [".sh"], ids: ["shell"] },
+		// Widened: the registry's php entry also owns the four alias extensions
+		// (.phtml/.php3/.php4/.php5), same reconciled decision as lens-engine's
+		// `lang` filter.
+		{
+			goldenKeys: [".php"],
+			ids: ["php"],
+			extra: [".phtml", ".php3", ".php4", ".php5"],
+		},
+		{ goldenKeys: [".lua"], ids: ["lua"] },
+		{ goldenKeys: [".dart"], ids: ["dart"] },
+		{ goldenKeys: [".vue"], ids: ["vue"] },
+		{ goldenKeys: [".svelte"], ids: ["svelte"] },
+		{ goldenKeys: [".css"], ids: ["css", "scss", "less"] },
+		{ goldenKeys: [".html"], ids: ["html"] },
+		// Widened: the registry's json entry also owns .json5; .jsonc stays its
+		// own entry (no grammar), same reconciled decision as lens-engine's
+		// `lang` filter.
+		{ goldenKeys: [".json"], ids: ["json", "jsonc"], extra: [".json5"] },
+		{ goldenKeys: [".yaml"], ids: ["yaml"] },
+		{ goldenKeys: [".toml"], ids: ["toml"] },
+		{ goldenKeys: [".prisma"], ids: ["prisma"] },
+	];
+
+	it("covers exactly the golden table's keys, once each", () => {
+		const covered = FAMILIES.flatMap((family) => family.goldenKeys).sort();
+		expect(covered).toEqual([...golden.order].sort());
+	});
+
+	it("every golden key's value set collapses to one family (the .tsx/.ts duplicate included)", () => {
+		for (const family of FAMILIES) {
+			const sets = family.goldenKeys.map(
+				(key) => new Set(golden.extensions[key]),
+			);
+			const [first, ...rest] = sets;
+			for (const other of rest) {
+				expect(
+					other,
+					`golden keys ${family.goldenKeys.join("/")} disagree on their extension set`,
+				).toEqual(first);
+			}
+		}
+	});
+
+	// #2458 fix-round F3: this used to compare a FLAT SCAN_LANGUAGE_PRIORITY
+	// against `FAMILIES.flatMap`, which collapsed family boundaries into one
+	// array and so could not, by construction, catch a family being reordered
+	// relative to its own golden position without ALSO catching plain id
+	// reordering — the two failure modes were indistinguishable and neither
+	// was independently pinned against a source outside this test file. Two
+	// checks now: family-level order against `golden.order` directly (not
+	// against `SCAN_LANGUAGE_PRIORITY`, so a bug that moves both in the same
+	// wrong direction still reds), and the full nested shape (family order AND
+	// intra-family id order) against `SCAN_LANGUAGE_PRIORITY` itself.
+	it("FAMILIES' family-level order matches golden.order exactly (goldenKeys[0], deduplicated)", () => {
+		// golden.order lists `.tsx` as its own entry even though it shares the
+		// `.ts` family's value (the old table's one true key duplicate) — drop
+		// every goldenKey that is not a family's FIRST one before comparing, or
+		// this would spuriously expect a 31st family that doesn't exist.
+		const nonLeadGoldenKeys = new Set(
+			FAMILIES.flatMap((family) => family.goldenKeys.slice(1)),
+		);
+		const dedupedGoldenOrder = golden.order.filter(
+			(key: string) => !nonLeadGoldenKeys.has(key),
+		);
+		expect(FAMILIES.map((family) => family.goldenKeys[0])).toEqual(
+			dedupedGoldenOrder,
+		);
+	});
+
+	it("SCAN_LANGUAGE_PRIORITY is exactly the families, family order AND intra-family id order both pinned", () => {
+		expect(SCAN_LANGUAGE_PRIORITY).toEqual(
+			FAMILIES.map((family) => family.ids),
+		);
+	});
+
+	it("each family's projected extension set equals the golden value plus only its documented extras", () => {
+		for (const family of FAMILIES) {
+			const goldenSet = new Set(golden.extensions[family.goldenKeys[0]]);
+			const projected = new Set(
+				family.ids.flatMap((id) => extensionsForLanguage(id)),
+			);
+			const expected = new Set([...goldenSet, ...(family.extra ?? [])]);
+			expect(
+				projected,
+				`family ${family.ids.join("+")} (golden ${family.goldenKeys.join("/")})`,
+			).toEqual(expected);
+		}
+	});
+
+	it("drops no extension the old table could ever scan", () => {
+		const allGolden = new Set(Object.values(golden.extensions).flat());
+		const allProjected = new Set(
+			SCAN_LANGUAGE_PRIORITY.flatMap((family) =>
+				family.flatMap((id) => extensionsForLanguage(id)),
+			),
+		);
+		const missing = [...allGolden].filter((ext) => !allProjected.has(ext));
+		expect(missing).toEqual([]);
+	});
+
+	// #2434 scope item 3: clients/lsp/server.ts's AST_GREP_KINDS carried a dead
+	// "solidity" entry — not a FileKind, so KIND_EXTENSIONS never had a row for
+	// it and it contributed zero extensions before or after removal (the
+	// deletion is a no-op on AstGrepServer.extensions, which is why a runtime
+	// assertion on that list can't guard the regression). Source-grep instead.
+	it("clients/lsp/server.ts's AST_GREP_KINDS names no phantom 'solidity' entry", () => {
+		const source = readFileSync(
+			new URL("../../clients/lsp/server.ts", import.meta.url),
+			"utf8",
+		);
+		const match = source.match(
+			/const AST_GREP_KINDS = \[([\s\S]*?)\] as const;/,
+		);
+		expect(match, "AST_GREP_KINDS declaration not found").not.toBeNull();
+		expect(match?.[1]).not.toContain("solidity");
+	});
+
+	// #2458 fix-round F5: `tools/shared.ts`'s `LANGUAGES` — spread into the
+	// `lang` enum of four agent-facing tool schemas (ast_dump,
+	// ast_grep_outline, ast_grep_replace, ast_grep_search) — carried the same
+	// phantom "solidity" entry (#2424 review, S2's finding, never actually
+	// swept from this table): not a registry id, not an ast-grep napi
+	// language, not reachable from `extensionsForLanguageToken` (see the
+	// `symbol_search lang filter` describe block above), so selecting it in
+	// any of those four tools' `lang` param could only ever no-op. Runtime
+	// assertion (not source-grep): `LANGUAGES` is a real array these tools
+	// spread at schema-build time, so a reintroduction is directly observable.
+	it("tools/shared.ts's LANGUAGES names no phantom 'solidity' entry", async () => {
+		const { LANGUAGES } = await import("../../tools/shared.js");
+		expect(LANGUAGES).not.toContain("solidity");
 	});
 });
