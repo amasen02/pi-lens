@@ -9,9 +9,11 @@
 import { describe, expect, it } from "vitest";
 import {
 	diffSurvivingLspProcesses,
+	evaluateNoSurvivingLspProcesses,
 	isLspServerCommand,
 	normalizeProcessFields,
 	parseProcessTable,
+	posixPsPath,
 	snapshotProcesses,
 	windowsExe,
 	ALL_PROCESS_FIELDS,
@@ -104,6 +106,54 @@ describe("diffSurvivingLspProcesses", () => {
 	});
 });
 
+describe("evaluateNoSurvivingLspProcesses", () => {
+	// PR #2438 review round 4, F-A: a failed/timed-out listing must never
+	// read as "no leak" just because its (empty) table diffed clean.
+	it("fails when the before-listing did not complete, even with an empty after diff", () => {
+		const result = evaluateNoSurvivingLspProcesses(
+			{ rows: [], ok: false },
+			{ rows: [{ pid: 1, command: "bash" }], ok: true },
+		);
+		expect(result.pass).toBe(false);
+		expect(result.detail).toMatch(/before\.ok=false/);
+	});
+
+	it("fails when the after-listing did not complete, even though it reported no rows", () => {
+		// The exact shape of reviewer probe C2/C3: a live leaked LSP process
+		// exists, but the after-listing times out and reports [] — an
+		// unverified table must not be read as proof nothing survived.
+		const result = evaluateNoSurvivingLspProcesses(
+			{ rows: [], ok: true },
+			{ rows: [], ok: false },
+		);
+		expect(result.pass).toBe(false);
+		expect(result.id).toBe("no-surviving-lsp-processes");
+		expect(result.detail).toMatch(/after\.ok=false/);
+	});
+
+	it("passes when both listings completed and nothing new survived", () => {
+		const result = evaluateNoSurvivingLspProcesses(
+			{ rows: [{ pid: 1, command: "bash" }], ok: true },
+			{ rows: [{ pid: 1, command: "bash" }], ok: true },
+		);
+		expect(result.pass).toBe(true);
+	});
+
+	it("fails when both listings completed and a new LSP process survived", () => {
+		const result = evaluateNoSurvivingLspProcesses(
+			{ rows: [], ok: true },
+			{
+				rows: [
+					{ pid: 2, command: "node .../typescript-language-server/cli.mjs" },
+				],
+				ok: true,
+			},
+		);
+		expect(result.pass).toBe(false);
+		expect(result.detail).toContain("pid=2");
+	});
+});
+
 // ---------------------------------------------------------------------------
 // The shared platform listing (PR #2438 review round 3, F2)
 // ---------------------------------------------------------------------------
@@ -143,6 +193,22 @@ describe("windowsExe", () => {
 		const resolved = windowsExe("WindowsPowerShell\\v1.0\\powershell.exe");
 		expect(resolved).toContain("System32");
 		expect(resolved.endsWith("powershell.exe")).toBe(true);
+	});
+});
+
+describe("posixPsPath", () => {
+	it("prefers the absolute /bin/ps when present, falling back to the bare name otherwise", async () => {
+		// The listing decides what the sweep KILLS, so it must not resolve
+		// through a PATH a caller can shadow — mirrors windowsExe's reasoning
+		// (PR #2438 review round 4, F-D). Whichever branch this box takes, the
+		// two are the only allowed answers.
+		const fs = await import("node:fs");
+		const resolved = posixPsPath();
+		if (fs.existsSync("/bin/ps")) {
+			expect(resolved).toBe("/bin/ps");
+		} else {
+			expect(resolved).toBe("ps");
+		}
 	});
 });
 

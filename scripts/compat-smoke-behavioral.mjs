@@ -64,7 +64,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
-	diffSurvivingLspProcesses,
+	evaluateNoSurvivingLspProcesses,
 	snapshotProcesses,
 } from "./lib/process-scan.mjs";
 import {
@@ -240,7 +240,7 @@ function runPiRpc({ piBin, extensionPath, cwd, env, timeoutMs = 45000 }) {
 // parent pid.
 
 function snapshotLspCandidates() {
-	return snapshotProcesses(["pid", "command"]).then((scan) => scan.rows);
+	return snapshotProcesses(["pid", "command"]);
 }
 
 function readLatencyLogEntries() {
@@ -395,15 +395,7 @@ async function main() {
 			// empirically — see docs/subagent-compat.md).
 			await new Promise((r) => setTimeout(r, 3000));
 			const after = await snapshotLspCandidates();
-			const surviving = diffSurvivingLspProcesses(before, after);
-			results.push({
-				id: "no-surviving-lsp-processes",
-				pass: surviving.length === 0,
-				detail:
-					surviving.length === 0
-						? "no new LSP-server processes survived pi's exit"
-						: `${surviving.length} surviving process(es): ${surviving.map((p) => `pid=${p.pid} ${p.command.slice(0, 80)}`).join("; ")}`,
-			});
+			results.push(evaluateNoSurvivingLspProcesses(before, after));
 		} catch (err) {
 			results.push({
 				id: "no-surviving-lsp-processes",

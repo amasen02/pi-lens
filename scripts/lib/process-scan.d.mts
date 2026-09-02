@@ -28,6 +28,8 @@ export const ALL_PROCESS_FIELDS: readonly ProcessField[];
 
 export function windowsExe(name: string): string;
 
+export function posixPsPath(): string;
+
 export function normalizeProcessFields(
 	fields: readonly ProcessField[] | null | undefined,
 ): ProcessField[];
@@ -42,3 +44,13 @@ export function snapshotProcesses(
 	fields?: readonly ProcessField[],
 	timeoutMs?: number,
 ): Promise<{ rows: ProcRow[]; ok: boolean }>;
+
+export interface ProcessSnapshot {
+	rows: ProcessRow[];
+	ok: boolean;
+}
+
+export function evaluateNoSurvivingLspProcesses(
+	before: ProcessSnapshot,
+	after: ProcessSnapshot,
+): { id: string; pass: boolean; detail: string };

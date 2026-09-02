@@ -22,6 +22,7 @@
 // rails. That cross-boundary consolidation is filed separately.
 
 import { spawn } from "node:child_process";
+import fs from "node:fs";
 import path from "node:path";
 
 const isWindows = process.platform === "win32";
@@ -62,6 +63,25 @@ export function windowsExe(name) {
 		"System32",
 		name,
 	);
+}
+
+/**
+ * Absolute path to POSIX `ps`, the same reasoning as `windowsExe` applied to
+ * the other platform: this listing decides what the sweep KILLS, so the
+ * interpreter is named absolutely rather than resolved through a PATH a
+ * caller can shadow (master's compat-smoke already spawned `/bin/ps`; this
+ * carries that into the shared listing). Falls back to the bare `ps` name
+ * only when `/bin/ps` is absent, so a POSIX-like environment that keeps it
+ * elsewhere still works.
+ *
+ * @returns {string}
+ */
+export function posixPsPath() {
+	try {
+		return fs.existsSync("/bin/ps") ? "/bin/ps" : "ps";
+	} catch {
+		return "ps";
+	}
 }
 
 /**
@@ -176,7 +196,7 @@ export function snapshotProcesses(
 	const layout = normalizeProcessFields(fields);
 	const command = isWindows
 		? windowsExe("WindowsPowerShell\\v1.0\\powershell.exe")
-		: "ps";
+		: posixPsPath();
 	const args = isWindows
 		? [
 				"-NoProfile",
@@ -277,4 +297,44 @@ export function diffSurvivingLspProcesses(before, after) {
 	return after.filter(
 		(row) => !beforePids.has(row.pid) && isLspServerCommand(row.command),
 	);
+}
+
+/**
+ * @typedef {{ rows: ProcessRow[], ok: boolean }} ProcessSnapshot
+ */
+
+/**
+ * The "no surviving LSP process" assertion (compat-smoke-behavioral.mjs,
+ * Layer B assertion 3), extracted so it is unit-testable without spawning a
+ * real `ps`/CIM listing.
+ *
+ * An absence of a row from `after` only means something when BOTH snapshots
+ * are known-complete: `snapshotProcesses`'s `ok` is the only evidence of
+ * that (see its doc comment). A failed or timed-out listing yields an empty
+ * table, which must never read as "no leak" — that is silence, not
+ * evidence, and would make a caller-side outage report a false pass
+ * (PR #2438 review round 4, F-A).
+ *
+ * @param {ProcessSnapshot} before
+ * @param {ProcessSnapshot} after
+ * @returns {{ id: string, pass: boolean, detail: string }}
+ */
+export function evaluateNoSurvivingLspProcesses(before, after) {
+	const id = "no-surviving-lsp-processes";
+	if (!before.ok || !after.ok) {
+		return {
+			id,
+			pass: false,
+			detail: `process listing unavailable (before.ok=${before.ok}, after.ok=${after.ok}); cannot verify no LSP process survived`,
+		};
+	}
+	const surviving = diffSurvivingLspProcesses(before.rows, after.rows);
+	return {
+		id,
+		pass: surviving.length === 0,
+		detail:
+			surviving.length === 0
+				? "no new LSP-server processes survived pi's exit"
+				: `${surviving.length} surviving process(es): ${surviving.map((p) => `pid=${p.pid} ${p.command.slice(0, 80)}`).join("; ")}`,
+	};
 }

@@ -454,17 +454,54 @@ export function worktreeActivityMs(worktreePath, nowMs) {
 	return worktreeActivityFromSignals(signals, nowMs);
 }
 
+/** Ceiling on how much of a reflog file the tail read pulls in. */
+const REFLOG_TAIL_MAX_BYTES = 64 * 1024;
+
+/**
+ * Read up to `maxBytes` from the END of `file`. `parseReflogLastEntryMs`
+ * only ever wants the LAST complete line, and it already scans its input
+ * back-to-front — a possibly-truncated first line at the start of the
+ * window is simply skipped (it fails the timestamp regex, or is discarded
+ * as not the newest). Never throws; an unreadable file yields "".
+ *
+ * @param {string} file
+ * @param {number} maxBytes
+ * @returns {string}
+ */
+function readFileTail(file, maxBytes) {
+	let fd;
+	try {
+		fd = fs.openSync(file, "r");
+		const size = fs.fstatSync(fd).size;
+		const length = Math.min(size, maxBytes);
+		const start = size - length;
+		const buffer = Buffer.alloc(length);
+		fs.readSync(fd, buffer, 0, length, start);
+		return buffer.toString("utf8");
+	} finally {
+		if (fd !== undefined) {
+			try {
+				fs.closeSync(fd);
+			} catch {
+				/* already closed */
+			}
+		}
+	}
+}
+
 /**
  * Last entry time of a reflog file, or null when it is absent or unparseable.
  * Reads only the tail: a long-lived worktree's `logs/HEAD` is small, but a
- * bounded read keeps the sweep's per-tree cost flat regardless.
+ * bounded read (see `readFileTail`) keeps the sweep's per-tree cost flat
+ * regardless — a `readFileSync` here would not (PR #2438 review round 4,
+ * F-B).
  *
  * @param {string} file
  * @returns {number|null}
  */
 function reflogLastEntryMs(file) {
 	try {
-		return parseReflogLastEntryMs(fs.readFileSync(file, "utf8"));
+		return parseReflogLastEntryMs(readFileTail(file, REFLOG_TAIL_MAX_BYTES));
 	} catch {
 		return null;
 	}
@@ -634,9 +671,14 @@ export function getHygieneLogPath() {
 }
 
 /**
- * Append records, then truncate to the newest DEFAULT_LOG_MAX_LINES. Best
- * effort: a ledger that cannot be written must never fail the sweep it is
- * recording.
+ * Append records to the ledger. Best effort: a ledger that cannot be written
+ * must never fail the sweep it is recording.
+ *
+ * A plain append is one atomic write syscall per call, so two SubagentStop
+ * hooks racing on the same ledger both survive — unlike the previous
+ * read-modify-write, which could lose whichever process wrote last (PR #2438
+ * review round 4, F-E). Trimming back to the bound is therefore split out
+ * and made rare, not run on every append — see `maybeTrimLedger`.
  *
  * @param {string[]} records
  */
@@ -645,18 +687,39 @@ function appendLedger(records) {
 	const logPath = getHygieneLogPath();
 	try {
 		fs.mkdirSync(path.dirname(logPath), { recursive: true });
-		let existing = [];
-		try {
-			existing = fs.readFileSync(logPath, "utf8").split(/\r?\n/);
-		} catch {
-			/* first write */
-		}
-		const kept = pruneLogLines(existing, records, DEFAULT_LOG_MAX_LINES);
-		fs.writeFileSync(logPath, `${kept.join("\n")}\n`, "utf8");
+		fs.appendFileSync(logPath, `${records.join("\n")}\n`, "utf8");
 	} catch (error) {
 		console.error(
 			`[hygiene] could not write ${logPath}: ${error instanceof Error ? error.message : error}`,
 		);
+		return;
+	}
+	maybeTrimLedger(logPath);
+}
+
+/**
+ * Trim the ledger back to `DEFAULT_LOG_MAX_LINES`, but only once it has grown
+ * to more than double that. A trim is still a destructive read-modify-write
+ * against a concurrent appender, so it stays reserved for the rare case
+ * where the file has actually grown unbounded rather than running (and
+ * racing) on every write. A lost race here just leaves the file oversized
+ * until the next write's check triggers a retry — never data loss for a
+ * concurrent append, since the appender's own write already landed.
+ *
+ * @param {string} logPath
+ */
+function maybeTrimLedger(logPath) {
+	try {
+		const lines = fs
+			.readFileSync(logPath, "utf8")
+			.split(/\r?\n/)
+			.filter((line) => line.trim() !== "");
+		if (lines.length <= DEFAULT_LOG_MAX_LINES * 2) return;
+		const kept = pruneLogLines([], lines, DEFAULT_LOG_MAX_LINES);
+		fs.writeFileSync(logPath, `${kept.join("\n")}\n`, "utf8");
+	} catch {
+		/* best effort; ledger writability failures are already reported by
+		   appendLedger */
 	}
 }
 
