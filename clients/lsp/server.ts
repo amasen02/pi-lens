@@ -59,6 +59,11 @@ import { logSessionStart } from "../sessionstart-logger.js";
 import { findLocalSgconfig, resolveBaselineSgconfig } from "../sgconfig.js";
 import { findLocalTyposConfig } from "../typos-config.js";
 import { resolvePackagePath } from "../package-root.js";
+import {
+	extractTomlTableSection,
+	parseTomlStringArray,
+	readTextFileOrUndefined,
+} from "../cargo-manifest.js";
 import { resolveAstGrepNativeExe } from "./wait-policy/index.js";
 import {
 	hasSpawnFailureKind,
@@ -2462,45 +2467,6 @@ export const GoServer: LSPServerInfo = {
 		return { ...result, initialization: { ui: { semanticTokens: true } } };
 	},
 };
-
-async function readTextFileOrUndefined(
-	filePath: string,
-): Promise<string | undefined> {
-	try {
-		return await readFile(filePath, "utf-8");
-	} catch {
-		return undefined;
-	}
-}
-
-/**
- * Slice out ONE top-level TOML table's raw body — from its `[name]` heading
- * to the next top-level `[...]`/`[[...]]` heading or EOF. `members`/`exclude`
- * must be read from the `[workspace]` table specifically: `[package]` has its
- * OWN `exclude` key (the standard cargo-publish exclude list, conventionally
- * written above `[workspace]` in a virtual-manifest-less root crate), and a
- * whole-file regex would misread it as workspace membership (#1671 F4).
- */
-function extractTomlTableSection(content: string, tableName: string): string {
-	const heading = new RegExp(`^\\[${tableName}\\][ \\t]*(?:#.*)?$`, "m");
-	const match = heading.exec(content);
-	if (!match) return "";
-	const rest = content.slice(match.index + match[0].length);
-	const nextHeading = rest.match(/^\[{1,2}[^\]]+\]{1,2}[ \t]*(?:#.*)?$/m);
-	return nextHeading?.index !== undefined
-		? rest.slice(0, nextHeading.index)
-		: rest;
-}
-
-function parseTomlStringArray(content: string, key: string): string[] {
-	const match = content.match(
-		new RegExp(`^[ \\t]*${key}[ \\t]*=[ \\t]*\\[([\\s\\S]*?)\\]`, "m"),
-	);
-	if (!match) return [];
-	return [...match[1].matchAll(/"([^"]*)"|'([^']*)'/g)].map((m) =>
-		(m[1] ?? m[2] ?? "").trim(),
-	);
-}
 
 /** Turn one `/`-delimited glob SEGMENT into a regex source: `*` matches any
  * run of characters within the segment, `?` matches exactly one character,
