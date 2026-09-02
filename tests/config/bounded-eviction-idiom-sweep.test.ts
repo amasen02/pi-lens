@@ -89,7 +89,7 @@ const EXEMPT_SITES: Readonly<Record<string, string>> = {
 		"(the issue asks for a FIFO sibling of BoundedLruCache, a K,V map). " +
 		"Named here rather than left invisible; a BoundedSet is the natural " +
 		"follow-up that would clear all four Set-shaped entries at once.",
-	"index.ts:549":
+	"index.ts:546":
 		"Set, not Map: `_lspConfigInitializedCwds` is membership-only — same " +
 		"reason as clients/lsp/session-roots.ts, whose SESSION_ROOT_CAP this " +
 		"cap is deliberately paired with. No BoundedSet exists; see that " +
@@ -104,7 +104,7 @@ const EXEMPT_SITES: Readonly<Record<string, string>> = {
 		"silent: it emits `observed_handled_evicted` naming the dropped path " +
 		"(#2449 review round 4, S2), because dropping a mark makes pi-lens read " +
 		"its own formatter output as third-party drift.",
-	"clients/lsp-mutation.ts:259":
+	"clients/lsp-mutation.ts:430":
 		"Set, not Map: `autofixRecordedPaths` is membership-only, and it is " +
 		"per-CONTEXT state (created on the mutation context, not module " +
 		"scope), so it is not even process-lifetime. No BoundedSet exists; " +

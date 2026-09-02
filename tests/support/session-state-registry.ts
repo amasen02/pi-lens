@@ -133,6 +133,12 @@ import {
 	registerSessionRoot,
 	resetSessionRootsForTests,
 } from "../../clients/lsp/session-roots.js";
+import {
+	_lspMutationNoBridgeDbgLoggedForTests,
+	recordLspMutation,
+	resetLspMutationNoBridgeDbgLatch,
+	type LspMutationContext,
+} from "../../clients/lsp-mutation.js";
 
 /**
  * When a piece of state must return to its initial value.
@@ -1002,6 +1008,61 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 		resetName: "resetRustAvailability",
 		reason:
 			"#2455 fix round 2: same shape as go-vet:goClientAvailability — RustClient's own createAvailabilityLatch() sits outside every generation counter that already covers this file's OTHER cache. A cargo install mid-process stayed invisible until process restart.",
+	},
+	{
+		id: "lsp-mutation:noBridgeDbgLogged",
+		module: "lsp-mutation.ts",
+		state: "noBridgeDbgLogged",
+		policy: "session_start",
+		resetName: "resetLspMutationNoBridgeDbgLatch",
+		reason:
+			"#2450 fix round 3: the 'mutation bridge unavailable' dbg line (a bridge-less process, e.g. the MCP server, has no bookkeeping seam for an LSP-applied edit) is gated once per SESSION so a rename touching many files does not spam it once per file. A latch that survived a session boundary would silently suppress the warning for every session after the first that ever hit it — exactly the #1635 class this registry exists to catch.",
+		probe: {
+			arm: () => {
+				const context: LspMutationContext = {
+					cwd: scratchCwd(),
+					correlationId: "session-state-registry-probe",
+					tool: "lsp_navigation:executeCommand",
+					source: "lsp-execute-command",
+					emitSummary: false,
+					dbg: () => {},
+				};
+				const filePath = path.join(context.cwd, "probe.ts");
+				recordLspMutation(context, {
+					results: [
+						{
+							descriptions: [],
+							files: [filePath],
+							operationTotal: 1,
+							appliedOperationTotal: 1,
+							appliedOperationIndexes: [0],
+							operationCounts: {
+								textEdits: 1,
+								create: 0,
+								rename: 0,
+								delete: 0,
+							},
+							fileDetails: [
+								{
+									filePath,
+									range: { start: 1, end: 1 },
+									importsChanged: false,
+								},
+							],
+						},
+					],
+				});
+			},
+			// `arm()` drives a no-bridge record — the same shape
+			// tests/clients/lsp-mutation-bridge-unmounted.test.ts exercises end to
+			// end — which flips the latch true as a side effect of the dbg line
+			// firing. `isArmed()` reads that latch directly (via the test-only
+			// getter) rather than re-deriving it from captured dbg messages, so
+			// re-arming genuinely means "a SECOND no-bridge record dbg's again",
+			// not just "a message array still has an old entry in it".
+			isArmed: () => !_lspMutationNoBridgeDbgLoggedForTests(),
+			reset: () => resetLspMutationNoBridgeDbgLatch(),
+		},
 	},
 
 	// ── Deliberately not session_start ───────────────────────────────────────

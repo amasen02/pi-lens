@@ -9,6 +9,7 @@
  */
 
 import * as fs from "node:fs";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	loadProjectSnapshot,
@@ -200,6 +201,15 @@ describe("word-index lifecycle — full mode (#348)", () => {
 			const runtime = new RuntimeCoordinator();
 			runtime.resetForSession();
 			const dbg = vi.fn();
+			// #2471: force the word-index-carrying promotion save to land ~1200ms
+			// after handleSessionStart resolves (the #2142 deferred-save seam,
+			// reused rather than hand-rolled). The old bare `loadProjectSnapshot`
+			// read below only passed because CI's scheduler usually let the real
+			// save finish inside the test's own turn — a scheduling accident, not
+			// a guarantee. Forcing the delay deterministically proves the fix
+			// (waiting for the persist) rather than hoping a slow CI box never
+			// reproduces the race again.
+			deferredRuntimeSnapshotSave.delayCall = 2;
 
 			await handleSessionStart(makeDeps(env.tmpDir, runtime, dbg));
 
@@ -213,8 +223,17 @@ describe("word-index lifecycle — full mode (#348)", () => {
 				),
 			).toBe(true);
 
-			const snapshot = loadProjectSnapshot(env.tmpDir);
-			expect(snapshot?.wordIndex).toBeDefined();
+			// Same wait shape as the quick-mode warmup sibling below (:480): poll
+			// loadProjectSnapshot until the async promotion has landed, instead of
+			// reading it once right after handleSessionStart resolves (#2108,
+			// #2142 — the same race in this file, twice).
+			await vi.waitFor(
+				() => {
+					const snapshot = loadProjectSnapshot(env.tmpDir);
+					expect(snapshot?.wordIndex).toBeDefined();
+				},
+				{ timeout: 5000 },
+			);
 		} finally {
 			env.cleanup();
 			restore();
@@ -470,4 +489,103 @@ describe("word-index lifecycle — quick-mode cold-start warmup (#348 decision 2
 			env.cleanup();
 		}
 	}, 15_000);
+});
+
+// #2471 (siblings of #2108, #2142): every `loadProjectSnapshot(` read in this
+// file follows an ASYNC promotion (a background session-start task, or a
+// deferred/worker persist) — a bare read right after such a build races the
+// promotion. Grep guard, not a lint rule, because the shape (which reads
+// count as guarded) only makes sense with this file's own known wait
+// vocabulary: `vi.waitFor(...)`, the file-existence `waitForPersistedSnapshot`
+// helper above, and `waitForProjectSnapshotPersistsForTests` imported from
+// project-snapshot.js. This is a floor, not a proof — see the KNOWN GAP note.
+describe("static guard: no bare loadProjectSnapshot read after an async build (#2471)", () => {
+	it("every loadProjectSnapshot call site in this file is either inside vi.waitFor or covered by a persist-wait with no un-awaited gap since", () => {
+		const selfPath = fileURLToPath(import.meta.url);
+		const source = fs.readFileSync(selfPath, "utf8");
+		const lines = source.split("\n");
+		const CALL_RE = /\bloadProjectSnapshot\(/;
+
+		// Bracket-match every `vi.waitFor(` call to the line its matching `)`
+		// closes on, so containment is real (a read many lines below an
+		// unrelated, already-closed vi.waitFor must NOT count as guarded — the
+		// false negative that let a first version of this guard pass a
+		// deliberately-reverted bare read in review).
+		type Span = { startLine: number; endLine: number };
+		const waitForSpans: Span[] = [];
+		const callRe = /vi\.waitFor\(/g;
+		let match: RegExpExecArray | null;
+		while ((match = callRe.exec(source))) {
+			const openParenIdx = match.index + match[0].length - 1;
+			let depth = 0;
+			let closeIdx = -1;
+			for (let i = openParenIdx; i < source.length; i += 1) {
+				if (source[i] === "(") depth += 1;
+				else if (source[i] === ")") {
+					depth -= 1;
+					if (depth === 0) {
+						closeIdx = i;
+						break;
+					}
+				}
+			}
+			if (closeIdx === -1) continue; // unbalanced — let the real read below flag it
+			const startLine = source.slice(0, match.index).split("\n").length - 1;
+			const endLine = source.slice(0, closeIdx).split("\n").length - 1;
+			waitForSpans.push({ startLine, endLine });
+		}
+
+		const PERSIST_WAIT_RE =
+			/\b(waitForPersistedSnapshot|waitForProjectSnapshotPersistsForTests)\(/;
+		// Not a real call: this describe/it title talks ABOUT the symbol in
+		// prose without ever invoking it.
+		const SELF_TITLE_RE = /^\s*(describe|it)\(/;
+
+		const unguarded: number[] = [];
+		lines.forEach((line, idx) => {
+			const trimmed = line.trim();
+			if (trimmed.startsWith("//") || trimmed.startsWith("*")) return;
+			if (trimmed === "loadProjectSnapshot,") return; // the bare import specifier
+			if (SELF_TITLE_RE.test(line)) return;
+			if (!CALL_RE.test(line)) return;
+
+			const insideWaitFor = waitForSpans.some(
+				(span) => idx >= span.startLine && idx <= span.endLine,
+			);
+			if (insideWaitFor) return;
+
+			// Find the nearest PRECEDING persist-wait call (anywhere above, not
+			// just the literal previous line — synchronous statements in between,
+			// like building an in-memory fixture, don't reopen the race). Then
+			// require no NEW `await` between that wait and this read: an
+			// intervening await is a fresh async gap this specific wait never
+			// covered, so it needs its own wait, not credit for an earlier one.
+			let waitLine = -1;
+			for (let i = idx - 1; i >= 0; i -= 1) {
+				if (PERSIST_WAIT_RE.test(lines[i])) {
+					waitLine = i;
+					break;
+				}
+			}
+			if (waitLine === -1) {
+				unguarded.push(idx + 1); // 1-based, matches editor/CI line numbers
+				return;
+			}
+			const gapHasNewAwait = lines
+				.slice(waitLine + 1, idx)
+				.some((gapLine) => /\bawait\b/.test(gapLine));
+			if (gapHasNewAwait) unguarded.push(idx + 1);
+		});
+		// KNOWN GAP: this recognizes exactly two shapes — containment inside a
+		// bracket-matched `vi.waitFor(...)`, and a nearest-preceding persist-wait
+		// call with no un-awaited gap since. A guarded read reached through some
+		// OTHER control-flow (e.g. a not-yet-invented helper function, or a
+		// non-await async primitive like `.then()`) would false-positive as
+		// unguarded — a human reviewer, not a silent pass, is the backstop for
+		// that direction. The guard's job is to fail LOUDLY the shape
+		// #2108/#2142/#2471 all were: a bare read on the very next statement
+		// after an async build resolves, with nothing snapshot-specific waited
+		// for since.
+		expect(unguarded).toEqual([]);
+	});
 });
