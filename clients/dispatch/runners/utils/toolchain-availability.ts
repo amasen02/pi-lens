@@ -51,14 +51,43 @@ export interface ToolchainAvailability {
 	 * toolchain installed mid-process stayed invisible for the rest of the
 	 * process's life, the same #1496/#1535 shape `resetZizmorTokenAvailability`
 	 * exists for. Callers wire this per session, not per process.
+	 *
+	 * It also supersedes any probe already in flight (#2455 fix round 3, F2):
+	 * a sweep that started before the reset answers the previous session, so it
+	 * is neither joinable by a post-reset caller nor allowed to write its
+	 * verdict into the cleared latch when it settles.
 	 */
 	reset: () => void;
 }
 
-const toolchainProbeFlights =
-	createAvailabilityProbeFlight<
-		Awaited<ReturnType<typeof probeAvailabilityCandidates>>
-	>();
+/**
+ * Session generation for toolchain-availability resets (#2455 fix round 3, F2).
+ *
+ * `reset()` clears the memo and the latch, but a probe that was ALREADY in
+ * flight when it ran knows nothing about that. Without a generation, a
+ * post-reset caller joins the pre-reset flight and, worse, that flight's own
+ * settlement writes its stale verdict back into the freshly cleared latch — so
+ * a tool installed between sessions still read "missing" for the whole new
+ * session. That is #1674's defect read from both the sharing side and the
+ * settle side, and the reason `SingleFlightOptions.generation` exists.
+ *
+ * A module-level counter rather than a per-instance one, deliberately, for two
+ * reasons. It is the `installRetryGeneration` idiom from `availability-policy.ts`
+ * — a counter, so nothing has to be hand-maintained and no flight is retained
+ * for the sake of superseding it. And `toolchainProbeFlights` is itself shared
+ * ACROSS instances (#2131: two clients probing the same candidate list run one
+ * sweep), so its supersede signal cannot live on any one instance. The cost is
+ * that resetting one toolchain also supersedes another's in-flight sweep; that
+ * is at worst one extra probe, never a wrong verdict, and every registered
+ * reset fires in the same `session_start` block anyway.
+ */
+let toolchainResetGeneration = 0;
+
+const readToolchainResetGeneration = (): number => toolchainResetGeneration;
+
+const toolchainProbeFlights = createAvailabilityProbeFlight<
+	Awaited<ReturnType<typeof probeAvailabilityCandidates>>
+>({ generation: readToolchainResetGeneration });
 
 /**
  * Own one toolchain's availability: sweep the platform candidate list, memoize
@@ -77,19 +106,28 @@ export function createToolchainAvailability(
 	let sweepHostStallMs = 0;
 	/** What the last classified candidate returned, for the decision record. */
 	let sweepEvidence: ProbeEvidence | undefined;
-	const ensureFlight = createSingleFlight<boolean>();
+	const ensureFlight = createSingleFlight<boolean>({
+		generation: readToolchainResetGeneration,
+	});
 
 	async function findPath(): Promise<string | null> {
 		if (toolPath) return toolPath;
 
 		const paths =
 			process.platform === "win32" ? config.windowsPaths : config.unixPaths;
+		const startedGeneration = toolchainResetGeneration;
 		const shared = toolchainProbeFlights.run(
 			`toolchain:${config.tool}|${config.probeArgs.join("|")}|${config.windowsPaths.join("|")}|${config.unixPaths.join("|")}`,
 			() =>
 				probeAvailabilityCandidates(paths, config.probeArgs, config.budgetMs),
 		);
 		const sweep = await shared.promise;
+		// A reset landed while this sweep was running. Its answer describes the
+		// session that just ended, so it must not write itself back into the memo
+		// `reset()` just cleared, nor into the classification fields the
+		// replacement flight reads to build ITS verdict. Callers already holding
+		// this promise still get what the sweep actually found.
+		if (startedGeneration !== toolchainResetGeneration) return sweep.foundPath;
 		sweepSawTransient = sweep.sawTransient;
 		sweepTransientCause = sweep.transientCause;
 		sweepHostStallMs = sweep.hostStallMs;
@@ -100,9 +138,17 @@ export function createToolchainAvailability(
 
 	async function resolveAvailability(): Promise<boolean> {
 		const startedAt = Date.now();
+		const startedGeneration = toolchainResetGeneration;
 		const found = (await findPath()) !== null;
+		// #2455 fix round 3, F2: a reset during the probe opened a NEW session.
+		// This flight answers the OLD one, so writing its verdict into the
+		// freshly cleared latch would re-latch a stale "missing" for the whole
+		// new session — the bug the reset exists to prevent, reintroduced by the
+		// reset's own timing. Report the verdict to this flight's own callers;
+		// do not latch it, and say so in the decision record's `latched`.
+		const superseded = startedGeneration !== toolchainResetGeneration;
 		if (found) {
-			availabilityLatch.noteAvailable();
+			if (!superseded) availabilityLatch.noteAvailable();
 			config.log(`${config.label} found: ${toolPath}`);
 			logAvailabilityDecision({
 				tool: config.tool,
@@ -110,7 +156,7 @@ export function createToolchainAvailability(
 				outcome: "success",
 				cause: "ok",
 				elapsedMs: Date.now() - startedAt,
-				latched: true,
+				latched: !superseded,
 				hostStallMs: sweepHostStallMs,
 				budgetMs: config.budgetMs,
 				classifiedBy: "probe",
@@ -122,14 +168,16 @@ export function createToolchainAvailability(
 		// whether the toolchain is installed; it expires instead of latching.
 		const outcome = sweepSawTransient ? "transient" : "missing";
 		const cause = sweepSawTransient ? sweepTransientCause : "not-found";
-		const retryAfterMs = availabilityLatch.noteUnavailable(outcome, cause);
+		const retryAfterMs = superseded
+			? 0
+			: availabilityLatch.noteUnavailable(outcome, cause);
 		logAvailabilityDecision({
 			tool: config.tool,
 			verdict: "unavailable",
 			outcome,
 			cause,
 			elapsedMs: Date.now() - startedAt,
-			latched: outcome !== "transient",
+			latched: !superseded && outcome !== "transient",
 			hostStallMs: sweepHostStallMs,
 			...(retryAfterMs > 0 && { retryAfterMs }),
 			budgetMs: config.budgetMs,
@@ -152,6 +200,13 @@ export function createToolchainAvailability(
 	function reset(): void {
 		toolPath = null;
 		availabilityLatch.reset();
+		// Supersede every sweep and availability flight already running, in this
+		// instance and in the shared registry. No `clear()`: the generation bump
+		// is what makes a stale flight unjoinable and unable to re-latch, and
+		// `SingleFlight.release`'s identity check already stops it from evicting
+		// its successor. Clearing the SHARED registry here would additionally
+		// drop another toolchain's live claim and cost it a duplicate sweep.
+		toolchainResetGeneration += 1;
 	}
 
 	return { findPath, isAvailable, reset };
