@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { writeFileAtomic } from "./atomic-write.js";
+import { BoundedFifoMap } from "./bounded-cache.js";
 import { getProjectDataDir } from "./file-utils.js";
 import { incrementDegradationCount } from "./degradation-ledger.js";
 import { readJsonCache } from "./json-cache-read.js";
@@ -274,14 +275,16 @@ interface SnapshotParseCacheEntry {
 	size: number;
 	snapshot: ProjectSnapshot | null;
 }
-const SNAPSHOT_PARSE_CACHE_MAX = 4;
+export const SNAPSHOT_PARSE_CACHE_MAX = 4;
 // #957 review: the cache exists to avoid re-parsing NORMAL snapshots within a
 // session. A 112MB-class body parses to hundreds of MB of heap — pinning that
 // for process lifetime inverts the win, so oversized bodies are simply never
 // cached (they re-parse per read, exactly the pre-#947 behavior). Measured
 // against the UNCOMPRESSED body size, never the (much smaller) gz file size.
 const SNAPSHOT_PARSE_CACHE_MAX_BYTES = 24 * 1024 * 1024;
-const snapshotParseCache = new Map<string, SnapshotParseCacheEntry>();
+const snapshotParseCache = new BoundedFifoMap<string, SnapshotParseCacheEntry>(
+	SNAPSHOT_PARSE_CACHE_MAX,
+);
 
 function withoutWordIndex(
 	snapshot: ProjectSnapshot | null,
@@ -295,14 +298,10 @@ function cacheParsedSnapshot(
 	snapshotPath: string,
 	entry: SnapshotParseCacheEntry,
 ): void {
-	// Refresh recency (Map preserves insertion order).
+	// Refresh recency (delete then set moves the key to the newest position;
+	// BoundedFifoMap itself never reorders an already-present key on set()).
 	snapshotParseCache.delete(snapshotPath);
 	snapshotParseCache.set(snapshotPath, entry);
-	while (snapshotParseCache.size > SNAPSHOT_PARSE_CACHE_MAX) {
-		const oldest = snapshotParseCache.keys().next().value;
-		if (oldest === undefined) break;
-		snapshotParseCache.delete(oldest);
-	}
 }
 
 /**
@@ -337,7 +336,7 @@ interface AuthoritativeSnapshotEntry {
 	idleTimer?: ReturnType<typeof setTimeout>;
 }
 const authoritativeSnapshots = new Map<string, AuthoritativeSnapshotEntry>();
-const PROJECT_SNAPSHOT_MAX_WARM_ROOTS = 8;
+export const PROJECT_SNAPSHOT_MAX_WARM_ROOTS = 8;
 const PROJECT_SNAPSHOT_IDLE_EVICT_MS_DEFAULT = 20 * 60_000;
 
 function projectSnapshotIdleEvictMs(): number {
@@ -935,11 +934,14 @@ const _snapshotGenerationStates = new Map<
 	string,
 	{ generation: number; seq: number }
 >();
-const _successfulSnapshotPersists = new Map<string, SnapshotPersistRecord>();
-const _failedSnapshotPersists = new Map<
+const _successfulSnapshotPersists = new BoundedFifoMap<
+	string,
+	SnapshotPersistRecord
+>(PROJECT_SNAPSHOT_MAX_WARM_ROOTS);
+const _failedSnapshotPersists = new BoundedFifoMap<
 	string,
 	{ seq: number; generation: number }
->();
+>(PROJECT_SNAPSHOT_MAX_WARM_ROOTS);
 const _activeSnapshotPersists = new Map<string, PendingSnapshotBody>();
 const _queuedSnapshotPersists = new Map<string, PendingSnapshotBody>();
 const _snapshotWorkerRequests = new Map<number, PendingSnapshotBody>();
@@ -974,11 +976,6 @@ function rememberSuccessfulSnapshotPersist(
 ): void {
 	_successfulSnapshotPersists.delete(key);
 	_successfulSnapshotPersists.set(key, record);
-	while (_successfulSnapshotPersists.size > PROJECT_SNAPSHOT_MAX_WARM_ROOTS) {
-		const oldest = _successfulSnapshotPersists.keys().next().value;
-		if (oldest === undefined) break;
-		_successfulSnapshotPersists.delete(oldest);
-	}
 }
 
 /**
@@ -1190,11 +1187,6 @@ function recordSnapshotPersistFailure(
 		seq: pending.snapshot.seq,
 		generation: pending.generation,
 	});
-	while (_failedSnapshotPersists.size > PROJECT_SNAPSHOT_MAX_WARM_ROOTS) {
-		const oldest = _failedSnapshotPersists.keys().next().value;
-		if (oldest === undefined) break;
-		_failedSnapshotPersists.delete(oldest);
-	}
 	deleteAuthoritativeSnapshot(pending.key);
 	logLatency({
 		type: "phase",
@@ -1964,6 +1956,52 @@ export function setProjectSnapshotPromotionSeamForTests(
 
 export function getProjectSnapshotPersistErrorForTests(): string | undefined {
 	return _lastSnapshotPersistErrorForTests;
+}
+
+// ── #2442 test-only seams: exercise the three BoundedFifoMap-backed caches ──
+// through the exact same write path production uses (cacheParsedSnapshot /
+// rememberSuccessfulSnapshotPersist's delete+set refresh, and a direct write
+// mirroring recordSnapshotPersistFailure's), without the real gzip/worker
+// persistence pipeline or a full ProjectSnapshot fixture.
+
+/** Test-only: seed the parse cache exactly as `cacheParsedSnapshot` would. */
+export function _seedSnapshotParseCacheForTests(
+	key: string,
+	entry: { mtimeMs: number; size: number; snapshot: ProjectSnapshot | null },
+): void {
+	cacheParsedSnapshot(key, entry);
+}
+export function _snapshotParseCacheKeysForTests(): string[] {
+	return [...snapshotParseCache.keys()];
+}
+
+/** Test-only: seed the successful-persist cache exactly as production would. */
+export function _seedSuccessfulSnapshotPersistForTests(
+	key: string,
+	record: {
+		seq: number;
+		fingerprint: string;
+		generatedAt: string;
+		generation: number;
+	},
+): void {
+	rememberSuccessfulSnapshotPersist(key, record);
+}
+export function _successfulSnapshotPersistKeysForTests(): string[] {
+	return [..._successfulSnapshotPersists.keys()];
+}
+
+/** Test-only: seed the failed-persist cache with the same write
+ *  `recordSnapshotPersistFailure` performs, without its side effects
+ *  (deleteAuthoritativeSnapshot / logLatency) or a full PendingSnapshotBody. */
+export function _seedFailedSnapshotPersistForTests(
+	key: string,
+	record: { seq: number; generation: number },
+): void {
+	_failedSnapshotPersists.set(key, record);
+}
+export function _failedSnapshotPersistKeysForTests(): string[] {
+	return [..._failedSnapshotPersists.keys()];
 }
 
 export function buildProjectSnapshotFromRuntime(args: {

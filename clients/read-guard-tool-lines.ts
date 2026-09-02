@@ -1,6 +1,7 @@
 import type { EditToolInput } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
 import * as nodeFs from "node:fs";
+import { BoundedFifoMap } from "./bounded-cache.js";
 import {
 	hostWouldApplyOldText,
 	normalizeForGuardMatch,
@@ -50,12 +51,12 @@ export interface GuardLineResult {
 }
 
 // Track repeated oldtext_not_found failures per (filePath, preview) to escalate messages.
-const recentOldTextFailures = new Map<
+export const MAX_FAILURE_TRACKER_SIZE = 200;
+const recentOldTextFailures = new BoundedFifoMap<
 	string,
 	{ count: number; lastTs: number }
->();
+>(MAX_FAILURE_TRACKER_SIZE);
 const REPEAT_FAILURE_TTL_MS = 300_000;
-const MAX_FAILURE_TRACKER_SIZE = 200;
 
 function trackOldTextFailure(filePath: string, preview: string): number {
 	const key = `${filePath}::${preview}`;
@@ -63,12 +64,27 @@ function trackOldTextFailure(filePath: string, preview: string): number {
 	const prev = recentOldTextFailures.get(key);
 	const count =
 		prev && now - prev.lastTs < REPEAT_FAILURE_TTL_MS ? prev.count + 1 : 1;
-	if (recentOldTextFailures.size >= MAX_FAILURE_TRACKER_SIZE) {
-		const oldest = recentOldTextFailures.keys().next().value;
-		if (oldest !== undefined) recentOldTextFailures.delete(oldest);
-	}
 	recentOldTextFailures.set(key, { count, lastTs: now });
 	return count;
+}
+
+/** #2442 test-only: exercise the bounded failure tracker's capacity
+ *  eviction directly, without a full read-guard preflight call. */
+export function _trackOldTextFailureForTests(
+	filePath: string,
+	preview: string,
+): number {
+	return trackOldTextFailure(filePath, preview);
+}
+/** #2442 test-only: was this (filePath, preview) pair's escalation count
+ *  reset by capacity eviction? (A fresh `_trackOldTextFailureForTests` call
+ *  answering 1 again, after previously answering >1, means yes — but this
+ *  reads the tracker's residency directly instead.) */
+export function _hasOldTextFailureForTests(
+	filePath: string,
+	preview: string,
+): boolean {
+	return recentOldTextFailures.has(`${filePath}::${preview}`);
 }
 
 function findFirstLineOfOldText(

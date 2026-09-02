@@ -15,6 +15,7 @@
 import { logTreeSitterDiagnostic } from "./tree-sitter-logger.js";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
+import { BoundedFifoMap } from "./bounded-cache.js";
 import { normalizeFilePath } from "./path-utils.js";
 
 const TREE_RETIREMENT_GRACE_MICROTASKS = 4;
@@ -138,7 +139,7 @@ export function deriveScanTreeCacheCapacity(
 
 export class TreeCache {
 	private cache = new Map<string, CachedTree>();
-	private recentlyEvicted = new Map<string, string>();
+	private recentlyEvicted: BoundedFifoMap<string, string>;
 	private maxSize: number;
 	private evictionHistoryMax: number;
 	private debug: (msg: string) => void;
@@ -155,6 +156,9 @@ export class TreeCache {
 	) {
 		this.maxSize = maxSize;
 		this.evictionHistoryMax = Math.max(1, Math.floor(evictionHistoryMax));
+		this.recentlyEvicted = new BoundedFifoMap<string, string>(
+			this.evictionHistoryMax,
+		);
 		this.counterObserver = counterObserver;
 		this.treeErrorObserver = treeErrorObserver;
 		this.debug = debug
@@ -240,14 +244,8 @@ export class TreeCache {
 
 	private rememberEviction(key: string, cached: CachedTree): void {
 		this.recentlyEvicted.delete(key);
-		if (this.recentlyEvicted.size >= this.evictionHistoryMax) {
-			const oldestKey = this.recentlyEvicted.keys().next().value;
-			if (oldestKey !== undefined) {
-				this.recentlyEvicted.delete(oldestKey);
-				this.recordCounter("ghostHistoryDrops");
-			}
-		}
-		this.recentlyEvicted.set(key, cached.contentHash);
+		const dropped = this.recentlyEvicted.set(key, cached.contentHash);
+		if (dropped.length > 0) this.recordCounter("ghostHistoryDrops");
 	}
 
 	/**
