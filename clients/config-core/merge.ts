@@ -23,17 +23,44 @@
  * keep caller order, which is how several `nested-project` files stay ordered
  * from outermost to innermost.
  *
- * TWO BOUNDS ARE ENFORCED HERE AS WELL AS IN `normalize.ts`, and the duplication
- * is deliberate (#2440 review). `merge()` is exported, and its input type says
- * "the value AFTER `validate()`" — a sentence, not a compiler check. A caller
- * that merges a hand-built value bypasses every guarantee the validator makes,
- * so the merger enforces the prototype-key policy through the same `safeAssign`
- * and counts its own recursion against the same `MAX_CONFIG_DEPTH`. One shared
- * constant and one shared helper, two enforcement points; neither is a second
- * copy of the rule.
+ * `merge()`'S CONTRACT IS NARROWER THAN "IT ENFORCES THE TWO BOUNDS TOO", which
+ * an earlier version of this comment claimed (#2440 F3 review). It required
+ * every source's `value` to already be `validate()`'s output — a sentence on
+ * `ConfigSource`, not a compiler check — and does NOT independently re-walk a
+ * value to confirm that. Five arms hand a contributor's value back BY
+ * REFERENCE, never walked: the leaf fall-through in `mergeNode`, the
+ * no-object arm in `mergeObject`, the no-array arm in `mergeArray`, `replace`,
+ * and `appendArrays`. Any of those can be reached with an opaque schema node
+ * whose tiers disagree on shape (one contributes an array, another a deeply
+ * nested object at the same key) — `isObjectNode`/`isArrayNode` both answer
+ * "no" for a mixed-shape node, the recursion falls through to the leaf arm,
+ * and whatever depth or hostile keys live inside that value ride along
+ * unexamined and unrecorded. Closing those five arms would mean re-deriving
+ * `normalize.ts`'s walk a second time here — the "half-enforcement" this
+ * function used to attempt and get half right.
+ *
+ * The fix is the CONTRACT, not a second walk: `merge()` is exported from this
+ * file (`@internal`) for `resolveConfig` and for tests that probe it
+ * directly, but it is not part of `index.ts`'s public surface. `resolveConfig`
+ * is the one supported way in, and it validates every source before merging —
+ * a mutation test in `hostile-input.test.ts` proves that by skipping
+ * `validate()` on one source and watching the suite go red.
+ *
+ * The depth counter (`mergeNode`) and the prototype-key check (`mergeObject`,
+ * over the KEYS an already-validated object's field-wise merge is about to
+ * combine) still run. They are a backstop for the common, well-typed
+ * recursion — a value `validate()` already bounded and sanitized, or a
+ * same-shape hand-built value in a direct `merge()` test — not an
+ * independent enforcement boundary; the paragraph above is what they do NOT
+ * cover. The key check also still matters for one real case even after
+ * `validate()`: a hostile key one tier introduces at a node the OTHER tier
+ * also contributes to is a key `mergeObject` discovers only when it unions
+ * that node's field names across contributions, so it is the one place that
+ * can still name and record it, even though `safeAssign` alone would already
+ * have refused the write.
  *
  * Pure: no state, no I/O, no ledger writes. Records, when the caller supplies a
- * collector, describe what the two bounds refused.
+ * collector, describe what the two backstops refused.
  */
 
 import {
@@ -122,6 +149,11 @@ interface MergeContext {
  *
  * Sources whose value is `undefined` contribute nothing — that is how a config
  * file that failed validation drops out without a special case.
+ *
+ * @internal Requires every source's `value` to already be `validate()`'s
+ * output. Not part of `clients/config-core/index.ts`'s public surface —
+ * `resolveConfig` is. See this module's doc comment for what merging a
+ * hand-built value can still get past.
  */
 export function merge<T = unknown>(
 	sources: readonly ConfigSource[],

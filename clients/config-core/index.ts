@@ -88,7 +88,15 @@ export {
 	validate,
 } from "./normalize.js";
 
-export { type ConfigSource, merge, type MergeOptions } from "./merge.js";
+// `merge()` itself is NOT re-exported. Its input type only PROMISES a
+// post-`validate()` value; nothing in the language enforces that a caller
+// who imports it directly honors the promise, and `merge()`'s own bounds are
+// a narrow backstop, not a second validator (see `merge.ts`'s module doc).
+// `resolveConfig` below is the one supported way in: it always validates
+// every source before merging. `merge()` stays exported from `merge.ts`
+// itself — marked `@internal` there — for this module's own use and for
+// tests that probe it directly.
+export { type ConfigSource, type MergeOptions } from "./merge.js";
 
 export {
 	boundedKeyLabel,

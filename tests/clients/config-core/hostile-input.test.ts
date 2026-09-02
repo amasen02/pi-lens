@@ -1,8 +1,8 @@
 /**
  * The config core against input that is trying to break it (#2425, #2440
- * review findings F1 and F2).
+ * review findings F1, F2 from round 2, and F8, F9 from round 3).
  *
- * Both findings had ONE cause: `normalize.ts` had two arms that handed a user
+ * F1 and F2 had ONE cause: `normalize.ts` had two arms that handed a user
  * subtree to the domain type with `as ConfigValue` instead of walking it. A
  * subtree that never gets walked never meets the prototype-key policy, is never
  * counted against the depth bound, and never produces a record — so the same
@@ -13,6 +13,21 @@
  * un-walked — an opaque schema node, an `additionalProperties: true` node, and
  * an unrecognized `type` keyword — rather than through the paths that always
  * worked.
+ *
+ * F8 (round 3) found that `merge.ts` still overclaimed: five of its own arms
+ * return a contributor's value by reference, unwalked, so the module doc's
+ * "merge() enforces the two bounds too" was false for a mixed-shape,
+ * opaque-schema node. The fix is the CONTRACT, not a second walk: `merge()`
+ * is no longer exported from `index.ts`, and `resolveConfig` — the one
+ * supported way in — validates every source before merging. The suite below
+ * proves that guarantee directly, using the same mixed-shape gap F8 named, and
+ * is sensitive to a mutant that skips validation on any one source.
+ *
+ * F9 (round 3) found the existing "hostile key introduced by a SECOND tier"
+ * test below passed with `merge.ts`'s own `isUnsafeConfigKey` check neutered,
+ * because it asserted only the sanitized value, which `safeAssign` backstops
+ * regardless of whether that check ran. It is extended to assert the record
+ * that only the check itself produces.
  */
 
 import { describe, expect, it } from "vitest";
@@ -24,6 +39,7 @@ import { resolveConfig } from "../../../clients/config-core/index.js";
 import { merge } from "../../../clients/config-core/merge.js";
 import { validate } from "../../../clients/config-core/normalize.js";
 import { provenanceFor } from "../../../clients/config-core/provenance.js";
+import { MigrationRecordCollector } from "../../../clients/config-core/records.js";
 import {
 	MAX_CONFIG_DEPTH,
 	UNSAFE_CONFIG_KEYS,
@@ -154,10 +170,18 @@ describe("no config input can reach an object's prototype (#2440 F1)", () => {
 		}
 	});
 
-	it("refuses a hostile key introduced by a SECOND tier during the merge", () => {
+	it("refuses a hostile key introduced by a SECOND tier during the merge, and RECORDS it (#2440 F9)", () => {
 		// merge.ts had the same `out[name] = …` defect independently of the
 		// validator, so it is probed through `merge()` directly — the exported
 		// entry point whose input type is a promise rather than a check.
+		//
+		// The VALUE alone does not prove `mergeObject`'s own `isUnsafeConfigKey`
+		// check ran: `safeAssign` backstops the write either way, so a neutered
+		// check still leaves the value clean while dropping the explanation
+		// (#2440 F9 — this test passed 170/170 with merge.ts:310 commented out
+		// before this assertion was added). A collector is passed explicitly
+		// because `merge()` without one builds and discards its own.
+		const collector = new MigrationRecordCollector();
 		const resolved = merge(
 			[
 				{ tier: "global", value: { diagnostics: { a: 1 } } },
@@ -169,10 +193,59 @@ describe("no config input can reach an object's prototype (#2440 F1)", () => {
 				},
 			],
 			OPAQUE_SCHEMA,
+			{ collector },
 		);
 		const value = resolved.value as { diagnostics: Record<string, unknown> };
 		expect(JSON.stringify(value)).toBe('{"diagnostics":{"a":1}}');
 		expect(value.diagnostics.injected).toBeUndefined();
+		const refusal = collector.records.find(
+			(entry) =>
+				entry.code === "PILENS_CFG_0006" &&
+				entry.key === "/diagnostics/__proto__",
+		);
+		expect(refusal).toBeDefined();
+		expect([...resolved.provenance.keys()]).not.toContain(
+			"/diagnostics/__proto__/injected",
+		);
+	});
+
+	it("resolveConfig validates every source before merging, even through merge.ts's own leaky arms (#2440 F8)", () => {
+		// The gap F8 named: a MIXED-SHAPE node at an opaque schema. `global`
+		// contributes an array, `project` a hostile object at the same key.
+		// `isObjectNode`/`isArrayNode` both answer "no" for a mixed shape, so
+		// `mergeNode` falls through to the leaf arm and returns the winning
+		// contribution BY REFERENCE — `mergeObject`'s own `isUnsafeConfigKey`
+		// check never runs for it, because that node is never treated as an
+		// object at all. The only thing keeping the reference clean is
+		// `validate()` having already walked `project`'s source in isolation
+		// before `merge()` ever saw it.
+		//
+		// Mutation-prove: change `index.ts`'s `resolveConfig` to skip `validate`
+		// on the second source (e.g. `options.sources.map((source, i) => i === 1
+		// ? { ...source, value: source.value } : ...validate...)`) and this goes
+		// red — the raw `__proto__` own-property rides through unwalked.
+		const resolution = resolveConfig({
+			schema: OPAQUE_SCHEMA,
+			sources: [
+				{ tier: "global", file: "g.json", value: { diagnostics: [] } },
+				{
+					tier: "project",
+					file: "p.json",
+					value: {
+						diagnostics: parsed(
+							'{"__proto__":{"injected":"pwned"},"kept":1}',
+						),
+					},
+				},
+			],
+		});
+		const value = resolution.resolved.value as {
+			diagnostics: Record<string, unknown>;
+		};
+		expect(
+			Object.prototype.hasOwnProperty.call(value.diagnostics, "__proto__"),
+		).toBe(false);
+		expect(JSON.stringify(value)).toBe('{"diagnostics":{"kept":1}}');
 	});
 });
 
