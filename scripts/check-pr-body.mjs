@@ -449,10 +449,10 @@ export async function resolveTouchesTests(
 			throw new Error("GitHub API returned no file list");
 		return files.some(
 			(file) =>
-				/^tests\//.test(file.filename ?? "") ||
+				(file.filename ?? "").startsWith("tests/") ||
 				// A rename OUT of tests/ reports only the new path in filename; a
 				// removal PR is exactly what the assessment exists to catch.
-				/^tests\//.test(file.previous_filename ?? ""),
+				(file.previous_filename ?? "").startsWith("tests/"),
 		);
 	} catch (error) {
 		console.warn(
