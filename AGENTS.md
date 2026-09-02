@@ -3276,10 +3276,23 @@ without a method filter). A class that structurally qualifies but is proven
 NOT to hold session state gets a documented `CONTAINER_CLASS_EXCLUSIONS`
 entry rather than a special case at the call site — empty today; both a stale
 entry (names a class the live scan no longer finds) and a reason-less entry
-red via `auditContainerClassExclusions()`. Known boundary the predicate still
-cannot see (`SWEEP_HEURISTIC_LIMITS`): a `new` bound to a constructor
+red via `auditContainerClassExclusions()`. Known boundaries the predicate
+still cannot see (`SWEEP_HEURISTIC_LIMITS`): a `new` bound to a constructor
 IMPORTED from outside `clients/` (a node_modules class), or built via a
 factory function instead of a bare `new Ctor(...)` call.
+
+**The container predicate is not the gate that decides what the sweep looks
+at.** `scanSessionStateCandidates` skips a file outright when it exports no
+reset (`if (resets.length === 0) continue`), so widening the predicate can
+only ever surface state in files that ALREADY have a reset seam. A file
+holding session state with no reset at all stays invisible however wide the
+predicate gets — MISS 3, "state with no reset seam at all", and neither #2455
+round touched it. `go-vet.ts` and `rust-clippy.ts` are the worked example:
+their `GoClient`/`RustClient` latches were found by HAND while auditing what
+the widening should have covered, and the files only entered the sweep once
+#2455 added `resetGoAvailability`/`resetRustAvailability`. Read a widened
+predicate as "the registry now describes more of what it already watches",
+never as "the sweep now finds unreset state".
 
 ## Issue triage & labels
 

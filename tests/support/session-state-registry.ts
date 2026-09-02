@@ -977,11 +977,22 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 		},
 	},
 	// ── #2455 fix round 2: GoClient/RustClient's own availability latches ──────
-	// The session-state detector widened from "owns clear()/delete()" to "any
-	// class declared in clients/" (#2455), which made `goClient`/`rustClient` —
-	// module-scope singletons wrapping a `createAvailabilityLatch()` each —
-	// visible to the sweep for the first time. Reading them showed they are NOT
-	// stateless: a probe-class "missing" verdict never expires
+	// Found by hand while auditing what the widened predicate SHOULD have
+	// covered, not by the widened predicate itself. #2455 fix round 3, F4
+	// corrects the causal claim an earlier draft of this comment made: the
+	// sweep skips any file that exports no reset at all (`session-state-scan.ts`:
+	// `if (resets.length === 0) continue`), and on master neither
+	// `go-vet.ts` nor `rust-clippy.ts` exported one — so however wide the
+	// container predicate got, these two files could never yield a candidate.
+	// They became visible to the sweep only because THIS fix round added
+	// `resetGoAvailability`/`resetRustAvailability`, i.e. the reset came first
+	// and the visibility followed. The pair-with-reset gate is MISS 3 in
+	// `SWEEP_HEURISTIC_LIMITS` ("state with no reset seam at all") and this
+	// round does not narrow it.
+	//
+	// What the audit found stands on its own: `goClient`/`rustClient` are
+	// module-scope singletons wrapping a `createAvailabilityLatch()` each, and
+	// they are NOT stateless. A probe-class "missing" verdict never expires
 	// (`isLatchingOutcome`), so a go/cargo install between sessions stayed
 	// unobserved for the rest of the process's life, the same #1496 shape
 	// `package-manager.ts` and the same #1535 shape `zizmor-config.ts`'s
@@ -1260,9 +1271,9 @@ export const EXEMPT_SESSION_STATE_FILES: Readonly<Record<string, string>> = {
 	"word-index.ts":
 		"word-index build guard, per build; asyncWordIndexOperations queue is keyed by WordIndex and self-deletes in finally, so it needs no reset",
 	"mcp/analyze.ts":
-		"warm word-index cache keyed by path with its own freshness check. #2455 fix round 2: the widened detector (any class declared in clients/, not just clear()/delete()-owning ones) also now flags `warmGraphFacts`, a module-scope FactStore. This registry only governs pi's own handleSessionStart reset chain, which the MCP analyze facade never runs — there is no pi session_start event to wire a reset into. `warmGraphFacts` is deliberately reused across calls by design (#536: buildOrUpdateGraph's incremental/cached tiers key off a stable instance, so a fresh store per call would defeat that reuse), and its entity-snapshot diff self-heals on eviction (wasBoundedSessionFactEvicted). It is NOT risk-free: the entity-snapshot key has no cwd component, so a warm process serving two projects that share a relative path could cross-contaminate a diff — filed as #2477, out of scope for the detector fix itself.",
+		"warm word-index cache keyed by path with its own freshness check. #2455 fix round 2: the widened detector (any class declared in clients/, not just clear()/delete()-owning ones) also now flags `warmGraphFacts`, a module-scope FactStore. #2455 fix round 3, F3: an earlier draft of this exemption claimed the MCP server has no pi session_start boundary to hook into. That is false — `clients/mcp/session.ts`'s runSessionStart calls handleSessionStart, and `mcp/server.ts` runs it both at boot (:252) and from the `pilens_session_start` tool (:1631) — so the exemption rests only on its real merits. `warmGraphFacts` is deliberately reused across calls by design (#536: buildOrUpdateGraph's incremental/cached tiers key off a stable instance, so a fresh store per call would defeat that reuse), and its entity-snapshot diff self-heals on eviction (wasBoundedSessionFactEvicted). It is NOT risk-free: the entity-snapshot key has no cwd component, so a warm process serving two projects that share a relative path could cross-contaminate a diff — filed as #2477, out of scope for the detector fix itself.",
 	"mcp/session.ts":
-		"MCP turn-end delivery chain, drained per turn; its session context is replaced, not accumulated. #2455 fix round 2: the widened detector also now flags `turnEndQueue`, a non-exported TurnEndQueue instance — the serial queue this same delivery chain drains through. It already has a reset seam (`_resetTurnEndChain`, exported above), and the same reasoning applies: at most one item is ever pending (a second enqueue is rejected busy), each carries its own 5s unref'd timeout, and MCP has no pi session_start boundary for this file to hook into anyway.",
+		"MCP turn-end delivery chain, drained per turn; its session context is replaced, not accumulated. #2455 fix round 2: the widened detector also now flags `turnEndQueue`, a non-exported TurnEndQueue instance — the serial queue this same delivery chain drains through. It already has a reset seam (`_resetTurnEndChain`, exported above), and the same reasoning applies: at most one item is ever pending (a second enqueue is rejected busy), and each carries its own 5s unref'd timeout, so nothing accumulates across a boundary. (#2455 fix round 3, F3: an earlier draft added the clause 'and MCP has no pi session_start boundary for this file to hook into anyway'. Struck — it is false. runSessionStart in this very file calls handleSessionStart, and `mcp/server.ts` runs it at boot (:252) and from the `pilens_session_start` tool (:1631).)",
 	"project-report.ts": "project-report build guard, per build",
 	"project-snapshot.ts":
 		"snapshot parse caches and the bounded per-root persist coordinator are process-lifetime state keyed by content/generation; a session reset must not abandon an in-flight durable publication",
