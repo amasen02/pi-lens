@@ -3808,7 +3808,6 @@ const AST_GREP_KINDS = [
 	"rust",
 	"scala",
 	"shell",
-	"solidity",
 	"swift",
 	"yaml",
 ] as const;

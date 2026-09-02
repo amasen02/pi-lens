@@ -61,7 +61,9 @@ function handle(line) {
 	if (m.type === "response" && m.command === "get_commands") {
 		const cmds = (m.data && m.data.commands) || [];
 		const lens = cmds.filter(
-			(c) => /^lens-/.test(c.name) || String(c.path || "").includes("pi-lens"),
+			(c) =>
+				String(c.name || "").startsWith("lens-") ||
+				String(c.path || "").includes("pi-lens"),
 		);
 		console.log(
 			`total commands: ${cmds.length}; pi-lens commands: ${lens.map((c) => c.name).join(", ") || "(none)"}`,
