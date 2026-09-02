@@ -74,7 +74,9 @@ instructions say so.
    grep missed). Do NOT hand-pick them from memory — #2470 round 3 shipped
    with Unit tests red because its "governance set" of eleven files omitted
    `generation-guard-sweep`. Select them mechanically, every time:
-   `ls tests/clients/*-{sweep,ratchet,conformance,coverage,gate,governance}*.test.ts`
+   `ls tests/clients/*{sweep,ratchet,conformance,coverage,gate,governance,silence,hermeticity,invariant,contract}*.test.ts`
+   (#2511 round 2 shipped CI red because `extension-terminal-silence` and the
+   hermeticity suites matched none of the old six words)
    plus EVERY `tests/config/*.test.ts` (those walk `scripts/` and `tests/`
    too; #2438 shipped red because a scripts-only PR read the clients/-walking
    list as not applying). Quote the file count you ran in the PR body. The full suite is CI's

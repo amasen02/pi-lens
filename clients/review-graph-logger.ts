@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
 import { getGlobalPiLensDir } from "./file-utils.js";
+import { getMaxLogSizeMB } from "./log-cleanup.js";
 import { createNdjsonLogger } from "./ndjson-logger.js";
 import { normalizeFilePath } from "./path-utils.js";
 import type {
@@ -14,7 +15,12 @@ const REVIEW_GRAPH_LOG_FILE = path.join(
 	"review-graph.log",
 );
 
-const writer = createNdjsonLogger({ filePath: REVIEW_GRAPH_LOG_FILE });
+// Bounded like every other global sink (#2505) — see sessionstart-logger.
+const writer = createNdjsonLogger({
+	filePath: REVIEW_GRAPH_LOG_FILE,
+	maxBytes: getMaxLogSizeMB() * 1024 * 1024,
+	backupPath: `${REVIEW_GRAPH_LOG_FILE}.1`,
+});
 
 export type ReviewGraphBuildMode =
 	| "full"
