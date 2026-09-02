@@ -9,11 +9,19 @@
  * (#1671/#1693) and now live here so `clients/formatters.ts`'s rustfmt
  * `--edition` resolution (#2466) reuses the exact same parser instead of a
  * second hand-rolled one. `clients/lsp/server.ts` re-imports them from here.
+ *
+ * NOT yet the only Cargo.toml reader in the tree: `clients/review-graph/
+ * workspace-modules.ts`'s `scanCargoModules`/`detectWorkspaceType` still
+ * carry an independent regex TOML reader (`extractTomlArray`/
+ * `extractTomlSection`/`extractTomlString`) for module-graph construction —
+ * a third copy, not folded onto this module in #2466 (see the follow-up
+ * issue referenced from AGENTS.md's Cargo.toml entry).
  */
 
 import { readFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { logExtension } from "./extension-log.js";
 import { findNearestMarkerRoot, isAtOrAboveHomeDir } from "./path-utils.js";
 
 export async function readTextFileOrUndefined(
@@ -96,7 +104,51 @@ export function isTomlKeyWorkspaceInherited(
 	return dotted.test(content) || inline.test(content);
 }
 
-const FOUR_DIGIT_EDITION = /^\d{4}$/;
+/**
+ * rustfmt's `--edition` is a closed enum — 2015/2018/2021/2024 as of rustfmt
+ * itself, NOT any four-digit string. A manifest typo (`edition = "2019"`) or
+ * an edition newer than the installed rustfmt understands would otherwise be
+ * passed straight through `--edition`, and rustfmt rejects an edition it
+ * doesn't recognize outright — turning EVERY `.rs` format into a hard
+ * `outcome: "failed"` where the pre-#2466 bare command formatted fine (#2466
+ * review round 2, F2). When Rust stabilizes a new edition, append it to this
+ * set — rustfmt's own enum is the forcing function for this list, not a
+ * pattern match on digit count.
+ */
+const SUPPORTED_RUSTFMT_EDITIONS = new Set(["2015", "2018", "2021", "2024"]);
+
+/**
+ * Validate a manifest-read edition value against rustfmt's actual enum
+ * before letting a caller pass it through `--edition`. A defined-but-invalid
+ * value (as opposed to "no edition found at all") is a config anomaly worth
+ * a debug trail, not a silent swap to `undefined` — logs the rejected value
+ * so a future report of "rustfmt still not carrying edition X" has the exact
+ * string that got refused.
+ */
+function validatedEdition(
+	value: string | undefined,
+	filePath: string,
+): string | undefined {
+	if (value === undefined) return undefined;
+	if (SUPPORTED_RUSTFMT_EDITIONS.has(value)) return value;
+	logExtension({
+		subsystem: "format",
+		message:
+			"resolveCargoPackageEdition: manifest edition is not a rustfmt-supported value; falling back to the static rustfmt command",
+		level: "debug",
+		metadata: { rejectedEdition: value, filePath },
+	});
+	return undefined;
+}
+
+/** Read `[workspace.package] edition` out of a manifest that declares it. */
+function readWorkspacePackageEdition(content: string): string | undefined {
+	const workspaceSection = extractTomlTableSection(
+		content,
+		"workspace.package",
+	);
+	return parseTomlScalarString(workspaceSection, "edition");
+}
 
 /**
  * Resolve the four-digit `edition` for the Cargo package that owns
@@ -109,17 +161,37 @@ const FOUR_DIGIT_EDITION = /^\d{4}$/;
  *   AGENTS.md walk-confinement; never a private walk-up loop).
  * - Reads `[package] edition` directly when present.
  * - When the package declares `edition.workspace = true` (or the inline-table
- *   equivalent), continues climbing ancestors — same home-ceiling guard — for
- *   the nearest `[workspace.package] edition`.
+ *   equivalent):
+ *   - First checks whether the package's OWN manifest also declares
+ *     `[workspace]` — a root crate can be its own workspace root (`[package]`
+ *     + `[workspace]` + `[workspace.package]` all in one file, a documented,
+ *     common Cargo shape) — before climbing past it (#2466 review round 2,
+ *     F1).
+ *   - Otherwise climbs ancestors — same home-ceiling guard — for the nearest
+ *     one that DECLARES `[workspace]` (Cargo's own workspace-root rule, not
+ *     merely the nearest ancestor Cargo.toml: an intermediate manifest for an
+ *     unrelated plain package is skipped, not treated as the answer — #2466
+ *     review round 2, F1), then reads that root's `[workspace.package]
+ *     edition`.
+ * - Every edition value (direct or inherited) is checked against rustfmt's
+ *   actual enum (`SUPPORTED_RUSTFMT_EDITIONS`), not just "looks like four
+ *   digits" (#2466 review round 2, F2).
  * - Returns `undefined` on any miss (unreadable manifest, no `[package]`
- *   table, non-four-digit value, unresolved inheritance): callers fall back
- *   to their pre-existing default argv rather than guessing.
+ *   table, unsupported/invalid value, unresolved inheritance): callers fall
+ *   back to their pre-existing default argv rather than guessing.
+ *
+ * `homeDir` defaults to `os.homedir()` and exists as a parameter so tests can
+ * inject a nearer ceiling and prove the guard actually stops a climb (#2466
+ * review round 2, F5) — production callers never pass it.
  */
 export async function resolveCargoPackageEdition(
 	filePath: string,
+	homeDir: string = os.homedir(),
 ): Promise<string | undefined> {
 	const startDir = path.dirname(path.resolve(filePath));
-	const packageDir = findNearestMarkerRoot(startDir, ["Cargo.toml"]);
+	const packageDir = findNearestMarkerRoot(startDir, ["Cargo.toml"], {
+		homeDir,
+	});
 	if (!packageDir) return undefined;
 
 	const packageContent = await readTextFileOrUndefined(
@@ -129,28 +201,38 @@ export async function resolveCargoPackageEdition(
 
 	const packageSection = extractTomlTableSection(packageContent, "package");
 	const direct = parseTomlScalarString(packageSection, "edition");
-	if (direct !== undefined) {
-		return FOUR_DIGIT_EDITION.test(direct) ? direct : undefined;
-	}
+	if (direct !== undefined) return validatedEdition(direct, filePath);
 
 	if (!isTomlKeyWorkspaceInherited(packageSection, "edition")) return undefined;
 
-	const homeDir = os.homedir();
+	// The package's own manifest may ALSO be the workspace root — check it
+	// before climbing so this common shape doesn't fall through to searching
+	// ancestors for a `[workspace.package]` that's actually right here.
+	if (extractTomlTableSection(packageContent, "workspace") !== "") {
+		return validatedEdition(
+			readWorkspacePackageEdition(packageContent),
+			filePath,
+		);
+	}
+
 	let current = path.dirname(packageDir);
 	for (let depth = 0; depth < 64; depth++) {
 		if (isAtOrAboveHomeDir(current, homeDir)) return undefined;
 		const ancestorContent = await readTextFileOrUndefined(
 			path.join(current, "Cargo.toml"),
 		);
-		if (ancestorContent !== undefined) {
-			const workspaceSection = extractTomlTableSection(
-				ancestorContent,
-				"workspace.package",
+		// Cargo's own rule: the workspace root is the nearest ancestor
+		// Cargo.toml that DECLARES `[workspace]`. An intermediate manifest for
+		// an unrelated package (no `[workspace]` table) is not it — keep
+		// climbing past it instead of stopping here.
+		if (
+			ancestorContent !== undefined &&
+			extractTomlTableSection(ancestorContent, "workspace") !== ""
+		) {
+			return validatedEdition(
+				readWorkspacePackageEdition(ancestorContent),
+				filePath,
 			);
-			const inherited = parseTomlScalarString(workspaceSection, "edition");
-			return inherited !== undefined && FOUR_DIGIT_EDITION.test(inherited)
-				? inherited
-				: undefined;
 		}
 		const parent = path.dirname(current);
 		if (parent === current) return undefined;
