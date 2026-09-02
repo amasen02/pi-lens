@@ -57,8 +57,10 @@
  * patterns apply to files inside that package, in addition to (and with
  * higher precedence than) the root config's `ignore` patterns.
  */
-import { logExtension } from "./extension-log.js";
-import { notifyUserDegradation } from "./user-notify.js";
+import {
+	resetIgnoredConfigWarnCache,
+	warnIgnoredConfigOnce,
+} from "./config-warn.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -76,7 +78,12 @@ import {
 import { isAtOrAboveHomeDir, walkUpDirs } from "./path-utils.js";
 import { findPiLensConfigMarkerInDir } from "./workspace-topology.js";
 
-const PROJECT_CONFIG_BASENAMES = [".pi-lens.json", "pi-lens.json"];
+/**
+ * Project config basenames, in precedence order. Exported so the
+ * deprecation-window registry test (#2418) checks deprecated FILE rows against
+ * the basenames actually read rather than a hand-copied second list.
+ */
+export const PROJECT_CONFIG_BASENAMES = [".pi-lens.json", "pi-lens.json"];
 
 /**
  * The project loader's OWN recognized top-level keys — pi-lens-native sections,
@@ -207,7 +214,6 @@ interface DiscoveryCacheEntry {
 /** Cache by absolute config path; we read each candidate's mtime before reuse. */
 const configCache = new Map<string, CacheEntry>();
 const discoveryCache = new Map<string, DiscoveryCacheEntry>();
-const warnedInvalidConfigs = new Set<string>();
 
 /**
  * Walk up from `startDir` looking for a `.pi-lens.json` or `pi-lens.json`.
@@ -242,7 +248,7 @@ export function loadPiLensProjectConfig(
 export function resetProjectLensConfigCache(): void {
 	configCache.clear();
 	discoveryCache.clear();
-	warnedInvalidConfigs.clear();
+	resetIgnoredConfigWarnCache("project-lens-config");
 }
 
 export interface PiLensProjectConfigFileInfo {
@@ -397,18 +403,13 @@ function discoverPiLensProjectConfig(startDir: string): DiscoveryCacheEntry {
 }
 
 function warnInvalidConfigOnce(configPath: string, reason: string): void {
-	const key = `${configPath}:${reason}`;
-	if (warnedInvalidConfigs.has(key)) return;
-	warnedInvalidConfigs.add(key);
-	const message = `ignoring invalid project config ${configPath}: ${reason}`;
-	logExtension({
+	// Shared seam since #2418: latch, extension.log line, durable
+	// `config-ignored` ledger row, and stable-coded notification in one place.
+	warnIgnoredConfigOnce({
 		subsystem: "project-lens-config",
-		level: "warn",
-		message,
-		metadata: { configPath, reason },
+		file: configPath,
+		reason,
 	});
-	// HUMAN-audience too: the user's own `.pi-lens.json` is being ignored.
-	notifyUserDegradation(`pi-lens: ${message}`);
 }
 
 function parseRulePolicyList(

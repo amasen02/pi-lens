@@ -29,11 +29,20 @@ function tmpDir(prefix: string): string {
 	return dir;
 }
 
-afterEach(() => {
+afterEach(async () => {
 	vi.restoreAllMocks();
 	for (const dir of dirs.splice(0)) removeTempDirSync(dir);
 	if (defaultGlobalDir === undefined) delete process.env.PI_LENS_HOME;
 	else process.env.PI_LENS_HOME = defaultGlobalDir;
+	// #2418 review round 3, S3. The ignored-config warn latch is
+	// process-lifetime and shared by all three loaders, so without an explicit
+	// clear these cases only stayed independent because every fixture happened
+	// to land in a fresh mkdtemp path — a property of the fixture, not of the
+	// test. The loader now exports the same reset seam lens-config and
+	// project-lens-config do.
+	const { resetLSPConfigWarnCache } =
+		await import("../../../clients/lsp/config.js");
+	resetLSPConfigWarnCache();
 });
 
 describe("loadLSPConfig global configuration (#870)", () => {
@@ -141,6 +150,29 @@ describe("loadLSPConfig global configuration (#870)", () => {
 		expect(error).toHaveBeenCalledWith(
 			expect.stringContaining("ignoring invalid LSP config"),
 		);
+	});
+
+	it("warns once per broken file, and again after the latch is reset", async () => {
+		// The seam S3 asks for, exercised rather than merely exported: the same
+		// path read twice nags once, and a caller that explicitly re-arms the
+		// latch (a new session's test, or this file's own afterEach) sees it
+		// again. Nothing here relies on the fixture path being unique.
+		const projectDir = tmpDir("pi-lens-lsp-project-");
+		const globalDir = tmpDir("pi-lens-lsp-global-");
+		process.env.PI_LENS_HOME = globalDir;
+		fs.writeFileSync(path.join(globalDir, "lsp.json"), "{ invalid");
+		const error = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		const { loadLSPConfig, resetLSPConfigWarnCache } =
+			await import("../../../clients/lsp/config.js");
+		resetLSPConfigWarnCache();
+		await loadLSPConfig(projectDir);
+		await loadLSPConfig(projectDir);
+		expect(error).toHaveBeenCalledTimes(1);
+
+		resetLSPConfigWarnCache();
+		await loadLSPConfig(projectDir);
+		expect(error).toHaveBeenCalledTimes(2);
 	});
 
 	it("treats a missing global file as a silent no-op", async () => {

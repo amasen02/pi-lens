@@ -85,6 +85,16 @@ describe("dependency boundary governance", () => {
 	it("pins the reviewed static-cycle baseline size", () => {
 		// Limitation: this count pin does not detect a baseline shrink. A removed
 		// entry is invisible when the remaining entries still satisfy the count.
+		//
+		// #2418: 30 -> 31. The three config loaders now warn through the shared
+		// `clients/config-warn.ts` seam, so three entries were RESHAPED (the same
+		// pre-existing extension-log -> file-utils -> lens-config cycle, with
+		// config-warn on the path instead of each loader directly) and one is
+		// net-new: config-warn -> degradation-ledger, the warn seam recording its
+		// own ignored-config telemetry. The ledger sits upstream of the config
+		// chain, so that edge closes a baseline-class cycle rather than
+		// introducing new coupling — the same reasoning entry 30 was accepted
+		// under (#2173). Reduction stays tracked in #2125.
 		const baseline = parseJson5(
 			readFileSync(
 				resolve(repoRoot, ".dependency-cruiser-known-violations.json"),
@@ -92,6 +102,6 @@ describe("dependency boundary governance", () => {
 			),
 		) as unknown[];
 
-		expect(baseline).toHaveLength(30);
+		expect(baseline).toHaveLength(31);
 	}, 30_000);
 });
