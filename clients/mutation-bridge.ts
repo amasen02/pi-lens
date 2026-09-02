@@ -167,6 +167,15 @@ export function isValidMutationEntry(
 	if (e["consumer"] !== undefined && typeof e["consumer"] !== "string")
 		return false;
 
+	if (
+		e["importsChanged"] !== undefined &&
+		typeof e["importsChanged"] !== "boolean"
+	)
+		return false;
+
+	if (e["deferAutofix"] !== undefined && typeof e["deferAutofix"] !== "boolean")
+		return false;
+
 	// #2430: only the observational net's two values are accepted. An unknown
 	// string is rejected rather than silently downgraded, so a producer that
 	// invents a provenance learns about it instead of publishing a wrong one.
@@ -236,14 +245,18 @@ export function recordMutationThroughSeam(
 		runtime.readGuard?.recordWritten?.(filePath);
 
 		// 2. Turn state: this is the insert that leaves `turn-state.json` `files`
-		//    non-empty for a mutation no `tool_result` described.
+		//    non-empty for a mutation no `tool_result` described. `importsChanged`
+		//    defaults to `false` (the historical, pre-#2450 behavior every
+		//    existing producer that doesn't compute it still gets); a producer
+		//    that DOES know the real value threads it through the entry instead
+		//    of this seam silently understating it (#2450 review round 2, F1).
 		const changedRange = resolveChangedRange(classification, deps, filePath);
 		deps
 			.getCacheManager()
 			.addModifiedRange?.(
 				filePath,
 				changedRange,
-				false,
+				entry.importsChanged ?? false,
 				projectRoot,
 				runtime.telemetrySessionId,
 			);
@@ -264,19 +277,36 @@ export function recordMutationThroughSeam(
 		// sweep re-baselines it instead of reporting the same bytes as drift no
 		// tool call explains. Every in-process producer passes through here, so
 		// this is the one place that has to say so.
+		//
+		// It sits OUTSIDE the `deferAutofix` guard below and must stay there
+		// (#2465). "pi-lens accounted for this write" and "pi-lens will also
+		// format this file later" are different questions: the LSP
+		// mutation-bridge fallback passes `deferAutofix: false` precisely
+		// because an LSP-applied edit is not this seam's to format, and it is
+		// still a write pi-lens recorded. Move this inside the guard and every
+		// such write is re-read by the settled sweep as unattributed drift.
 		noteMutationHandled(filePath);
 
 		// 4. Deferred autofix and format at `agent_settled` — never immediate.
-		for (const kind of ["autofix", "format"] as const) {
-			runtime.deferMutation?.(
-				filePath,
-				dispatchCwd,
-				classification.toolName,
-				projectRoot,
-				kind,
-				runtime.telemetrySessionId,
-				projectRoot,
-			);
+		//    Skippable per entry (`deferAutofix: false`, #2450 review round 2 F3):
+		//    the LSP mutation-bridge fallback (`clients/lsp-mutation.ts`) sets
+		//    this because `bookkeepLspMutation`'s direct path never enqueues a
+		//    deferred pass for an LSP-applied edit — the two branches must stay
+		//    behaviorally equivalent for the same write. Every other producer
+		//    (ast_grep_replace, a third-party extension) omits the field and
+		//    keeps deferring, unchanged.
+		if (entry.deferAutofix !== false) {
+			for (const kind of ["autofix", "format"] as const) {
+				runtime.deferMutation?.(
+					filePath,
+					dispatchCwd,
+					classification.toolName,
+					projectRoot,
+					kind,
+					runtime.telemetrySessionId,
+					projectRoot,
+				);
+			}
 		}
 	} catch (err) {
 		// Bookkeeping must never break a producer's own write path.
