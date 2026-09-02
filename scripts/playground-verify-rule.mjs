@@ -353,6 +353,7 @@ export function buildScrapeExpr(sentinelB64, maxLine) {
 	// never match the rendered page for any line containing a space, which
 	// looked exactly like the schema-drift condition this check exists to
 	// catch. Normalize nbsp to a regular space on the page side before
+	// oxlint-disable-next-line no-irregular-whitespace -- the U+00A0 nbsp below is the literal character this comment documents, not accidental paste.
 	// comparing. (`" "` here is resolved to the real character by this
 	// file's own parser, not sent over argv as a `\`-escape, so it survives
 	// Windows argv's backslash-stripping same as the rest of this

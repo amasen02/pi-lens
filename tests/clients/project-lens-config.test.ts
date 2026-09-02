@@ -166,6 +166,24 @@ describe("loadPiLensProjectConfig", () => {
 		);
 	});
 
+	it("does not leak a token from a malformed config into the warning (#2431)", () => {
+		// The literal shape from #2431's evidence: Node's own JSON.parse
+		// SyntaxError embeds a slice of the source text, so an unquoted value
+		// next to a real-shaped credential leaked straight through as `reason`
+		// before this fix.
+		const TOKEN = `ghp_${"A".repeat(36)}`;
+		const configPath = path.join(tmpDir, ".pi-lens.json");
+		fs.writeFileSync(configPath, `{"piToken": ${TOKEN}}`);
+
+		const cfg = loadPiLensProjectConfig(tmpDir);
+		expect(cfg.ignore).toEqual([]);
+
+		expect(console.error).toHaveBeenCalledTimes(1);
+		const [message] = vi.mocked(console.error).mock.calls[0];
+		expect(message).not.toContain(TOKEN);
+		expect(message).not.toContain("ghp_");
+	});
+
 	it("returns empty config when root is a non-object JSON value", () => {
 		fs.writeFileSync(path.join(tmpDir, ".pi-lens.json"), '"a string"');
 		const cfg = loadPiLensProjectConfig(tmpDir);

@@ -20,7 +20,6 @@
  */
 
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const getServersForFileWithConfig = vi.fn();
@@ -38,11 +37,6 @@ vi.mock("../../../clients/lsp/config.js", () => ({
 	getServerInitOverride: vi.fn().mockReturnValue(undefined),
 }));
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const FAKE_SERVER_PATH = path.join(
-	__dirname,
-	"../../fixtures/fake-lsp-server.mjs",
-);
 const ROOT = process.cwd();
 /**
  * The server dies above this many unread documents. Deliberately three times the
@@ -61,7 +55,8 @@ const NOTIFY_COST_MS = 60;
 const SWEEP_FILES = 12;
 
 async function makeAuxServer() {
-	const { launchLSP } = await import("../../../clients/lsp/launch.js");
+	const { spawnFakeLspServer } =
+		await import("../../support/fake-lsp-server.js");
 	return {
 		id: "ast-grep",
 		name: "ast-grep",
@@ -69,7 +64,7 @@ async function makeAuxServer() {
 		extensions: [".ts"],
 		root: async () => ROOT,
 		spawn: async () => ({
-			process: await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+			process: await spawnFakeLspServer({
 				cwd: ROOT,
 				env: {
 					...process.env,

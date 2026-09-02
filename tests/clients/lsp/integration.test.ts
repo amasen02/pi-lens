@@ -9,7 +9,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // SHUTDOWN_REQUEST_TIMEOUT_MS is read at MODULE LOAD in client.ts, so the env
 // override must land before the static import below evaluates — vi.hoisted
@@ -23,20 +23,15 @@ vi.hoisted(() => {
 });
 import { createLSPClient } from "../../../clients/lsp/client.js";
 import { launchLSP, stopLSP } from "../../../clients/lsp/launch.js";
+import { spawnFakeLspServer } from "../../support/fake-lsp-server.js";
 import { removeTempDirSync } from "../test-utils.js";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const FAKE_SERVER_PATH = path.join(
-	__dirname,
-	"../../fixtures/fake-lsp-server.mjs",
-);
 
 describe("LSP Client Integration", () => {
 	let client: Awaited<ReturnType<typeof createLSPClient>> | undefined;
 	let proc: Awaited<ReturnType<typeof launchLSP>> | undefined;
 
 	beforeEach(async () => {
-		proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+		proc = await spawnFakeLspServer({
 			cwd: process.cwd(),
 		});
 		client = await createLSPClient({
@@ -236,7 +231,7 @@ describe("LSP Client Integration — nested capability gates (#1971)", () => {
 	it.each(capabilityCases)(
 		"sends workspace/willRenameFiles only when nested capability is $name",
 		async ({ env, supported }) => {
-			const proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+			const proc = await spawnFakeLspServer({
 				cwd: process.cwd(),
 				env: {
 					...process.env,
@@ -301,7 +296,7 @@ describe("LSP Client Integration — nested capability gates (#1971)", () => {
 		];
 
 		for (const { name, env, sent } of cases) {
-			const proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+			const proc = await spawnFakeLspServer({
 				cwd: process.cwd(),
 				env: {
 					...process.env,
@@ -369,7 +364,7 @@ describe("LSP Client Integration — nested capability gates (#1971)", () => {
 		] as const;
 
 		for (const { glob, sent } of cases) {
-			const proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+			const proc = await spawnFakeLspServer({
 				cwd: process.cwd(),
 				env: {
 					...process.env,
@@ -549,22 +544,18 @@ describe("LSP Client Integration — nested capability gates (#1971)", () => {
 						operation === "will"
 							? "FAKE_LSP_WILL_RENAME_FILTERS"
 							: "FAKE_LSP_DID_RENAME_FILTERS";
-					const launched = await launchLSP(
-						process.execPath,
-						[FAKE_SERVER_PATH],
-						{
-							cwd: tempRoot,
-							env: {
-								...process.env,
-								FAKE_LSP_WILL_RENAME: "true",
-								FAKE_LSP_DID_RENAME: "true",
-								[envKey]: JSON.stringify(testCase.filters),
-								...(operation === "will"
-									? { FAKE_LSP_ECHO_REQUEST_METHODS: "1" }
-									: { FAKE_LSP_ECHO_NOTIFY_METHODS: "1" }),
-							},
+					const launched = await spawnFakeLspServer({
+						cwd: tempRoot,
+						env: {
+							...process.env,
+							FAKE_LSP_WILL_RENAME: "true",
+							FAKE_LSP_DID_RENAME: "true",
+							[envKey]: JSON.stringify(testCase.filters),
+							...(operation === "will"
+								? { FAKE_LSP_ECHO_REQUEST_METHODS: "1" }
+								: { FAKE_LSP_ECHO_NOTIFY_METHODS: "1" }),
 						},
-					);
+					});
 					const filteredClient = await createLSPClient({
 						serverId: `fake-${operation}-${testCase.name}`,
 						process: launched,
@@ -644,7 +635,7 @@ describe("LSP Client Integration — nested capability gates (#1971)", () => {
 	it.each(resolveCases)(
 		"sends codeAction/resolve only when resolveProvider is $name",
 		async ({ env, supported }) => {
-			const proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+			const proc = await spawnFakeLspServer({
 				cwd: process.cwd(),
 				env: {
 					...process.env,
@@ -696,7 +687,7 @@ describe("LSP Client Integration — cold start", () => {
 	});
 
 	it("shutdown falls back to process kill when server ignores shutdown", async () => {
-		const proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+		const proc = await spawnFakeLspServer({
 			cwd: process.cwd(),
 			env: { ...process.env, FAKE_LSP_IGNORE_SHUTDOWN: "1" },
 		});
@@ -724,7 +715,7 @@ describe("LSP Client Integration — UTF-8 position encoding (#269)", () => {
 		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-posenc-"));
 		filePath = path.join(tmpDir, "a.ts");
 		fs.writeFileSync(filePath, SRC); // toWirePosition reads the line from disk
-		proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+		proc = await spawnFakeLspServer({
 			cwd: process.cwd(),
 			env: { ...process.env, FAKE_LSP_POSITION_ENCODING: "utf-8" },
 		});
@@ -782,7 +773,7 @@ describe("LSP Client Integration — stale navigation drop (#276)", () => {
 		filePath = path.join(process.cwd(), "stale-nav.ts");
 		// The fake holds its definition reply for 300ms so we can land a
 		// notify.change (which bumps the client's documentVersions) mid-request.
-		proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+		proc = await spawnFakeLspServer({
 			cwd: process.cwd(),
 			env: { ...process.env, FAKE_LSP_DEFINITION_DELAY_MS: "300" },
 		});
@@ -854,7 +845,7 @@ describe("LSP Client Integration — batched watched-files (#271)", () => {
 
 	beforeEach(async () => {
 		received = [];
-		proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+		proc = await spawnFakeLspServer({
 			cwd: process.cwd(),
 			env: { ...process.env, FAKE_LSP_ECHO_WATCHED_FILES: "1" },
 		});

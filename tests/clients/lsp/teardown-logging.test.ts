@@ -12,10 +12,9 @@
  * wait).
  */
 
-import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { logLatency } from "../../../clients/latency-logger.js";
+import { spawnFakeLspServer } from "../../support/fake-lsp-server.js";
 
 // Every `client.js` import in this file is dynamic (inside the test bodies
 // below), so a plain assignment here — unlike integration.test.ts's static
@@ -30,12 +29,6 @@ vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
 	>()),
 	logLatency: vi.fn(),
 }));
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const FAKE_SERVER_PATH = path.join(
-	__dirname,
-	"../../fixtures/fake-lsp-server.mjs",
-);
 
 // ---------------------------------------------------------------------------
 // (a) lsp_service_reset — LSPService.shutdown()
@@ -101,11 +94,7 @@ describe("clientShutdown() — lsp_client_shutdown phase", () => {
 				>
 		  >
 		| undefined;
-	let proc:
-		| Awaited<
-				ReturnType<typeof import("../../../clients/lsp/launch.js").launchLSP>
-		  >
-		| undefined;
+	let proc: Awaited<ReturnType<typeof spawnFakeLspServer>> | undefined;
 
 	beforeEach(() => {
 		(logLatency as ReturnType<typeof vi.fn>).mockReset();
@@ -125,11 +114,8 @@ describe("clientShutdown() — lsp_client_shutdown phase", () => {
 
 	it("writes lsp_client_shutdown with shutdownRequestTimedOut=false on clean shutdown", async () => {
 		const { createLSPClient } = await import("../../../clients/lsp/client.js");
-		const { launchLSP } = await import("../../../clients/lsp/launch.js");
 
-		proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
-			cwd: process.cwd(),
-		});
+		proc = await spawnFakeLspServer({ cwd: process.cwd() });
 		client = await createLSPClient({
 			serverId: "fake",
 			process: proc,
@@ -157,9 +143,8 @@ describe("clientShutdown() — lsp_client_shutdown phase", () => {
 		// in clientShutdown will fire after SHUTDOWN_REQUEST_TIMEOUT_MS and set
 		// shutdownRequestTimedOut=true in the log entry.
 		const { createLSPClient } = await import("../../../clients/lsp/client.js");
-		const { launchLSP } = await import("../../../clients/lsp/launch.js");
 
-		proc = await launchLSP(process.execPath, [FAKE_SERVER_PATH], {
+		proc = await spawnFakeLspServer({
 			cwd: process.cwd(),
 			env: { ...process.env, FAKE_LSP_IGNORE_SHUTDOWN: "1" },
 		});
