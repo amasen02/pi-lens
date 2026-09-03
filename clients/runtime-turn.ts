@@ -216,6 +216,28 @@ export const TEST_RUNNER_BATCH_BUDGET_MS = 20_000;
  */
 export const TEST_RUNNER_MAX_DEFERRALS = 2;
 
+/**
+ * Union two deferral sets by target identity, keeping the HIGHER attempt count
+ * (#2522 review round 3, F3). Two overlapping batches can both be cut on the
+ * same target; taking the lower count would let a target trade an attempt for
+ * every overlap and never converge on `TEST_RUNNER_MAX_DEFERRALS`. Keyed
+ * through `normalizeMapKey` so `/`- and `\`-separated spellings of one path are
+ * one entry (AGENTS.md cross-form-path screen).
+ */
+function mergeDeferredTargets(
+	existing: readonly DeferredTestTarget[],
+	incoming: readonly DeferredTestTarget[],
+): DeferredTestTarget[] {
+	const byKey = new Map<string, DeferredTestTarget>();
+	for (const entry of [...existing, ...incoming]) {
+		const key = normalizeMapKey(path.resolve(entry.testFile));
+		const prior = byKey.get(key);
+		if (prior && (prior.attempts ?? 0) >= (entry.attempts ?? 0)) continue;
+		byKey.set(key, entry);
+	}
+	return [...byKey.values()];
+}
+
 export interface BoundedTestBatchOutcome<R, T> {
 	/** One entry per target that was dispatched AND settled before the close. */
 	results: PromiseSettledResult<R>[];
@@ -226,6 +248,10 @@ export interface BoundedTestBatchOutcome<R, T> {
 	 * next turn (#2522 review round 2, F1). `deferred.length` is the count the
 	 * pre-round-2 `skipped` field used to carry, so there is exactly one
 	 * source of truth for "what didn't run".
+	 *
+	 * Round 3, F4: a target that FINISHED and was only dropped by the close
+	 * latch is not in here — its result is folded back into `results` before
+	 * this returns, so it is never charged an attempt toward retirement.
 	 */
 	deferred: T[];
 	/** Which bound ended the batch early, if either did. */
@@ -268,6 +294,18 @@ export async function runTestTargetsBounded<T, R>(args: {
 	// would silently change a batch it has finished reasoning about.
 	let closed = false;
 	const settledIndexes = new Set<number>();
+	/**
+	 * #2522 review round 3, F4: a target whose `run` had ALREADY produced a
+	 * value when the bound fired — its continuation was merely queued behind
+	 * `finish()` — is not a target that was cut. Round 2 dropped that result and
+	 * returned the target in `deferred`, so the caller charged it an attempt
+	 * toward retirement and eventually retired a suite that had been finishing
+	 * inside the budget all along. Parked here and folded back in below, inside
+	 * this call, so the latch's real job (nothing lands in an array the CALLER
+	 * has already consumed) is untouched.
+	 */
+	const latchedOut: Array<{ index: number; result: PromiseSettledResult<R> }> =
+		[];
 	const budgetMs = Math.max(0, args.budgetMs);
 	const deadline = Date.now() + budgetMs;
 	const shouldStop = (): boolean => {
@@ -293,11 +331,17 @@ export async function runTestTargetsBounded<T, R>(args: {
 				// The batch may have closed while this target was in flight — a
 				// killed spawn still resolves (with its runner-error shape) and
 				// must not land in an array the caller already has.
-				if (closed) return;
+				if (closed) {
+					latchedOut.push({ index, result: { status: "fulfilled", value } });
+					return;
+				}
 				results.push({ status: "fulfilled", value });
 				settledIndexes.add(index);
 			} catch (reason) {
-				if (closed) return;
+				if (closed) {
+					latchedOut.push({ index, result: { status: "rejected", reason } });
+					return;
+				}
 				results.push({ status: "rejected", reason });
 				settledIndexes.add(index);
 			}
@@ -335,6 +379,21 @@ export async function runTestTargetsBounded<T, R>(args: {
 			() => finish(),
 		);
 	});
+
+	// #2522 review round 3, F4: drain the queue ONCE. A target whose `run` had
+	// already resolved when `finish()` latched has its continuation sitting in
+	// the microtask queue right now; one macrotask hop lets every such
+	// continuation land in `latchedOut` before this call decides what "did not
+	// run" means. This waits on the QUEUE, not on the work: a target still
+	// genuinely in flight has nothing queued, and a spawn killed by
+	// `batchAbort.abort()` resolves on process exit — an I/O event, strictly
+	// after this hop — so it is still, correctly, counted as cut.
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	for (const { index, result } of latchedOut) {
+		if (settledIndexes.has(index)) continue;
+		results.push(result);
+		settledIndexes.add(index);
+	}
 
 	return {
 		results,
@@ -2150,23 +2209,64 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			cwd,
 		)?.data;
 		const carriedDeferred = priorTestCache?.deferredTargets ?? [];
+		// #2522 review round 3, F5: a deferral list belongs to the session that
+		// cut it. `runtime.telemetrySessionId` is the same identity the batch
+		// stamps its own entries with below (`firedSessionId`), so this is a
+		// single comparison against one source of truth.
+		const turnSessionId = sessionId ?? runtime.telemetrySessionId;
+		const isThisSession = (entry: DeferredTestTarget): boolean =>
+			entry.sessionId === turnSessionId;
+		/**
+		 * #2522 review round 3, F1: the retirement, carried forward.
+		 *
+		 * Round 2 announced the retirement and dropped it on the floor, so the
+		 * candidate loop below re-resolved the very same file through
+		 * `related`/`self` in the SAME turn and ran it anyway with a fresh
+		 * (undefined) attempt count. Steady state was a 3-turn cycle that spawned
+		 * and cut the slow suite on every turn. The retired set is persisted on
+		 * the record instead — pruned to this session, so `session_start` re-arms
+		 * every target rather than inheriting another session's verdict.
+		 */
+		const retiredCarry: DeferredTestTarget[] = (
+			priorTestCache?.retiredTargets ?? []
+		).filter(isThisSession);
+		const retiredKeys = new Set(
+			retiredCarry.map((entry) =>
+				normalizeMapKey(path.resolve(cwd, entry.testFile)),
+			),
+		);
 		let deferredRetired = 0;
+		let foreignDeferred = 0;
 		for (const carried of carriedDeferred) {
 			const testFile = path.resolve(cwd, carried.testFile);
-			if (seen.has(testFile)) continue;
+			const carriedKey = normalizeMapKey(testFile);
+			if (seen.has(carriedKey)) continue;
+			if (!isThisSession(carried)) {
+				foreignDeferred++;
+				continue;
+			}
 			const attempts = carried.attempts ?? 0;
 			if (attempts >= TEST_RUNNER_MAX_DEFERRALS) {
-				// Never silent, and counted rather than once-per-subject: this is
-				// the ledger entry that names WHICH suite is too slow to belong in
-				// a per-turn batch at all.
-				incrementDegradationCount({
-					kind: "test-runner-batch-capped",
-					subject: `${cwd}:deferral-exhausted`,
-					reason: `test target ${path.relative(cwd, testFile)} was cut at the turn-end batch budget ${attempts} turn(s) running and is retired from turn-end selection — too slow for a per-turn batch, run it explicitly`,
-				});
-				dbg(
-					`turn_end: retiring deferred test target ${path.relative(cwd, testFile)} after ${attempts} cut batch(es) — too slow for the turn-end budget, run it explicitly`,
-				);
+				if (!retiredKeys.has(carriedKey)) {
+					retiredKeys.add(carriedKey);
+					retiredCarry.push({
+						testFile,
+						runner: carried.runner,
+						attempts,
+						sessionId: turnSessionId,
+					});
+					// Never silent, and counted rather than once-per-subject: this is
+					// the ledger entry that names WHICH suite is too slow to belong in
+					// a per-turn batch at all.
+					incrementDegradationCount({
+						kind: "test-runner-batch-capped",
+						subject: `${cwd}:deferral-exhausted`,
+						reason: `test target ${path.relative(cwd, testFile)} was cut at the turn-end batch budget ${attempts} turn(s) running and is retired from turn-end selection for the rest of this session — too slow for a per-turn batch, run it explicitly`,
+					});
+					dbg(
+						`turn_end: retiring deferred test target ${path.relative(cwd, testFile)} after ${attempts} cut batch(es) — too slow for the turn-end budget, run it explicitly`,
+					);
+				}
 				continue;
 			}
 			// A RunnerConfig carries functions, so the cache stores the runner KEY
@@ -2181,7 +2281,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				deferredRetired++;
 				continue;
 			}
-			seen.add(testFile);
+			seen.add(carriedKey);
 			targets.push({
 				testFile,
 				runner: carried.runner,
@@ -2198,18 +2298,39 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				`turn_end: retired ${deferredRetired} deferred test target(s) that no longer resolve (missing file, excluded, unknown runner, or over the per-turn cap)`,
 			);
 		}
+		if (foreignDeferred > 0) {
+			dbg(
+				`turn_end: dropped ${foreignDeferred} deferred test target(s) carried from an earlier session — a deferral is scoped to the session that cut it`,
+			);
+		}
 
 		let overCapTargets = 0;
 		let missingTargetFiles = 0;
 		let excludedTargets = 0;
+		let retiredSkips = 0;
 		for (const { display, abs, isNeighbor } of candidates) {
 			const target = testRunnerClient.getTestRunTarget(
 				abs,
 				cwd,
 				runtime.turnIndex,
 			);
-			if (target && !seen.has(target.testFile)) {
-				seen.add(target.testFile);
+			const targetKey = target ? normalizeMapKey(target.testFile) : "";
+			if (target && !seen.has(targetKey)) {
+				seen.add(targetKey);
+				// #2522 review round 3, F1: THE gate that makes the deferral cap a
+				// cap. Whichever strategy produced this target — related, self,
+				// failed-first — a target already retired this session for
+				// outrunning the whole batch budget is not fired again. Without
+				// this the retire branch above was decorative: it logged, and the
+				// candidate loop three lines down re-resolved the same file and
+				// spawned it anyway, with its attempt counter reset to zero.
+				if (retiredKeys.has(targetKey)) {
+					retiredSkips++;
+					dbg(
+						`turn_end: ${display} → test target retired earlier this session (outran the turn-end batch budget), skipping spawn (${path.relative(cwd, target.testFile)})`,
+					);
+					continue;
+				}
 				// #2522: built-in exclusion for turn-end SELECTION — a resolved
 				// target under an integration/e2e directory or naming convention
 				// is never auto-fired, whichever strategy (failed-first/related/
@@ -2262,6 +2383,11 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				`turn_end: excluded ${excludedTargets} test target(s) under the built-in integration/e2e exclusion list`,
 			);
 		}
+		if (retiredSkips > 0) {
+			dbg(
+				`turn_end: skipped ${retiredSkips} test target(s) retired earlier this session for outrunning the turn-end batch budget`,
+			);
+		}
 		if (missingTargetFiles > 0) {
 			dbg(
 				`turn_end: skipped ${missingTargetFiles} test target(s) whose file no longer exists`,
@@ -2285,7 +2411,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				`turn_end: firing ${targets.length} test target(s) async (non-blocking, max ${TEST_RUNNER_BATCH_CONCURRENCY} concurrent)`,
 			);
 			const firedAtTurn = runtime.turnIndex;
-			const firedSessionId = sessionId ?? runtime.telemetrySessionId;
+			const firedSessionId = turnSessionId;
 			const testRunGeneration = (priorTestCache?.testRunGeneration ?? 0) + 1;
 			const provenanceFiles = [
 				...candidates.map((candidate) => ({
@@ -2311,6 +2437,11 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 					// Consumed above into `targets` (or retired). The batch's own
 					// outcome writes the NEW deferral set below.
 					deferredTargets: [],
+					// #2522 R3 F1/F5: the retirement outlives the turn, and the
+					// spread above would otherwise carry a PREVIOUS session's
+					// retirements straight back in. `retiredCarry` is already
+					// pruned to this session.
+					retiredTargets: retiredCarry,
 				},
 				cwd,
 			);
@@ -2340,6 +2471,10 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 						// selection loop above, which retires it at
 						// TEST_RUNNER_MAX_DEFERRALS rather than carrying it forever.
 						attempts: (t.deferralAttempts ?? 0) + 1,
+						// #2522 R3 F5: stamped with the session that cut it, so the
+						// next session re-arms this target instead of inheriting an
+						// attempt count measured under a load it never saw.
+						sessionId: firedSessionId,
 					}));
 					if (deferred.length > 0) {
 						// #2522 review round 2, F4: `incrementDegradationCount`, not
@@ -2368,11 +2503,11 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 					 * fourth call site.
 					 */
 					const supersededByNewerGeneration = (label: string): boolean => {
-						const currentGeneration =
-							cacheManager.readCache<TestRunnerFindingsCache>(
-								"test-runner-findings",
-								cwd,
-							)?.data?.testRunGeneration;
+						const current = cacheManager.readCache<TestRunnerFindingsCache>(
+							"test-runner-findings",
+							cwd,
+						)?.data;
+						const currentGeneration = current?.testRunGeneration;
 						if (
 							currentGeneration !== undefined &&
 							currentGeneration > testRunGeneration
@@ -2380,6 +2515,30 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 							dbg(
 								`turn_end: ${label}test generation ${testRunGeneration} superseded by ${currentGeneration}`,
 							);
+							// #2522 review round 3, F3: returning here USED to drop this
+							// batch's cut targets entirely. The newer batch's own pre-run
+							// write already reset `deferredTargets` to `[]`, and it never
+							// saw this set — so with two overlapping batches the targets
+							// the older one was cut on were never deferred, never
+							// re-selected, and the suite they belong to simply never ran
+							// again. Merge them into the live record instead; the newer
+							// batch's own `.then` merges by the same rule.
+							if (deferredTargets.length > 0) {
+								cacheManager.writeCache(
+									"test-runner-findings",
+									{
+										...(current ?? { content: "" }),
+										deferredTargets: mergeDeferredTargets(
+											current?.deferredTargets ?? [],
+											deferredTargets,
+										),
+									},
+									cwd,
+								);
+								dbg(
+									`turn_end: ${label}carried ${deferredTargets.length} cut target(s) into the newer generation's deferral set`,
+								);
+							}
 							return true;
 						}
 						return false;
@@ -2538,6 +2697,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 								superseded,
 								runnerErrorOnly,
 								deferredTargets,
+								retiredTargets: retiredCarry,
 							},
 							cwd,
 						);
@@ -2618,6 +2778,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 								// error. See `TestRunnerFindingsCache.runnerErrorOnly`.
 								runnerErrorOnly: true,
 								deferredTargets,
+								retiredTargets: retiredCarry,
 							},
 							cwd,
 						);
@@ -2650,6 +2811,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 								provenance: publishedAgainst,
 								superseded,
 								deferredTargets: [],
+								retiredTargets: retiredCarry,
 							},
 							cwd,
 						);
@@ -2681,14 +2843,20 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 					}
 				})
 				.catch(() => {});
-		} else if (carriedDeferred.length > 0) {
-			// Every carried target was retired above (deleted, excluded, or its
-			// runner is gone) and nothing new fired, so no batch outcome will
-			// write the list back. Drop it here rather than re-reading a set of
-			// dead paths on every future turn.
+		} else if (carriedDeferred.length > 0 || retiredCarry.length > 0) {
+			// Every carried target was retired above (deleted, excluded, its
+			// runner is gone, or it exhausted the deferral cap) and nothing new
+			// fired, so no batch outcome will write the list back. Drop the
+			// deferrals here rather than re-reading a set of dead paths on every
+			// future turn — but PERSIST the retirements, or the cap forgets what
+			// it retired the moment a turn fires no targets at all.
 			cacheManager.writeCache(
 				"test-runner-findings",
-				{ ...(priorTestCache ?? { content: "" }), deferredTargets: [] },
+				{
+					...(priorTestCache ?? { content: "" }),
+					deferredTargets: [],
+					retiredTargets: retiredCarry,
+				},
 				cwd,
 			);
 		}

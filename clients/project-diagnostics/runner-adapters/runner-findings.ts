@@ -48,6 +48,19 @@ export interface DeferredTestTarget {
 	 * Absent on a record written before the cap existed, read as 0.
 	 */
 	attempts?: number;
+	/**
+	 * #2522 review round 3, F5: which session cut (or retired) this target.
+	 *
+	 * A deferral is a statement about ONE session's turn-end batches. The cache
+	 * record outlives the session, so without an identity stamp a fresh session
+	 * adopts the previous one's cut list — re-firing suites for edits it never
+	 * made — and, worse, inherits its `attempts` counters, so a target can be
+	 * retired on its first cut in a session that never cut it. Entries whose
+	 * stamp is not the current session are dropped at selection time, which is
+	 * also what re-arms a retirement at `session_start` (#2504's shape).
+	 * Absent on a record written before the stamp existed; read as foreign.
+	 */
+	sessionId?: string;
 }
 
 export interface TestRunnerFindingsCache {
@@ -78,6 +91,22 @@ export interface TestRunnerFindingsCache {
 	 * also what stops an unfinished batch from being recorded as a clean run.
 	 */
 	deferredTargets?: DeferredTestTarget[];
+	/**
+	 * #2522 review round 3, F1: the targets that exhausted
+	 * `TEST_RUNNER_MAX_DEFERRALS` and are retired from turn-end selection for
+	 * the rest of the session.
+	 *
+	 * Round 2 announced the retirement and then `continue`d, leaving no record
+	 * of it anywhere: the same turn's candidate loop re-resolved the file
+	 * through `related`/`self` and re-added it with no attempt count, so the
+	 * cap reset every turn and the "too slow" suite was spawned and cut on
+	 * every single turn — exactly the livelock the cap was added to end. The
+	 * retirement has to outlive the turn to be a retirement at all. It is
+	 * session-scoped by the `sessionId` stamp on each entry, so a new session
+	 * re-arms every target rather than inheriting a verdict measured under
+	 * another session's load.
+	 */
+	retiredTargets?: DeferredTestTarget[];
 }
 
 function failureMessage(failure: TestFailure): string {
