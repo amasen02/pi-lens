@@ -23,12 +23,13 @@ import {
 	getProcessSingletonResets,
 	PROCESS_SINGLETON_RESET_KIND,
 } from "./process-singletons.js";
-// #2506: same inversion, same reason — `file-utils.ts` cannot import this
-// module (directly OR dynamically) without closing a no-client-cycles cycle
-// through the existing extension-log.ts/latency-logger.ts/safe-spawn.js path,
-// so `getGlobalPiLensLogDir()`'s probe-home-redirect event is written to this
-// zero-import leaf and read back here instead. See
-// `probe-home-state.ts`'s doc comment for the full account.
+// #2506: same inversion, same reason — the log-dir resolver cannot import this
+// module (directly OR dynamically). THIS module is on a no-client-cycles cycle
+// via extension-log.ts; the resolver's whole correctness argument is that it
+// sits off every cycle, so an edge in that direction would put it back on one.
+// `getGlobalPiLensLogDir()`'s probe-home-redirect event is therefore written
+// into `probe-home-state.ts` and read back here instead. See that module's doc
+// comment for the full account.
 import { getProbeHomeRedirectEvent } from "./probe-home-state.js";
 
 // Re-exported so existing importers keep one name for the ledger's bound.
@@ -727,10 +728,11 @@ export type DegradationKind =
 	 * other kind above — the same `log-sink-write-failure`/
 	 * `process-singleton-reset` shape: it is folded into
 	 * `getDegradationSummary()` at READ time from `probe-home-state.ts`'s own
-	 * process-scoped event, because `file-utils.ts` cannot import this module
-	 * (directly OR dynamically) without closing a `no-client-cycles` violation
-	 * through the existing `extension-log.ts`/`latency-logger.ts`/
-	 * `safe-spawn.js` cycle. See `probe-home-state.ts`'s doc comment.
+	 * process-scoped event, because the resolver cannot import this module
+	 * (directly OR dynamically) without landing back on a `no-client-cycles`
+	 * cycle — this one is on the `extension-log.ts` cycle, and staying off
+	 * every cycle is the resolver's whole correctness argument. See
+	 * `probe-home-state.ts`'s doc comment.
 	 */
 	| "global-dir-probe-redirect"
 	/**

@@ -484,8 +484,10 @@ describe("the log-dir resolver is reachable without a cycle (#2516 round 2)", ()
 		// Anti-vacuity: the walk really did traverse something.
 		expect(seen.size).toBeGreaterThan(1);
 		expect([...seen].sort()).not.toContain("file-utils.ts");
-		// The cycle file-utils.ts sits on, named explicitly so that pulling any
-		// one of these in fails loudly rather than silently re-arming the TDZ.
+		// Every module the resolver reached through before the move, named
+		// explicitly so that pulling any one of them back in fails loudly
+		// rather than silently re-arming the TDZ. Each is on, or one edge from,
+		// a no-client-cycles cycle.
 		for (const onCycle of [
 			"file-utils.ts",
 			"safe-spawn.ts",

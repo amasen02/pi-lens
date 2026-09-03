@@ -12,10 +12,14 @@
  * `resolveProbeHomeDir()` answers with a per-probe directory instead.
  *
  * WHY IT ALL LIVES HERE and not beside its `getGlobalPiLensDir()` sibling in
- * `file-utils.ts`, where round 2 of #2516 left it. `file-utils.ts` sits on a
- * pre-existing import cycle (`file-utils.js` -> `safe-spawn.js` ->
- * `degradation-ledger.js` -> `extension-log.js` -> `file-utils.js`), and
- * fifteen log-family modules call `getGlobalPiLensLogDir()` at their OWN module
+ * `file-utils.ts`, where round 2 of #2516 left it. `file-utils.ts` sits on an
+ * import cycle (it still does, via `safe-spawn.js` -> `resource-sampler.js` ->
+ * `instance-reaper.js` -> `file-utils.js`; the shorter route through
+ * `degradation-ledger.js` -> `extension-log.js` was this move's doing —
+ * `extension-log.ts` imported `file-utils.ts` for THIS function and nothing
+ * else, so the edge went with it, and the known-violations baseline dropped
+ * from 33 pinned cycles to 12 with none added). Fifteen log-family modules
+ * call `getGlobalPiLensLogDir()` at their OWN module
  * top level. Under vitest's vite-SSR transform each import becomes a
  * `__vite_ssr_import_N__` variable assigned in source order, so one of those
  * top-level calls re-enters `file-utils.ts` while its body is only PARTWAY
