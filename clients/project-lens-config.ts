@@ -65,6 +65,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { toPositiveFinite } from "./env-utils.js";
+import { FRESHNESS_CADENCE_MS } from "./freshness-cadence.js";
 import {
 	assignFlagConfigSection,
 	flagConfigSectionKeys,
@@ -256,6 +257,13 @@ interface DiscoveryCacheEntry {
 	legacyRecords: readonly MigrationRecord[];
 	/** The legacy documents `legacyRecords` was derived from, for freshness. */
 	legacySources: readonly FileStamp[];
+	/**
+	 * When this entry was built (#2483 round 2). Only consulted for the
+	 * no-`info` case — see `discoveryCacheStillFresh` — where `dirMtimes` is
+	 * scoped to `startDir` alone (`bearingDirMtimes`'s no-`info` branch) and so
+	 * cannot by itself see a config file newly created further up the chain.
+	 */
+	checkedAtMs: number;
 }
 
 /** Cache by absolute config path; we read each candidate's mtime before reuse. */
@@ -490,6 +498,28 @@ function discoveryCacheStillFresh(entry: DiscoveryCacheEntry): boolean {
 	) {
 		return false;
 	}
+	// #2483 round 2. When no config was found anywhere, `bearingDirMtimes`'s
+	// no-`info` branch scopes `dirMtimes` to `startDir` alone, so the `.every`
+	// above can only ever see churn AT `startDir` — a config file created at
+	// any ancestor above it moves nothing this entry tracks, and the entry
+	// would then read as fresh for the rest of the process (no production
+	// caller resets it, and a same-`startDir` load never rediscovers). The
+	// issue's acceptance line rules that out ("a new config file created in
+	// the chain IS noticed (bounded staleness stated)"), so a no-`info` entry
+	// is force-expired at most once per `FRESHNESS_CADENCE_MS` regardless of
+	// what `dirMtimes` says — the same negative-cache cadence bound
+	// `file-utils.ts`'s `patternsForDir` already applies to its own no-match
+	// case, reused rather than a second cadence mechanism invented here. The
+	// forced re-walk that follows re-stats the FULL ancestor chain (see
+	// `discoverPiLensProjectConfig`), so a config created anywhere in it is
+	// found — bounded to at most one cadence window of staleness, not
+	// unbounded.
+	if (
+		entry.info === undefined &&
+		Date.now() - entry.checkedAtMs >= FRESHNESS_CADENCE_MS
+	) {
+		return false;
+	}
 	// A legacy document can be EDITED in place without its directory's mtime
 	// moving, and its top-level key set is what `legacyRecords` describes — so
 	// those files carry their own freshness axis, the same (mtime, size) pair
@@ -572,6 +602,7 @@ function discoverPiLensProjectConfig(startDir: string): DiscoveryCacheEntry {
 		dirMtimes: bearingDirMtimes(dirMtimes, info),
 		legacyRecords: legacyDeprecationRecords(legacyDocuments),
 		legacySources,
+		checkedAtMs: Date.now(),
 	};
 }
 
@@ -634,14 +665,21 @@ function legacyDeprecationRecords(
  *
  * The nearest directory a config COULD have appeared in is `startDir` itself
  * — `dirMtimes[0]`, first in the innermost-first walk order (`configSearchDirs`)
- * — so that is what freshness is scoped to, the same bearing-directory
+ * — so that is what per-call freshness is scoped to, the same bearing-directory
  * principle as the presence case (a directory always includes itself as the
  * degenerate bearing chain). A config file created directly in `startDir`
- * bumps `startDir`'s own mtime and is found on the next load. A config file
- * created further up the chain is not noticed until some other invalidation
- * reaches it (an explicit `resetProjectLensConfigCache`, or a later load whose
- * `startDir` differs) — bounded staleness, and strictly narrower than the
- * pre-fix "any ancestor up to $HOME invalidates".
+ * bumps `startDir`'s own mtime and is found on the next load.
+ *
+ * A config file created further up the chain does not move `startDir`'s own
+ * mtime, so it is invisible to THIS check alone (round 1 of #2483 stopped
+ * here, leaving staleness unbounded — no production caller ever resets the
+ * cache and a same-`startDir` load never rediscovers). `discoveryCacheStillFresh`
+ * closes that gap: a no-`info` entry is force-expired at most once per
+ * `FRESHNESS_CADENCE_MS`, independent of what `dirMtimes` says, which sends
+ * the NEXT load through a full re-walk of the ancestor chain regardless — so
+ * a config created anywhere in it is noticed within one cadence window.
+ * Bounded staleness, and strictly narrower than the pre-fix "any ancestor up
+ * to $HOME invalidates on every load".
  */
 function bearingDirMtimes(
 	dirMtimes: readonly { dir: string; mtimeMs: number }[],

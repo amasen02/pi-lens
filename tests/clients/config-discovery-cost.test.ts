@@ -28,6 +28,7 @@
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { FRESHNESS_CADENCE_MS } from "../../clients/freshness-cadence.js";
 
 const counter = vi.hoisted(() => ({ stats: 0, counting: false }));
 
@@ -78,6 +79,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+	vi.useRealTimers();
 	if (previousConfigPath === undefined) delete process.env.PI_LENS_CONFIG_PATH;
 	else process.env.PI_LENS_CONFIG_PATH = previousConfigPath;
 	if (previousHome === undefined) delete process.env.PI_LENS_HOME;
@@ -237,16 +239,61 @@ describe("#2483: a warm load with NO config found anywhere is bearing-scoped too
 		statsFor(() => loadPiLensProjectConfig(projectDir)); // warm, cache settled
 
 		// A config file created directly in startDir bumps startDir's OWN mtime —
-		// the one directory this entry's freshness still tracks — so it is found
-		// on the very next load. Bounded staleness: a file created further up the
-		// chain is not noticed until some other invalidation (a legacy document's
-		// own edit stamp, or an explicit reset) reaches it; that gap is accepted
-		// and is strictly narrower than "any ancestor up to $HOME invalidates".
+		// the one directory this entry's per-call freshness check tracks — so it
+		// is found on the very next load, no cadence wait needed. A file created
+		// further up the chain relies on the cadence-bound force-expiry instead
+		// (see the round-2 describe block below).
 		write(path.join(projectDir, ".pi-lens.json"), { maxProjectFiles: 42 });
 		const createStamp = new Date(Date.now() + 10_000);
 		fs.utimesSync(projectDir, createStamp, createStamp);
 
 		const config = loadPiLensProjectConfig(projectDir);
 		expect(config.maxProjectFiles).toBe(42);
+	});
+});
+
+describe("#2483 round 2: a no-config entry re-checks the full ancestor chain at most once per cadence window", () => {
+	it("does not notice a config created two levels above startDir within the cadence window, but does once it elapses", async () => {
+		const home = tmpRoot("pi-lens-cost7-home-");
+		process.env.PI_LENS_HOME = tmpRoot("pi-lens-cost7-global-");
+		process.env.PI_LENS_CONFIG_PATH = path.join(home, "absent", "config.json");
+		// The reviewer's probe shape: a repo-root config created above a nested
+		// worktree's startDir (clients/file-utils.ts:783-784's nested-worktree
+		// case) — two levels up, well outside what `bearingDirMtimes`'s no-`info`
+		// branch tracks (`startDir` alone).
+		const repoRoot = path.join(home, "repo");
+		const projectDir = path.join(repoRoot, "worktrees", "wt1");
+		fs.mkdirSync(projectDir, { recursive: true });
+
+		// Fake timers installed BEFORE the cold load, so `checkedAtMs` (captured
+		// via `Date.now()` inside the loader) is pinned to `start` exactly —
+		// real wall-clock time spent on the cold walk's own I/O does not eat
+		// into the 1ms-precision margin the two assertions below rely on.
+		vi.useFakeTimers();
+		const start = Date.now();
+
+		const { loadPiLensProjectConfig } = await loader();
+		expect(loadPiLensProjectConfig(projectDir).maxProjectFiles).toBeUndefined();
+
+		// Created two levels above startDir — moves nothing `dirMtimes` (scoped
+		// to `startDir` alone in the no-config case) tracks.
+		write(path.join(repoRoot, ".pi-lens.json"), { maxProjectFiles: 99 });
+
+		// Still inside the cadence window: the entry force-expires at most once
+		// per window, so this load must NOT re-walk yet.
+		vi.setSystemTime(start + FRESHNESS_CADENCE_MS - 1);
+		expect(
+			loadPiLensProjectConfig(projectDir).maxProjectFiles,
+			"picked up the ancestor config before the cadence window elapsed",
+		).toBeUndefined();
+
+		// Past the cadence window: the next load force-expires the entry,
+		// re-walks the full ancestor chain, and finds the config that was
+		// created above startDir.
+		vi.setSystemTime(start + FRESHNESS_CADENCE_MS + 1);
+		expect(
+			loadPiLensProjectConfig(projectDir).maxProjectFiles,
+			"did not pick up the ancestor config after the cadence window elapsed",
+		).toBe(99);
 	});
 });
