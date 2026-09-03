@@ -56,7 +56,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { getGlobalPiLensLogDir } from "./file-utils.js";
+import { getGlobalPiLensLogDir } from "./probe-home-state.js";
 
 /** Bounded tail-read budget PER source log file — never a full-file scan. */
 export const SMELLS_TAIL_BYTES_PER_FILE = 64 * 1024;

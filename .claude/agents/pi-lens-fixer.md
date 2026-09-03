@@ -158,11 +158,12 @@ finding with its red-run evidence.
 
 ## Hard-won mechanics (2026-08-26 harvest — each cost a fix round)
 
-- **Screen the diff against shapes 28–35 before pushing** (hot-path hoist for a
+- **Screen the diff against shapes 28–36 before pushing** (hot-path hoist for a
   cold record, cap reset by its own selector, module-load platform const,
   pull-only observability, mixed-case path predicate, source-text assertion
   in place of a runtime probe, spelling-enumerating guard, a guard that reds
-  only on a platform CI never runs). Each cost a review round
+  only on a platform CI never runs, a table-rewriting tool that matches by
+  count). Each cost a review round
   on 2026-09-03; each has a one-line screen in AGENTS.md.
 - **You are a leaf. Never spawn agents.** A fixer that spawned two helper
   agents (#2526, 2026-09-03) returned an empty report while its children ran

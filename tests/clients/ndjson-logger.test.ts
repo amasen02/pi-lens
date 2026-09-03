@@ -1017,5 +1017,45 @@ describe("createNdjsonLogger", () => {
 				vi.useRealTimers();
 			}
 		});
+
+		it("does not rotate an already-empty active file even when the incoming line alone exceeds maxBytes (#2515 S1, probe E)", async () => {
+			// Sibling case of the test above, pinning the OTHER half of the same
+			// guard (`actualSize === 0` at ndjson-logger.ts's rotateNow). Process A
+			// has already rotated: the active file is genuinely EMPTY on disk and
+			// A's real content now lives in the backup. B's in-memory knownSize is
+			// still stale-HIGH from before A's rotation, so B believes a rotation
+			// is due. Here B's own next line is, by itself, >= maxBytes — so
+			// without the `actualSize === 0` short-circuit, the SECOND guard
+			// (`actualSize + incomingBytes < maxBytes`) would ALSO believe a
+			// rotation is due from the oversized incoming line alone, even though
+			// the real file has nothing left to rotate away. That would
+			// force-remove A's backup and rename the (still-empty) active file on
+			// top of it, destroying A's real content. Deleting the
+			// `actualSize === 0` line reproduces exactly that.
+			vi.useFakeTimers({ toFake: ["Date"] });
+			try {
+				const backup = `${logFile}.1`;
+				const logger = createNdjsonLogger({ filePath: logFile, maxBytes: 50 });
+				logger.log({ i: 0, pad: "z".repeat(10) });
+				await logger.flush();
+				const primed = fs.statSync(logFile).size;
+				expect(primed).toBeGreaterThan(0);
+				expect(primed).toBeLessThan(50);
+
+				// Process A rotates underneath us and leaves the active file
+				// genuinely empty — not merely small, as in the sibling test above.
+				fs.writeFileSync(backup, "A-BACKUP\n");
+				fs.writeFileSync(logFile, "");
+
+				// B's own next line, on its own, is already >= maxBytes.
+				logger.log({ i: 1, pad: "z".repeat(60) });
+				await logger.flush();
+
+				expect(fs.readFileSync(backup, "utf-8")).toBe("A-BACKUP\n");
+				expect(getSinkRotations()).toEqual([]);
+			} finally {
+				vi.useRealTimers();
+			}
+		});
 	});
 });
