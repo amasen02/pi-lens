@@ -446,7 +446,8 @@ function bookkeepLspMutation(
 		// turn-summary publisher just because SOME other surface fell back.
 		if (context.recordAutofix && context.source === "autofix") {
 			const key = normalizeMapKey(filePath);
-			const seen = context.autofixRecordedPaths ?? new BoundedSet<string>(MAX_SAMPLES);
+			const seen =
+				context.autofixRecordedPaths ?? new BoundedSet<string>(MAX_SAMPLES);
 			context.autofixRecordedPaths = seen;
 			if (!seen.has(key)) {
 				seen.add(key);

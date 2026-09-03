@@ -18,10 +18,7 @@ import { setupTestEnvironment } from "./test-utils.js";
  * FIFO, a reordering read) shows up here even though `bounded-cache.test.ts`
  * covers the primitive itself in isolation.
  */
-function record(
-	context: LspMutationContext,
-	filePath: string,
-): void {
+function record(context: LspMutationContext, filePath: string): void {
 	recordLspMutation(context, {
 		bookkeep: true,
 		results: [
