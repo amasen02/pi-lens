@@ -69,6 +69,27 @@ export function isFullyQualified(filePath: string): boolean {
 }
 
 /**
+ * Shape-based absolute check (mirrors `toProjectRelativePath`'s idiom): a
+ * Windows-shaped path (drive-letter/UNC) is parsed with `win32.isAbsolute`
+ * regardless of host OS, since the host-default `path.isAbsolute` returns
+ * FALSE for a Windows-shaped path on POSIX (#1150 class) and would let a
+ * cross-platform-persisted relative path slip past this guard on Linux CI.
+ * MUST run on the RAW `filePath`, before `normalizeMapKey`: on Windows,
+ * `normalizeMapKey`'s nonexistent-path fallback (`resolveNonExisting`) calls
+ * `win32.resolve`, which silently makes any relative path absolute against
+ * `process.cwd()` — checking the normalized value would defeat this guard
+ * entirely on Windows.
+ *
+ * Promoted from a private copy in `clients/review-graph/service.ts` (#2477)
+ * so `clients/dispatch/dispatcher.ts`'s baseline-key guard (#2489) can share
+ * the same sanctioned check instead of hand-rolling a second one.
+ */
+export function isAbsoluteFilePath(filePath: string): boolean {
+	const p = isWindowsPath(filePath) ? win32 : path;
+	return p.isAbsolute(filePath);
+}
+
+/**
  * Split a path into its non-empty segments on EITHER separator (`\` or `/`),
  * regardless of the running OS — the shape-safe form of `p.split(path.sep)` /
  * an inline `p.split(/[\\/]+/)`, which #1161/#1163 showed must not assume the

@@ -91,6 +91,13 @@ lands at the semantically correct seam — the one that captures the bug's
 pattern, not the incidental spot where it happened to surface. (5) Remove all
 instrumentation and record the root cause where the fix lands.
 
+## Filing follow-up issues
+
+Any issue you file carries one TYPE label, at least one `area:*`, and exactly
+one `priority:p1|p2|p3` per the AGENTS.md triage rubric (`gh issue create
+--label bug --label area:lsp --label priority:p2 ...`). Missing priority is a
+defect the orchestrator will bounce.
+
 ## Probe hygiene (mandatory)
 
 Any ad-hoc probe you run against the built `clients/*.js` outside vitest — a
