@@ -991,7 +991,8 @@ describe("#2522 R2/R3 — a target that never fits the budget is retired, not ca
 	it("retires a target at its attempt cap even though the candidate loop re-resolves it", async () => {
 		const runtime = new RuntimeCoordinator();
 		const cacheManager = new CacheManager(false);
-		const { fresh, freshTest, foreverSource, forever } = seedRetirementProject();
+		const { fresh, freshTest, foreverSource, forever } =
+			seedRetirementProject();
 		// BOTH sources are edited this turn, so `forever.test.ts` is reachable
 		// through `related` — the production shape round 2's fixture omitted.
 		markEdited(cacheManager, runtime, [fresh, foreverSource]);
@@ -1072,10 +1073,84 @@ describe("#2522 R2/R3 — a target that never fits the budget is retired, not ca
 		);
 	});
 
+	/**
+	 * The retirement is persisted by the turn's OWN write, not by the batch
+	 * outcome. A `turn_end` fires its batch and returns; the session can end,
+	 * the batch can be superseded, or its `.then` can throw, and none of those
+	 * may cost the cap what it just measured. `writeTestFindings` applies
+	 * `retiredCarry` to every write in the block for exactly this reason.
+	 */
+	it("persists the retirement before the batch it fired has settled", async () => {
+		const runtime = new RuntimeCoordinator();
+		const cacheManager = new CacheManager(false);
+		const { fresh, foreverSource, forever } = seedRetirementProject();
+		markEdited(cacheManager, runtime, [fresh, foreverSource]);
+		cacheManager.writeCache(
+			"test-runner-findings",
+			{
+				content: "1 test target(s) deferred to the next turn",
+				deferredTargets: [
+					{
+						testFile: forever,
+						runner: "vitest",
+						attempts: TEST_RUNNER_MAX_DEFERRALS,
+						sessionId: runtime.telemetrySessionId,
+					},
+				],
+			},
+			env.tmpDir,
+		);
+
+		const controller = new AbortController();
+		setAmbientAbortSignal(controller.signal);
+		const dbgLines: string[] = [];
+		const client = new TestRunnerClient(false);
+		// The batch never settles on its own — only the abort below releases it,
+		// so the assertion runs strictly before any outcome write.
+		(client as unknown as { runTestFileAsync: unknown }).runTestFileAsync =
+			async (
+				testFile: string,
+				_cwd: string,
+				request: { signal?: AbortSignal },
+			) => {
+				await new Promise<void>((resolve) => {
+					if (request.signal?.aborted) return resolve();
+					request.signal?.addEventListener("abort", () => resolve(), {
+						once: true,
+					});
+				});
+				return {
+					file: testFile,
+					runner: "vitest",
+					passed: 0,
+					failed: 0,
+					error: "killed at the batch bound",
+				};
+			};
+
+		try {
+			await runTurn({ cacheManager, runtime, client, dbgLines });
+
+			const midFlight = cacheManager.readCache<{
+				retiredTargets?: { testFile: string }[];
+			}>("test-runner-findings", env.tmpDir)?.data;
+			expect(
+				(midFlight?.retiredTargets ?? []).some(
+					(t) => path.resolve(t.testFile) === path.resolve(forever),
+				),
+			).toBe(true);
+		} finally {
+			controller.abort();
+			setAmbientAbortSignal(undefined);
+		}
+		await delay(300);
+	});
+
 	it("keeps the target retired on the NEXT turn, with no deferral list left to read", async () => {
 		const runtime = new RuntimeCoordinator();
 		const cacheManager = new CacheManager(false);
-		const { fresh, freshTest, foreverSource, forever } = seedRetirementProject();
+		const { fresh, freshTest, foreverSource, forever } =
+			seedRetirementProject();
 		markEdited(cacheManager, runtime, [fresh, foreverSource]);
 		cacheManager.writeCache(
 			"test-runner-findings",
@@ -1127,6 +1202,116 @@ describe("#2522 R2/R3 — a target that never fits the budget is retired, not ca
 
 		expect(secondRan).toContain(path.resolve(freshTest));
 		expect(secondRan).not.toContain(path.resolve(forever));
+	});
+
+	/**
+	 * A target can be BOTH retired and back on the deferral list: the F3 merge
+	 * lets a superseded batch push a cut target into `deferredTargets` after
+	 * this session already retired it. Re-announcing that retirement would
+	 * inflate the ledger count and duplicate the persisted entry.
+	 */
+	it("does not re-record a retirement the record already carries", async () => {
+		const runtime = new RuntimeCoordinator();
+		const cacheManager = new CacheManager(false);
+		const { fresh, foreverSource, forever } = seedRetirementProject();
+		markEdited(cacheManager, runtime, [fresh, foreverSource]);
+		cacheManager.writeCache(
+			"test-runner-findings",
+			{
+				content: "",
+				deferredTargets: [
+					{
+						testFile: forever,
+						runner: "vitest",
+						attempts: TEST_RUNNER_MAX_DEFERRALS + 1,
+						sessionId: runtime.telemetrySessionId,
+					},
+				],
+				retiredTargets: [
+					{
+						testFile: forever,
+						runner: "vitest",
+						attempts: TEST_RUNNER_MAX_DEFERRALS,
+						sessionId: runtime.telemetrySessionId,
+					},
+				],
+			},
+			env.tmpDir,
+		);
+
+		const ran: string[] = [];
+		const dbgLines: string[] = [];
+		await runTurn({
+			cacheManager,
+			runtime,
+			client: recordingClient(ran),
+			dbgLines,
+		});
+		const deadline = Date.now() + 5000;
+		while (Date.now() < deadline && ran.length < 1) await delay(20);
+		await delay(150);
+
+		expect(ran).not.toContain(path.resolve(forever));
+		// Announced once, when it was retired — not again on every later turn.
+		expect(
+			dbgLines.filter(
+				(l) => l.includes("retiring deferred") && l.includes("forever.test.ts"),
+			),
+		).toHaveLength(0);
+		const persisted = cacheManager.readCache<{
+			retiredTargets?: { testFile: string }[];
+		}>("test-runner-findings", env.tmpDir)?.data;
+		expect(persisted?.retiredTargets ?? []).toHaveLength(1);
+	});
+
+	/**
+	 * The other half of the session stamp: a RETIREMENT is a measurement of one
+	 * session's batch budget under one session's load. A new session re-arms it
+	 * — otherwise a suite retired once is silently excluded from turn-end
+	 * selection forever, on every future session, with nothing on disk that ever
+	 * expires (#2522 R3 F5, the #2504 stale-owner shape).
+	 */
+	it("re-arms a retirement recorded by a previous session", async () => {
+		const runtime = new RuntimeCoordinator();
+		const cacheManager = new CacheManager(false);
+		const { fresh, freshTest, foreverSource, forever } =
+			seedRetirementProject();
+		markEdited(cacheManager, runtime, [fresh, foreverSource]);
+		cacheManager.writeCache(
+			"test-runner-findings",
+			{
+				content: "",
+				retiredTargets: [
+					{
+						testFile: forever,
+						runner: "vitest",
+						attempts: TEST_RUNNER_MAX_DEFERRALS,
+						sessionId: `${runtime.telemetrySessionId}-a-previous-session`,
+					},
+				],
+			},
+			env.tmpDir,
+		);
+
+		const ran: string[] = [];
+		const dbgLines: string[] = [];
+		await runTurn({
+			cacheManager,
+			runtime,
+			client: recordingClient(ran),
+			dbgLines,
+		});
+		const deadline = Date.now() + 5000;
+		while (Date.now() < deadline && ran.length < 2) await delay(20);
+		await delay(150);
+
+		expect(ran).toContain(path.resolve(freshTest));
+		expect(ran).toContain(path.resolve(forever));
+		// And the foreign entry is pruned rather than carried forward.
+		const persisted = cacheManager.readCache<{
+			retiredTargets?: { testFile: string }[];
+		}>("test-runner-findings", env.tmpDir)?.data;
+		expect(persisted?.retiredTargets ?? []).toHaveLength(0);
 	});
 
 	it("does not adopt a deferral list carried over from another session", async () => {
@@ -1267,11 +1452,25 @@ describe("#2522 R3 F3 — a superseded batch carries its cut targets forward", (
 			while (Date.now() < dispatched && ran.length < 1) await delay(20);
 
 			// A NEWER batch publishes for this project while this one is still in
-			// flight — byte-for-byte what its own pre-run write does: bump the
-			// generation and reset the deferral list.
+			// flight — bumping the generation and writing its OWN deferral set.
+			// `s0.test.ts` is on both sides: the newer batch has already cut it
+			// five times, this stale one is cutting it for the first. The merge
+			// must keep the HIGHER count, or a target trades an attempt back for
+			// every overlap and never converges on the retirement cap.
 			cacheManager.writeCache(
 				"test-runner-findings",
-				{ content: "", testRunGeneration: 999, deferredTargets: [] },
+				{
+					content: "",
+					testRunGeneration: 999,
+					deferredTargets: [
+						{
+							testFile: path.join(env.tmpDir, "src", "s0.test.ts"),
+							runner: "vitest",
+							attempts: 5,
+							sessionId: runtime.telemetrySessionId,
+						},
+					],
+				},
 				env.tmpDir,
 			);
 			controller.abort();
@@ -1290,8 +1489,20 @@ describe("#2522 R3 F3 — a superseded batch carries its cut targets forward", (
 		expect(persisted?.testRunGeneration).toBe(999);
 		// ...but the targets it was cut on are now the newer generation's problem
 		// rather than nobody's.
-		expect((persisted?.deferredTargets ?? []).length).toBeGreaterThan(0);
-		expect((persisted?.deferredTargets ?? [])[0]?.attempts).toBe(1);
+		const merged = persisted?.deferredTargets ?? [];
+		expect(merged.length).toBeGreaterThan(1);
+		// The overlapping target keeps the higher attempt count, so progress
+		// toward the retirement cap is never traded back.
+		const overlap = merged.find(
+			(t) =>
+				path.resolve(t.testFile) ===
+				path.resolve(path.join(env.tmpDir, "src", "s0.test.ts")),
+		);
+		expect(overlap?.attempts).toBe(5);
+		// The stale batch's own cut targets are charged their first attempt.
+		expect(
+			merged.filter((t) => t.attempts === 1).length,
+		).toBeGreaterThanOrEqual(1);
 		expect(
 			dbgLines.some((l) => l.includes("into the newer generation's deferral")),
 		).toBe(true);
