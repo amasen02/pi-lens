@@ -2940,7 +2940,13 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			// entry lives only on `publishResult.report`, and formatting the
 			// pre-merge report silently dropped it from the turn_end advisory
 			// even though it was correctly persisted to cache.
-			const advisory = formatActionableWarningsAdvisory(publishResult.report);
+			// #2521: `cwd` is what resolves the store location the advisory
+			// names -- it is the SAME cwd `publishActionableWarningsReport`
+			// just wrote through, so the two cannot disagree.
+			const advisory = formatActionableWarningsAdvisory(
+				publishResult.report,
+				cwd,
+			);
 			// @delivery-surface: runtime-turn:actionable-warnings-advisory
 			if (advisory) advisoryParts.push(advisory);
 			logActionableWarningsEvent({
@@ -2995,7 +3001,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		});
 		writeCodeQualityWarningsReport(cacheManager, cwd, qualityReport);
 		appendCodeQualityWarningsHistory(cwd, qualityReport);
-		const advisory = formatCodeQualityWarningsAdvisory(qualityReport);
+		const advisory = formatCodeQualityWarningsAdvisory(qualityReport, cwd);
 		// @delivery-surface: runtime-turn:code-quality-warnings-advisory
 		if (advisory) advisoryParts.push(advisory);
 		logLatency({

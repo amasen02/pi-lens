@@ -3,10 +3,14 @@
  *
  * Manages persistent cache for scanner results and turn state.
  * Provides read/write/freshness checks for:
- * - Scanner cache: .pi-lens/cache/{scanner}.json
- * - Turn state: .pi-lens/turn-state.json
+ * - Scanner cache: <project-data-dir>/cache/{scanner}.json
+ * - Turn state: <project-data-dir>/turn-state.json
  *
- * All paths are relative to project root (process.cwd()).
+ * `<project-data-dir>` is `getProjectDataDir(cwd)` (clients/file-utils.ts) --
+ * `<cwd>/.pi-lens` only when that legacy directory already exists, otherwise
+ * `~/.pi-lens/projects/<slug>` or a `PILENS_DATA_DIR` location. Never assume
+ * the legacy spelling, and never show it to an agent: build a displayed path
+ * with `displayProjectDataPath` (#2521).
  */
 
 import { createSubsystemLogger } from "./extension-log.js";
