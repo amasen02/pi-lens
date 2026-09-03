@@ -134,8 +134,7 @@ const warnedIgnoredConfigs = new Set<string>();
  * #2431's evidence hit (`ghp_SECRET` sitting in the snippet on Node 24), and
  * `locateSyntaxErrorOffset` below locates it in the source instead.
  */
-const JSON_PARSE_POSITION =
-	/at position (\d+) \(line (\d+) column (\d+)\)/;
+const JSON_PARSE_POSITION = /at position (\d+) \(line (\d+) column (\d+)\)/;
 
 /**
  * True for `JSON.parse`'s own `SyntaxError`, including one thrown across a
@@ -341,7 +340,9 @@ export function normalizeParseErrorReason(
 			return error.name;
 		}
 		const match = JSON_PARSE_POSITION.exec(error.message);
-		return match ? `${error.name} at line ${match[2]} col ${match[3]}` : error.name;
+		return match
+			? `${error.name} at line ${match[2]} col ${match[3]}`
+			: error.name;
 	}
 	const message = error instanceof Error ? error.message : String(error);
 	return redactSecrets(message);

@@ -536,9 +536,14 @@ describe("normalizeParseErrorReason locates a position-free SyntaxError in its s
 		// A synthetic message in V8's exact position-free shape. `sourceText`
 		// contains the quoted snippet TWICE — the located position would be a
 		// coin flip, so the safe answer is no location at all, not a guess.
-		const error = { name: "SyntaxError", message: `Unexpected token 'w', "hello world" is not valid JSON` };
+		const error = {
+			name: "SyntaxError",
+			message: `Unexpected token 'w', "hello world" is not valid JSON`,
+		};
 		const sourceText = "hello world, and also: hello world again";
-		expect(normalizeParseErrorReason(error, { sourceText })).toBe("SyntaxError");
+		expect(normalizeParseErrorReason(error, { sourceText })).toBe(
+			"SyntaxError",
+		);
 	});
 
 	it("degrades to the snippet's own start when the offending token repeats inside it", () => {
@@ -546,7 +551,10 @@ describe("normalizeParseErrorReason locates a position-free SyntaxError in its s
 		// inside it is not (it appears in both "hello" and "world"), so the
 		// exact character cannot be picked out — the snippet's own (unambiguous)
 		// start position stands in, still the correct line.
-		const error = { name: "SyntaxError", message: `Unexpected token 'o', "hello world" is not valid JSON` };
+		const error = {
+			name: "SyntaxError",
+			message: `Unexpected token 'o', "hello world" is not valid JSON`,
+		};
 		const sourceText = "xxx hello world yyy";
 		// snippet starts at index 4 -> line 1, col 5.
 		expect(normalizeParseErrorReason(error, { sourceText })).toBe(
@@ -650,6 +658,8 @@ describe("normalizeParseErrorReason locates a position-free SyntaxError in its s
 		expect(notified[0].message).not.toContain("ghp_");
 
 		const group = configIgnoredGroup();
-		expect(group?.latestReasons[0]?.reason).toBe("SyntaxError at line 1 col 13");
+		expect(group?.latestReasons[0]?.reason).toBe(
+			"SyntaxError at line 1 col 13",
+		);
 	});
 });

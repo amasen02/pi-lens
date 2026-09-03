@@ -45,9 +45,13 @@ describe("validate: the internal-throw catch names the error CLASS only (#2451)"
 	it("records the class name, never the message, when walk() itself throws", () => {
 		fault.armed = true;
 		try {
-			const result = validate({ a: 1 }, { type: "object", properties: {} }, {
-				file: ".pi-lens.json",
-			});
+			const result = validate(
+				{ a: 1 },
+				{ type: "object", properties: {} },
+				{
+					file: ".pi-lens.json",
+				},
+			);
 			expect(result.value).toBeUndefined();
 			expect(result.records).toHaveLength(1);
 			const [record] = result.records;
