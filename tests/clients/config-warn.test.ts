@@ -564,6 +564,52 @@ describe("normalizeParseErrorReason locates a position-free SyntaxError in its s
 		).toBe("SyntaxError");
 	});
 
+	it("requires the shape at the START of the message, not merely present somewhere in it", () => {
+		// A hand-authored `name: "SyntaxError"` object (not a real JSON.parse
+		// error at all) whose message happens to CONTAIN this shape's marker
+		// after some other prefix text. Locating a snippet from unrelated,
+		// caller-controlled prose is not this function's contract.
+		const notFromJsonParse = {
+			name: "SyntaxError",
+			message: `zzzzz Unexpected token 'q', "hello" is not valid JSON`,
+		};
+		expect(
+			normalizeParseErrorReason(notFromJsonParse, {
+				sourceText: "xxx hello yyy",
+			}),
+		).toBe("SyntaxError");
+	});
+
+	it("requires the message to end in one of V8's two known suffixes, not just be quoted", () => {
+		// Properly quoted, but the tail is neither `" is not valid JSON` nor
+		// `"... is not valid JSON` — not a shape this function recognizes, so it
+		// must not guess a snippet out of whatever text happens to follow.
+		const unknownTail = {
+			name: "SyntaxError",
+			message: `Unexpected token 'q', "hello" this is a weird ending`,
+		};
+		expect(
+			normalizeParseErrorReason(unknownTail, {
+				sourceText: `xxx hello" this is a weird ending yyy`,
+			}),
+		).toBe("SyntaxError");
+	});
+
+	it("requires the snippet to actually be quoted, not just followed by a trailing suffix", () => {
+		// The marker (`', `) is present and the message DOES end with the
+		// "is not valid JSON" suffix, but there is no opening `"` — V8 never
+		// emits that shape, so this is not a real snippet to trust.
+		const noOpeningQuote = {
+			name: "SyntaxError",
+			message: `Unexpected token 'q', Xhello" is not valid JSON`,
+		};
+		expect(
+			normalizeParseErrorReason(noOpeningQuote, {
+				sourceText: "xxx hello yyy",
+			}),
+		).toBe("SyntaxError");
+	});
+
 	it("classOnly overrides source-derived locality too, for a SyntaxError", () => {
 		const content = `{"piToken": ${TOKEN}}`;
 		const error = realJsonParseError(content);

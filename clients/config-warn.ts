@@ -197,7 +197,13 @@ function parseUnexpectedTokenMessage(
 	const prefix = "Unexpected token '";
 	if (!message.startsWith(prefix)) return undefined;
 	const closeIdx = message.indexOf("', ", prefix.length);
-	if (closeIdx === -1) return undefined;
+	// No explicit `closeIdx === -1` branch: when the marker is missing,
+	// `closeIdx` is `-1`, so `rest` below starts at `message[2]` — always
+	// still inside the fixed `prefix` text the `startsWith` check just
+	// confirmed, never `"`. The `rest.startsWith('"')` check a few lines down
+	// already rejects that case; a second explicit check here could never be
+	// exercised by any input that passes the first, so it stayed untestable
+	// dead code rather than a guard (#2451 mutation pass).
 	const token = message.slice(prefix.length, closeIdx);
 	let rest = message.slice(closeIdx + 3);
 	if (rest.startsWith("...")) rest = rest.slice(3);
@@ -210,9 +216,13 @@ function parseUnexpectedTokenMessage(
 		: rest.endsWith(plainSuffix)
 			? rest.slice(0, -plainSuffix.length)
 			: undefined;
-	return snippet === undefined || snippet.length === 0
-		? undefined
-		: { token, snippet };
+	// No explicit `snippet.length === 0` branch: `String#indexOf("")` matches
+	// at EVERY position, so an empty snippet always fails the caller's
+	// uniqueness check (`sourceText.indexOf(snippet, snippetAt + 1) !== -1`
+	// is true at every offset, including on an empty `sourceText`) — a second
+	// explicit check here could never be exercised by any input the first
+	// does not already catch (#2451 mutation pass).
+	return snippet === undefined ? undefined : { token, snippet };
 }
 
 /**
