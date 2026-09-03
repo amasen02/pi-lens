@@ -1814,6 +1814,59 @@ describe("#2504 r7 F4 — a foreign session's zero-seq entry no longer passes th
 			true,
 		);
 	});
+
+	// #2504 review round 8 (S2): the ledger reason for an in-band carry-forward
+	// drop said "changed before this turn's in-band publish could keep them"
+	// unconditionally, but this scenario (a foreign sessionId, seqs matching)
+	// drops the entry WITHOUT its file having changed on disk -- the reason
+	// must name the session boundary, not assert a change that never happened.
+	it("names the session boundary, not a file change, when the drop is a foreign-sessionId drop", async () => {
+		const { publishActionableWarningsReport } = await loadWarnings();
+		const cacheManager = new CacheManager(false);
+		const [foreign] = makeSources(1);
+
+		cacheManager.writeCache(
+			"actionable-warnings",
+			baseReport({
+				sessionId: "mcp-foreign-session",
+				turnIndex: 5,
+				projectSeqEnd: 5,
+				files: [
+					{
+						filePath: foreign,
+						displayPath: path.basename(foreign),
+						fileSeq: 0,
+						generatedAt: new Date(2_000_000).toISOString(),
+						warnings: [warning(foreign, "FOREIGN-0")],
+						origin: "deferred" as const,
+					},
+				],
+			}),
+			env.tmpDir,
+		);
+
+		publishActionableWarningsReport(
+			cacheManager,
+			env.tmpDir,
+			baseReport({
+				sessionId: "lens-current-session",
+				turnIndex: 1,
+				projectSeqEnd: 1,
+				files: [],
+			}),
+			{
+				origin: "in-band",
+				getFileSeq: () => 0,
+			},
+		);
+
+		const group = getDegradationSummary().find(
+			(g) => g.kind === "actionable-warnings-inband-superseded",
+		);
+		const reason = group?.latestReasons.at(-1)?.reason ?? "";
+		expect(reason).not.toContain("changed before this turn's in-band publish");
+		expect(reason.toLowerCase()).toContain("session");
+	});
 });
 
 /**

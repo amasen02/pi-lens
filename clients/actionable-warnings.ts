@@ -1407,6 +1407,13 @@ export function mergeActionableWarningsReports(args: {
 	report: ActionableWarningsReport;
 	mergedFiles: number;
 	droppedFiles: string[];
+	/**
+	 * #2504 review round 8 (S2): whether the drop was caused by a session
+	 * boundary (a foreign sessionId, files not necessarily changed) rather
+	 * than the file having changed on disk -- the two causes need different
+	 * ledger wording, since "changed" is false on the session-boundary path.
+	 */
+	droppedForSessionMismatch: boolean;
 } {
 	const { persisted, incoming, origin } = args;
 	const deferredPublish = origin === "deferred";
@@ -1525,6 +1532,11 @@ export function mergeActionableWarningsReports(args: {
 			report: { ...incoming, files, summary: summarizeReportFiles(files) },
 			mergedFiles,
 			droppedFiles,
+			// sessionMismatch is a single flag for the whole call, not per-entry:
+			// once true, every stale check above is forced true by the `||`, so
+			// EITHER every drop in this batch is a session-boundary drop, OR none
+			// are (droppedFiles is then purely fileSeq-mismatch drops).
+			droppedForSessionMismatch: sessionMismatch && droppedFiles.length > 0,
 		};
 	}
 	const base = persisted ?? incoming;
@@ -1557,6 +1569,9 @@ export function mergeActionableWarningsReports(args: {
 		},
 		mergedFiles,
 		droppedFiles,
+		// The deferred-publish path never sets sessionMismatch (gated by
+		// `!deferredPublish` above), so its drops are always fileSeq-mismatch.
+		droppedForSessionMismatch: false,
 	};
 }
 
@@ -1621,10 +1636,18 @@ export function publishActionableWarningsReport(
 	// whose carry-forward window already closed) got a dbg line. Same
 	// accounting, mirrored for the origin that was silent.
 	if (origin === "in-band" && merged.droppedFiles.length > 0) {
+		// #2504 review round 8 (S2): "changed" is only true on the fileSeq-
+		// mismatch path. A foreign sessionId (a resumed process, or a
+		// different session's write) drops the same carried-forward entries
+		// without any file having moved -- name the actual cause instead of
+		// asserting a change that may not have happened.
+		const cause = merged.droppedForSessionMismatch
+			? "the publish crossed a session boundary (a different session's write, or a resumed process) before this turn's in-band publish could keep them"
+			: "changed before this turn's in-band publish could keep them";
 		incrementDegradationCount({
 			kind: "actionable-warnings-inband-superseded",
 			subject: `${path.resolve(cwd)}:inband-carry-superseded`,
-			reason: `${merged.droppedFiles.length} carried-forward deferred file entry/entries changed before this turn's in-band publish could keep them (${merged.droppedFiles.slice(0, 3).join(", ")}${merged.droppedFiles.length > 3 ? ", ..." : ""}); their earlier findings are LOST on this channel rather than published against content that has since moved`,
+			reason: `${merged.droppedFiles.length} carried-forward deferred file entry/entries ${cause} (${merged.droppedFiles.slice(0, 3).join(", ")}${merged.droppedFiles.length > 3 ? ", ..." : ""}); their earlier findings are LOST on this channel rather than published against content that has since moved`,
 		});
 		opts.dbg?.(
 			`actionable_warnings: in-band publish dropped ${merged.droppedFiles.length} superseded carried-forward file entry/entries (${merged.droppedFiles.slice(0, 3).join(", ")}${merged.droppedFiles.length > 3 ? ", ..." : ""})`,
@@ -2025,16 +2048,6 @@ export function formatActionableWarningsAdvisory(
 		report.summary.autoFixEligible > 0
 			? ` ${report.summary.autoFixEligible} appear to have conservative preferred quickfixes.`
 			: "";
-	// #2504 review round 7 (F2, secondary): a file still carrying `origin:
-	// "deferred"` was found by a PRIOR turn's off-hook pull, not this one --
-	// "introduced this turn" overstates it. Cheap to say so.
-	const deferredCount = files.filter(
-		(file) => file.origin === "deferred",
-	).length;
-	const deferredNote =
-		deferredCount > 0
-			? ` (${deferredCount} delivered from a deferred pull)`
-			: "";
 	// #1777: hint and info are style opinions, so say how much of the count is
 	// opinion. The line appears only when a quiet tier is actually present —
 	// an all-warning turn already says everything in the count above.
@@ -2045,7 +2058,7 @@ export function formatActionableWarningsAdvisory(
 			? `${quiet} of those are hint/info tier — style opinions, worth fixing only while you are already in that code.`
 			: undefined;
 	return [
-		`🟡 Fixable warnings introduced this turn: ${report.summary.unsuppressed}.${safe}${deferredNote}`,
+		`🟡 Fixable warnings introduced this turn: ${report.summary.unsuppressed}.${safe}`,
 		tierLine,
 		`Details written to .pi-lens/cache/actionable-warnings.json`,
 		fileList ? `Files:\n${fileList}${more}` : undefined,
