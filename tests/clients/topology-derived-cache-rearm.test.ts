@@ -146,7 +146,15 @@ describe("topology-derived cache re-arm (#2263)", () => {
 				homeDir,
 			});
 			expect(firstLanguage.configured.jsts).toBeUndefined();
-			expect(firstScan.canWarmCaches).toBe(false);
+			// No marker exists in env.tmpDir yet (.git/package.json are only
+			// written below), so the walk cannot resolve projectRoot to tmpDir
+			// itself — it either finds nothing or lands on a real ancestor
+			// marker further up the host's filesystem. Asserting `canWarmCaches`
+			// here is vacuous: homeDir is nested inside env.tmpDir, so
+			// isAtOrAboveHomeDir rejects every reachable root regardless of
+			// whether a marker exists at env.tmpDir, making the assertion true
+			// both before and after a marker is planted there.
+			expect(firstScan.projectRoot).not.toBe(path.resolve(env.tmpDir));
 			const tsconfig = path.join(env.tmpDir, "tsconfig.json");
 			fs.writeFileSync(
 				tsconfig,
@@ -246,12 +254,13 @@ describe("topology-derived cache re-arm (#2263)", () => {
 			// check (nested inside `env.tmpDir`, so any found root is necessarily
 			// at-or-above it); it does not confine the unbounded upward walk, so
 			// `projectRoot` itself can legitimately come back as a real marker
-			// found above `env.tmpDir` on this host. Assert the warm-cache verdict
-			// instead, which is deterministic regardless of what the host's real
-			// ancestor tree contains.
+			// found above `env.tmpDir` on this host. `canWarmCaches` is vacuous
+			// here for the same reason as the sibling test: no marker exists in
+			// env.tmpDir yet (.git is only created below), so the walk cannot
+			// land on env.tmpDir itself — assert that directly instead.
 			const homeDir = path.join(env.tmpDir, "home");
 			const before = resolveStartupScanContext(env.tmpDir, { homeDir });
-			expect(before.canWarmCaches).toBe(false);
+			expect(before.projectRoot).not.toBe(path.resolve(env.tmpDir));
 
 			fs.mkdirSync(path.join(env.tmpDir, ".git"));
 			resetWorkspaceTopology();
