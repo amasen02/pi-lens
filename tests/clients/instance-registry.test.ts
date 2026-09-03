@@ -20,7 +20,6 @@ vi.mock("../../clients/file-utils.js", () => ({
 	// production returns one value for both, so a double that split them
 	// would diverge from production on the axis these tests measure.
 	getGlobalPiLensDir: () => dir,
-	getGlobalPiLensLogDir: () => dir,
 }));
 
 describe("instance-registry", () => {

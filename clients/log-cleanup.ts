@@ -23,7 +23,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { getGlobalPiLensLogDir } from "./file-utils.js";
+import { getGlobalPiLensLogDir } from "./probe-home-state.js";
 import { getRegisteredLogFiles } from "./ndjson-logger.js";
 import { pathsEqual } from "./path-utils.js";
 
