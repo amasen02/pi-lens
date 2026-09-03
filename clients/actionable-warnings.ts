@@ -110,6 +110,23 @@ export interface ActionableWarningsReportFile {
 	 * only the report-level stamp, and every reader must tolerate that.
 	 */
 	generatedAt?: string;
+	/**
+	 * Set only on an entry a DEFERRED publish contributed to (#2504 review
+	 * round 5, F1). Distinct from {@link ActionableWarningRecord.origin}, which
+	 * says which analyzer found a warning; this says which PUBLISH produced the
+	 * entry, and it exists for exactly one reason: it is the scope guard on
+	 * carry-forward.
+	 *
+	 * The in-band publisher merges into what is persisted so that a deferred
+	 * report landing mid-turn is not erased. Without a marker that merge would
+	 * carry EVERY prior turn's entries into every later turn's `turn_delta`
+	 * report, which accumulates without bound and re-serves findings the agent
+	 * has already seen. So the in-band publisher carries forward only entries a
+	 * deferral produced, and CLEARS the marker as it does: a deferred finding
+	 * survives exactly one subsequent in-band publish -- the one that would
+	 * otherwise have erased it -- and is then the report's own business.
+	 */
+	origin?: "deferred";
 	warnings: ActionableWarningRecord[];
 }
 
@@ -706,6 +723,21 @@ export async function buildActionableWarningsReport(
 	const cwd = path.resolve(args.cwd);
 	const records: ActionableWarningRecord[] = [...args.dispatchWarnings];
 	const lspService = getLSPService();
+	// #2504 review round 5 (F2): when each file's LSP observation FINISHED,
+	// keyed by normalized path. assembleReport used to stamp every entry with
+	// one `new Date()` taken at ASSEMBLY -- which for the deferred loop is the
+	// loop's END, so a file read 60 s and 24 files ago claimed to be
+	// milliseconds old. applyDeltaFreshnessGate compares that stamp against the
+	// file's mtime to catch an out-of-band edit made after the observation, and
+	// a stamp that late hands it a window which has already closed. Shared with
+	// the deferred closure below, so the in-band entries it carries over keep
+	// the stamps their own pass gave them.
+	const observedAtByPath = new Map<string, string>();
+	// The conservative stand-in for an entry no LSP pull ever touched (a
+	// dispatch-origin warning): the moment this build began. Never LATER than
+	// the observation it stands in for, which is the direction that matters --
+	// an over-old stamp costs a line number, an over-new one leaks a stale one.
+	const buildStartedAt = new Date().toISOString();
 
 	logActionableWarningsEvent({
 		event: "report_started",
@@ -844,6 +876,12 @@ export async function buildActionableWarningsReport(
 				records.push(
 					...(await enrichFileFromLsp(cwd, args, target, inBandDeps)),
 				);
+				// #2504 review round 5 (F2): stamped when THIS file's pull
+				// returned, not when the report is assembled.
+				observedAtByPath.set(
+					normalizeMapKey(target.filePath),
+					new Date().toISOString(),
+				);
 			}
 		};
 
@@ -931,6 +969,13 @@ export async function buildActionableWarningsReport(
 								deferredDeps,
 							)),
 						);
+						// #2504 review round 5 (F2). This is the loop the defect
+						// was about: it can run for a minute, and one stamp taken
+						// at its end described all of it.
+						observedAtByPath.set(
+							normalizeMapKey(target.filePath),
+							new Date().toISOString(),
+						);
 					}
 					if (deferredUnchecked > 0) {
 						recordDegradationOnce({
@@ -957,7 +1002,10 @@ export async function buildActionableWarningsReport(
 						return;
 					}
 					deferredArgs.onDeferredReport?.(
-						assembleReport(cwd, deferredArgs, deferredRecords),
+						assembleReport(cwd, deferredArgs, deferredRecords, {
+							observedAtByPath,
+							fallbackObservedAt: buildStartedAt,
+						}),
 					);
 				})().catch((err) => {
 					args.dbg?.(`actionable_warnings: deferred LSP pull failed: ${err}`);
@@ -985,7 +1033,10 @@ export async function buildActionableWarningsReport(
 		}
 	}
 
-	return assembleReport(cwd, args, records);
+	return assembleReport(cwd, args, records, {
+		observedAtByPath,
+		fallbackObservedAt: buildStartedAt,
+	});
 }
 
 /**
@@ -1181,6 +1232,12 @@ function assembleReport(
 	cwd: string,
 	args: BuildActionableWarningsArgs,
 	records: ActionableWarningRecord[],
+	stamps?: {
+		/** When each file's LSP pull returned, by normalized path (#2504 r5 F2). */
+		observedAtByPath: Map<string, string>;
+		/** Stand-in for a file no LSP pull touched; never later than the truth. */
+		fallbackObservedAt: string;
+	},
 ): ActionableWarningsReport {
 	const merged = mergeWarnings(records);
 	updateWarningState(cwd, merged);
@@ -1205,7 +1262,14 @@ function assembleReport(
 			filePath,
 			displayPath: toRunnerDisplayPath(cwd, filePath),
 			fileSeq: args.fileSeqByPath?.get(normalizeMapKey(filePath)),
-			generatedAt,
+			// #2504 review round 5 (F2): the moment THIS file was observed. The
+			// report-level stamp remains the assembly moment and is only the
+			// last-resort fallback, for a caller that supplied no observations
+			// at all.
+			generatedAt:
+				stamps?.observedAtByPath.get(normalizeMapKey(filePath)) ??
+				stamps?.fallbackObservedAt ??
+				generatedAt,
 			warnings,
 		}),
 	);
@@ -1264,7 +1328,21 @@ function summarizeReportFiles(
 	};
 }
 
-export function writeActionableWarningsReport(
+/**
+ * The ONE place an actionable-warnings report reaches disk.
+ *
+ * Deliberately NOT exported (#2504 review round 5, F1). Two writers used to
+ * publish to this key: the in-band turn_end report, which OVERWROTE blindly,
+ * and the deferred off-hook report, which read-modify-wrote. A deferred merge
+ * that landed anywhere inside turn N+1's handleTurnEnd -- the cascade settle,
+ * knip, madge, the test batch, the in-band LSP enrichment; a window seconds
+ * wide, measured at 607 ms in the reviewer's trace -- was erased by that
+ * turn's blind write, and the findings the whole deferral exists to deliver
+ * were gone with it. A blind writer and a merging writer on one key can only
+ * ever be a race. There is now one publisher and it always merges; the private
+ * scope is what keeps it that way.
+ */
+function writeActionableWarningsReport(
 	cacheManager: CacheManager,
 	cwd: string,
 	report: ActionableWarningsReport,
@@ -1272,40 +1350,54 @@ export function writeActionableWarningsReport(
 	cacheManager.writeCache("actionable-warnings", report, cwd);
 }
 
+/** Which publish an entry came from; the merge is asymmetric between them. */
+export type ActionableWarningsPublishOrigin = "in-band" | "deferred";
+
 /**
- * #2504 review round 4 (F1) -- merge a DEFERRED report into whatever is
- * persisted, PER FILE.
+ * Merge a report about to be published into whatever is already persisted,
+ * PER FILE.
  *
- * Rounds 2 and 3 published the deferred report or discarded it whole, ordered
- * by the whole report's turnIndex/projectSeqEnd. Those two rules composed with
- * incumbent-wins into "publish nothing": every turn_end with modified files
- * persists an in-band report stamped with a strictly INCREASING turnIndex, and
- * the decline in armDeferredLspWork fires exactly when such a turn runs while
- * an incumbent loop is in flight. So a decline implied a supersede, always --
- * and the declining turn's EMPTY placeholder report out-ranked the incumbent's
- * real findings on ordering alone. Both turns' findings were lost.
+ * #2504 review round 4 (F1) established the shape: a report is a MAP of
+ * per-file entries, each stamped with that file's fileSeq and its own
+ * observation time, so ordering belongs PER FILE and not to the report as a
+ * whole. Rounds 2 and 3 ordered whole reports -- publish, or discard on a
+ * newer turnIndex/projectSeqEnd -- and that composed with incumbent-wins into
+ * "publish nothing".
  *
- * A report is a MAP of per-file entries, each stamped with that file's
- * fileSeq, so ordering belongs PER FILE and not to the report as a whole. A
- * deferred report upserts its entries into the persisted one for every file
- * whose fileSeq has not advanced since the pull read it, and drops only the
- * files that did change -- the one case where its findings really do describe
- * content that has moved. Where both halves hold the same file the warnings
- * are UNIONED through mergeWarnings (the same de-duplicating merge the
- * dispatch/LSP union already uses), so a newer entry is never replaced by an
- * older one: it only gains what the older one found.
+ * #2504 review round 5 (F1) generalized it to BOTH publishers, because the
+ * in-band write was still blind and erased a deferred merge that landed
+ * mid-turn. The two directions are asymmetric and the asymmetry is the whole
+ * design:
+ *
+ *  - A DEFERRED publish carries the OLDER observation. Everything persisted is
+ *    newer and is kept unconditionally; the deferred entries upsert into it
+ *    wherever their file has not moved.
+ *  - An IN-BAND publish carries the NEWER observation. It is this turn's own
+ *    report, and its identity (turnIndex, projectSeq window, deltaOnly) is
+ *    published untouched. From the persisted report it carries forward ONLY
+ *    entries a deferral produced -- the scope guard, see
+ *    {@link ActionableWarningsReportFile.origin}. Carrying everything would
+ *    accumulate every prior turn's findings into a report whose scope field
+ *    says "turn_delta"; carrying nothing is the F1 defect.
+ *
+ * Where both halves hold a file the warnings are UNIONED through mergeWarnings
+ * (the same de-duplicating merge the dispatch/LSP union already uses), so a
+ * newer entry is never REPLACED by an older one -- it only gains what the
+ * older one found -- and the merged entry is aged by the OLDER of the two
+ * stamps, because it now holds both observations.
  *
  * Exported because the merge, not the write, is what has to be pinned: a test
  * can hand it two reports and read the ordering decision directly.
  */
-export function mergeDeferredActionableWarningsReport(args: {
+export function mergeActionableWarningsReports(args: {
 	persisted?: ActionableWarningsReport;
-	deferred: ActionableWarningsReport;
+	incoming: ActionableWarningsReport;
+	origin: ActionableWarningsPublishOrigin;
 	/**
 	 * The runtime's LIVE per-file sequence, and the authoritative baseline: the
 	 * persisted report lists only files that have warnings, so a file the next
 	 * turn edited into cleanliness is absent from it and would otherwise read
-	 * as unchanged. Falls back to the persisted entry's own fileSeq when the
+	 * as unchanged. Falls back to the surviving entry's own fileSeq when the
 	 * caller has no runtime to ask.
 	 */
 	getFileSeq?: (filePath: string) => number;
@@ -1314,15 +1406,37 @@ export function mergeDeferredActionableWarningsReport(args: {
 	mergedFiles: number;
 	droppedFiles: string[];
 } {
-	const { persisted, deferred } = args;
+	const { persisted, incoming, origin } = args;
+	const deferredPublish = origin === "deferred";
+
+	// The newer half wins identity and fileSeq; the older half is folded in.
+	const newerHalf = deferredPublish ? (persisted?.files ?? []) : incoming.files;
+	const olderHalf = deferredPublish
+		? incoming.files
+		: // A persisted report from ANOTHER session can never hold an entry this
+			// session's deferral produced: resetLSPService aborts the deferred
+			// loop at session_start and session_shutdown alike, and an aborted
+			// loop publishes nothing. Without this the live getFileSeq -- which
+			// answers 0 for a file the new session has not touched -- would read
+			// a days-old entry as unmoved and resurrect it.
+			persisted?.sessionId === incoming.sessionId
+			? (persisted?.files ?? [])
+			: [];
+	const newerReport = deferredPublish ? persisted : incoming;
+	const olderReport = deferredPublish ? incoming : persisted;
+
 	const byPath = new Map<string, ActionableWarningsReportFile>();
-	for (const entry of persisted?.files ?? []) {
+	for (const entry of newerHalf) {
 		byPath.set(normalizeMapKey(entry.filePath), entry);
 	}
 
 	const droppedFiles: string[] = [];
 	let mergedFiles = 0;
-	for (const entry of deferred.files) {
+	for (const entry of olderHalf) {
+		// The scope guard. An in-band publish exists to add THIS turn's
+		// findings; the only thing it owes the persisted report is the deferred
+		// work that would otherwise be erased between the read and the write.
+		if (!deferredPublish && entry.origin !== "deferred") continue;
 		const key = normalizeMapKey(entry.filePath);
 		const incumbent = byPath.get(key);
 		const baselineSeq = args.getFileSeq?.(entry.filePath) ?? incumbent?.fileSeq;
@@ -1335,27 +1449,43 @@ export function mergeDeferredActionableWarningsReport(args: {
 			continue;
 		}
 		mergedFiles++;
-		if (!incumbent) {
-			byPath.set(key, entry);
-			continue;
+		const merged: ActionableWarningsReportFile = incumbent
+			? {
+					...incumbent,
+					fileSeq: incumbent.fileSeq ?? entry.fileSeq,
+					generatedAt: olderStamp(
+						incumbent.generatedAt ?? newerReport?.generatedAt,
+						entry.generatedAt ?? olderReport?.generatedAt,
+					),
+					warnings: mergeWarnings([...incumbent.warnings, ...entry.warnings]),
+				}
+			: { ...entry };
+		if (deferredPublish) {
+			// Mark it, so the next in-band publish carries it forward across the
+			// window in which it would otherwise be overwritten.
+			merged.origin = "deferred";
+		} else {
+			// Carried forward exactly once: the marker is spent here.
+			merged.origin = undefined;
 		}
-		byPath.set(key, {
-			...incumbent,
-			fileSeq: incumbent.fileSeq ?? entry.fileSeq,
-			// The OLDER of the two stamps. This entry now carries warnings from
-			// both halves, and the mtime gate in lens_diagnostics must judge it
-			// by the earlier observation -- an out-of-band edit after that moment
-			// makes every line in it suspect, not just the older half's.
-			generatedAt: olderStamp(
-				incumbent.generatedAt ?? persisted?.generatedAt,
-				entry.generatedAt ?? deferred.generatedAt,
-			),
-			warnings: mergeWarnings([...incumbent.warnings, ...entry.warnings]),
-		});
+		byPath.set(key, merged);
 	}
 
 	const files = [...byPath.values()];
-	const base = persisted ?? deferred;
+	if (!deferredPublish) {
+		// This turn's report, with the rescued entries folded in. Its identity
+		// is published untouched: a carried entry's provenance lives ON the
+		// entry (its own fileSeq and generatedAt), which is exactly why round 4
+		// moved those fields there, and widening turnIndex/projectSeqStart to
+		// span the older half would make the report claim a window it never
+		// observed.
+		return {
+			report: { ...incoming, files, summary: summarizeReportFiles(files) },
+			mergedFiles,
+			droppedFiles,
+		};
+	}
+	const base = persisted ?? incoming;
 	return {
 		report: {
 			...base,
@@ -1363,12 +1493,12 @@ export function mergeDeferredActionableWarningsReport(args: {
 			// of their own (a cache file from an older build), so it takes the
 			// NEWER of the two; per-entry stamps carry the real ages.
 			generatedAt:
-				newerStamp(persisted?.generatedAt, deferred.generatedAt) ??
+				newerStamp(persisted?.generatedAt, incoming.generatedAt) ??
 				base.generatedAt,
-			turnIndex: Math.max(base.turnIndex, deferred.turnIndex),
+			turnIndex: Math.max(base.turnIndex, incoming.turnIndex),
 			projectSeqStart: minDefined(
 				persisted?.projectSeqStart,
-				deferred.projectSeqStart,
+				incoming.projectSeqStart,
 			),
 			// max, so a merged report never claims to be fresher OR staler than
 			// the newest part it holds. checkActionableWarningsReportFresh still
@@ -1376,10 +1506,10 @@ export function mergeDeferredActionableWarningsReport(args: {
 			// entry's fileSeq, so this widens nothing.
 			projectSeqEnd: maxDefined(
 				persisted?.projectSeqEnd,
-				deferred.projectSeqEnd,
+				incoming.projectSeqEnd,
 			),
 			includeLspCodeActions:
-				base.includeLspCodeActions || deferred.includeLspCodeActions,
+				base.includeLspCodeActions || incoming.includeLspCodeActions,
 			files,
 			summary: summarizeReportFiles(files),
 		},
@@ -1388,6 +1518,58 @@ export function mergeDeferredActionableWarningsReport(args: {
 	};
 }
 
+/**
+ * Publish an actionable-warnings report: read what is persisted, merge per
+ * file, write. THE choke point (#2504 review round 5, F1) -- every publisher
+ * goes through it, so no writer can clobber another's entries.
+ *
+ * The read and the merge and the write are one synchronous block, which is
+ * what makes this safe against the deferred callback: node runs no other
+ * continuation between them, so the only interleaving left is publish-vs-
+ * publish, and that is exactly what the merge resolves.
+ */
+export function publishActionableWarningsReport(
+	cacheManager: CacheManager,
+	cwd: string,
+	report: ActionableWarningsReport,
+	opts: {
+		origin?: ActionableWarningsPublishOrigin;
+		getFileSeq?: (filePath: string) => number;
+		dbg?: (msg: string) => void;
+	} = {},
+): {
+	report: ActionableWarningsReport;
+	mergedFiles: number;
+	droppedFiles: string[];
+} {
+	const origin = opts.origin ?? "in-band";
+	// No TTL: "what is already on disk" is a question about ORDERING, not
+	// freshness, so an entry old enough to have expired for a CONSUMER still
+	// has to be merged into rather than clobbered.
+	const persisted = cacheManager.readCache<ActionableWarningsReport>(
+		"actionable-warnings",
+		cwd,
+		Number.MAX_SAFE_INTEGER,
+	)?.data;
+	const merged = mergeActionableWarningsReports({
+		persisted,
+		incoming: report,
+		origin,
+		getFileSeq: opts.getFileSeq,
+	});
+	writeActionableWarningsReport(cacheManager, cwd, merged.report);
+	// The history records what THIS publish OBSERVED, not what it carried: a
+	// merged-in entry is already on the NDJSON from the publish that produced
+	// it, and appending the merged report would duplicate every carried row on
+	// every subsequent turn.
+	appendActionableWarningsHistory(cwd, report);
+	if (merged.mergedFiles > 0) {
+		opts.dbg?.(
+			`actionable_warnings: ${origin} publish merged ${merged.mergedFiles} persisted file entry/entries`,
+		);
+	}
+	return merged;
+}
 /** The earlier of two ISO stamps; either may be missing or unparseable. */
 function olderStamp(a?: string, b?: string): string | undefined {
 	if (a === undefined) return b;
@@ -1420,15 +1602,20 @@ function maxDefined(a?: number, b?: number): number | undefined {
 }
 
 /**
- * Publish a DEFERRED off-hook report by merging it into what is persisted.
+ * Publish a DEFERRED off-hook report.
  *
  * The deferred fresh-pull loop is stamped with the ORIGINATING turn's
  * turnIndex/projectSeq and may run for up to
  * ACTIONABLE_WARNINGS_DEFERRED_BUDGET_MS -- many turns in a busy session. It
  * must therefore neither overwrite a newer report nor be thrown away because
- * one exists; see mergeDeferredActionableWarningsReport for why replace-or-
- * discard could only ever discard. Per-file loss is the only loss left, and it
- * is recorded rather than silent.
+ * one exists; see mergeActionableWarningsReports for why replace-or-discard
+ * could only ever discard. Per-file loss is the only loss left, and it is
+ * recorded rather than silent.
+ *
+ * A thin wrapper over the choke point since #2504 review round 5 (F1). It
+ * exists only to own the degradation record for the per-file loss -- the
+ * "declined the write" branches it used to carry are gone, because a publish
+ * that merges has nothing to decline.
  */
 export function writeDeferredActionableWarningsReport(args: {
 	cacheManager: CacheManager;
@@ -1437,25 +1624,15 @@ export function writeDeferredActionableWarningsReport(args: {
 	getFileSeq?: (filePath: string) => number;
 	dbg?: (msg: string) => void;
 }): {
-	written: boolean;
-	reason?: string;
 	mergedFiles: number;
 	droppedFiles: number;
 } {
-	// No TTL: "what is already on disk" is a question about ordering, not
-	// freshness, so an entry old enough to have expired for a CONSUMER still
-	// has to be merged into rather than clobbered.
-	const persisted = args.cacheManager.readCache<ActionableWarningsReport>(
-		"actionable-warnings",
+	const { mergedFiles, droppedFiles } = publishActionableWarningsReport(
+		args.cacheManager,
 		args.cwd,
-		Number.MAX_SAFE_INTEGER,
-	)?.data;
-	const { report, mergedFiles, droppedFiles } =
-		mergeDeferredActionableWarningsReport({
-			persisted,
-			deferred: args.report,
-			getFileSeq: args.getFileSeq,
-		});
+		args.report,
+		{ origin: "deferred", getFileSeq: args.getFileSeq, dbg: args.dbg },
+	);
 
 	if (droppedFiles.length > 0) {
 		// Bounded and counted: one subject per project, a tally per occurrence.
@@ -1469,26 +1646,10 @@ export function writeDeferredActionableWarningsReport(args: {
 		);
 	}
 
-	if (mergedFiles === 0 && persisted !== undefined) {
-		// Nothing survived to add, and something is already published: writing
-		// the merge back would only churn the cache and the history file.
-		args.dbg?.(
-			"turn_end: deferred actionable-warnings added no file entries — persisted report left as is",
-		);
-		return {
-			written: false,
-			reason: "no_surviving_file_entries",
-			mergedFiles,
-			droppedFiles: droppedFiles.length,
-		};
-	}
-
-	writeActionableWarningsReport(args.cacheManager, args.cwd, report);
-	appendActionableWarningsHistory(args.cwd, report);
 	args.dbg?.(
 		`turn_end: deferred actionable-warnings merged ${mergedFiles} file entry/entries into the persisted report`,
 	);
-	return { written: true, mergedFiles, droppedFiles: droppedFiles.length };
+	return { mergedFiles, droppedFiles: droppedFiles.length };
 }
 export interface ActionableWarningsHistoryEntry {
 	timestamp: string;

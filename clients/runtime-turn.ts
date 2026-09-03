@@ -1,10 +1,9 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
-	appendActionableWarningsHistory,
 	buildActionableWarningsReport,
 	formatActionableWarningsAdvisory,
-	writeActionableWarningsReport,
+	publishActionableWarningsReport,
 	writeDeferredActionableWarningsReport,
 } from "./actionable-warnings.js";
 import { logActionableWarningsEvent } from "./actionable-warnings-logger.js";
@@ -2631,8 +2630,25 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 					}
 				},
 			});
-			writeActionableWarningsReport(cacheManager, cwd, report);
-			appendActionableWarningsHistory(cwd, report);
+			// #2504 review round 5 (F1): THE publish choke point. This was a
+			// blind `writeActionableWarningsReport` while the deferred callback
+			// above read-modify-wrote the SAME cache key. The deferred merge can
+			// land anywhere inside this handleTurnEnd -- the cascade settle,
+			// knip, madge, the test batch, the in-band LSP enrichment are all
+			// awaited between the moment it is armed and the moment we get
+			// here -- and the blind write erased it 607 ms later in the
+			// reviewer's trace. The publisher now always reads what is persisted
+			// and merges per file, so the two writers cannot race. It carries
+			// forward only entries a DEFERRAL produced, and only while their
+			// file has not moved, so a `turn_delta` report does not accumulate
+			// every prior turn's findings.
+			publishActionableWarningsReport(cacheManager, cwd, report, {
+				origin: "in-band",
+				getFileSeq: getFileSeq
+					? (filePath: string) => getFileSeq.call(runtime, filePath)
+					: undefined,
+				dbg,
+			});
 			const advisory = formatActionableWarningsAdvisory(report);
 			// @delivery-surface: runtime-turn:actionable-warnings-advisory
 			if (advisory) advisoryParts.push(advisory);

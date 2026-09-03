@@ -48,6 +48,15 @@ let wedgedOpens = new Set<string>();
 let diagnosticsByFile = new Map<string, LSPDiagnostic[]>();
 /** What `codeAction` returns. A record only survives if it has one. */
 let codeActions: LSPCodeAction[] = [];
+/**
+ * How long a fresh pull takes (#2504 review round 5, F2). A real one is
+ * ~880 ms; the defect was that 25 of them in one deferred loop all claimed
+ * the SAME observation time, taken when the loop finished.
+ */
+let pullDelayMs = 0;
+/** Wall-clock ms when each file's pull STARTED / RETURNED, by basename. */
+let pullStartedAt = new Map<string, number>();
+let pullReturnedAt = new Map<string, number>();
 
 const openFile = vi.fn(async (filePath: string, _content?: string) => {
 	if (wedgedOpens.has(path.basename(filePath))) {
@@ -57,11 +66,17 @@ const openFile = vi.fn(async (filePath: string, _content?: string) => {
 	return undefined;
 });
 const getDiagnostics = vi.fn(async (filePath: string) => {
-	if (wedgedFiles.has(path.basename(filePath))) {
+	const base = path.basename(filePath);
+	if (wedgedFiles.has(base)) {
 		// Never settles. Only a per-round-trip bound can get past this.
 		await new Promise(() => {});
 	}
-	return diagnosticsByFile.get(path.basename(filePath)) ?? [];
+	pullStartedAt.set(base, Date.now());
+	if (pullDelayMs > 0) {
+		await new Promise((resolve) => setTimeout(resolve, pullDelayMs));
+	}
+	pullReturnedAt.set(base, Date.now());
+	return diagnosticsByFile.get(base) ?? [];
 });
 const codeAction = vi.fn(async (): Promise<LSPCodeAction[]> => codeActions);
 /** Nothing is ever primed: every file is a cold fresh pull, so it defers. */
@@ -99,6 +114,9 @@ beforeEach(() => {
 	wedgedOpens = new Set();
 	diagnosticsByFile = new Map();
 	codeActions = [];
+	pullDelayMs = 0;
+	pullStartedAt = new Map();
+	pullReturnedAt = new Map();
 	openFile.mockClear();
 	getDiagnostics.mockClear();
 	codeAction.mockClear();
@@ -708,7 +726,6 @@ describe("#2504 r4 F1 — the deferred report merges into the persisted one", ()
 			getFileSeq: (filePath) => (filePath === a ? 5 : 2),
 		});
 
-		expect(result.written).toBe(true);
 		expect(result.mergedFiles).toBe(1);
 		expect(result.droppedFiles).toBe(0);
 
@@ -752,7 +769,6 @@ describe("#2504 r4 F1 — the deferred report merges into the persisted one", ()
 		expect(
 			(persisted?.files ?? []).flatMap((f) => f.warnings.map((w) => w.id)),
 		).toEqual(["b1"]);
-		expect(result.written).toBe(true);
 		expect(result.mergedFiles).toBe(1);
 		expect(result.droppedFiles).toBe(1);
 
@@ -1067,5 +1083,270 @@ describe("#2504 r4 F1 — consumers accept a merged report", () => {
 		expect(stale.fresh).toBe(false);
 		expect(stale.reason).toBe("file_seq_mismatch");
 		expect(stale.filePath).toBe(a);
+	});
+});
+
+/**
+ * #2504 review round 5 (F1) — the in-band write was a BLIND OVERWRITE.
+ *
+ * `runtime-turn.ts` wrote the turn's own report with a bare
+ * `writeActionableWarningsReport` while the deferred callback beside it
+ * read-modify-wrote the SAME cache key. Everything between arming the
+ * deferral and that write is awaited — the cascade settle, knip, madge, the
+ * test batch, the in-band LSP enrichment — so a deferred merge that lands
+ * inside turn N+1's handleTurnEnd is erased by it. The reviewer measured the
+ * gap at 607 ms: "merged 1 entry -> writeCache files=[f1.ts] -> final
+ * [f1.ts]", with f0 gone.
+ *
+ * The window is forced open deterministically here rather than raced: turn 1's
+ * `depChecker.ensureAvailable` — a dep the REAL handleTurnEnd awaits well
+ * before it publishes — waits for turn 0's deferred loop to land. Production
+ * code from `handleTurnEnd` down is untouched; only the moment the deferral
+ * settles is pinned, which is exactly the variable a race test must control.
+ */
+describe("#2504 r5 F1 — a deferred merge that lands mid-turn survives", () => {
+	/** turn_end deps whose madge step blocks until `gate` resolves. */
+	function gatedTurnEndDeps(
+		runtime: RuntimeCoordinator,
+		cacheManager: CacheManager,
+		gate: () => Promise<unknown>,
+	): unknown {
+		return {
+			...(turnEndDeps(runtime, cacheManager) as Record<string, unknown>),
+			getFlag: (name: string) =>
+				name === "lens-actionable-warnings" ||
+				name === "lens-actionable-warning-actions" ||
+				name === "lens-turn-end-madge",
+			depChecker: {
+				ensureAvailable: async () => {
+					await gate();
+					// False, so nothing else in the madge branch runs.
+					return false;
+				},
+			},
+		};
+	}
+
+	it("keeps the deferred entry AND turn N+1's own, instead of clobbering it", async () => {
+		const { _awaitDeferredLspPullForTest } = await loadWarnings();
+		const { handleTurnEnd } = await import("../../clients/runtime-turn.js");
+		const runtime = new RuntimeCoordinator();
+		const cacheManager = new CacheManager(false);
+		const [deferredFile, dispatchFile] = makeSources(2);
+
+		// ── turn 0: one modified file, nothing primed, so its pull is deferred.
+		runtime.beginTurn();
+		cacheManager.addModifiedRange(
+			deferredFile,
+			{ start: 1, end: 1 },
+			false,
+			env.tmpDir,
+			runtime.telemetrySessionId,
+		);
+		armOneActionableWarning(path.basename(deferredFile));
+		// biome-ignore lint/suspicious/noExplicitAny: minimal turn_end deps
+		await handleTurnEnd(turnEndDeps(runtime, cacheManager) as any);
+		// The awaited report carries nothing — that is #2504's whole point.
+		expect(
+			cacheManager.readCache<ActionableWarningsReport>(
+				"actionable-warnings",
+				env.tmpDir,
+			)?.data?.summary.files,
+		).toBe(0);
+
+		// ── turn 1: its own dispatch finding, and turn 0's deferral lands
+		// while this handleTurnEnd is still running.
+		runtime.beginTurn();
+		cacheManager.addModifiedRange(
+			dispatchFile,
+			{ start: 1, end: 1 },
+			false,
+			env.tmpDir,
+			runtime.telemetrySessionId,
+		);
+		runtime.recordActionableWarnings([
+			{
+				id: "turn1-dispatch",
+				filePath: dispatchFile,
+				displayPath: path.basename(dispatchFile),
+				line: 1,
+				severity: "warning",
+				tool: "ast-grep",
+				message: "turn 1 found this itself",
+				actions: [],
+				suppressed: false,
+				origin: "dispatch",
+			},
+		]);
+
+		let landedMidTurn = false;
+		const gatedDeps = gatedTurnEndDeps(runtime, cacheManager, async () => {
+			// Turn 0's loop has not started yet: it yields a macrotask before
+			// its first pull, and everything since has been microtasks.
+			await _awaitDeferredLspPullForTest();
+			const midTurn = cacheManager.readCache<ActionableWarningsReport>(
+				"actionable-warnings",
+				env.tmpDir,
+			)?.data;
+			landedMidTurn = (midTurn?.summary.files ?? 0) === 1;
+		});
+		// biome-ignore lint/suspicious/noExplicitAny: minimal turn_end deps
+		await handleTurnEnd(gatedDeps as any);
+
+		// Premise check: the deferred merge really did land INSIDE turn 1's
+		// handleTurnEnd, before its own publish. Without this the case could go
+		// green for the wrong reason.
+		expect(landedMidTurn).toBe(true);
+
+		const persisted = cacheManager.readCache<ActionableWarningsReport>(
+			"actionable-warnings",
+			env.tmpDir,
+		)?.data;
+		const paths = (persisted?.files ?? []).map((f) => f.filePath).sort();
+		// Pre-fix: [dispatchFile] only — the blind write erased the merge.
+		expect(paths).toEqual([deferredFile, dispatchFile].sort());
+		expect(
+			(persisted?.files ?? []).flatMap((f) => f.warnings.map((w) => w.id)),
+		).toContain("turn1-dispatch");
+		const rescued = (persisted?.files ?? []).find(
+			(f) => f.filePath === deferredFile,
+		);
+		expect(rescued?.warnings.length).toBe(1);
+		// Its fix action is the only reason the deferral is worth delivering.
+		expect(rescued?.warnings[0].actions.length).toBeGreaterThan(0);
+		expect(persisted?.summary.files).toBe(2);
+
+		// Drain turn 1's own deferral so nothing outlives the test.
+		await settlesWithin(_awaitDeferredLspPullForTest(), 8_000);
+	});
+
+	it("does NOT accumulate entries across turns when nothing was deferred", async () => {
+		const { handleTurnEnd } = await import("../../clients/runtime-turn.js");
+		const runtime = new RuntimeCoordinator();
+		const cacheManager = new CacheManager(false);
+		const [first, second] = makeSources(2);
+
+		// The scope guard on the F1 fix. `publishActionableWarningsReport` reads
+		// the persisted report on EVERY publish; if it carried every entry
+		// forward, a report whose own `scope` says "turn_delta" would grow
+		// without bound and re-serve findings the agent already acted on. Only
+		// an entry a DEFERRAL produced is carried, and only once.
+		//
+		// No LSP enrichment here (the actions flag is off), so no deferral is
+		// ever armed and nothing is eligible to carry.
+		const deps = (r: RuntimeCoordinator) => ({
+			...(turnEndDeps(r, cacheManager) as Record<string, unknown>),
+			getFlag: (name: string) => name === "lens-actionable-warnings",
+		});
+
+		for (const [file, id] of [
+			[first, "turn1-only"],
+			[second, "turn2-only"],
+		] as const) {
+			runtime.beginTurn();
+			cacheManager.addModifiedRange(
+				file,
+				{ start: 1, end: 1 },
+				false,
+				env.tmpDir,
+				runtime.telemetrySessionId,
+			);
+			runtime.recordActionableWarnings([
+				{
+					id,
+					filePath: file,
+					displayPath: path.basename(file),
+					line: 1,
+					severity: "warning",
+					tool: "ast-grep",
+					message: `finding ${id}`,
+					actions: [],
+					suppressed: false,
+					origin: "dispatch",
+				},
+			]);
+			// biome-ignore lint/suspicious/noExplicitAny: minimal turn_end deps
+			await handleTurnEnd(deps(runtime) as any);
+		}
+
+		const persisted = cacheManager.readCache<ActionableWarningsReport>(
+			"actionable-warnings",
+			env.tmpDir,
+		)?.data;
+		expect(
+			(persisted?.files ?? []).flatMap((f) => f.warnings.map((w) => w.id)),
+		).toEqual(["turn2-only"]);
+		expect(persisted?.files.map((f) => f.filePath)).toEqual([second]);
+	});
+});
+
+/**
+ * #2504 review round 5 (F2) — one assembly stamp for a loop that runs minutes.
+ *
+ * `assembleReport` took a single `new Date()` and put it on every entry. For
+ * the deferred loop that moment is the loop's END: with the shipped bounds
+ * that is up to 25 files x ~880 ms, so the FIRST file's entry claimed to have
+ * been observed ~21 s after it actually was. `applyDeltaFreshnessGate`
+ * compares that stamp against the file's mtime precisely to catch an edit made
+ * after the observation — handed a stamp that late, the window it checks has
+ * already closed and an out-of-band edit is served as live.
+ */
+describe("#2504 r5 F2 — each entry is stamped when its own pull returned", () => {
+	it("gives five files five stamps, none later than its own observation", async () => {
+		const { buildActionableWarningsReport, _awaitDeferredLspPullForTest } =
+			await loadWarnings();
+		const files = makeSources(5);
+		for (const file of files) armOneActionableWarning(path.basename(file));
+		pullDelayMs = 400;
+		let delivered: ActionableWarningsReport | undefined;
+
+		await buildActionableWarningsReport({
+			cwd: env.tmpDir,
+			sessionId: "lens-test",
+			turnIndex: 1,
+			files,
+			modifiedRangesByFile: new Map(),
+			dispatchWarnings: [],
+			includeLspCodeActions: true,
+			deltaOnly: false,
+			lspPullTimeoutMs: 5_000,
+			onDeferredReport: (r: ActionableWarningsReport) => {
+				delivered = r;
+			},
+		});
+
+		expect(await settlesWithin(_awaitDeferredLspPullForTest(), 20_000)).toBe(
+			"settled",
+		);
+		expect(delivered?.files.length).toBe(5);
+
+		const entries = delivered?.files ?? [];
+		// Pre-fix every entry carried the SAME stamp, taken at assembly.
+		expect(new Set(entries.map((f) => f.generatedAt)).size).toBe(5);
+
+		for (const entry of entries) {
+			const base = path.basename(entry.filePath);
+			const startedAt = pullStartedAt.get(base);
+			const returnedAt = pullReturnedAt.get(base);
+			expect(startedAt).toBeDefined();
+			expect(returnedAt).toBeDefined();
+			const stamp = Date.parse(entry.generatedAt as string);
+			expect(Number.isFinite(stamp)).toBe(true);
+			// The clause the gate depends on: an entry never claims to be
+			// FRESHER than the observation behind it. Pre-fix the first file
+			// overshot by the whole remaining loop (~1.6 s here, ~21 s in
+			// production at the shipped 25-file cap).
+			expect(stamp).toBeLessThanOrEqual((returnedAt as number) + 250);
+			expect(stamp).toBeGreaterThanOrEqual(startedAt as number);
+		}
+
+		// And the spread is real, not two stamps a millisecond apart: the first
+		// file's entry is at least three pull-lengths older than the last.
+		const stamps = entries
+			.map((f) => Date.parse(f.generatedAt as string))
+			.sort((a, b) => a - b);
+		expect(stamps[stamps.length - 1] - stamps[0]).toBeGreaterThanOrEqual(
+			3 * 400,
+		);
 	});
 });
