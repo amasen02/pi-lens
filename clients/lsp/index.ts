@@ -2806,6 +2806,86 @@ export class LSPService {
 		const servers = getServersForFileWithConfig(filePath).filter(
 			(s) => s.role !== "auxiliary",
 		);
+		// #2525: candidate roots are resolved LAZILY, and at most once per call.
+		// They are deliberately NOT hoisted: `NearestRoot` (clients/lsp/server.ts)
+		// caches successful hits but never negatives, so a fallback that cannot
+		// root here — DenoServer (`fallbackFor: "typescript"`, gated on
+		// deno.json(c)) in a project with no deno.json — re-walks to the
+		// filesystem root on EVERY call, by design, so that a deno.json
+		// scaffolded mid-session is picked up without a restart. Hoisting would
+		// charge that walk to every touch of every .ts file in every non-Deno
+		// project. The sequential trial loop below needs no roots of its own
+		// (`ensureClientForServer` resolves and bails at `!root` before any spawn
+		// work), so a served touch — the hot path — resolves nothing extra at
+		// all. Only the branches that EMIT a candidate list ask, and all of them
+		// are cold paths.
+		const rootMemo = new Map<string, Promise<string | undefined>>();
+		/**
+		 * Split the candidates into the ones that could actually have been waited
+		 * on and the ones that never had a spawn slot. A record's subject must be
+		 * its producer (#1550) — the #2524 shape.
+		 *
+		 * #2525 round 3 (F3): no SHIPPED `server.root` rejects today — every one
+		 * bottoms out in `markerExists`, which only ever resolves `false` on a
+		 * miss — so this was reasoned "removed by construction". A reviewer probe
+		 * disproved that: a `root()` that rejects makes this `Promise.all` reject,
+		 * which throws out of `getClientForFile` itself (the caller never gets
+		 * `undefined` back, and `lsp_client_wait_timeout` is never emitted). A
+		 * per-server catch degrades that candidate to unrooted instead of taking
+		 * the whole partition down — the same "producer" the memo already knows
+		 * (a failed root resolution never got a client either), now WITH the
+		 * failure reason so the record says why, not just that.
+		 */
+		const partitionCandidates = async (): Promise<{
+			rooted: { server: LSPServerInfo; root: string }[];
+			unrootedIds: string[];
+			unrootedReasons: Record<string, string>;
+		}> => {
+			const resolved = await Promise.all(
+				servers.map(async (server) => {
+					try {
+						return {
+							server,
+							root: await this.resolveServerRootOnce(
+								server,
+								filePath,
+								rootMemo,
+							),
+							reason: undefined as string | undefined,
+						};
+					} catch (error) {
+						return {
+							server,
+							root: undefined as string | undefined,
+							reason: error instanceof Error ? error.message : String(error),
+						};
+					}
+				}),
+			);
+			const unrootedReasons: Record<string, string> = {};
+			for (const entry of resolved) {
+				if (entry.root === undefined && entry.reason !== undefined) {
+					unrootedReasons[entry.server.id] = entry.reason;
+				}
+			}
+			return {
+				rooted: resolved
+					.filter(
+						(
+							entry,
+						): entry is {
+							server: LSPServerInfo;
+							root: string;
+							reason: string | undefined;
+						} => entry.root !== undefined,
+					)
+					.map(({ server, root }) => ({ server, root })),
+				unrootedIds: resolved
+					.filter((entry) => entry.root === undefined)
+					.map((entry) => entry.server.id),
+				unrootedReasons,
+			};
+		};
 		// hardCapMs is a caller-imposed ceiling (e.g. pipeline budget) that
 		// prevents tool_result from blocking the TUI for the full LSP cold-start
 		// window. When no server config sets a wait (serverWaitOverrideMs = 0),
@@ -2849,7 +2929,10 @@ export class LSPService {
 			let erroredServerId: string | undefined;
 			let erroredOutcome: LSPClientAcquisitionOutcome | undefined;
 
-			// Try each matching server
+			// Try each matching server in registration order.
+			// `ensureClientForServer` resolves the root itself and returns before
+			// any spawn work when there is none, so an unrooted fallback costs
+			// this loop one already-memoized resolution and no spawn slot.
 			for (const server of servers) {
 				// A box, not a `let`: control-flow analysis cannot see the callback
 				// write and would narrow a plain local to its initializer.
@@ -2864,6 +2947,7 @@ export class LSPService {
 					(reported) => {
 						acquisition.outcome = reported;
 					},
+					rootMemo,
 				);
 				if (spawned) {
 					logLatency({
@@ -2914,10 +2998,22 @@ export class LSPService {
 				});
 			}
 
+			// #2525: reuse the roots the trial loop above already resolved rather
+			// than re-walking with the RAW `server.root`. Two reasons: the raw
+			// call skips the ceiling/session-root gates, so this dedupe key could
+			// disagree with the identity the acquisition path actually used; and
+			// on the unserved path — the only path that reaches here — every
+			// unrooted candidate would pay a second full walk to the filesystem
+			// root, on every touch, before the `unavailableLogged` dedupe even
+			// looked at it.
 			const unavailable = (
 				await Promise.all(
 					servers.map(async (server) => {
-						const root = await server.root(filePath);
+						const root = await this.resolveServerRootOnce(
+							server,
+							filePath,
+							rootMemo,
+						);
 						return {
 							server,
 							key: `${server.id}:${root ? normalizeMapKey(root) : "<unresolved>"}`,
@@ -2987,11 +3083,16 @@ export class LSPService {
 			// `inFlight` is cleared in ensureClientForServer's finally block, so a
 			// settled acquisition can still be present here. Re-read the published
 			// clients at the decision point; a usable client outranks the sentinel.
-			for (const server of servers) {
-				const root = await this.resolveServerRoot(server, filePath);
-				const client = root
-					? this.state.clients.get(`${server.id}:${normalizeMapKey(root)}`)
-					: undefined;
+			// #2525: this is a cold path, so it is where the roots get resolved —
+			// once, memoized with the trial loop's own resolutions. An unrooted
+			// fallback can never have a client keyed under its (non-existent)
+			// root, so it is neither probed here nor named in the record below.
+			const { rooted, unrootedIds, unrootedReasons } =
+				await partitionCandidates();
+			for (const { server, root } of rooted) {
+				const client = this.state.clients.get(
+					`${server.id}:${normalizeMapKey(root)}`,
+				);
 				if (client?.isAlive()) return { client, info: server };
 			}
 			waitSkipReasons?.add("budget_skipped_known_slow");
@@ -3002,7 +3103,14 @@ export class LSPService {
 				durationMs: 0,
 				metadata: {
 					maxWaitMs: effectiveMaxWaitMs,
-					serverIds: servers.map((server) => server.id),
+					serverIds: rooted.map(({ server }) => server.id),
+					unrootedCandidates: {
+						count: unrootedIds.length,
+						ids: unrootedIds,
+						...(Object.keys(unrootedReasons).length > 0
+							? { reasons: unrootedReasons }
+							: {}),
+					},
 					reason: "budget_skipped_known_slow",
 				},
 			});
@@ -3010,9 +3118,35 @@ export class LSPService {
 		}
 
 		if (waitResult === timeoutSentinel) {
+			// #2525: likewise a cold path — resolve here, not up front.
+			//
+			// #2525 round 3 (L2): `partitionCandidates` does UNCACHED negative
+			// root walks (`NearestRoot` never caches misses, by design — see the
+			// comment above `rootMemo`) and this branch only reaches it AFTER
+			// `effectiveMaxWaitMs` has already elapsed. Measured by the reviewer:
+			// 2.06ms native, ~150ms on the #462 slow-FS profile — unbounded on top
+			// of a budget whose entire contract is "return within the cap". Bound
+			// it with a small ceiling of its own (a quarter of the caller's hard
+			// cap when one was given, capped at 250ms) rather than leaving it the
+			// one piece of async work in this function with no bound at all
+			// (the "async work needs both bounds" shape — here there is no
+			// per-call abort signal to race, only the timer bound applies).
+			const partitionBudgetMs =
+				hardCapMs !== undefined ? Math.min(250, hardCapMs / 4) : 250;
+			const partitioned = await withDeadline(partitionCandidates(), {
+				ms: partitionBudgetMs,
+				onTimeout: "undefined",
+			});
+			const { rooted, unrootedIds, unrootedReasons } = partitioned ?? {
+				rooted: [],
+				unrootedIds: [],
+				unrootedReasons: {},
+			};
 			// Snapshot known client health — scan by serverId prefix (no root needed)
 			const knownHealth = [...this.state.clients.entries()]
-				.filter(([k]) => servers.some((s) => k.startsWith(`${s.id}:`)))
+				.filter(([k]) =>
+					rooted.some(({ server }) => k.startsWith(`${server.id}:`)),
+				)
 				.map(([k, c]) => ({
 					serverId: k.split(":")[0],
 					alive: c.isAlive(),
@@ -3025,9 +3159,23 @@ export class LSPService {
 				durationMs: effectiveMaxWaitMs,
 				metadata: {
 					maxWaitMs: effectiveMaxWaitMs,
-					serverIds: servers.map((s) => s.id),
+					// `serverIds` names the ROOTED pool the timeout record reports
+					// against, not "servers this call actually waited on" — the
+					// sequential trial loop can time out having reached only the
+					// first of several rooted candidates (case 2 in the regression
+					// test pins both `["typescript","deno"]` even though the loop
+					// never got past `typescript`).
+					serverIds: rooted.map(({ server }) => server.id),
+					unrootedCandidates: {
+						count: unrootedIds.length,
+						ids: unrootedIds,
+						...(Object.keys(unrootedReasons).length > 0
+							? { reasons: unrootedReasons }
+							: {}),
+					},
 					// servers absent from knownHealth were never spawned or are still spawning
 					knownClientHealth: knownHealth,
+					...(partitioned === undefined ? { partition: "timed-out" } : {}),
 				},
 			});
 			return undefined;
@@ -3498,12 +3646,38 @@ export class LSPService {
 		this.lastSpawnVerdict.set(key, verdict);
 	}
 
+	/**
+	 * {@link resolveServerRoot}, memoized against a caller-owned map so one
+	 * acquisition asks a given server for its root at most once (#2525).
+	 *
+	 * Resolution is cheap exactly when it SUCCEEDS: `NearestRoot` caches hits,
+	 * but deliberately never caches negatives (so a marker scaffolded
+	 * mid-session is picked up without a restart). An unrooted candidate
+	 * therefore re-walks to the filesystem root on every call, which is why the
+	 * acquisition path and the records it emits must share one resolution
+	 * instead of each taking their own. Without a `memo` this is a plain
+	 * passthrough, for callers that have no acquisition to share with.
+	 */
+	private resolveServerRootOnce(
+		server: LSPServerInfo,
+		filePath: string,
+		memo?: Map<string, Promise<string | undefined>>,
+	): Promise<string | undefined> {
+		if (!memo) return this.resolveServerRoot(server, filePath);
+		const pending = memo.get(server.id);
+		if (pending !== undefined) return pending;
+		const started = this.resolveServerRoot(server, filePath);
+		memo.set(server.id, started);
+		return started;
+	}
+
 	private async ensureClientForServer(
 		filePath: string,
 		server: LSPServerInfo,
 		resolvedRoots?: Map<string, string>,
 		onSpawnInFlight?: (serverId: string) => void,
 		onOutcome?: (outcome: LSPClientAcquisitionOutcome) => void,
+		rootMemo?: Map<string, Promise<string | undefined>>,
 	): Promise<SpawnedServer | undefined> {
 		const handoff = this.generationHandoff;
 		if (handoff) {
@@ -3514,7 +3688,7 @@ export class LSPService {
 			if (this.checkDestroyed()) return undefined;
 		}
 
-		const root = await this.resolveServerRoot(server, filePath);
+		const root = await this.resolveServerRootOnce(server, filePath, rootMemo);
 		if (!root || this.checkDestroyed()) return undefined;
 		if (server.role !== "auxiliary") {
 			resolvedRoots?.set(server.id, normalizeMapKey(root));
@@ -7901,6 +8075,22 @@ export class LSPService {
 		// never proved it can answer diagnostics — that's a failed warm-up. A
 		// server with an unresolvable key never spawns here, so it can't fail this
 		// way and is excluded (never skipped by the caller for this file).
+		// #2525: same split the readiness logic above already makes — `keys[i]`
+		// is `undefined` exactly when the server resolves no key for this file,
+		// i.e. it will never spawn here (DenoServer without a deno.json). The
+		// `lsp_sweep_warmup_*` records must not claim to have warmed it. Free:
+		// `keys` is already resolved, so this costs no filesystem work.
+		const rootedServerIds: string[] = [];
+		const unrootedServerIds: string[] = [];
+		for (let i = 0; i < servers.length; i++) {
+			if (keys[i] !== undefined) rootedServerIds.push(servers[i].id);
+			else unrootedServerIds.push(servers[i].id);
+		}
+		const unrootedCandidates = {
+			count: unrootedServerIds.length,
+			ids: unrootedServerIds,
+		};
+
 		const stillColdServerIds = (): string[] => {
 			const cold: string[] = [];
 			for (let i = 0; i < servers.length; i++) {
@@ -7920,7 +8110,12 @@ export class LSPService {
 				phase: "lsp_sweep_warmup_start",
 				filePath: representativeFile,
 				durationMs: 0,
-				metadata: { serverIds: servers.map((s) => s.id), timeoutMs, attempt },
+				metadata: {
+					serverIds: rootedServerIds,
+					unrootedCandidates,
+					timeoutMs,
+					attempt,
+				},
 			});
 			const warmupAttempt = this.touchFile(representativeFile, content, {
 				diagnostics: "document",
@@ -7970,7 +8165,8 @@ export class LSPService {
 				filePath: representativeFile,
 				durationMs: Date.now() - startedAt,
 				metadata: {
-					serverIds: servers.map((s) => s.id),
+					serverIds: rootedServerIds,
+					unrootedCandidates,
 					timeoutMs,
 					attempt,
 					coldServerIds,

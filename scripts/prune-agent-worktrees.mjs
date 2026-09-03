@@ -1012,6 +1012,22 @@ async function terminatePid(pid) {
  * test-suite lock already uses — this sweep is machine-scoped, not
  * project-scoped), then `~/.pi-lens`.
  *
+ * DELIBERATELY hand-rolled rather than delegating to
+ * `getGlobalPiLensLogDir()` (`clients/probe-home-state.ts`) — decided and
+ * documented here per #2516 review item 4. This script is a standalone `.mjs`
+ * run directly by Node (`scripts/`), and it runs BEFORE the build: importing
+ * a `clients/*.js` module would make it depend on compiled output that may
+ * not exist yet in a bare checkout. (It would no longer inherit an import
+ * cycle — #2516 round 2 moved that resolver onto a cycle-free leaf — so the
+ * pre-build constraint is now the whole of the reason.) The consequence is the
+ * one this file's own two-process-divergence note describes: a hygiene sweep
+ * run from inside a worktree does NOT get the `.pi-lens-probe-home`
+ * redirect, so its ledger always lands in the real machine-global root (or
+ * `PI_LENS_HOME`/`PILENS_DATA_DIR` if set) — accepted, since this sweep
+ * genuinely IS machine-scoped work, not an ad-hoc probe the redirect exists
+ * to isolate. Coordinate any future change here with #2493 (the SubagentStop
+ * reap path), which shares this resolver.
+ *
  * @returns {string}
  */
 export function getHygieneLogPath() {

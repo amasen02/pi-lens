@@ -15,6 +15,7 @@ import { Type } from "../clients/deps/typebox.js";
 import {
 	effectiveConfig,
 	type EffectiveConfigView,
+	isEffectiveFileViewError,
 } from "../clients/lens-engine.js";
 import { compactRenderResult } from "./render-compact.js";
 
@@ -22,6 +23,9 @@ import { compactRenderResult } from "./render-compact.js";
 function summarize(view: EffectiveConfigView): string {
 	const documents = `${view.documents.length} config file(s)`;
 	if (!view.file) return `effective_config — ${documents}`;
+	if (isEffectiveFileViewError(view.file)) {
+		return `effective_config — ${documents} · ${view.file.error}`;
+	}
 	const selected = view.file.servers.filter((entry) => entry.selected).length;
 	const denied = view.file.servers.filter(
 		(entry) => entry.reason === "disabled-by-config",
@@ -57,7 +61,11 @@ export function createEffectiveConfigTool(getProjectRoot: () => string) {
 			file: Type.Optional(
 				Type.String({
 					description:
-						"Path to explain: adds the resolved language plus the per-server and per-runner selection decisions for it.",
+						"Path to explain: adds the resolved language plus the per-server and " +
+						"per-runner selection decisions for it. Must resolve inside `cwd` " +
+						"(a sibling package in the same monorepo does not count) — a file " +
+						"outside it is rejected with the `cwd` it was measured against; " +
+						"re-query with `cwd` set to that file's own workspace instead.",
 				}),
 			),
 		}),
@@ -92,12 +100,14 @@ export function createEffectiveConfigTool(getProjectRoot: () => string) {
 					provenance: view.provenance.length,
 					...(view.file === undefined
 						? {}
-						: {
-								file: view.file.path,
-								selectedServers: view.file.servers.filter(
-									(entry) => entry.selected,
-								).length,
-							}),
+						: isEffectiveFileViewError(view.file)
+							? { fileError: view.file.error }
+							: {
+									file: view.file.path,
+									selectedServers: view.file.servers.filter(
+										(entry) => entry.selected,
+									).length,
+								}),
 				},
 			};
 		},

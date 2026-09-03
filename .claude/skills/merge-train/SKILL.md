@@ -90,6 +90,15 @@ exactly one `priority:p1|p2|p3` (AGENTS.md #1676 rubric). The priority labels
 were found deleted from the repo on 2026-09-03 and recreated (#2553); an
 issue filed without one is a triage defect, not a shortcut.
 
+## Round-count rail (orchestrator)
+
+When a verify round reports that a fix round introduced a NEW defect on the
+same record or seam (not merely left one), the next fix brief opens with
+AGENTS.md's state-space step — invariants, writers × axes, the cell list —
+written into the PR body BEFORE any edit, and the fixer is Opus. Never send a
+third patch-only round: #2528 went r2 → r3 → r4 on one cache record, each
+round fixing three findings and adding two, until the model was demanded.
+
 ## Honesty rules
 
 - A finding is real when a probe proves it; a fix is real when the same probe
