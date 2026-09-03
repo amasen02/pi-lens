@@ -157,6 +157,12 @@ finding with its red-run evidence.
   on, tripling the lane's quota with nothing to merge. If the issue is too
   large for one worker, say so in your report and stop; splitting is the
   orchestrator's call.
+- **Delete vacuous tests in the files you touch.** While mutation-probing
+  your own guards, any pre-existing case in the same file that reds on no
+  mutation, asserts a constant, or duplicates a sibling's assertions is
+  deleted in this PR with the sweep transcript quoted in `Test assessment`
+  (AGENTS.md "Test assessment and removal"). Redundant-but-guarding tests
+  still need the named survivor; vacuous ones need nothing but the proof.
 - **Run the reviewer's standing probes on your own branch before you push.**
   Read `.claude/agents/pi-lens-reviewer.md` "Standing probes" and run every
   one your diff can trip — mutation revert of each new guard, red-proof

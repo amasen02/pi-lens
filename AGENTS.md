@@ -3377,6 +3377,15 @@ contention flakes.
   have redded on. Run the mutations and quote the surviving red. "Low value"
   is a misjudgment this repo has made before: guards that looked redundant
   (the #2044 alias test) or vacuous (win32 skip shapes) were load-bearing.
+- **Vacuous and trivial tests are deleted in the PR that touches them, not
+  ledgered.** Redundancy needs a named survivor (above); vacuity needs no
+  survivor. A test that reds on NO mutation of the code it names, asserts a
+  constant against itself, pins a type shape the compiler already pins, or
+  re-asserts a sibling's exact assertions on the same fixture is weight with
+  no guard behind it. Fixers are EXPECTED to delete these while working in a
+  file — quote the mutation sweep that shows nothing reds, list each deleted
+  case in `Test assessment`, and move on. Deferring an obvious deletion to
+  the ledger is the failure mode, not the safe choice (maintainer, 2026-09-03).
 - **Removal candidates you identify but do not delete go to the corpus
   value ledger issue** (deferral hygiene: the candidate is recorded with the
   mutation evidence it still owes, and the ledger stays open).
