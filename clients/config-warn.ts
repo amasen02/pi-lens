@@ -28,6 +28,7 @@ import {
 	DEPRECATED_CONFIG_SURFACES,
 } from "./config-diagnostic-codes.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
+import { errorClassName } from "./error-class.js";
 import { logExtension } from "./extension-log.js";
 import { redactSecrets } from "./redact/secrets.js";
 import { notifyUserDegradation } from "./user-notify.js";
@@ -120,13 +121,21 @@ const warnedIgnoredConfigs = new Set<string>();
 /**
  * The one shape `JSON.parse`'s own `SyntaxError#message` states a position
  * in, on every supported Node (CI pins Node 22; V8 has emitted `at position N
- * (line L column C)` for this shape since ~Node 20). V8 also emits a
- * position-free shape for a token error — `Unexpected token 'x',
- * "<snippet>"... is not valid JSON` — which carries no position at all, only
- * a slice of the source text being parsed. That is the exact shape #2431's
- * evidence hit (`ghp_SECRET` sitting in the snippet on Node 24).
+ * (line L column C)` for this shape since ~Node 20). Captures the absolute
+ * offset too (group 1), not just V8's own stated line/col (groups 2, 3):
+ * with source text in hand, line/col is recomputed by scanning the source
+ * ourselves rather than trusted from the message (#2451) — the offset is
+ * still just a digit, kept only as the pre-#2451 fallback for a caller that
+ * has no source text to scan.
+ *
+ * V8 also emits a position-free shape for a token error — `Unexpected token
+ * 'x', "<snippet>"... is not valid JSON` — which carries no position at all,
+ * only a slice of the source text being parsed. That is the exact shape
+ * #2431's evidence hit (`ghp_SECRET` sitting in the snippet on Node 24), and
+ * `locateSyntaxErrorOffset` below locates it in the source instead.
  */
-const JSON_PARSE_POSITION = /at position \d+ \(line (\d+) column (\d+)\)/;
+const JSON_PARSE_POSITION =
+	/at position (\d+) \(line (\d+) column (\d+)\)/;
 
 /**
  * True for `JSON.parse`'s own `SyntaxError`, including one thrown across a
@@ -149,9 +158,138 @@ function isSyntaxError(
 }
 
 /**
+ * Line (1-based) and column (1-based, V8's own convention) of a character
+ * offset, scanned directly from the source — never trusted from anything the
+ * message states (#2451). `offset` is always in `[0, sourceText.length]`: it
+ * comes from either V8's own `at position N` digit (bounded by construction —
+ * V8 cannot state a position past the text it just parsed) or a snippet
+ * `indexOf` match inside `sourceText` itself, so there is no out-of-range
+ * case for this function to guard against.
+ */
+function lineColAt(
+	sourceText: string,
+	offset: number,
+): { readonly line: number; readonly col: number } {
+	let line = 1;
+	let lastNewline = -1;
+	for (let i = 0; i < offset; i++) {
+		if (sourceText[i] === "\n") {
+			line++;
+			lastNewline = i;
+		}
+	}
+	return { line, col: offset - lastNewline };
+}
+
+/**
+ * Split V8's position-free `Unexpected token` message into the offending
+ * token and the (possibly truncated) source snippet around it.
+ *
+ * NOT regex-quote-matched: the snippet is a raw slice of the user's source
+ * text and can itself contain `"`, which a `/"([\s\S]*?)"/`-shaped pattern
+ * would stop at prematurely (`{"a": ghp_SECRET` has one right after the
+ * opening `{`). Fixed prefix/suffix stripping instead, which is exact
+ * regardless of what the snippet contains.
+ */
+function parseUnexpectedTokenMessage(
+	message: string,
+): { readonly token: string; readonly snippet: string } | undefined {
+	const prefix = "Unexpected token '";
+	if (!message.startsWith(prefix)) return undefined;
+	const closeIdx = message.indexOf("', ", prefix.length);
+	if (closeIdx === -1) return undefined;
+	const token = message.slice(prefix.length, closeIdx);
+	let rest = message.slice(closeIdx + 3);
+	if (rest.startsWith("...")) rest = rest.slice(3);
+	if (!rest.startsWith('"')) return undefined;
+	rest = rest.slice(1);
+	const truncatedSuffix = '"... is not valid JSON';
+	const plainSuffix = '" is not valid JSON';
+	const snippet = rest.endsWith(truncatedSuffix)
+		? rest.slice(0, -truncatedSuffix.length)
+		: rest.endsWith(plainSuffix)
+			? rest.slice(0, -plainSuffix.length)
+			: undefined;
+	return snippet === undefined || snippet.length === 0
+		? undefined
+		: { token, snippet };
+}
+
+/**
+ * Locate a `JSON.parse` `SyntaxError`'s offset in ITS OWN source text
+ * (#2451). Two shapes, both anchored to the source rather than to anything
+ * V8 states about it:
+ *
+ * - `at position N`: N is already an exact offset.
+ * - `Unexpected token 'x', "<snippet>"...`: no offset in the message at all,
+ *   only a slice of the source. `snippet` is searched for in `sourceText`
+ *   with `indexOf`; a match that is not unique is not trusted (the wrong
+ *   occurrence would report a false location, and a `config-ignored` reason
+ *   is not worth that risk). Inside a unique match, the offending token's
+ *   own OFFSET is used when it too occurs exactly once in the snippet — the
+ *   common case (JSON punctuation, a typo'd letter) — otherwise the snippet's
+ *   own start stands in: still the correct line far more often than not
+ *   (the snippet is a ~20-char window around the real offset), never a
+ *   snippet the user did not already put in their own file.
+ *
+ * Returns `undefined` when neither shape locates unambiguously — the honest,
+ * safe answer, which the caller degrades to the bare class name for.
+ */
+function locateSyntaxErrorOffset(
+	message: string,
+	sourceText: string,
+): number | undefined {
+	const stated = JSON_PARSE_POSITION.exec(message);
+	if (stated) return Number(stated[1]);
+
+	const parsed = parseUnexpectedTokenMessage(message);
+	if (!parsed) return undefined;
+	const { token, snippet } = parsed;
+
+	const snippetAt = sourceText.indexOf(snippet);
+	if (snippetAt === -1 || sourceText.indexOf(snippet, snippetAt + 1) !== -1) {
+		return undefined;
+	}
+	const tokenAt = snippet.indexOf(token);
+	const onlyTokenOccurrence =
+		tokenAt !== -1 && snippet.indexOf(token, tokenAt + 1) === -1;
+	return snippetAt + (onlyTokenOccurrence ? tokenAt : 0);
+}
+
+export interface NormalizeParseErrorReasonOptions {
+	/**
+	 * The raw text the error was parsed from. Enables recovering `line L col
+	 * C` locality for EVERY V8 `SyntaxError` shape, including the
+	 * position-free `Unexpected token` one that otherwise degrades to a bare
+	 * class name (#2451) — derived by scanning the source, never by trusting a
+	 * digit or a snippet straight out of the message. Omit when no source was
+	 * ever read (e.g. an `fs.readFileSync` failure); the reason then falls
+	 * back to the pre-#2451 shape (V8's own stated line/col, still nothing but
+	 * digits, when the message states one).
+	 */
+	readonly sourceText?: string;
+	/**
+	 * Force class-name-only, even for a non-`SyntaxError`. For a caller whose
+	 * caught error is NOT documented to be free of embedded file content — a
+	 * bug inside this module's own object-walking/merge code, which throws on
+	 * a value it read out of the untrusted parsed document, and whose message
+	 * could therefore quote it — never the message, whatever the error's type.
+	 * Delegates to `./error-class.js`'s `errorClassName`, the ONE
+	 * implementation `clients/config-core/normalize.ts`,
+	 * `clients/config-core/resolve.ts`, and `clients/lens-config.ts` also call
+	 * directly (#2451) — NOT this function, on purpose: `config-core/` must
+	 * never import a sink (this module -> the degradation ledger), which is
+	 * exactly the cycle #2426 removed from it, so its two catch sites reach
+	 * the shared leaf without reaching back through this seam.
+	 */
+	readonly classOnly?: boolean;
+}
+
+/**
  * Normalize a caught parse/validation error into a bounded, snippet-free
- * reason: the error's own class plus a position, when the engine's message
- * states one — NEVER the raw message (#2431).
+ * reason: the error's own class plus a position, when one can be derived —
+ * NEVER the raw message (#2431), and never anything but the class name at
+ * all for a `classOnly` caller (#2451).
  *
  * `JSON.parse`'s `SyntaxError#message` is DOCUMENTED (V8) to embed a slice of
  * the source text being parsed. A user's malformed config that happens to
@@ -170,17 +308,30 @@ function isSyntaxError(
  * still worth calling on this branch because most non-`SyntaxError` messages
  * are hand-authored by this codebase, not engine dumps of file content — but
  * `normalizeParseErrorReason`'s own guarantee (no message survives at all)
- * applies only to the `SyntaxError` branch. `warnIgnoredConfigOnce` (the one
+ * applies only to the `SyntaxError` branch (and, unconditionally, to a
+ * `classOnly` caller). `warnIgnoredConfigOnce` (the one `{ parseError }`
  * caller) additionally redacts EVERY reason, including hand-authored ones,
  * so a caller-composed string that happens to interpolate file content (a
  * user-authored config KEY, a rule id) is still covered.
  */
-export function normalizeParseErrorReason(error: unknown): string {
+export function normalizeParseErrorReason(
+	error: unknown,
+	options: NormalizeParseErrorReasonOptions = {},
+): string {
+	if (options.classOnly) {
+		return errorClassName(error);
+	}
 	if (isSyntaxError(error)) {
+		if (options.sourceText !== undefined) {
+			const offset = locateSyntaxErrorOffset(error.message, options.sourceText);
+			if (offset !== undefined) {
+				const { line, col } = lineColAt(options.sourceText, offset);
+				return `${error.name} at line ${line} col ${col}`;
+			}
+			return error.name;
+		}
 		const match = JSON_PARSE_POSITION.exec(error.message);
-		return match
-			? `${error.name} at line ${match[1]} col ${match[2]}`
-			: error.name;
+		return match ? `${error.name} at line ${match[2]} col ${match[3]}` : error.name;
 	}
 	const message = error instanceof Error ? error.message : String(error);
 	return redactSecrets(message);
@@ -234,8 +385,14 @@ export interface WarnIgnoredConfigOptions {
 	 * seam — and only this seam — is what decides how much of it survives into
 	 * the three sinks below (#2431). Callers that catch a `JSON.parse` or `fs`
 	 * error must use `{ parseError }`, never pre-stringify it themselves.
+	 * `sourceText`, when the caller actually read the file (a `JSON.parse`
+	 * failure, never an `fs` read failure — nothing was ever read then), lets
+	 * `normalizeParseErrorReason` recover `line L col C` locality for the
+	 * position-free `Unexpected token` shape too (#2451).
 	 */
-	readonly reason: string | { readonly parseError: unknown };
+	readonly reason:
+		| string
+		| { readonly parseError: unknown; readonly sourceText?: string };
 	/**
 	 * The offending KEY inside the file, when the loader is rejecting one key
 	 * rather than the whole file. Part of the ledger subject, so
@@ -287,7 +444,9 @@ export function warnIgnoredConfigOnce(options: WarnIgnoredConfigOptions): void {
 	const reason: string = redactSecrets(
 		typeof options.reason === "string"
 			? options.reason
-			: normalizeParseErrorReason(options.reason.parseError),
+			: normalizeParseErrorReason(options.reason.parseError, {
+					sourceText: options.reason.sourceText,
+				}),
 	);
 
 	// The durable half (#2418 F6), and it runs BEFORE the latch on purpose
