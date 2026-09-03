@@ -175,14 +175,25 @@ describe("#2504 AC2 — bounded test-runner batch helper", () => {
 	 */
 	it("defers a target whose spawn was aborted before it started", async () => {
 		const outcome = await runTestTargetsBounded({
-			targets: ["slow", "aborted-pre-spawn"],
+			targets: ["aborted-pre-spawn", "still-running"],
 			concurrency: 2,
 			budgetMs: 30,
 			run: async (target: string, batchSignal: AbortSignal) => {
-				// Stands in for `await this.resolveExec(...)`: the batch bound can
-				// fire while this is pending.
-				await delay(target === "slow" ? 400 : 120);
-				if (batchSignal.aborted) {
+				if (target === "aborted-pre-spawn") {
+					// `runTestFileAsync` awaits `resolveExec` and only THEN reaches
+					// `safeSpawnAsync`, whose early-abort branch resolves
+					// SYNCHRONOUSLY, with no child spawned at all. Arriving there just
+					// as the batch aborts is exactly this: the value appears in the
+					// microtask drain that follows the close, describing work that
+					// never happened. (This is deliberately NOT the killed-spawn
+					// shape, which settles later on the child's `exit` event — that
+					// one is `killableClient`/the F1 tests.)
+					await new Promise<void>((resolve) => {
+						if (batchSignal.aborted) return resolve();
+						batchSignal.addEventListener("abort", () => resolve(), {
+							once: true,
+						});
+					});
 					return {
 						file: target,
 						runner: "vitest",
@@ -191,6 +202,7 @@ describe("#2504 AC2 — bounded test-runner batch helper", () => {
 						error: "Runner error: Spawn aborted before start",
 					};
 				}
+				await delay(400);
 				return { file: target, runner: "vitest", passed: 1, failed: 0 };
 			},
 		});
@@ -198,7 +210,7 @@ describe("#2504 AC2 — bounded test-runner batch helper", () => {
 		expect(outcome.stopReason).toBe("budget");
 		// A value produced only because the batch was cut is not a result.
 		expect(outcome.results).toHaveLength(0);
-		expect(outcome.deferred).toEqual(["slow", "aborted-pre-spawn"]);
+		expect(outcome.deferred).toEqual(["aborted-pre-spawn", "still-running"]);
 	});
 
 	it("stops dispatching when the ambient abort signal fires", async () => {
@@ -1423,10 +1435,8 @@ describe("#2522 R2/R3 — a target that never fits the budget is retired, not ca
 
 		expect(ran).toContain(path.resolve(freshTest));
 		expect(ran).not.toContain(path.resolve(strangerTest));
-		expect(
-			dbgLines.some((l) => l.includes("belonging to another session")),
-		).toBe(true);
 		// I1: ignored, not deleted — the session that cut it still owes that run.
+		// Asserted before the log line so this reds on the behaviour.
 		const persisted = cacheManager.readCache<{
 			deferredTargets?: { testFile: string }[];
 		}>("test-runner-findings", env.tmpDir)?.data;
@@ -1434,6 +1444,9 @@ describe("#2522 R2/R3 — a target that never fits the budget is retired, not ca
 			(persisted?.deferredTargets ?? []).some(
 				(t) => path.resolve(t.testFile) === path.resolve(strangerTest),
 			),
+		).toBe(true);
+		expect(
+			dbgLines.some((l) => l.includes("belonging to another session")),
 		).toBe(true);
 	});
 });
@@ -1811,17 +1824,18 @@ describe("#2522 R4 — the deferral record across sessions, generations and caps
 		while (Date.now() < deadline && ran.length < 1) await delay(20);
 		await delay(200);
 
-		// The MCP turn ran its own target and ignored the pi route's deferral...
+		// THE invariant first, so this reds on the behaviour and not on a log
+		// string: the MCP turn did not delete the pi route's deferral.
+		const afterMcp = readRecord(cacheManager);
+		const carried = entryFor(afterMcp.deferredTargets ?? [], p.slowTest);
+		expect(carried).toBeDefined();
+		expect(carried?.sessionId).toBe(PI_SESSION);
+		// And it ran its own target without adopting the foreign one.
 		expect(ran).toContain(path.resolve(p.freshTest));
 		expect(ran).not.toContain(path.resolve(p.slowTest));
 		expect(
 			dbgLines.some((l) => l.includes("belonging to another session")),
 		).toBe(true);
-		// ...and, the invariant: it did not delete it.
-		const afterMcp = readRecord(cacheManager);
-		const carried = entryFor(afterMcp.deferredTargets ?? [], p.slowTest);
-		expect(carried).toBeDefined();
-		expect(carried?.sessionId).toBe(PI_SESSION);
 	});
 
 	/**
