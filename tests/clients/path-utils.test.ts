@@ -625,6 +625,21 @@ describe("isAtOrAboveHomeDir (#253)", () => {
 		);
 	});
 
+	/**
+	 * lane: dev-box-only in effect. Asserted on EVERY platform (no skip, and the
+	 * expectation is the same everywhere), but only win32 can actually break it:
+	 * `path.relative` returns an ABSOLUTE path when the two paths sit on
+	 * different drive letters, and an absolute `rel` has no leading `..`, so
+	 * without the `!path.isAbsolute(rel)` clause `C:\` would report itself as
+	 * at-or-above a `D:\` home and ceiling every walker on the wrong drive. On
+	 * POSIX these are ordinary relative names and `..` already answers, so the
+	 * ubuntu Unit tests lane runs this as a plain regression assertion.
+	 */
+	it("does not treat a directory on another Windows drive as at-or-above home", () => {
+		expect(isAtOrAboveHomeDir("C:\\", "D:\\Users\\jane")).toBe(false);
+		expect(isAtOrAboveHomeDir("C:\\Users", "D:\\Users\\jane")).toBe(false);
+	});
+
 	it("does not treat a directory whose name merely PREFIXES home as at-or-above it", () => {
 		// `…/user2` → `path.relative` gives `../user`; a bare "is home a prefix of
 		// dir" test would call this the home directory itself.
