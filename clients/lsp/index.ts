@@ -2824,25 +2824,66 @@ export class LSPService {
 		 * Split the candidates into the ones that could actually have been waited
 		 * on and the ones that never had a spawn slot. A record's subject must be
 		 * its producer (#1550) — the #2524 shape.
+		 *
+		 * #2525 round 3 (F3): no SHIPPED `server.root` rejects today — every one
+		 * bottoms out in `markerExists`, which only ever resolves `false` on a
+		 * miss — so this was reasoned "removed by construction". A reviewer probe
+		 * disproved that: a `root()` that rejects makes this `Promise.all` reject,
+		 * which throws out of `getClientForFile` itself (the caller never gets
+		 * `undefined` back, and `lsp_client_wait_timeout` is never emitted). A
+		 * per-server catch degrades that candidate to unrooted instead of taking
+		 * the whole partition down — the same "producer" the memo already knows
+		 * (a failed root resolution never got a client either), now WITH the
+		 * failure reason so the record says why, not just that.
 		 */
 		const partitionCandidates = async (): Promise<{
 			rooted: { server: LSPServerInfo; root: string }[];
 			unrootedIds: string[];
+			unrootedReasons: Record<string, string>;
 		}> => {
 			const resolved = await Promise.all(
-				servers.map(async (server) => ({
-					server,
-					root: await this.resolveServerRootOnce(server, filePath, rootMemo),
-				})),
+				servers.map(async (server) => {
+					try {
+						return {
+							server,
+							root: await this.resolveServerRootOnce(
+								server,
+								filePath,
+								rootMemo,
+							),
+							reason: undefined as string | undefined,
+						};
+					} catch (error) {
+						return {
+							server,
+							root: undefined as string | undefined,
+							reason: error instanceof Error ? error.message : String(error),
+						};
+					}
+				}),
 			);
+			const unrootedReasons: Record<string, string> = {};
+			for (const entry of resolved) {
+				if (entry.root === undefined && entry.reason !== undefined) {
+					unrootedReasons[entry.server.id] = entry.reason;
+				}
+			}
 			return {
-				rooted: resolved.filter(
-					(entry): entry is { server: LSPServerInfo; root: string } =>
-						entry.root !== undefined,
-				),
+				rooted: resolved
+					.filter(
+						(
+							entry,
+						): entry is {
+							server: LSPServerInfo;
+							root: string;
+							reason: string | undefined;
+						} => entry.root !== undefined,
+					)
+					.map(({ server, root }) => ({ server, root })),
 				unrootedIds: resolved
 					.filter((entry) => entry.root === undefined)
 					.map((entry) => entry.server.id),
+				unrootedReasons,
 			};
 		};
 		// hardCapMs is a caller-imposed ceiling (e.g. pipeline budget) that
@@ -3046,7 +3087,8 @@ export class LSPService {
 			// once, memoized with the trial loop's own resolutions. An unrooted
 			// fallback can never have a client keyed under its (non-existent)
 			// root, so it is neither probed here nor named in the record below.
-			const { rooted, unrootedIds } = await partitionCandidates();
+			const { rooted, unrootedIds, unrootedReasons } =
+				await partitionCandidates();
 			for (const { server, root } of rooted) {
 				const client = this.state.clients.get(
 					`${server.id}:${normalizeMapKey(root)}`,
@@ -3065,6 +3107,9 @@ export class LSPService {
 					unrootedCandidates: {
 						count: unrootedIds.length,
 						ids: unrootedIds,
+						...(Object.keys(unrootedReasons).length > 0
+							? { reasons: unrootedReasons }
+							: {}),
 					},
 					reason: "budget_skipped_known_slow",
 				},
@@ -3074,7 +3119,29 @@ export class LSPService {
 
 		if (waitResult === timeoutSentinel) {
 			// #2525: likewise a cold path — resolve here, not up front.
-			const { rooted, unrootedIds } = await partitionCandidates();
+			//
+			// #2525 round 3 (L2): `partitionCandidates` does UNCACHED negative
+			// root walks (`NearestRoot` never caches misses, by design — see the
+			// comment above `rootMemo`) and this branch only reaches it AFTER
+			// `effectiveMaxWaitMs` has already elapsed. Measured by the reviewer:
+			// 2.06ms native, ~150ms on the #462 slow-FS profile — unbounded on top
+			// of a budget whose entire contract is "return within the cap". Bound
+			// it with a small ceiling of its own (a quarter of the caller's hard
+			// cap when one was given, capped at 250ms) rather than leaving it the
+			// one piece of async work in this function with no bound at all
+			// (the "async work needs both bounds" shape — here there is no
+			// per-call abort signal to race, only the timer bound applies).
+			const partitionBudgetMs =
+				hardCapMs !== undefined ? Math.min(250, hardCapMs / 4) : 250;
+			const partitioned = await withDeadline(partitionCandidates(), {
+				ms: partitionBudgetMs,
+				onTimeout: "undefined",
+			});
+			const { rooted, unrootedIds, unrootedReasons } = partitioned ?? {
+				rooted: [],
+				unrootedIds: [],
+				unrootedReasons: {},
+			};
 			// Snapshot known client health — scan by serverId prefix (no root needed)
 			const knownHealth = [...this.state.clients.entries()]
 				.filter(([k]) =>
@@ -3092,13 +3159,23 @@ export class LSPService {
 				durationMs: effectiveMaxWaitMs,
 				metadata: {
 					maxWaitMs: effectiveMaxWaitMs,
+					// `serverIds` names the ROOTED pool the timeout record reports
+					// against, not "servers this call actually waited on" — the
+					// sequential trial loop can time out having reached only the
+					// first of several rooted candidates (case 2 in the regression
+					// test pins both `["typescript","deno"]` even though the loop
+					// never got past `typescript`).
 					serverIds: rooted.map(({ server }) => server.id),
 					unrootedCandidates: {
 						count: unrootedIds.length,
 						ids: unrootedIds,
+						...(Object.keys(unrootedReasons).length > 0
+							? { reasons: unrootedReasons }
+							: {}),
 					},
 					// servers absent from knownHealth were never spawned or are still spawning
 					knownClientHealth: knownHealth,
+					...(partitioned === undefined ? { partition: "timed-out" } : {}),
 				},
 			});
 			return undefined;

@@ -322,4 +322,122 @@ describe("getClientForFile wait records — unrooted candidates (#2525)", () => 
 		expect(typescriptRoot).toHaveBeenCalledTimes(1);
 		expect(denoRoot).toHaveBeenCalledTimes(1);
 	});
+
+	it("degrades a rejecting root() to an unrooted candidate with a reason, instead of throwing (round 3, F3)", async () => {
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const service = new LSPService();
+
+		// Mirrors case 1's rooted-but-slow primary: forces the real
+		// `timeoutSentinel` branch, so `partitionCandidates` runs after the wait
+		// race has already settled.
+		const typescriptSpawn = vi.fn(async () => {
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			return fakeProcess(601);
+		});
+		// No SHIPPED `root()` rejects today — every one bottoms out in
+		// `markerExists`, which only ever resolves `false` on a miss. This
+		// double is deliberately unfaithful to any real server so the test
+		// exercises the *robustness* of `partitionCandidates` itself, not a
+		// real-world trigger; F3's own review probe showed nothing in
+		// `getClientForFile` actually guards against it, so "no shipped root()
+		// rejects" was not the same claim as "removed by construction".
+		const denoRoot = vi.fn(async () => {
+			throw new Error("deno root probe: simulated filesystem error");
+		});
+
+		getServersForFileWithConfig.mockReturnValue([
+			{
+				id: "typescript",
+				name: "TypeScript",
+				extensions: [".ts"],
+				root: async () => "C:/repo",
+				spawn: typescriptSpawn,
+			},
+			{
+				id: "deno",
+				name: "Deno",
+				fallbackFor: "typescript",
+				extensions: [".ts"],
+				root: denoRoot,
+				spawn: vi.fn(async () => fakeProcess(602)),
+			},
+		]);
+
+		const file = "C:/repo/main.ts";
+		// Pre-fix, the rejecting root() throws out of `getClientForFile` itself
+		// (the bare `Promise.all` inside `partitionCandidates` propagates it) —
+		// this `await` is the assertion that matters: it must resolve, not reject.
+		const result = await service.getClientForFile(file, 1);
+
+		expect(result).toBeUndefined();
+
+		const timeoutCalls = logLatency.mock.calls.filter(
+			([entry]) => entry?.phase === "lsp_client_wait_timeout",
+		);
+		expect(timeoutCalls).toHaveLength(1);
+		const metadata = timeoutCalls[0][0].metadata as {
+			serverIds: string[];
+			unrootedCandidates: {
+				count: number;
+				ids: string[];
+				reasons?: Record<string, string>;
+			};
+		};
+		expect(metadata.serverIds).toEqual(["typescript"]);
+		expect(metadata.unrootedCandidates.count).toBe(1);
+		expect(metadata.unrootedCandidates.ids).toEqual(["deno"]);
+		expect(metadata.unrootedCandidates.reasons?.deno).toContain(
+			"deno root probe",
+		);
+	});
+
+	it("bounds partitionCandidates's own root walk so the timeout record still emits when a candidate's root() never resolves (round 3, L2)", async () => {
+		vi.useFakeTimers();
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const service = new LSPService();
+
+		getServersForFileWithConfig.mockReturnValue([
+			{
+				id: "typescript",
+				name: "TypeScript",
+				extensions: [".ts"],
+				// Never resolves: `resolveServerRootOnce`'s trial-loop call and
+				// `partitionCandidates`'s own call share this SAME pending promise
+				// via the per-call `rootMemo`, so this reproduces an uncached
+				// negative root walk that outlives the wait budget.
+				root: () => new Promise(() => {}),
+				spawn: vi.fn(async () => fakeProcess(701)),
+			},
+		]);
+
+		const file = "C:/repo/main.ts";
+		const resultPromise = service.getClientForFile(file, 1);
+
+		// The outer wait-budget timer (effectiveMaxWaitMs=1) fires first,
+		// selecting the real `timeoutSentinel` branch.
+		await vi.advanceTimersByTimeAsync(1);
+		// Pre-fix, `partitionCandidates()` here has no bound of its own and
+		// would hang forever on the never-resolving `root()`. Advancing past
+		// the L2 partition budget (<=250ms) is what proves it is bounded: the
+		// promise below only settles because this fires.
+		await vi.advanceTimersByTimeAsync(250);
+
+		const result = await resultPromise;
+		expect(result).toBeUndefined();
+
+		const timeoutCalls = logLatency.mock.calls.filter(
+			([entry]) => entry?.phase === "lsp_client_wait_timeout",
+		);
+		expect(timeoutCalls).toHaveLength(1);
+		const metadata = timeoutCalls[0][0].metadata as {
+			serverIds: string[];
+			unrootedCandidates: { count: number; ids: string[] };
+			partition?: string;
+		};
+		// Nothing settled within the partition budget, so the record honestly
+		// reports "don't know" rather than a false zero-unrooted-candidates.
+		expect(metadata.serverIds).toEqual([]);
+		expect(metadata.unrootedCandidates).toEqual({ count: 0, ids: [] });
+		expect(metadata.partition).toBe("timed-out");
+	});
 });
