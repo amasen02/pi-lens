@@ -62,6 +62,57 @@ vi.mock("../clients/sessionstart-logger.js", async (importActual) => {
 	};
 });
 
+// #2512: the session_start handler kicks off registerInstance/
+// logVanishedInstances/sweepOrphans fire-and-forget (session_start must not
+// block on registry I/O — see index.ts's own comment at the call site) and
+// this test used to bridge the gap with a fixed 50ms sleep, hoping the real
+// fs read-modify-write chain landed by then. Under shared-slot contention
+// (#2509 round 4's 47-file batch) it sometimes did not, and the assertions
+// below raced ahead of the write. `sweepOrphans` is the LAST step of that
+// chain (index.ts's `.finally(() => { void sweepOrphans(); })`), so wrapping
+// it to notify a listener after it settles gives an exact, awaitable signal
+// for "the whole chain has landed" instead of a wall-clock guess — the same
+// shape as instance-registry.ts's own `_settleRegistryMutationsForTests`,
+// just for the reaper's independent (non-tail-queued) prune write.
+const { onSweepOrphansSettled, notifySweepOrphansSettled } = vi.hoisted(() => {
+	const listeners = new Set<() => void>();
+	return {
+		onSweepOrphansSettled: (cb: () => void): (() => void) => {
+			listeners.add(cb);
+			return () => listeners.delete(cb);
+		},
+		notifySweepOrphansSettled: () => {
+			for (const cb of listeners) cb();
+		},
+	};
+});
+vi.mock("../clients/instance-reaper.js", async (importActual) => {
+	const actual =
+		await importActual<typeof import("../clients/instance-reaper.js")>();
+	return {
+		...actual,
+		sweepOrphans: async (): Promise<void> => {
+			try {
+				await actual.sweepOrphans();
+			} finally {
+				notifySweepOrphansSettled();
+			}
+		},
+	};
+});
+
+/** Resolves the NEXT time the wrapped `sweepOrphans` above completes. Must be
+ * called (to register the listener) BEFORE the action that triggers it, so
+ * the completion can never be missed racing the listener's own registration. */
+function waitForSweepOrphansSettled(): Promise<void> {
+	return new Promise((resolve) => {
+		const unsubscribe = onSweepOrphansSettled(() => {
+			unsubscribe();
+			resolve();
+		});
+	});
+}
+
 function registryFilePath(): string {
 	return path.join(process.env.PI_LENS_HOME as string, "instances.json");
 }
@@ -121,11 +172,15 @@ describe("index session_start vanished-instance wiring (#1123 item 2)", () => {
 
 		const pi = createPiMock();
 		extension(pi.asExtensionAPI());
+		// Registered BEFORE emit so the settle notification can never fire
+		// before this listener exists to catch it.
+		const settled = waitForSweepOrphansSettled();
 		await pi.emit("session_start", {}, makeCtx({ cwd: tmp }));
 		// registerInstance/logVanishedInstances/sweepOrphans are fire-and-forget
-		// (session_start must not block on registry I/O) — give the microtask/IO
-		// chain a tick to land.
-		await new Promise((r) => setTimeout(r, 50));
+		// (session_start must not block on registry I/O); sweepOrphans is the
+		// LAST step of that chain, so awaiting its settle signal proves the
+		// marker log (which runs strictly before it) has already landed too.
+		await settled;
 
 		// logSessionStart (via dbg()) also carries plenty of other session_start
 		// trace lines — isolate the marker line specifically.
@@ -150,8 +205,9 @@ describe("index session_start vanished-instance wiring (#1123 item 2)", () => {
 	it("logs nothing when the registry has no dead entries", async () => {
 		const pi = createPiMock();
 		extension(pi.asExtensionAPI());
+		const settled = waitForSweepOrphansSettled();
 		await pi.emit("session_start", {}, makeCtx({ cwd: tmp }));
-		await new Promise((r) => setTimeout(r, 50));
+		await settled;
 
 		const markerLines = logSessionStartSpy.mock.calls
 			.map((call) => call[0] as string)

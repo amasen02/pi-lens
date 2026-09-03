@@ -2594,5 +2594,17 @@ describe("turn_end test runner — cascade neighbors get their own test companio
 			}
 			env.cleanup();
 		}
-	});
+		// #2512 round 2: spawns a REAL child process (process.execPath -e ...)
+		// through the real TestRunnerClient — same #1022/#2332 contention class
+		// as the LSP-spawn-heavy lane siblings. Seen timing out at vitest's
+		// 5000ms default under a 47-file parallel batch (5153/5013ms), green
+		// solo every time (7.67s) and on CI alone (405ms) — scheduler
+		// contention, not code speed. This test asserts no elapsed-time budget
+		// (only that the spawn completes and its telemetry lands), so it does
+		// not qualify for the wall-clock-budget project's dead-last serialized
+		// phase (vitest.config.ts's wallClockBudgetInclude — "carry a
+		// wall-clock budget assertion, not just slowness"). An explicit
+		// per-test timeout, 4× the observed worst case, absorbs the contention
+		// directly instead.
+	}, 20_000);
 });
