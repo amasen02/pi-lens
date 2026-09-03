@@ -177,12 +177,14 @@ pi-lens MCP server expose the same shape to Claude Code / any MCP client.
 
 ### Actionable Warnings
 
-At `turn_end`, pi-lens writes `.pi-lens/cache/actionable-warnings.json` summarizing fixable warnings introduced by the current turn. This powers the optional conservative autofix at `agent_end`.
+At `turn_end`, pi-lens writes `<project-data-dir>/cache/actionable-warnings.json` summarizing fixable warnings introduced by the current turn. This powers the optional conservative autofix at `agent_end`.
+
+`<project-data-dir>` is whatever `getProjectDataDir(cwd)` resolves to: `<project>/.pi-lens` only when that legacy directory already exists, otherwise `~/.pi-lens/projects/<project-slug>` (or a `PILENS_DATA_DIR` location). The turn-end advisory points at `lens_diagnostics mode=delta` first and names the resolved file second, so you never have to work the layout out by hand (#2521).
 
 **Report contents:**
 
 - Warnings are delta-only by default: only diagnostics in lines touched during the current turn are included. Pass `--lens-actionable-warning-all` to report all warnings regardless of location
-- Each warning carries a stable `aw:<hash>` ID derived from file, rule, and message, so suppression state persists across turns in `.pi-lens/cache/actionable-warning-state.json`
+- Each warning carries a stable `aw:<hash>` ID derived from file, rule, and message, so suppression state persists across turns in `<project-data-dir>/cache/actionable-warning-state.json`
 - Sources: pipeline `fixable` diagnostics (always included) and LSP code-action warnings when `--lens-actionable-warning-actions` is set
 - When warnings are present, a concise advisory is injected into the agent context (no blocker language)
 

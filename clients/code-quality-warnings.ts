@@ -3,7 +3,7 @@ import * as path from "node:path";
 import type { CacheManager, ModifiedRange } from "./cache-manager.js";
 import type { Diagnostic } from "./dispatch/types.js";
 import { toRunnerDisplayPath } from "./dispatch/runner-context.js";
-import { getProjectDataDir } from "./file-utils.js";
+import { displayProjectDataPath, getProjectDataDir } from "./file-utils.js";
 import { normalizeMessage, stableFindingId } from "./finding-identity.js";
 import { normalizeMapKey } from "./path-utils.js";
 
@@ -69,7 +69,7 @@ export interface CodeQualityWarningsReport {
 		 * being folded into `warning`.
 		 *
 		 * OPTIONAL on purpose: this report is persisted to
-		 * `.pi-lens/cache/code-quality-warnings.json` and read back by
+		 * `<project-data-dir>/cache/code-quality-warnings.json` and read back by
 		 * `tools/lens-diagnostics.ts`, which can find a file written by a
 		 * pi-lens build that predates the field. Readers must tolerate absence.
 		 */
@@ -362,8 +362,16 @@ export function appendCodeQualityWarningsHistory(
 	}
 }
 
+/**
+ * The turn-end advisory for this report.
+ *
+ * `cwd` is REQUIRED for the same reason as
+ * {@link formatActionableWarningsAdvisory} (#2521): this advisory carried the
+ * identical hardcoded-legacy-path defect, one cache key over.
+ */
 export function formatCodeQualityWarningsAdvisory(
 	report: CodeQualityWarningsReport,
+	cwd: string,
 ): string | undefined {
 	if (report.summary.warnings === 0) return undefined;
 	const topRules = report.summary.topRules
@@ -392,8 +400,15 @@ export function formatCodeQualityWarningsAdvisory(
 			? `By tier: ${tiers}. Hint and info are style opinions, not defects.`
 			: undefined,
 		topRules ? `Top rules: ${topRules}` : undefined,
-		"Details written to .pi-lens/cache/code-quality-warnings.json",
+		// #2521: tool route first (`mode=delta` covers the code-quality cache
+		// as well as the actionable one), resolved path second.
+		"Use lens_diagnostics with mode=delta to inspect these warnings.",
 		"No action required unless you are already refactoring these areas.",
+		`Raw report (only if you need the JSON): ${displayProjectDataPath(
+			cwd,
+			"cache",
+			"code-quality-warnings.json",
+		)}`,
 	]
 		.filter(Boolean)
 		.join("\n");
