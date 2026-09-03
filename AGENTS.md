@@ -228,7 +228,7 @@ real seam, observes an independent result, and turns red when its guard or
 filter is removed. Treat setup-echoing assertions, duplicated predicates, and
 unnecessary in-process mocks as test defects.
 
-**The minimalism ladder — climb it before writing any code.** Be lazy about the solution, never about reading: understand the problem and trace the real code flow first, then ask, in order: (1) does this need to exist at all — would nothing break without it? (2) does this codebase already do it — reuse the existing seam (single-source-of-truth rule); (3) does the stdlib or platform do it? (4) does an installed dependency do it? (5) is it one line? Only then write the minimum that works. Lazy, not negligent: validation, error handling, security, bounded observability, and the degradation records this repo requires are never skipped for minimalism. The record: #2091 was built and then killed by measurement — step 1 asked before building would have saved the PR; #2106's catch-path outcome split was an unobservable discriminator that step 1 would have stopped ("a discriminator nothing can observe is a vacuous guard"). When a reviewer finds over-built code, the finding names the ladder step that was skipped.
+**The minimalism ladder — climb it before writing any code.** Be lazy about the solution, never about reading: understand the problem and trace the real code flow first, then ask, in order: (1) does this need to exist at all — would nothing break without it? (2) does this codebase already do it — reuse the existing seam (single-source-of-truth rule); (3) does the stdlib or platform do it? (4) does an installed dependency do it? (5) is it one line? Only then write the minimum that works. Lazy, not negligent: validation, error handling, security, bounded observability, and the degradation records this repo requires are never skipped for minimalism. The record: #2091 was built and then killed by measurement — step 1 asked before building would have saved the PR; #2106's catch-path outcome split was an unobservable discriminator that step 1 would have stopped ("a discriminator nothing can observe is a vacuous guard"). When a reviewer finds over-built code, the finding names the ladder step that was skipped. **Net-count rule for shared helpers (#2523/#2530, 2026-09-03):** a PR that introduces a shared helper while same-shape siblings already exist (a second timeout+signal race, a second bin walker, a second warn-once latch) must delete at least one sibling in the same PR; the helper count never goes up. Deferring the fold to "slice 2" is allowed only when the brief names every sibling, states why folding them in one PR is unsafe, and links the follow-up issue. A bare slice plan is not a justification, and this rule binds the brief author (orchestrator) as much as the fixer — #2530 shipped a fifth bound helper because the brief scoped the fold out.
 
 **External-PR handling.** Maintainer agents may commit directly to a contributor's PR branch when "allow edits from maintainers" is enabled. Prefer this over asking the contributor to apply small review asks. Keep the contributor's authorship: commit only the review deltas, write clear commit messages, and reference the review. When you post a review on an external PR, thank the contributor first. Then state plainly that the review is AI-generated and that a maintainer supervises the process.
 
@@ -3378,6 +3378,15 @@ contention flakes.
   have redded on. Run the mutations and quote the surviving red. "Low value"
   is a misjudgment this repo has made before: guards that looked redundant
   (the #2044 alias test) or vacuous (win32 skip shapes) were load-bearing.
+- **Vacuous and trivial tests are deleted in the PR that touches them, not
+  ledgered.** Redundancy needs a named survivor (above); vacuity needs no
+  survivor. A test that reds on NO mutation of the code it names, asserts a
+  constant against itself, pins a type shape the compiler already pins, or
+  re-asserts a sibling's exact assertions on the same fixture is weight with
+  no guard behind it. Fixers are EXPECTED to delete these while working in a
+  file — quote the mutation sweep that shows nothing reds, list each deleted
+  case in `Test assessment`, and move on. Deferring an obvious deletion to
+  the ledger is the failure mode, not the safe choice (maintainer, 2026-09-03).
 - **Removal candidates you identify but do not delete go to the corpus
   value ledger issue** (deferral hygiene: the candidate is recorded with the
   mutation evidence it still owes, and the ledger stays open).

@@ -79,6 +79,7 @@ import {
 	unrefChildAndPipes,
 } from "./child-unref.js";
 import {
+	type DegradationKind,
 	incrementDegradationCount,
 	recordDegradationOnce,
 } from "./degradation-ledger.js";
@@ -370,7 +371,21 @@ async function findPidsByMarkerWindows(marker: string): Promise<number[]> {
 			// without this exclusion the search matches itself.
 			excludeSelfPid: true,
 		},
-		{ timeoutMs: BACKSTOP_SCAN_TIMEOUT_MS },
+		{
+			timeoutMs: BACKSTOP_SCAN_TIMEOUT_MS,
+			// #2527 review F2: omitting `onTimeout` falls through to
+			// child-unref.ts's default — one bare, unverified `child.kill()`, no
+			// tree kill, no identity-carrying record — inside the orphan backstop
+			// path, the exact abandonment `terminateScannerChild`'s own doc
+			// comment says it exists to prevent. This query shares the backstop's
+			// scanner identity and budget (same producer as
+			// `enumerateManagedProcesses`), so it gets the same kind.
+			onTimeout: (child) =>
+				terminateScannerChild(child, {
+					kind: "orphan-backstop-scanner-escalated",
+					timeoutMs: BACKSTOP_SCAN_TIMEOUT_MS,
+				}),
+		},
 	);
 	if (result.status !== "ok") {
 		recordDegradationOnce({
@@ -401,7 +416,18 @@ async function queryCommandLines(pids: number[]): Promise<Map<number, string>> {
 			fields: ["pid", "command"],
 			filter: { column: "ProcessId", op: "eq", values: valid },
 		},
-		{ timeoutMs: BACKSTOP_SCAN_TIMEOUT_MS },
+		{
+			timeoutMs: BACKSTOP_SCAN_TIMEOUT_MS,
+			// #2527 review F2: same rationale as findPidsByMarkerWindows above —
+			// route through the reaper's own tree-kill-and-verify machinery with
+			// the backstop's kind rather than falling through to the unverified
+			// default kill with no ledger record.
+			onTimeout: (child) =>
+				terminateScannerChild(child, {
+					kind: "orphan-backstop-scanner-escalated",
+					timeoutMs: BACKSTOP_SCAN_TIMEOUT_MS,
+				}),
+		},
 	);
 	// POSIX `ps -p` exits nonzero when NONE of the requested pids exist, which
 	// is a legitimate clean result for this caller, so that one status is not
@@ -763,14 +789,21 @@ async function enumerateManagedProcesses(
 	// POSIX branch. Windows over-collects for its own reason anyway
 	// (`node.exe` is a superset image name covering every node process on the
 	// machine).
+	const scanTimeoutMs = options.timeoutMs ?? BACKSTOP_SCAN_TIMEOUT_MS;
 	const result = await queryProcessTable(
 		{
 			fields: ["pid", "ppid", "ageMs", "command"],
 			filter: { column: "Name", op: "eq", values: MANAGED_IMAGE_NAMES },
 		},
 		{
-			timeoutMs: options.timeoutMs ?? BACKSTOP_SCAN_TIMEOUT_MS,
-			onTimeout: (child: ChildProcess) => terminateScannerChild(child, options),
+			timeoutMs: scanTimeoutMs,
+			onTimeout: (child: ChildProcess) =>
+				terminateScannerChild(child, {
+					verifyAttempts: options.verifyAttempts,
+					verifyIntervalMs: options.verifyIntervalMs,
+					kind: "orphan-backstop-scanner-escalated",
+					timeoutMs: scanTimeoutMs,
+				}),
 		},
 	);
 	return narrowToManagedBinaries(
@@ -813,6 +846,34 @@ interface ManagedProcessScan {
 	timeoutKill?: SpawnTimeoutKill;
 }
 
+export interface TerminateScannerChildOptions {
+	verifyAttempts?: number;
+	verifyIntervalMs?: number;
+	/**
+	 * The degradation kind this escalation is attributed to. #2524: this
+	 * function has callers with two different budgets and cadences — the
+	 * registry-independent orphan backstop's own scanner queries
+	 * (`enumerateManagedProcesses`, `findPidsByMarkerWindows`,
+	 * `queryCommandLines`; one scan per cooldown window,
+	 * `BACKSTOP_SCAN_TIMEOUT_MS`) and the resource sampler's process-table
+	 * queries (`sampleProcessesWindows`, `findDescendantPidsWindows`; every
+	 * heartbeat/spawn-bracket tick, `RESOURCE_SAMPLE_QUERY_TIMEOUT_MS`).
+	 * A hardcoded kind here mis-attributed every sampler escalation to the
+	 * backstop (defect shape: a record's subject must be its producer) — the
+	 * caller now supplies its own kind so the ledger names who actually timed
+	 * out. #2527 review F2: `findPidsByMarkerWindows` and `queryCommandLines`
+	 * originally omitted `onTimeout` entirely, so a scanner they spawned that
+	 * blew `BACKSTOP_SCAN_TIMEOUT_MS` fell through to `child-unref.ts`'s bare,
+	 * unverified default kill with no identity-carrying record — the exact
+	 * abandonment this function exists to prevent, reachable from inside the
+	 * orphan backstop path itself. Both now route through here too.
+	 */
+	kind: DegradationKind;
+	/** The caller's own timeout budget in ms, folded into the reason text so
+	 *  the ledger names WHICH budget was blown without a second lookup. */
+	timeoutMs: number;
+}
+
 /**
  * Terminate a scanner child that blew the scan timeout, using the reaper's
  * OWN tree-kill-and-verify machinery (#1864 review F3).
@@ -824,10 +885,22 @@ interface ManagedProcessScan {
  * exists to fix, so the scanner now gets exactly what an orphan gets:
  * `taskkill /F /T` or a POSIX group kill, then a verified liveness poll. The
  * escalation is recorded with the scanner's identity, never swallowed.
+ *
+ * The kill attempt itself is real regardless of what happens next: this
+ * handler is invoked the instant the caller's timer elapses, which can race
+ * a query child that is genuinely about to close successfully (its own
+ * "close" event may still win the overall settle — see
+ * `child-unref.ts#spawnCollectStdoutResult`, which resolves on whichever of
+ * "close" or the timeout handler's own settle lands first). This function has
+ * no way to observe that outcome — it runs strictly BEFORE the caller's
+ * promise resolves — so it always records the escalation it actually
+ * attempted; callers whose escalation kind can fire on that race classify it
+ * as informational rather than a warning (see
+ * `degradation-ledger.ts`'s `resource-sampler-scanner-escalated` doc comment).
  */
 export async function terminateScannerChild(
 	child: ChildProcess,
-	options: { verifyAttempts?: number; verifyIntervalMs?: number },
+	options: TerminateScannerChildOptions,
 ): Promise<SpawnTimeoutKill> {
 	const pid = child.pid;
 	const outcome =
@@ -838,9 +911,9 @@ export async function terminateScannerChild(
 				})
 			: "invalid";
 	incrementDegradationCount({
-		kind: "orphan-backstop-scanner-escalated",
+		kind: options.kind,
 		subject: `${isWindows ? "win32-cim" : "posix-ps"}#${pid ?? "no-pid"}`,
-		reason: `scan exceeded its timeout; tree kill reported ${outcome}`,
+		reason: `scan exceeded its ${options.timeoutMs}ms timeout; tree kill reported ${outcome}`,
 	});
 	return outcome;
 }
