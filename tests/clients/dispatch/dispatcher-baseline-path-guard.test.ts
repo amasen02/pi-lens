@@ -117,8 +117,12 @@ describe("dispatchForFile baseline-path guard (#2489 round 2)", () => {
 		expect(group?.latestReasons[0]?.subject).toBe("relative/test.ts");
 
 		// The write below the read is gated on the same safety check, so no
-		// fact was written under the unreachable relative key either — a
-		// second dispatch under the same spelling must still read as a fresh
+		// fact was ever written under the unreachable relative key.
+		expect(
+			facts.hasBoundedSessionFact("session.baseline.relative/test.ts"),
+		).toBe(false);
+
+		// A second dispatch under the same spelling must still read as a fresh
 		// miss, not a "prior write found" hit.
 		const secondResult = await dispatchForFile(ctx, groups, registry);
 		expect(secondResult.baselineWarningCount).toBe(0);
