@@ -69,18 +69,17 @@ describe("published manifest carries no devDependencies", () => {
 				"utf8",
 			);
 			const npm = process.platform === "win32" ? "npm.cmd" : "npm";
-			const out = execFileSync(
-				npm,
-				["pack", "--ignore-scripts=false", "--pack-destination", tmp, "--json"],
-				{
-					cwd: root,
-					encoding: "utf8",
-					shell: process.platform === "win32",
-					timeout: 180_000,
-				},
-			);
-			const filename = (JSON.parse(out) as Array<{ filename: string }>)[0]
-				.filename;
+			// Not `--json`: `prepare` also runs on pack and its scripts write to stdout
+			// (setup-git-hooks on a fresh CI checkout), which corrupts the JSON payload.
+			execFileSync(npm, ["pack", "--pack-destination", tmp], {
+				cwd: root,
+				encoding: "utf8",
+				shell: process.platform === "win32",
+				timeout: 180_000,
+				stdio: ["ignore", "ignore", "inherit"],
+			});
+			const filename = fs.readdirSync(tmp).find((f) => f.endsWith(".tgz"));
+			if (!filename) throw new Error("npm pack produced no tarball");
 			// tar with cwd + a relative path: GNU/bsd tar misread `C:...` as a remote host spec.
 			const manifest = execFileSync(
 				"tar",
