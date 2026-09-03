@@ -58,9 +58,11 @@ merge — you report internally to the orchestrator.
      purpose.
 5. Run the targeted suites the PR names, PLUS grep tests/ for every symbol the
    diff touches and run every referencing file. `npm run build` first, always.
-6. Read CI on the exact head SHA (REST check-runs when GraphQL 503s). Confirm
-   Unit tests genuinely executed. Read the logs of any failing check and judge
-   infra vs code — never wave a failure through unread.
+6. Read CI on the exact head SHA with `node scripts/ci-verdict.mjs
+   <pr-number|sha>` (#2539; one REST check-runs read, exits 0/1/2/3 for
+   success/failure/DIRTY/pending). Confirm Unit tests genuinely executed. Read
+   the logs of any failing check and judge infra vs code — never wave a
+   failure through unread.
 7. Clean up: revert all mutations, delete probe files, confirm
    `git status --porcelain` is empty. Junctions (if you created any) removed.
 
@@ -91,8 +93,14 @@ can trip, and say in your report which you ran and what each returned.
   title. `CHANGELOG.md` itself is never hand-edited. The only legitimate edits
   to it are the rollups `npm run changelog:release` generates on a release PR.
 - **CI executed, not merely absent.** Read the check runs on the exact head
-  SHA and confirm Unit tests and Lint ran there. A DIRTY PR cannot build its
-  merge ref, so those checks are skipped silently rather than failed.
+  SHA with `node scripts/ci-verdict.mjs <pr-number|sha>` (#2539) and confirm
+  Unit tests and Lint ran there (exit 0). The script's DIRTY verdict (exit 2)
+  fires whenever `gh pr view` reports the head as merge-conflicted
+  (`mergeable=CONFLICTING`), regardless of whether the required checks are
+  present or absent in the check-runs payload (#2539 round 3, F1): a PR can
+  go green and only turn conflicting afterward — same head SHA, old green
+  runs still attached — and that stale green no longer reflects a mergeable
+  state, so it must not read as a pass either.
 - **Session-start reset placement.** `SessionStartClassification`
   (`clients/session-lifecycle.ts`) has three values, and only one of them skips
   the reset. `primary` and `sequential-replacement` both register as the

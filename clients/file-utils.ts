@@ -6,6 +6,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Minimatch, type MinimatchOptions } from "./deps/minimatch.js";
+import { FRESHNESS_CADENCE_MS } from "./freshness-cadence.js";
 import {
 	isInSpawnTimeoutCooldown,
 	noteSpawnTimeout,
@@ -736,8 +737,17 @@ const projectIgnoreMatcherCache = new Map<
 	}
 >();
 
-/** Nested ignore sources are checked at most once per root per cadence window. */
-export const PROJECT_IGNORE_FRESHNESS_CADENCE_MS = 2_000;
+/**
+ * Nested ignore sources are checked at most once per root per cadence window.
+ * Sourced from the shared leaf (`freshness-cadence.ts`) rather than owning the
+ * value: `project-lens-config.ts`'s no-config discovery cache (#2483 round 2)
+ * needs the same cadence and cannot import it FROM here, because this module
+ * already imports `project-lens-config.ts` (the `clients/` acyclic-imports
+ * rule would reject the reverse edge). Re-exported under this name so the
+ * existing test imports (`tests/clients/project-ignore-freshness.test.ts` and
+ * siblings) are unaffected.
+ */
+export const PROJECT_IGNORE_FRESHNESS_CADENCE_MS = FRESHNESS_CADENCE_MS;
 
 /**
  * `size:mtimeMs` freshness signature for a single file (#1105). mtime alone
