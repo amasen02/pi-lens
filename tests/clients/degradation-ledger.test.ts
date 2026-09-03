@@ -288,6 +288,43 @@ describe("session degradation ledger", () => {
 		expect(lines[2]).toContain("⚠ log-sink-rotate-failed: 2");
 		expect(lines[2]).toContain(sink);
 	});
+
+	// #2504 review round 8 (S1): both actionable-warnings carry-forward drops
+	// fire on the ordinary re-edit cadence and self-heal on the next turn's
+	// analysis or deferral, so they get the same informational treatment as a
+	// routine log rotation -- no `⚠`.
+	it("renders both actionable-warnings carry-forward drops informationally", () => {
+		const lines = renderDegradationLines([
+			{
+				kind: "actionable-warnings-inband-superseded",
+				count: 1,
+				droppedCount: 0,
+				latestReasons: [
+					{
+						subject: "/repo:inband-carry-superseded",
+						reason:
+							"1 carried-forward deferred file entry changed before this turn's in-band publish could keep them (src/a.ts)",
+					},
+				],
+			},
+			{
+				kind: "actionable-warnings-deferred-superseded",
+				count: 1,
+				droppedCount: 0,
+				latestReasons: [
+					{
+						subject: "/repo:deferred-file-superseded",
+						reason:
+							"1 file(s) changed while the deferred LSP pull was reading them (src/b.ts)",
+					},
+				],
+			},
+		]);
+		expect(lines[1]).toBe("  actionable-warnings-inband-superseded: 1");
+		expect(lines[1]).not.toContain("⚠");
+		expect(lines[2]).toBe("  actionable-warnings-deferred-superseded: 1");
+		expect(lines[2]).not.toContain("⚠");
+	});
 	it("renders newly wired degradation kinds", () => {
 		recordDegradation({
 			kind: "formatter-failure",

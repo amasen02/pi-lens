@@ -1,9 +1,10 @@
+import * as fs from "node:fs";
 import * as path from "node:path";
 import {
-	appendActionableWarningsHistory,
 	buildActionableWarningsReport,
 	formatActionableWarningsAdvisory,
-	writeActionableWarningsReport,
+	publishActionableWarningsReport,
+	writeDeferredActionableWarningsReport,
 } from "./actionable-warnings.js";
 import { logActionableWarningsEvent } from "./actionable-warnings-logger.js";
 import {
@@ -118,7 +119,12 @@ import {
 // #1631 review V2: moved to its own leaf module so a low-level store
 // (widget-state.ts) can use the marker without importing this orchestrator —
 // see clients/stale-marker.ts's doc comment.
-import { incrementDegradationCount } from "./degradation-ledger.js";
+import {
+	incrementDegradationCount,
+	recordDegradationOnce,
+} from "./degradation-ledger.js";
+import { mapWithConcurrency } from "./map-with-concurrency.js";
+import { getAmbientAbortSignal } from "./safe-spawn.js";
 import { emitBounded } from "./bounded-telemetry.js";
 import {
 	degradeDemotedFindingBody,
@@ -140,6 +146,117 @@ import type { TestRunnerFindingsCache } from "./project-diagnostics/runner-adapt
 
 /** Maximum detailed notify-stall coverage-gap rows emitted in one turn. */
 const LATE_AUX_COVERAGE_GAP_DETAIL_CAP_PER_TURN = 20;
+
+/**
+ * #2504 — bounds on the per-turn test-runner fan-out.
+ *
+ * The reported turn fired 59 `vitest.cmd` spawns at once from a bare
+ * `Promise.allSettled(targets.map(...))`. Each spawn carries its OWN 60 s
+ * timeout (`test-runner-client.ts`), which bounds one target and says nothing
+ * about the batch: 59 of them starved the event loop for the whole turn
+ * (`cpuCoverageRatio 0.56`, 20 orphan-backstop escalations inside the storm).
+ *
+ * Three separate bounds, because they fail differently:
+ *  - CONCURRENCY caps how much CPU the batch can hold at one instant;
+ *  - TARGET COUNT caps how much work one turn may enqueue at all;
+ *  - the WALL BUDGET caps how long the batch may keep spawning, and is raced
+ *    against the ambient abort signal so a cancelled turn stops dispatching
+ *    immediately rather than at the next natural boundary.
+ */
+export const TEST_RUNNER_BATCH_CONCURRENCY = 4;
+export const TEST_RUNNER_MAX_TARGETS = 12;
+export const TEST_RUNNER_BATCH_BUDGET_MS = 90_000;
+
+export interface BoundedTestBatchOutcome<R> {
+	/** One entry per target that was actually dispatched AND settled. */
+	results: PromiseSettledResult<R>[];
+	/** Targets never dispatched (or still in flight when a bound fired). */
+	skipped: number;
+	/** Which bound ended the batch early, if either did. */
+	stopReason?: "budget" | "abort";
+}
+
+/**
+ * Run `run` over `targets` with a concurrency cap, a batch-wide wall budget
+ * and an abort-signal race. Reuses `mapWithConcurrency` (the repo's existing
+ * worker-pool shape) rather than hand-rolling a second pool.
+ *
+ * Both bounds are enforced twice on purpose: cooperatively, before each
+ * dispatch, so no NEW work starts past the bound; and as a real race against
+ * the pool, so an in-flight target cannot hold the batch past its budget.
+ * Whatever has settled by then is returned — a partial batch of real results
+ * is strictly better than none, and the caller reports the shortfall.
+ */
+export async function runTestTargetsBounded<T, R>(args: {
+	targets: T[];
+	concurrency: number;
+	budgetMs: number;
+	signal?: AbortSignal;
+	run: (target: T) => Promise<R>;
+}): Promise<BoundedTestBatchOutcome<R>> {
+	const results: PromiseSettledResult<R>[] = [];
+	if (args.targets.length === 0) return { results, skipped: 0 };
+
+	let stopReason: "budget" | "abort" | undefined;
+	const budgetMs = Math.max(0, args.budgetMs);
+	const deadline = Date.now() + budgetMs;
+	const shouldStop = (): boolean => {
+		if (stopReason !== undefined) return true;
+		if (args.signal?.aborted) {
+			stopReason = "abort";
+			return true;
+		}
+		if (Date.now() >= deadline) {
+			stopReason = "budget";
+			return true;
+		}
+		return false;
+	};
+
+	const pool = mapWithConcurrency(
+		args.targets,
+		Math.max(1, args.concurrency),
+		async (target) => {
+			if (shouldStop()) return;
+			try {
+				results.push({ status: "fulfilled", value: await args.run(target) });
+			} catch (reason) {
+				results.push({ status: "rejected", reason });
+			}
+		},
+	);
+	// The pool's mapper swallows every throw, so this can only reject on an
+	// internal fault — never leave it unhandled after the race below.
+	void pool.catch(() => {});
+
+	await new Promise<void>((resolve) => {
+		let settled = false;
+		const finish = (reason?: "budget" | "abort"): void => {
+			if (settled) return;
+			settled = true;
+			if (reason !== undefined) stopReason ??= reason;
+			clearTimeout(timer);
+			args.signal?.removeEventListener("abort", onAbort);
+			resolve();
+		};
+		const onAbort = (): void => finish("abort");
+		const timer = setTimeout(() => finish("budget"), budgetMs);
+		// A pending batch timer must never hold the process open.
+		timer.unref?.();
+		if (args.signal?.aborted) finish("abort");
+		else args.signal?.addEventListener("abort", onAbort, { once: true });
+		void pool.then(
+			() => finish(),
+			() => finish(),
+		);
+	});
+
+	return {
+		results,
+		skipped: args.targets.length - results.length,
+		stopReason,
+	};
+}
 
 interface TurnEndDeps {
 	ctxCwd?: string;
@@ -449,13 +566,27 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 
 	// A live foreign writer owns this worklist. Do not clear or consume another
 	// pi/MCP session's files; a dead/aged owner is safely evicted instead.
-	const currentOwner: TurnStateOwner = owner ?? {
-		kind: "pi",
-		id: runtime.telemetrySessionId,
-		pid: process.pid,
-		lastSeen: new Date().toISOString(),
+	// #2504: `sessionStartedAt` dates the persisted worklist against THIS
+	// session. Without it an ownerless turn-state.json — the resting shape
+	// before #2504 — read back as "owned" no matter how old it was.
+	const currentOwner: TurnStateOwner = {
+		...(owner ?? {
+			kind: "pi",
+			id: runtime.telemetrySessionId,
+			pid: process.pid,
+			lastSeen: new Date().toISOString(),
+		}),
+		sessionStartedAt: owner?.sessionStartedAt ?? runtime.sessionStartedAt,
 	};
 	const access = cacheManager.getTurnStateAccess(cwd, currentOwner);
+	// Captured BEFORE the eviction below rewrites the file: the owner the gate
+	// actually judged. This pair is what would have settled #2504 from the
+	// debug log alone.
+	const gateOwnerLabel = turnState.owner
+		? `${turnState.owner.kind}:${turnState.owner.id}`
+		: turnState.sessionId
+			? `legacy:${turnState.sessionId}`
+			: "none";
 	const sameProcessPiSessionHandoff =
 		access === "foreign-live" &&
 		currentOwner.kind === "pi" &&
@@ -597,7 +728,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 	}
 
 	dbg(
-		`turn_end: ${files.length} file(s) modified, cycles: ${turnState.turnCycles}/${turnState.maxCycles}`,
+		`turn_end: ${files.length} file(s) modified, cycles: ${turnState.turnCycles}/${turnState.maxCycles}, access: ${access}, owner: ${gateOwnerLabel}`,
 	);
 
 	if (cacheManager.isMaxCyclesExceeded(cwd)) {
@@ -1914,6 +2045,8 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			}
 		}
 
+		let overCapTargets = 0;
+		let missingTargetFiles = 0;
 		for (const { display, abs, isNeighbor } of candidates) {
 			const target = testRunnerClient.getTestRunTarget(
 				abs,
@@ -1922,6 +2055,22 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			);
 			if (target && !seen.has(target.testFile)) {
 				seen.add(target.testFile);
+				// #2504: a conventional target that no longer exists on disk still
+				// cost a full runner spawn, which came back "Test file not found"
+				// and was then dropped as an expected skip further down. 9 of the
+				// reported turn's 59 spawns were this. One statSync is cheaper
+				// than a vitest process by four orders of magnitude.
+				if (!fs.existsSync(target.testFile)) {
+					missingTargetFiles++;
+					dbg(
+						`turn_end: ${display} → test file missing, skipping spawn (${path.relative(cwd, target.testFile)})`,
+					);
+					continue;
+				}
+				if (targets.length >= TEST_RUNNER_MAX_TARGETS) {
+					overCapTargets++;
+					continue;
+				}
 				targets.push(target);
 				dbg(
 					`turn_end: ${display} → test ${target.runner} ${path.relative(cwd, target.testFile)} (${target.strategy}${isNeighbor ? ", cascade-neighbor" : ""})`,
@@ -1932,9 +2081,27 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				);
 			}
 		}
+		if (missingTargetFiles > 0) {
+			dbg(
+				`turn_end: skipped ${missingTargetFiles} test target(s) whose file no longer exists`,
+			);
+		}
+		if (overCapTargets > 0) {
+			// Never silent: the agent is told that some of this turn's tests were
+			// not run, rather than reading an all-green batch that covered part
+			// of the edit set.
+			recordDegradationOnce({
+				kind: "test-runner-batch-capped",
+				subject: cwd,
+				reason: `turn touched more test targets than one turn may fire; ran ${TEST_RUNNER_MAX_TARGETS}, skipped ${overCapTargets} — re-run the remainder with lens_diagnostics or edit them in a smaller batch`,
+			});
+			dbg(
+				`turn_end: test target count capped at ${TEST_RUNNER_MAX_TARGETS}, ${overCapTargets} skipped`,
+			);
+		}
 		if (targets.length > 0) {
 			dbg(
-				`turn_end: firing ${targets.length} test target(s) async (non-blocking)`,
+				`turn_end: firing ${targets.length} test target(s) async (non-blocking, max ${TEST_RUNNER_BATCH_CONCURRENCY} concurrent)`,
 			);
 			const firedAtTurn = runtime.turnIndex;
 			const firedSessionId = sessionId ?? runtime.telemetrySessionId;
@@ -1964,16 +2131,31 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				{ ...(priorTestCache ?? { content: "" }), testRunGeneration },
 				cwd,
 			);
-			Promise.allSettled(
-				targets.map((t) =>
+			runTestTargetsBounded({
+				targets,
+				concurrency: TEST_RUNNER_BATCH_CONCURRENCY,
+				budgetMs: TEST_RUNNER_BATCH_BUDGET_MS,
+				// Both bounds, per AGENTS.md: a wall budget AND the ambient
+				// abort signal the rest of the spawn layer already honours.
+				signal: getAmbientAbortSignal(),
+				run: (t) =>
 					testRunnerClient.runTestFileAsync(t.testFile, cwd, {
 						runner: t.runner,
 						config: t.config,
 						turnIndex: firedAtTurn,
 					}),
-				),
-			)
-				.then((results) => {
+			})
+				.then(({ results, skipped, stopReason }) => {
+					if (skipped > 0) {
+						recordDegradationOnce({
+							kind: "test-runner-batch-capped",
+							subject: `${cwd}:${stopReason ?? "incomplete"}`,
+							reason: `test batch stopped early (${stopReason ?? "incomplete"}); ${skipped} target(s) produced no result this turn`,
+						});
+						dbg(
+							`turn_end: test batch stopped early (${stopReason ?? "incomplete"}), ${skipped} target(s) unrun`,
+						);
+					}
 					const publishedAgainst = snapshotAdvisoryProvenance({
 						cwd,
 						runtime,
@@ -2402,10 +2584,82 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				fileSeqByPath,
 				deltaOnly: !getFlag("lens-actionable-warning-all"),
 				dbg,
+				// #2504: this call is AWAITED on the turn_end hook, so its cost is
+				// terminal-blocking time. The file cap and wall budget are its
+				// bounds; the abort signal is the second one AGENTS.md requires.
+				signal: getAmbientAbortSignal(),
+				// A cold-cache turn hands the fresh-pull loop back here, off the
+				// hook — it lands in the same cache the in-band report goes to.
+				onDeferredReport: (deferred) => {
+					try {
+						// #2504 review round 2 (F2): GUARDED. This callback fires up
+						// to a minute after the turn that armed it, and the report
+						// it carries is stamped with THAT turn's
+						// turnIndex/projectSeq. Writing it unconditionally
+						// overwrote a newer report, which `agent_end` then rejected
+						// as `project_seq_mismatch` (silently skipping the autofix
+						// pass) and `lens_diagnostics` re-served as a stale delta.
+						// #2504 review round 4 (F1): guarded PER FILE, not per
+						// report. The round-3 shape (publish, or discard whole
+						// when something newer is persisted) composed with
+						// incumbent-wins into "publish nothing" — every turn_end
+						// with modified files persists an in-band report with a
+						// strictly increasing turnIndex, and the decline fires
+						// exactly when such a turn runs while a loop is in
+						// flight, so a decline always implied a supersede. The
+						// merge upserts the entries whose file has not moved and
+						// drops only those that have.
+						writeDeferredActionableWarningsReport({
+							cacheManager,
+							cwd,
+							report: deferred,
+							// The LIVE per-file sequence at WRITE time is the
+							// baseline the merge judges each entry against. The
+							// runtime is the only thing that knows it: a file
+							// edited into cleanliness by a later turn is absent
+							// from the persisted report entirely.
+							getFileSeq: getFileSeq
+								? (filePath: string) => getFileSeq.call(runtime, filePath)
+								: undefined,
+							dbg,
+						});
+					} catch (deferErr) {
+						dbg(
+							`turn_end: deferred actionable-warnings write failed — ${deferErr}`,
+						);
+					}
+				},
 			});
-			writeActionableWarningsReport(cacheManager, cwd, report);
-			appendActionableWarningsHistory(cwd, report);
-			const advisory = formatActionableWarningsAdvisory(report);
+			// #2504 review round 5 (F1): THE publish choke point. This was a
+			// blind `writeActionableWarningsReport` while the deferred callback
+			// above read-modify-wrote the SAME cache key. The deferred merge can
+			// land anywhere inside this handleTurnEnd -- the cascade settle,
+			// knip, madge, the test batch, the in-band LSP enrichment are all
+			// awaited between the moment it is armed and the moment we get
+			// here -- and the blind write erased it 607 ms later in the
+			// reviewer's trace. The publisher now always reads what is persisted
+			// and merges per file, so the two writers cannot race. It carries
+			// forward only entries a DEFERRAL produced, and only while their
+			// file has not moved, so a `turn_delta` report does not accumulate
+			// every prior turn's findings.
+			const publishResult = publishActionableWarningsReport(
+				cacheManager,
+				cwd,
+				report,
+				{
+					origin: "in-band",
+					getFileSeq: getFileSeq
+						? (filePath: string) => getFileSeq.call(runtime, filePath)
+						: undefined,
+					dbg,
+				},
+			);
+			// #2504 review round 6 (a): the advisory must read the MERGED report,
+			// not the pre-merge `report` this turn assembled -- a rescued deferred
+			// entry lives only on `publishResult.report`, and formatting the
+			// pre-merge report silently dropped it from the turn_end advisory
+			// even though it was correctly persisted to cache.
+			const advisory = formatActionableWarningsAdvisory(publishResult.report);
 			// @delivery-surface: runtime-turn:actionable-warnings-advisory
 			if (advisory) advisoryParts.push(advisory);
 			logActionableWarningsEvent({
@@ -2413,7 +2667,13 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				sessionId: runtime.telemetrySessionId,
 				metadata: {
 					turnIndex: runtime.turnIndex,
-					unsuppressed: report.summary.unsuppressed,
+					// #2504 review round 7 (F2): the MERGED report, matching the
+					// advisory text above it (round 6, a) -- a rescued deferred
+					// entry lives only on `publishResult.report`, and the pre-merge
+					// `report` this turn assembled undercounts it. This is the value
+					// scripts/analyze-pi-lens-logs.mjs sums, so an undercount here is
+					// a silent miscount there too.
+					unsuppressed: publishResult.report.summary.unsuppressed,
 				},
 			});
 			logLatency({

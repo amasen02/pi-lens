@@ -75,6 +75,15 @@ export interface LspMutationCacheManager {
 		importsChanged: boolean,
 		cwd: string,
 		sessionId?: string,
+		ownerKind?: "pi",
+		/**
+		 * #2504 review round 2 (F1): the root the worklist's containment filter
+		 * judges against. `cwd` still selects which `turn-state.json` the entry
+		 * lands in; this says which paths BELONG to that project. They differ
+		 * for exactly the caller below — a `cwd`-scoped context for a call
+		 * issued from a sub-package of a monorepo-wide server's root.
+		 */
+		projectRoot?: string,
 	) => unknown;
 }
 
@@ -398,6 +407,19 @@ function bookkeepLspMutation(
 						detail.importsChanged ?? true,
 						context.cwd,
 						runtime?.telemetrySessionId,
+						undefined,
+						// #2504 review round 2 (F1). #2504 added a containment
+						// filter to `addModifiedRange` and gave it `cwd` as the
+						// project root. On THIS path `cwd` is the calling
+						// directory, which `tools/lsp-navigation.ts` scopes to a
+						// sub-package while the LSP client's root spans the whole
+						// monorepo — so a server-initiated edit on a sibling
+						// package (#2450) and every edit whose context carries a
+						// separate bookkeeping cwd (#2479) were silently dropped
+						// from the worklist. Same root the `isRecordable` gate a
+						// few frames up already uses: `runtime.projectRoot`,
+						// falling back to `cwd` when no runtime is threaded.
+						runtime?.projectRoot ?? context.cwd,
 					);
 				} catch (err) {
 					context.dbg?.(

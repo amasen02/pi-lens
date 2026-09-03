@@ -58,6 +58,11 @@ import {
 	resetAnalyzerBootstrapSessionState,
 } from "../../clients/bootstrap.js";
 import {
+	abortDeferredLspWork,
+	armDeferredLspWork,
+	isDeferredLspWorkArmed,
+} from "../../clients/deferred-lsp-work.js";
+import {
 	lookupLearnedMutatingTool,
 	noteObservedMutation,
 	resetMutationAttribution,
@@ -842,6 +847,22 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 		resetName: "resetLSPService",
 		reason:
 			"The service is torn down and rebuilt per session; this reset is also the seam that carries the sweep hold and TS-repair guard resets.",
+	},
+	{
+		id: "deferred-lsp-work:handle",
+		module: "deferred-lsp-work.ts",
+		state: "deferredController, deferredWork",
+		policy: "session_start",
+		resetName: "resetLSPService",
+		reason:
+			"#2504 review round 2 (F3): the slot holds the off-hook actionable-warnings pull that is still talking to the LSP service after turn_end returned. Its lifetime is exactly the service's, so it is retired through the same seam — resetLSPService aborts it before any teardown and before the no-live-service early return, which is how session_shutdown, session_start and the idle reset all reach it. A session_start that left the previous session's loop running would have it opening documents against a service the new session just replaced; that is defect shape 17 with an LSP client attached. Round 3 removed the unused _resetDeferredLspWorkForTests export (S-1), which was the file's only Signal-B hit, so the scan no longer flags it and it carries no SESSION_STATE_SYMBOL_COUNTS row; this hand-written entry and its probe are its coverage.",
+		probe: {
+			arm: () => {
+				armDeferredLspWork();
+			},
+			isArmed: () => !isDeferredLspWorkArmed(),
+			reset: () => abortDeferredLspWork("session-state-registry-probe"),
+		},
 	},
 	{
 		id: "lsp-server:launchAvailabilityGeneration",

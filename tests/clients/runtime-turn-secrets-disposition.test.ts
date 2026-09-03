@@ -22,6 +22,17 @@ function setMtime(file: string, ms: number): void {
 // every turn. These prove the fix reaches this exact gate, not just
 // `lens_diagnostics mode=full`'s parallel (also-fixed) surface.
 
+/**
+ * #2504: every production `addModifiedRange` caller stamps a writer id
+ * (`lsp-mutation`, `mutation-bridge`, `runtime-tool-result`,
+ * `runtime-agent-end`, the MCP routes) — an OWNERLESS worklist is only ever
+ * the resting shape left behind by `clearTurnState`. These tests used to
+ * register their range with no id, so they persisted a shape production never
+ * writes, and #2504's stale-worklist gate (correctly) evicted it as carried
+ * over from a session that ended before this one began.
+ */
+const TURN_STATE_SESSION_ID = "turnend-secrets-session";
+
 const EMPTY_KNIP_RESULT = {
 	success: true,
 	issues: [],
@@ -69,7 +80,13 @@ describe("turn_end secrets gate honors dispositions (#1617)", () => {
 			// returns) when no file was touched this turn — register a modified
 			// range so it runs the full findings pipeline, same as the existing
 			// cascade turn-end tests do.
-			cacheManager.addModifiedRange(filePath, { start: 1, end: 1 }, false, cwd);
+			cacheManager.addModifiedRange(
+				filePath,
+				{ start: 1, end: 1 },
+				false,
+				cwd,
+				TURN_STATE_SESSION_ID,
+			);
 			cacheManager.writeCache(
 				"gitleaks",
 				{
@@ -113,7 +130,13 @@ describe("turn_end secrets gate honors dispositions (#1617)", () => {
 				"false-positive",
 			);
 
-			cacheManager.addModifiedRange(filePath, { start: 1, end: 1 }, false, cwd);
+			cacheManager.addModifiedRange(
+				filePath,
+				{ start: 1, end: 1 },
+				false,
+				cwd,
+				TURN_STATE_SESSION_ID,
+			);
 			const runtimeAfter = new RuntimeCoordinator();
 			await handleTurnEnd(makeTurnEndDeps(runtimeAfter, cacheManager, cwd));
 			const after = consumeTurnEndFindings(cacheManager, cwd);
@@ -144,7 +167,13 @@ describe("turn_end secrets gate honors dispositions for trivy secrets (#1628)", 
 			fs.writeFileSync(filePath, content);
 
 			const cacheManager = new CacheManager(false);
-			cacheManager.addModifiedRange(filePath, { start: 1, end: 1 }, false, cwd);
+			cacheManager.addModifiedRange(
+				filePath,
+				{ start: 1, end: 1 },
+				false,
+				cwd,
+				TURN_STATE_SESSION_ID,
+			);
 			cacheManager.writeCache(
 				"trivy",
 				{
@@ -190,7 +219,13 @@ describe("turn_end secrets gate honors dispositions for trivy secrets (#1628)", 
 				"false-positive",
 			);
 
-			cacheManager.addModifiedRange(filePath, { start: 1, end: 1 }, false, cwd);
+			cacheManager.addModifiedRange(
+				filePath,
+				{ start: 1, end: 1 },
+				false,
+				cwd,
+				TURN_STATE_SESSION_ID,
+			);
 			const runtimeAfter = new RuntimeCoordinator();
 			await handleTurnEnd(makeTurnEndDeps(runtimeAfter, cacheManager, cwd));
 			const after = consumeTurnEndFindings(cacheManager, cwd);
@@ -232,7 +267,13 @@ describe("turn_end secrets gate honors dispositions on the STALE arm (#1694)", (
 			setMtime(filePath, scannedAtMs + 5_000);
 
 			const cacheManager = new CacheManager(false);
-			cacheManager.addModifiedRange(filePath, { start: 1, end: 1 }, false, cwd);
+			cacheManager.addModifiedRange(
+				filePath,
+				{ start: 1, end: 1 },
+				false,
+				cwd,
+				TURN_STATE_SESSION_ID,
+			);
 			cacheManager.writeCache(
 				"gitleaks",
 				{
@@ -278,7 +319,13 @@ describe("turn_end secrets gate honors dispositions on the STALE arm (#1694)", (
 				"false-positive",
 			);
 
-			cacheManager.addModifiedRange(filePath, { start: 1, end: 1 }, false, cwd);
+			cacheManager.addModifiedRange(
+				filePath,
+				{ start: 1, end: 1 },
+				false,
+				cwd,
+				TURN_STATE_SESSION_ID,
+			);
 			const runtimeAfter = new RuntimeCoordinator();
 			await handleTurnEnd(makeTurnEndDeps(runtimeAfter, cacheManager, cwd));
 			const after = consumeTurnEndFindings(cacheManager, cwd);
@@ -305,7 +352,13 @@ describe("turn_end secrets gate honors dispositions on the STALE arm for trivy s
 			setMtime(filePath, scannedAtMs + 5_000);
 
 			const cacheManager = new CacheManager(false);
-			cacheManager.addModifiedRange(filePath, { start: 1, end: 1 }, false, cwd);
+			cacheManager.addModifiedRange(
+				filePath,
+				{ start: 1, end: 1 },
+				false,
+				cwd,
+				TURN_STATE_SESSION_ID,
+			);
 			cacheManager.writeCache(
 				"trivy",
 				{
@@ -348,7 +401,13 @@ describe("turn_end secrets gate honors dispositions on the STALE arm for trivy s
 				"false-positive",
 			);
 
-			cacheManager.addModifiedRange(filePath, { start: 1, end: 1 }, false, cwd);
+			cacheManager.addModifiedRange(
+				filePath,
+				{ start: 1, end: 1 },
+				false,
+				cwd,
+				TURN_STATE_SESSION_ID,
+			);
 			const runtimeAfter = new RuntimeCoordinator();
 			await handleTurnEnd(makeTurnEndDeps(runtimeAfter, cacheManager, cwd));
 			const after = consumeTurnEndFindings(cacheManager, cwd);
@@ -380,7 +439,13 @@ describe("turn_end govulncheck advisory honors dispositions (#1694 F1)", () => {
 			fs.writeFileSync(filePath, content);
 
 			const cacheManager = new CacheManager(false);
-			cacheManager.addModifiedRange(filePath, { start: 1, end: 1 }, false, cwd);
+			cacheManager.addModifiedRange(
+				filePath,
+				{ start: 1, end: 1 },
+				false,
+				cwd,
+				TURN_STATE_SESSION_ID,
+			);
 			cacheManager.writeCache(
 				"govulncheck",
 				{
@@ -427,7 +492,13 @@ describe("turn_end govulncheck advisory honors dispositions (#1694 F1)", () => {
 				"false-positive",
 			);
 
-			cacheManager.addModifiedRange(filePath, { start: 1, end: 1 }, false, cwd);
+			cacheManager.addModifiedRange(
+				filePath,
+				{ start: 1, end: 1 },
+				false,
+				cwd,
+				TURN_STATE_SESSION_ID,
+			);
 			const runtimeAfter = new RuntimeCoordinator();
 			await handleTurnEnd(makeTurnEndDeps(runtimeAfter, cacheManager, cwd));
 			const after = consumeTurnEndFindings(cacheManager, cwd);
@@ -470,7 +541,13 @@ describe("turn_end trivy CVE advisory honors dispositions (#1813)", () => {
 			const targetPath = path.resolve(cwd, target);
 
 			const cacheManager = new CacheManager(false);
-			cacheManager.addModifiedRange(filePath, { start: 1, end: 1 }, false, cwd);
+			cacheManager.addModifiedRange(
+				filePath,
+				{ start: 1, end: 1 },
+				false,
+				cwd,
+				TURN_STATE_SESSION_ID,
+			);
 			cacheManager.writeCache(
 				"trivy",
 				{
@@ -521,7 +598,13 @@ describe("turn_end trivy CVE advisory honors dispositions (#1813)", () => {
 				"false-positive",
 			);
 
-			cacheManager.addModifiedRange(filePath, { start: 1, end: 1 }, false, cwd);
+			cacheManager.addModifiedRange(
+				filePath,
+				{ start: 1, end: 1 },
+				false,
+				cwd,
+				TURN_STATE_SESSION_ID,
+			);
 			const runtimeAfter = new RuntimeCoordinator();
 			await handleTurnEnd(makeTurnEndDeps(runtimeAfter, cacheManager, cwd));
 			const after = consumeTurnEndFindings(cacheManager, cwd);

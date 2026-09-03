@@ -732,7 +732,27 @@ export type DegradationKind =
 	 * through the existing `extension-log.ts`/`latency-logger.ts`/
 	 * `safe-spawn.js` cycle. See `probe-home-state.ts`'s doc comment.
 	 */
-	| "global-dir-probe-redirect";
+	| "global-dir-probe-redirect"
+	/**
+	 * #2504 review round 8 (S1): a carried-forward deferred file entry was
+	 * dropped from an IN-BAND `turn_end` publish (`clients/actionable-warnings.ts`)
+	 * because its file changed, or the publish crossed a session boundary,
+	 * before this turn's own publish could keep it. Informational, not a
+	 * fault: the entry's findings are re-discoverable on the ordinary re-edit
+	 * cadence (a later turn's own analysis, or a later deferral, sees the
+	 * file again), so the loss self-heals and does not warrant a `⚠` in a
+	 * dogfood summary. See `INFORMATIONAL_DEGRADATION_KINDS` below.
+	 */
+	| "actionable-warnings-inband-superseded"
+	/**
+	 * #2504 review round 7 (F5): the DEFERRED sibling of
+	 * `actionable-warnings-inband-superseded` — a file changed while the
+	 * off-hook deferred LSP pull was reading it, so its carried entry is
+	 * dropped rather than published against content that has since moved.
+	 * Same informational treatment: the next deferral or in-band analysis
+	 * re-observes the file.
+	 */
+	| "actionable-warnings-deferred-superseded";
 
 export interface DegradationRecord {
 	kind: unknown;
@@ -1059,6 +1079,13 @@ function isRenderableSummary(value: unknown): value is DegradationGroup[] {
  */
 const INFORMATIONAL_DEGRADATION_KINDS: ReadonlySet<string> = new Set([
 	"log-sink-rotated",
+	// #2504 review round 8 (S1): both fire on the ordinary re-edit cadence
+	// (a carry-forward window closing, or a session boundary) and are
+	// self-healing -- the next turn's analysis or deferral re-observes the
+	// file -- so a `⚠` overstates them the same way a routine log rotation
+	// would.
+	"actionable-warnings-inband-superseded",
+	"actionable-warnings-deferred-superseded",
 ]);
 
 export function renderDegradationLines(

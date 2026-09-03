@@ -778,11 +778,58 @@ function loadProjectRulePolicyMap(cwd: string) {
  * `clients/finding-delivery-gate.ts` surface `lens-diagnostics:mode-delta`.
  */
 function applyDeltaFreshnessGate<W extends DispositionCandidate>(
-	files: Array<{ filePath: string; warnings: W[] }>,
+	files: Array<{ filePath: string; warnings: W[]; generatedAt?: string }>,
 	cwd: string,
 	generatedAt: string | undefined,
 ): Array<{ filePath: string; warnings: Array<W & { stale?: boolean }> }> {
-	if (!generatedAt) return files;
+	// #2504 review round 4 (F1): an actionable-warnings report is no longer the
+	// product of exactly ONE pass. A deferred off-hook LSP pull upserts its
+	// per-file entries into whatever report is persisted when it lands, so one
+	// report can carry entries observed minutes apart. Judging the older half
+	// against the newer report-level stamp would pass an out-of-band edit made
+	// in between off as live -- exactly the leak this gate exists to stop. Each
+	// distinct stamp is gated on its own; the ordinary single-stamp report
+	// takes one pass, as before, and the original file order is preserved.
+	const stamps = new Set(
+		files.map((file) => file.generatedAt ?? generatedAt ?? ""),
+	);
+	if (stamps.size > 1) {
+		const gatedByPath = new Map<
+			string,
+			{ filePath: string; warnings: Array<W & { stale?: boolean }> }
+		>();
+		for (const stamp of stamps) {
+			const group = files.filter(
+				(file) => (file.generatedAt ?? generatedAt ?? "") === stamp,
+			);
+			for (const gated of applyDeltaFreshnessGate(
+				group.map((file) => ({
+					filePath: file.filePath,
+					warnings: file.warnings,
+				})),
+				cwd,
+				stamp === "" ? undefined : stamp,
+			)) {
+				gatedByPath.set(gated.filePath, gated);
+			}
+		}
+		return files
+			.map((file) => gatedByPath.get(file.filePath))
+			.filter(
+				(
+					entry,
+				): entry is {
+					filePath: string;
+					warnings: Array<W & { stale?: boolean }>;
+				} => entry !== undefined,
+			);
+	}
+	// Every entry shares one stamp here; prefer the per-entry one when it has
+	// it, so a merged report's single surviving half is still aged by its own.
+	const stampedAt = [...stamps][0];
+	const effectiveAt =
+		stampedAt !== undefined && stampedAt !== "" ? stampedAt : generatedAt;
+	if (!effectiveAt) return files;
 	const flat: Array<{ filePath: string; warning: W }> = [];
 	for (const file of files) {
 		for (const warning of file.warnings)
@@ -793,7 +840,7 @@ function applyDeltaFreshnessGate<W extends DispositionCandidate>(
 		store: "lens-diagnostics-delta",
 		findings: flat,
 		cwd,
-		scannedAt: generatedAt,
+		scannedAt: effectiveAt,
 		citedPath: (f) => f.filePath,
 		onMissing: "drop",
 	});
@@ -859,12 +906,17 @@ function formatDeltaMode(
 	const visibleWarningFiles = <
 		W extends DispositionCandidate & { observedAt?: number },
 	>(
-		files: Array<{ filePath: string; warnings?: W[] }> | undefined,
+		files:
+			| Array<{ filePath: string; warnings?: W[]; generatedAt?: string }>
+			| undefined,
 	) =>
 		(files ?? [])
 			.filter((file) => includeFile(file.filePath))
 			.map((file) => ({
 				filePath: file.filePath,
+				// #2504 r4 (F1): carried through, so a merged report's older
+				// entries keep their own age all the way to the freshness gate.
+				generatedAt: file.generatedAt,
 				warnings: applyRulePolicy(
 					applyCachedDispositions(file.warnings ?? [], cwd, file.filePath),
 					policyMap,
