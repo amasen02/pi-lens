@@ -19,7 +19,11 @@ import {
 	dispatchForFile as runDispatchForFile,
 } from "../../../clients/dispatch/dispatcher.js";
 import { FactStore } from "../../../clients/dispatch/fact-store.js";
-import type { RunnerGroup } from "../../../clients/dispatch/types.js";
+import type {
+	Diagnostic,
+	RunnerGroup,
+	RunnerResult,
+} from "../../../clients/dispatch/types.js";
 import { normalizeMapKey } from "../../../clients/path-utils.js";
 import {
 	createCleanRunner,
@@ -718,6 +722,88 @@ describe("Dispatch Flow", () => {
 			expect(result.diagnostics[0].semantic).toBe("blocking");
 			expect(result.diagnostics[0].severity).toBe("error");
 			expect(result.hasBlockers).toBe(true);
+		});
+
+		it("does not cross-contaminate delta baselines across cwds sharing a relative path (refs #2489)", async () => {
+			// Simulates the warm `pilens_analyze` MCP route: one `FactStore`
+			// instance (production's module-scope `sessionFacts` singleton)
+			// serving delta-mode dispatches for many different project roots
+			// over its lifetime, real `createDispatchContext` + `dispatchForFile`
+			// call path throughout — no hand-fed context.
+			const facts = new FactStore();
+			registerRunner({
+				id: "reporter",
+				appliesTo: ["jsts"],
+				priority: 10,
+				async run(ctx): Promise<RunnerResult> {
+					// Project A and project B each have their own `src/index.ts`;
+					// the runner reports issue ids specific to whichever absolute
+					// file it was actually invoked on.
+					const diagnostics: Diagnostic[] = ctx.cwd.includes("projecta")
+						? [
+								{
+									id: "issue-1",
+									message: "A's issue",
+									filePath: "src/index.ts",
+									severity: "warning",
+									semantic: "warning",
+									tool: "reporter",
+								},
+							]
+						: [
+								{
+									id: "issue-1",
+									message: "B's issue (id collides with A's by coincidence)",
+									filePath: "src/index.ts",
+									severity: "warning",
+									semantic: "warning",
+									tool: "reporter",
+								},
+								{
+									id: "issue-2",
+									message: "B's second issue",
+									filePath: "src/index.ts",
+									severity: "warning",
+									semantic: "warning",
+									tool: "reporter",
+								},
+							];
+					return {
+						status: "succeeded",
+						diagnostics,
+						semantic: "warning",
+					};
+				},
+			});
+			const groups: RunnerGroup[] = [{ mode: "all", runnerIds: ["reporter"] }];
+
+			// Project A's first-ever delta-mode dispatch of its `src/index.ts`
+			// on the shared warm FactStore. This stores A's baseline.
+			const ctxA = createDispatchContext(
+				"src/index.ts",
+				"/projecta",
+				{ getFlag: () => false },
+				facts,
+			);
+			await dispatchForFile(ctxA, groups);
+
+			// Project B's first-ever delta-mode dispatch of ITS OWN
+			// `src/index.ts` — a different absolute file under a different
+			// project root, which shares only the relative path with A's.
+			// B has never been dispatched before, so nothing should read as
+			// "already seen": both of B's diagnostics must be reported.
+			const ctxB = createDispatchContext(
+				"src/index.ts",
+				"/projectb",
+				{ getFlag: () => false },
+				facts,
+			);
+			const resultB = await dispatchForFile(ctxB, groups);
+
+			expect(resultB.diagnostics.map((d) => d.id).sort()).toEqual([
+				"issue-1",
+				"issue-2",
+			]);
 		});
 	});
 

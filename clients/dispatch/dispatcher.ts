@@ -1182,17 +1182,26 @@ export async function dispatchForFile(
 	);
 
 	// Count baseline warnings before filtering (for delta count display)
-	const relativeKey = path.relative(ctx.cwd, ctx.filePath).replace(/\\/g, "/");
+	//
+	// #2489: `ctx.filePath` is `createDispatchContext`'s `normalizedFilePath`
+	// (`resolveRunnerPath` -> `path.resolve` -> `normalizeMapKey`), which is
+	// ALWAYS absolute — the #2016 invariant this seam already relies on. A
+	// prior relative-path fallback key (`session.baseline.<path relative to
+	// ctx.cwd>`) existed here for self-consistency across the abs/rel read
+	// and write, but on `ctx.facts` singletons that outlive one project root
+	// (`dispatch/integration.ts`'s module-scope `sessionFacts`, reached by
+	// the warm `pilens_analyze` MCP route across any number of cwds) two
+	// different projects dispatching files that share a relative path (e.g.
+	// both have `src/index.ts`) collided on that fallback key, so project
+	// B's first-ever delta baseline read could silently return project A's
+	// stored diagnostics. Since the absolute key can never collide across
+	// projects (an absolute path is unique on the filesystem) and both
+	// writes always land together, the relative fallback is both unneeded
+	// and the sole source of the collision — removed rather than cwd-scoped
+	// (`cwd` is not a stable identity across this seam's callers, #2494).
 	const baselineAbsKey = `session.baseline.${ctx.filePath}`;
-	// #2016: `relativeKey` is relative to `ctx.cwd`. `normalizeMapKey` resolved
-	// it against the process cwd instead, so on Windows this "relative" key
-	// became an absolute path anchored on the wrong root while POSIX left it
-	// relative. Both the read here and the write below use this const, so the
-	// key stays self-consistent within a session.
-	const baselineRelKey = `session.baseline.${normalizeEphemeralMapKey(relativeKey)}`;
 	const previousBaseline = ctx.deltaMode
-		? (ctx.facts.getBoundedSessionFact<Diagnostic[]>(baselineAbsKey) ??
-			ctx.facts.getBoundedSessionFact<Diagnostic[]>(baselineRelKey))
+		? ctx.facts.getBoundedSessionFact<Diagnostic[]>(baselineAbsKey)
 		: undefined;
 	const baselineWarnings = previousBaseline?.filter(
 		(d) => d.semantic === "warning" || d.semantic === "none",
@@ -1282,7 +1291,6 @@ export async function dispatchForFile(
 	// Persist full current snapshot for next run (not delta-filtered subset).
 	if (ctx.deltaMode) {
 		ctx.facts.setBoundedSessionFact(baselineAbsKey, [...dedupedDiagnostics]);
-		ctx.facts.setBoundedSessionFact(baselineRelKey, [...dedupedDiagnostics]);
 	}
 
 	// Categorize results
