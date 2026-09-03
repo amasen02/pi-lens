@@ -19,7 +19,10 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { FileKind } from "../file-kinds.js";
 import { recordRunner } from "../widget-state.js";
-import { incrementDegradationCount } from "../degradation-ledger.js";
+import {
+	incrementDegradationCount,
+	recordDegradationOnce,
+} from "../degradation-ledger.js";
 import { detectFileKind } from "../file-kinds.js";
 import { detectFileRole } from "../file-role.js";
 import {
@@ -31,7 +34,11 @@ import { getPrimaryDispatchGroup } from "../language-policy.js";
 import { resolveLanguageRootForFile } from "../language-profile.js";
 import { logLatency, phaseFinished, phaseStarted } from "../latency-logger.js";
 import { isSpawnableCommand } from "../installer/index.js";
-import { normalizeEphemeralMapKey, normalizeMapKey } from "../path-utils.js";
+import {
+	isAbsoluteFilePath,
+	normalizeEphemeralMapKey,
+	normalizeMapKey,
+} from "../path-utils.js";
 import { loadPiLensProjectConfig } from "../project-lens-config.js";
 import { RUNTIME_CONFIG, getRunnerTimeoutFloorMs } from "../runtime-config.js";
 import { safeSpawnAsync } from "../safe-spawn.js";
@@ -1182,18 +1189,49 @@ export async function dispatchForFile(
 	);
 
 	// Count baseline warnings before filtering (for delta count display)
-	const relativeKey = path.relative(ctx.cwd, ctx.filePath).replace(/\\/g, "/");
+	//
+	// #2489: `ctx.filePath` is `createDispatchContext`'s `normalizedFilePath`
+	// (`resolveRunnerPath` -> `path.resolve` -> `normalizeMapKey`), which is
+	// ALWAYS absolute — the #2016 invariant this seam already relies on. A
+	// prior relative-path fallback key (`session.baseline.<path relative to
+	// ctx.cwd>`) existed here for self-consistency across the abs/rel read
+	// and write, but on `ctx.facts` singletons that outlive one project root
+	// (`dispatch/integration.ts`'s module-scope `sessionFacts`, reached by
+	// the warm `pilens_analyze` MCP route across any number of cwds) two
+	// different projects dispatching files that share a relative path (e.g.
+	// both have `src/index.ts`) collided on that fallback key, so project
+	// B's first-ever delta baseline read could silently return project A's
+	// stored diagnostics. Since the absolute key can never collide across
+	// projects (an absolute path is unique on the filesystem) and both
+	// writes always land together, the relative fallback is both unneeded
+	// and the sole source of the collision — removed rather than cwd-scoped
+	// (`cwd` is not a stable identity across this seam's callers, #2494).
+	//
+	// #2489 round 2: the #2016 invariant above is enforced by
+	// `createDispatchContext`, the sole real constructor, but nothing enforced
+	// it AT THIS SEAM — a hand-built `DispatchContext` (test scaffolding, a
+	// future caller) carrying a relative `filePath` would silently key the
+	// baseline under a value the constructor could never produce, and every
+	// subsequent same-session dispatch of the real (absolute-keyed) file would
+	// read back `undefined`, never the collision itself. Mirrors the sibling
+	// guard `recordEntitySnapshotDiff` already enforces for the entity-snapshot
+	// seam (`clients/review-graph/service.ts`, #2477): reject visibly and skip
+	// the baseline read/write for this dispatch rather than compute one under
+	// an unreachable key.
+	const baselinePathSafe = isAbsoluteFilePath(ctx.filePath);
+	if (ctx.deltaMode && !baselinePathSafe) {
+		recordDegradationOnce({
+			kind: "dispatch-non-absolute-baseline-path",
+			subject: ctx.filePath,
+			reason:
+				"dispatchForFile requires an absolute ctx.filePath to key the delta baseline (refs #2489)",
+		});
+	}
 	const baselineAbsKey = `session.baseline.${ctx.filePath}`;
-	// #2016: `relativeKey` is relative to `ctx.cwd`. `normalizeMapKey` resolved
-	// it against the process cwd instead, so on Windows this "relative" key
-	// became an absolute path anchored on the wrong root while POSIX left it
-	// relative. Both the read here and the write below use this const, so the
-	// key stays self-consistent within a session.
-	const baselineRelKey = `session.baseline.${normalizeEphemeralMapKey(relativeKey)}`;
-	const previousBaseline = ctx.deltaMode
-		? (ctx.facts.getBoundedSessionFact<Diagnostic[]>(baselineAbsKey) ??
-			ctx.facts.getBoundedSessionFact<Diagnostic[]>(baselineRelKey))
-		: undefined;
+	const previousBaseline =
+		ctx.deltaMode && baselinePathSafe
+			? ctx.facts.getBoundedSessionFact<Diagnostic[]>(baselineAbsKey)
+			: undefined;
 	const baselineWarnings = previousBaseline?.filter(
 		(d) => d.semantic === "warning" || d.semantic === "none",
 	);
@@ -1280,9 +1318,12 @@ export async function dispatchForFile(
 	}
 
 	// Persist full current snapshot for next run (not delta-filtered subset).
-	if (ctx.deltaMode) {
+	// Gated on `baselinePathSafe` too: a non-absolute `ctx.filePath` already
+	// skipped the read above (the degradation record fired there), and writing
+	// under that same unreachable key here would just seed a baseline no real
+	// reader (always absolute) could ever read back.
+	if (ctx.deltaMode && baselinePathSafe) {
 		ctx.facts.setBoundedSessionFact(baselineAbsKey, [...dedupedDiagnostics]);
-		ctx.facts.setBoundedSessionFact(baselineRelKey, [...dedupedDiagnostics]);
 	}
 
 	// Categorize results
@@ -1381,6 +1422,13 @@ export async function dispatchForFile(
 			})),
 			totalDiagnostics: visibleDiagnostics.length,
 			blockers: blockers.length,
+			// #2489 round 2: distinguishes a delta baseline HIT (a prior snapshot
+			// was read for this file this session) from a MISS (first dispatch, or
+			// the non-absolute-path guard above skipped the read) — `dispatch_start`
+			// (above, `metadata: { groupCount, kind, runners }`) fires before the
+			// baseline read ever runs and cannot carry either value.
+			baselineHit: previousBaseline !== undefined,
+			baselineWarningCount,
 		},
 	});
 
