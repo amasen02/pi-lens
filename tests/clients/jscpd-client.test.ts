@@ -20,7 +20,12 @@ vi.mock("../../clients/installer/index.js", () => ({
 	// Seam probes route through this on cached hits (#1203); default spawnable.
 	isSpawnableCommand: vi.fn(async () => true),
 }));
-vi.mock("../../clients/package-manager.js", () => ({ findNodeToolBinary }));
+vi.mock("../../clients/package-manager.js", async (importOriginal) => ({
+	...(await importOriginal<
+		typeof import("../../clients/package-manager.js")
+	>()),
+	findNodeToolBinary,
+}));
 
 vi.mock("../../clients/safe-spawn.js", () => ({
 	safeSpawnAsync: vi.fn(async () => ({

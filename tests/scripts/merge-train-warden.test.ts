@@ -4,6 +4,10 @@ import { fileURLToPath } from "node:url";
 import * as yaml from "js-yaml";
 import { describe, expect, it } from "vitest";
 import {
+	REQUIRED_CHECKS,
+	resolveLatestByName,
+} from "../../scripts/lib/ci-checks.mjs";
+import {
 	commentMarkerExists,
 	MAX_REST_PAGES,
 	REST_PAGE_SIZE,
@@ -34,7 +38,6 @@ import {
 	MAX_PAGES,
 	PAGE_SIZE,
 	RED_CI_LABEL,
-	resolveCheckRuns,
 	runWarden,
 } from "../../scripts/lib/merge-train-warden.mjs";
 import {
@@ -581,10 +584,7 @@ describe("merge-train warden GraphQL fetch + REST apply (#1844)", () => {
 		const { fetcher } = fakeGithub({ "POST /graphql": page });
 		const { prs } = await fetchOpenPullRequests(fetcher, "acme", "repo");
 		expect(prs[0].failingRequiredChecks).toEqual([]);
-		expect(prs[0].unresolvedRequiredChecks).toEqual([
-			"Unit tests",
-			"Lint & type-check",
-		]);
+		expect(prs[0].unresolvedRequiredChecks).toEqual(REQUIRED_CHECKS);
 	});
 
 	it("marks a required check missing from the rollup as unresolved, not passing", async () => {
@@ -2615,16 +2615,53 @@ describe("merge-lane gate (#2185)", () => {
 	});
 
 	it("fails closed when duplicates disagree and carry no usable startedAt", () => {
-		const resolved = resolveCheckRuns([
+		const resolved = resolveLatestByName([
 			{ name: "Unit tests", status: "COMPLETED", conclusion: "SUCCESS" },
 			{ name: "Unit tests", status: "IN_PROGRESS", conclusion: null },
 		]);
 		expect(resolved.get("Unit tests")).toMatchObject({ status: "IN_PROGRESS" });
-		const flipped = resolveCheckRuns([
+		const flipped = resolveLatestByName([
 			{ name: "Unit tests", status: "IN_PROGRESS", conclusion: null },
 			{ name: "Unit tests", status: "COMPLETED", conclusion: "SUCCESS" },
 		]);
 		expect(flipped.get("Unit tests")).toMatchObject({ status: "IN_PROGRESS" });
+	});
+
+	// #2539 round 2, F2: this is the same resolver ci-verdict.mjs now uses for
+	// REST-shaped payloads (lowercase status/conclusion, `started_at`), so the
+	// tie policy has to hold case-insensitively and across the field-name
+	// difference too -- not just for the GraphQL shape above.
+	it("fails closed on a REST-shaped tie too (lowercase status/conclusion, started_at)", () => {
+		const resolved = resolveLatestByName([
+			{ name: "Unit tests", status: "completed", conclusion: "success" },
+			{ name: "Unit tests", status: "in_progress", conclusion: null },
+		]);
+		expect(resolved.get("Unit tests")).toMatchObject({ status: "in_progress" });
+	});
+
+	// #2539 round 2, F2/F5 (reviewer probe): a superseded success carrying the
+	// HIGHER id, and a duplicate with no startedAt at all -- neither may read
+	// as success. An id-based or array-order tiebreak (ci-verdict.mjs's
+	// pre-round-2 `latestRunNamed`) would get both of these wrong.
+	it("does not let a superseded success with the higher id win a tie", () => {
+		const resolved = resolveLatestByName([
+			{ name: "Unit tests", status: "IN_PROGRESS", conclusion: null, id: 1 },
+			{
+				name: "Unit tests",
+				status: "COMPLETED",
+				conclusion: "SUCCESS",
+				id: 99,
+			},
+		]);
+		expect(resolved.get("Unit tests")).toMatchObject({ status: "IN_PROGRESS" });
+	});
+
+	it("fails closed when NEITHER duplicate carries a startedAt at all", () => {
+		const resolved = resolveLatestByName([
+			{ name: "Unit tests", status: "COMPLETED", conclusion: "SUCCESS" },
+			{ name: "Unit tests", status: "QUEUED", conclusion: null },
+		]);
+		expect(resolved.get("Unit tests")).toMatchObject({ status: "QUEUED" });
 	});
 
 	// Review round 1, F1: master protection is `strict: true` (probed), so

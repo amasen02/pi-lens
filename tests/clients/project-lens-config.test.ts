@@ -219,6 +219,12 @@ describe("loadPiLensProjectConfig", () => {
 		const [message] = vi.mocked(console.error).mock.calls[0];
 		expect(message).not.toContain(TOKEN);
 		expect(message).not.toContain("ghp_");
+		// #2451: the position-free `Unexpected token` shape (exactly what this
+		// fixture hits) used to lose ALL locality after #2431's redaction —
+		// strictly less signal than before that fix. It is recovered here, end
+		// to end, through the real `readConfigDocument` -> `reportConfigReadFailure`
+		// production wiring, not just at the `normalizeParseErrorReason` unit level.
+		expect(message).toContain("SyntaxError at line 1 col 13");
 	});
 
 	it("returns empty config when root is a non-object JSON value", () => {

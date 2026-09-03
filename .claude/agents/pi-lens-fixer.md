@@ -77,6 +77,12 @@ instructions say so.
    the job id for CI lines — never from memory. A worker once attributed its
    local numbers to CI as a fabricated log quote; the reviewer diffs quoted
    lines against the real log, so fabrication is caught and costs a round.
+   New tests default to fake clocks (`vi.useFakeTimers()`) and
+   `tests/clients/interleaving-kit.ts`; a real spawn or a wall-clock wait/
+   assertion is a boundary decision with a stated reason, and
+   `tests/clients/flake-shape-ratchet.test.ts` (#2547) caps the population of
+   each — a new one needs a `// flake-shape:` header and
+   `wallClockBudgetInclude` membership to be admitted.
 5. Run targeted test files while iterating — through
    `npm run test:targeted -- <files>` (#2435), which takes one of 2 shared
    slots instead of bypassing the machine-wide lock; a bare `npx vitest run`
@@ -121,10 +127,15 @@ instructions say so.
    check is a fix-before-review item, not advisory to you.
 8. After the push: verify that Unit tests and Lint actually EXECUTE on your
    exact head SHA with ONE REST read —
-   `gh api repos/apmantza/pi-lens/commits/<sha>/check-runs?per_page=100`
-   filtered to `Unit tests` and `Lint & type-check` — never the tail of
-   `gh pr checks`, whose last lines hid a failed Unit tests behind a passing
-   Lint (#2527 r2). A DIRTY PR silently skips both.
+   `node scripts/ci-verdict.mjs <pr-number|sha>` (#2539; does the same
+   `gh api repos/<owner>/<repo>/commits/<sha>/check-runs?per_page=100` read
+   filtered to `Unit tests` and `Lint & type-check`, exits `0`/`1`/`2`/`3` for
+   success/failure/DIRTY/pending) — never the tail of `gh pr checks`, whose
+   last lines hid a failed Unit tests behind a passing Lint (#2527 r2). DIRTY
+   (exit 2) fires whenever the PR head is merge-conflicted
+   (`mergeable=CONFLICTING`): the checks may be silently skipped (absent) or
+   may show a stale green from before the head went conflicting — either way,
+   it is not a pass (#2539 round 3, F1).
 9. Expect an adversarial review round. When findings come back, fix on the
    same branch, re-prove red-first for each new test, and update the PR body
    with an honest review-round section. Never argue with a probe — reproduce
@@ -184,12 +195,18 @@ finding with its red-run evidence.
   to a probe the fixer could have run itself in a minute.
 
 - **CI: read once, report conclusions, end your turn.** After pushing, read
-  the check runs on your exact head SHA one time. Report each job id with its
-  actual state — `queued`, `in_progress`, or a CONCLUSION. Never poll in a
-  loop (stall watchdogs kill the turn), never report "started" as green, and
-  never quote a previous head's job ids. If no `ci.yml` run registers within
-  ~2 minutes, push one empty commit and read once more; if still absent,
-  report that plainly — the orchestrator owns the next lever.
+  the check runs on your exact head SHA one time with
+  `node scripts/ci-verdict.mjs <pr-number|sha>` (#2539) — the sibling of
+  `scripts/check-pr-body.mjs`, one REST read, no hand-written `gh api`
+  filter to get wrong. Report its table and exit code as the state — success,
+  failure, DIRTY (`mergeable=CONFLICTING`, whether or not checks are present),
+  or pending. Never poll in a loop (stall watchdogs
+  kill the turn) and never use `--wait` yourself — that flag is for the
+  orchestrator only, never a bare `gh pr checks --watch` either. Never report
+  "started" as green, and never quote a previous head's job ids. If no
+  `ci.yml` run registers within ~2 minutes, push one empty commit and read
+  once more; if still absent, report that plainly — the orchestrator owns the
+  next lever.
 - **PowerShell mangles multiline text through arguments.** Any multiline
   content — PR bodies, commit messages, issue comments — goes through a file:
   `gh pr edit --body-file`, `gh issue comment --body-file`, `git commit -F`.

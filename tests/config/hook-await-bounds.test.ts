@@ -1368,15 +1368,14 @@ const EXEMPT_SITES: Readonly<Record<string, SweepExemption>> = {
 			"observed path above.",
 		owner: "#2523 slice 2",
 	},
-	"clients/runtime-turn.ts#runTestTargetsBounded:fc8ee2c1~5c726b69": {
+	"clients/runtime-turn.ts#runTestTargetsBounded:a0d413d5~f6c4b650": {
 		family: "hook-await",
 		site: "turn_end",
 		reason:
-			"`runTestTargetsBounded`'s per-target loop. Its batch budget " +
-			"(TEST_RUNNER_BATCH_BUDGET_MS, 90000ms) is 30x turn_end's " +
-			"total; test-runner delivery already has an off-hook channel " +
-			"(#2366) and #2522 owns selection.",
-		owner: "#2523 slice 2",
+			"`await stamp` settles with the run it stamps; the batch's own " +
+			"wall budget and batchAbort bound it; wrapping it in bounded() " +
+			"would add a second timer per target.",
+		owner: "#2523 slice 3",
 	},
 	"clients/runtime-turn.ts#runTestTargetsBounded:7307dda7~99843961": {
 		family: "hook-await",

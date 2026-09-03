@@ -176,11 +176,68 @@ export function peekTestFindings(
 			{
 				role: "user",
 				content: current
-					? `${AUTOMATION_FRAMING}Test failures detected last turn — fix before continuing:\n\n${findings.data.content}`
+					? `${AUTOMATION_FRAMING}${testFindingsCurrentPrefix(findings.data.runnerErrorOnly)}\n\n${findings.data.content}`
 					: `${AUTOMATION_FRAMING}${historicalTestContent(findings.data.content, findings.data.provenance)}`,
 			},
 		],
 	};
+}
+
+/**
+ * #2522: a batch made entirely of RUNNER errors (timeout, missing
+ * provider/binary — see `TestRunnerFindingsCache.runnerErrorOnly`) is not a
+ * failure the agent introduced, so it must not read as a blocker the way a
+ * genuine failing test does.
+ */
+function testFindingsCurrentPrefix(
+	runnerErrorOnly: boolean | undefined,
+): string {
+	return runnerErrorOnly
+		? "Test runner could not complete last turn (advisory — not a failure introduced this turn):"
+		: "Test failures detected last turn — fix before continuing:";
+}
+
+/**
+ * Retire a delivered test-findings record: blank the content, keep everything a
+ * delivery does not settle.
+ *
+ * ONE function, called by both `consumeTestFindings` (the in-process context
+ * hook) and `acknowledgeTestFindings` (the MCP Stop-hook commit), because
+ * "what survives a retire" is exactly the kind of rule that rots when it is
+ * stated twice. It already had: round 2 taught the consume copy to preserve
+ * `deferredTargets` and left the acknowledge copy dropping them, and the
+ * acknowledge copy is the LIVE Stop-hook path — including the branch where
+ * `handleTurnEnd` never runs at all — so on that path the deferral set was
+ * wiped before anything could ever dispatch it (#2522 review round 3, F2).
+ *
+ * What survives, and why:
+ *  - `testRunGeneration` — nulling the slot would let a still-in-flight OLDER
+ *    batch read `undefined`, pass the strictly-greater suppression check, and
+ *    resurrect a consumed one-shot advisory with stale results.
+ *  - `deferredTargets` — delivering the advisory says the agent has SEEN the
+ *    deferral, not that those targets ran. Dropping the list silently un-defers
+ *    them and the cut batch is never finished.
+ *  - `retiredTargets` — the session-scoped deferral cap. Dropping it re-arms a
+ *    suite already measured as too slow for the batch budget, which puts the
+ *    livelock back.
+ *
+ * An empty-content record peeks as undelivered while keeping all three intact.
+ */
+function retireTestFindings(cacheManager: CacheManager, cwd: string): void {
+	const prior = cacheManager.readCache<TestRunnerFindingsCache>(
+		"test-runner-findings",
+		cwd,
+	)?.data;
+	cacheManager.writeCache(
+		"test-runner-findings",
+		{
+			content: "",
+			testRunGeneration: prior?.testRunGeneration,
+			deferredTargets: prior?.deferredTargets,
+			retiredTargets: prior?.retiredTargets,
+		} as TestRunnerFindingsCache,
+		cwd,
+	);
 }
 
 export function consumeTestFindings(
@@ -195,23 +252,7 @@ export function consumeTestFindings(
 	if (!record?.data?.content) return;
 	const findings = peekTestFindings(cacheManager, cwd, runtime, true);
 	if (!findings) return;
-	// Retire the content but PRESERVE the generation high-water mark: nulling
-	// the whole slot would let a still-in-flight OLDER batch see `undefined`,
-	// pass the strictly-greater suppression check, and resurrect a consumed
-	// one-shot advisory with stale results. An empty-content record peeks as
-	// undelivered while keeping late-generation ordering intact.
-	const priorGeneration = cacheManager.readCache<TestRunnerFindingsCache>(
-		"test-runner-findings",
-		cwd,
-	)?.data?.testRunGeneration;
-	cacheManager.writeCache(
-		"test-runner-findings",
-		{
-			content: "",
-			testRunGeneration: priorGeneration,
-		} as TestRunnerFindingsCache,
-		cwd,
-	);
+	retireTestFindings(cacheManager, cwd);
 	return findings;
 }
 
@@ -248,15 +289,7 @@ export function acknowledgeTestFindings(
 		cwd,
 	);
 	if (!findings?.data?.content) return;
-	// Same high-water-mark preservation as consumeTestFindings.
-	cacheManager.writeCache(
-		"test-runner-findings",
-		{
-			content: "",
-			testRunGeneration: findings.data.testRunGeneration,
-		} as TestRunnerFindingsCache,
-		cwd,
-	);
+	retireTestFindings(cacheManager, cwd);
 }
 
 export function consumeSessionStartGuidance(

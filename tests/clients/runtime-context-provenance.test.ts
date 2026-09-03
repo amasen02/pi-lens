@@ -312,6 +312,51 @@ describe("advisory provenance at context delivery (#1413)", () => {
 		);
 	});
 
+	// #2522: a batch made entirely of RUNNER errors (timeout, missing
+	// provider/binary) is not a failure the agent introduced. It must not
+	// read as "fix before continuing" — that framing is reserved for a
+	// genuine failing test.
+	it("delivers a runner-error-only batch as advisory, not 'fix before continuing'", () => {
+		const { env, runtime, cache, provenance } = setup();
+		cache.writeCache(
+			"test-runner-findings",
+			{
+				content: "[Tests] ⚠ Could not run tests: spawn opencode ENOENT",
+				provenance,
+				runnerErrorOnly: true,
+			},
+			env.tmpDir,
+		);
+		const content =
+			consumeTestFindings(cache, env.tmpDir, runtime)?.messages[0]?.content ??
+			"";
+		expect(content).not.toContain("fix before continuing");
+		expect(content).toContain("advisory");
+		expect(content).toContain("Could not run tests");
+	});
+
+	// A batch with at least one GENUINE failing test keeps the blocking
+	// framing even if `runnerErrorOnly` is explicitly false — same string as
+	// the pre-#2522 behavior, unchanged.
+	it("keeps the blocking framing when runnerErrorOnly is false", () => {
+		const { env, runtime, cache, provenance } = setup();
+		cache.writeCache(
+			"test-runner-findings",
+			{
+				content: "[Tests] ✗ 1/1 failed",
+				provenance,
+				runnerErrorOnly: false,
+			},
+			env.tmpDir,
+		);
+		const content =
+			consumeTestFindings(cache, env.tmpDir, runtime)?.messages[0]?.content ??
+			"";
+		expect(content).toContain(
+			"Test failures detected last turn — fix before continuing",
+		);
+	});
+
 	it("preserves structured commit-gate state when consumed", () => {
 		const { env, runtime, cache, provenance } = setup();
 		cache.writeCache(
