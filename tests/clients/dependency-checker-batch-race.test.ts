@@ -29,7 +29,10 @@ const safeSpawnAsync = vi.fn();
 const safeSpawn = vi.fn();
 
 vi.mock("../../clients/safe-spawn.js", () => ({ safeSpawnAsync, safeSpawn }));
-vi.mock("../../clients/package-manager.js", () => ({
+vi.mock("../../clients/package-manager.js", async (importOriginal) => ({
+	...(await importOriginal<
+		typeof import("../../clients/package-manager.js")
+	>()),
 	findNodeToolBinary: vi.fn(async () => "/fake/bin/madge"),
 }));
 // Guard: without this, a `findNodeToolBinary → undefined` fallthrough would load

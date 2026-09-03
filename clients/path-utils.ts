@@ -524,13 +524,26 @@ export function findNearestMarkerRoot(
  *   rel absolute                     ⇢ different Windows drive
  *
  * Same shape as `isUnderDir` above; keep the two in step.
+ *
+ * `pathImpl` exists so the ubuntu Unit tests lane — the authoritative one —
+ * can exercise the WIN32 semantics this helper's whole bug was about. Every
+ * assertion that matters here (drive-letter folding, cross-drive `rel`) is
+ * win32-only, so with the ambient `path` hardcoded the ceiling was enforced
+ * only on a maintainer's dev box and CI's diff was structurally zero (#2544
+ * review F2). Production never passes it; `path.win32`/`path.posix` are pure,
+ * host-independent implementations, so `tests/clients/path-utils.test.ts` runs
+ * the same table under both on every lane. Lane-level fix tracked as #2536.
  */
 export function isAtOrAboveHomeDir(
 	dir: string,
 	homeDir: string = os.homedir(),
+	pathImpl: typeof path = path,
 ): boolean {
-	const rel = path.relative(path.resolve(dir), path.resolve(homeDir));
-	return !rel.startsWith("..") && !path.isAbsolute(rel);
+	const rel = pathImpl.relative(
+		pathImpl.resolve(dir),
+		pathImpl.resolve(homeDir),
+	);
+	return !rel.startsWith("..") && !pathImpl.isAbsolute(rel);
 }
 
 /**

@@ -34,7 +34,12 @@ import {
 	logAvailabilityDecision,
 	startHostStallSampler,
 } from "./dispatch/runners/utils/availability-policy.js";
-import { findGlobalBinary, findLocalBinUpwards } from "./package-manager.js";
+import {
+	findGlobalBinary,
+	findLocalBinUpwards,
+	VENDOR_BIN_DIRS,
+	VENV_BIN_DIRS,
+} from "./package-manager.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
 import { assertInstallAllowed } from "./project-trust.js";
 import { tryLazyInstallForFormatter } from "./dispatch/runners/utils/lazy-installer.js";
@@ -597,46 +602,24 @@ async function resolveGoFmtBinary(): Promise<string | null> {
 // --- Venv / Local Binary Helpers ---
 
 /**
- * Project-relative bin directories, most-preferred first, for each of the three
- * ecosystems this module resolves tools from. Passed to `findLocalBinUpwards`,
- * which owns the walk itself.
- *
- * #2514/#2544 F2: these WERE three private copies of one ancestor-walk loop
- * that had already drifted apart — only `findLocalBinUpwards` resolved a
- * relative `startDir`, and #2514's HOME ceiling had to be applied to each copy
- * by hand. There is now exactly ONE walker; these constants are the only thing
- * that differs between the callers.
- */
-const VENV_BIN_DIRS: readonly string[] =
-	process.platform === "win32"
-		? [path.join(".venv", "Scripts"), path.join("venv", "Scripts")]
-		: [path.join(".venv", "bin"), path.join("venv", "bin")];
-const VENDOR_BIN_DIRS: readonly string[] = [path.join("vendor", "bin")];
-
-/**
  * Walk up from cwd looking for a binary in .venv or venv.
  * Returns the absolute path if found, null otherwise.
  *
  * Tool-resolution walker, not a config lookup (#2514/#2517 policy): escaping
  * the project upward past HOME means STOP, not keep reading — a `.venv`/`venv`
  * bin found at or above HOME can never be THIS project's own virtualenv. The
- * ceiling lives in `findLocalBinUpwards`; `homeDir` is injectable (default
- * `os.homedir()`) so tests can pin a fake HOME instead of touching the real
- * one.
+ * ceiling lives in `findLocalBinUpwards` and is default-on there; the tests
+ * that pin a fake HOME drive that walker directly rather than threading a
+ * `homeDir` no production caller ever passed (#2544 review F3).
  *
  * On Windows the candidate order is EXT-OUTER, DIR-INNER — `.venv/Scripts/x.exe`,
  * `venv/Scripts/x.exe`, then the bare names — which is what the pre-fold copy
  * did and what `findLocalBinUpwards` preserves.
  */
-async function findInVenv(
-	binary: string,
-	cwd: string,
-	homeDir?: string,
-): Promise<string | null> {
+async function findInVenv(binary: string, cwd: string): Promise<string | null> {
 	return (
 		findLocalBinUpwards(binary, cwd, {
 			windowsExt: ".exe",
-			homeDir,
 			binDirs: VENV_BIN_DIRS,
 		}) ?? null
 	);
@@ -655,12 +638,10 @@ async function findInVenv(
 async function findInVendorBin(
 	binary: string,
 	cwd: string,
-	homeDir?: string,
 ): Promise<string | null> {
 	return (
 		findLocalBinUpwards(binary, cwd, {
 			windowsExt: ".bat",
-			homeDir,
 			binDirs: VENDOR_BIN_DIRS,
 		}) ?? null
 	);
@@ -685,9 +666,8 @@ async function findInVendorBin(
 async function findInNodeModules(
 	binary: string,
 	cwd: string,
-	homeDir?: string,
 ): Promise<string | null> {
-	return findLocalBinUpwards(binary, cwd, { homeDir }) ?? null;
+	return findLocalBinUpwards(binary, cwd) ?? null;
 }
 
 /**

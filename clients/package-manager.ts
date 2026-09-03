@@ -31,7 +31,7 @@ import {
 	createGenerationSource,
 	type GenerationHandle,
 } from "./generation-guard.js";
-import { isAtOrAboveHomeDir } from "./path-utils.js";
+import { isAtOrAboveHomeDir, walkUpDirs } from "./path-utils.js";
 
 export type NodePackageManager = "npm" | "pnpm" | "yarn" | "bun";
 
@@ -522,55 +522,106 @@ export async function findGlobalBinary(
 	return undefined;
 }
 
+/**
+ * The three project-local bin-directory shapes in this repo, most-preferred
+ * first. Exported so every caller passes the SAME constant instead of
+ * re-listing the directory names next to its own copy of the walk — the venv
+ * list alone had three independent spellings before #2544 review F1
+ * (`formatters.ts`, `runner-helpers.ts`'s `createVenvFinder`,
+ * `dead-code-client.ts`'s `venvCandidates`).
+ *
+ * `VENV_BIN_DIRS` lists BOTH the POSIX (`bin`) and Windows (`Scripts`) layouts
+ * unconditionally rather than branching on `process.platform` at module load:
+ * a module-load platform constant cannot be forced per test, so the other
+ * branch is never exercised on the ubuntu lane (defect shape 30). The extra
+ * two `existsSync` calls per directory are the price of a testable list, and
+ * a `.venv/Scripts` on Linux (or `.venv/bin` under msys) resolves correctly
+ * instead of being invisible.
+ */
+export const NODE_MODULES_BIN_DIRS: readonly string[] = [
+	path.join("node_modules", ".bin"),
+];
+export const VENDOR_BIN_DIRS: readonly string[] = [path.join("vendor", "bin")];
+export const VENV_BIN_DIRS: readonly string[] = [
+	path.join(".venv", "bin"),
+	path.join("venv", "bin"),
+	path.join(".venv", "Scripts"),
+	path.join("venv", "Scripts"),
+];
+
 /** Tuning for {@link findLocalBinUpwards}. */
 export interface LocalBinWalkOptions {
-	/** Extension tried BEFORE the bare name on Windows. Default `.cmd`. */
+	/**
+	 * Extension tried BEFORE the bare name on Windows. Default `.cmd`. An
+	 * EMPTY string means the caller already spelled every name it wants (the
+	 * ast-grep sweep passes `ast-grep.cmd`/`ast-grep.exe`/`ast-grep` itself, in
+	 * a shell-dependent order this option cannot express) — without that case
+	 * the bare name would be probed twice and reported twice.
+	 */
 	readonly windowsExt?: string;
 	/** HOME ceiling; injectable so tests never touch the real home. */
 	readonly homeDir?: string;
 	/**
 	 * Project-relative directories that hold the bin, most-preferred first.
-	 * Default `["node_modules/.bin"]`. `vendor/bin` (Composer) and
-	 * `.venv/bin`+`venv/bin` (Python) are the other three shapes in the repo.
+	 * Default {@link NODE_MODULES_BIN_DIRS}; {@link VENDOR_BIN_DIRS} (Composer)
+	 * and {@link VENV_BIN_DIRS} (Python) are the other two shapes in the repo.
 	 */
 	readonly binDirs?: readonly string[];
+	/**
+	 * Whether to expand `windowsExt` into the candidate names. Defaults to a
+	 * LIVE `process.platform` read (never a module-load constant, shape 30).
+	 * Injectable so the ubuntu Unit tests lane can exercise the Windows
+	 * candidate ORDER — which only exists when there are two names — instead of
+	 * leaving it to a dev box (#2544 review F4).
+	 */
+	readonly isWindows?: boolean;
 }
 
 /**
- * THE project-local tool-bin walker: looks for `<binDir>/<tool>` in `startDir`
- * and each ancestor, stopping at the HOME ceiling (never the fs root — see
- * below).
+ * THE project-local tool-bin walk: yields every `<binDir>/<tool>` that exists
+ * in `startDir` or one of its ancestors, nearest first, stopping at the HOME
+ * ceiling (never the fs root — see below).
  *
- * Exported so callers that must NOT pay for global-bin discovery can reuse this
- * walk instead of copying it. `findNodeToolBinary` below adds `findGlobalBinary`,
- * which spawns a probe per package manager; a caller resolving a command on
- * every run (knip, #1721) needs the filesystem half only.
+ * A generator on purpose. {@link findLocalBinUpwards} takes the first match and
+ * the walk suspends there — no ancestor above the hit is ever stat'd, which is
+ * what a per-edit resolver needs — while {@link findLocalBinsUpwards} drains it
+ * for the callers that legitimately want every candidate (the ast-grep probe
+ * sweep, vulture's venv candidates). One walk body, two arities, no
+ * "collect-all" flag whose disabled half nothing can observe.
  *
- * `binDirs` makes this the ONLY such walker in the repo: `formatters.ts`'s
- * `findInNodeModules`, `findInVendorBin` and `findInVenv` were four copies of
- * this loop that drifted apart (only one resolved a relative `startDir`, and
- * #2514 had to fix the HOME ceiling in each separately). They now all delegate
- * here, so the ceiling, the candidate ordering and the `path.resolve` of
- * `startDir` have exactly one implementation (#2544 review F2).
+ * `tools` is a LIST because the sweep callers probe several spellings of the
+ * same tool and the preference order is per-directory: all of a directory's
+ * candidates, in `tools` order, before the parent directory is looked at.
+ *
+ * `binDirs` makes this the ONLY such walker in the repo. Before #2544 there
+ * were SIX copies of this loop — `formatters.ts`'s `findInNodeModules` /
+ * `findInVendorBin` / `findInVenv`, `oxlint.ts`'s `resolveLocalVp`,
+ * `runner-helpers.ts`'s `findNodeBinRoots` and `resolveVendorToolCommand` —
+ * and they had drifted apart: only this one resolved a relative `startDir`,
+ * only this one had the #2514 HOME ceiling, and `vp` was resolved with
+ * OPPOSITE ceiling policies depending on whether `formatters.ts` or `oxlint.ts`
+ * asked (#2544 review F1). They all delegate here now.
  *
  * Candidate order is EXT-OUTER, DIR-INNER: on Windows every `binDir` is tried
  * with `windowsExt` before any is tried with the bare name, matching what the
  * `.venv/Scripts` walker did before the fold.
  */
-export function findLocalBinUpwards(
-	tool: string,
+function* localBinMatches(
+	tools: readonly string[],
 	startDir: string,
-	options: LocalBinWalkOptions = {},
-): string | undefined {
+	options: LocalBinWalkOptions,
+): Generator<string> {
 	const {
 		windowsExt = ".cmd",
 		homeDir = os.homedir(),
-		binDirs = [path.join("node_modules", ".bin")],
+		binDirs = NODE_MODULES_BIN_DIRS,
+		isWindows = onWindows(),
 	} = options;
-	const names = onWindows() ? [`${tool}${windowsExt}`, tool] : [tool];
-	let dir = path.resolve(startDir);
-	const root = path.parse(dir).root;
-	while (true) {
+	const names =
+		isWindows && windowsExt !== ""
+			? tools.flatMap((tool) => [`${tool}${windowsExt}`, tool])
+			: [...tools];
+	for (const dir of walkUpDirs(startDir)) {
 		// Tool-resolution walker, not a config lookup (#2514/#2517 policy):
 		// escaping the project upward past HOME means STOP, not keep reading. A
 		// config-file lookup (`findLocalToolConfig`) keeps climbing past HOME
@@ -581,19 +632,50 @@ export function findLocalBinUpwards(
 		// Default-on (not opt-in like `findLocalToolConfig`'s `options.homeDir`)
 		// because there is no legitimate case for this resolver to hand back a
 		// bin from outside the project tree.
-		if (isAtOrAboveHomeDir(dir, homeDir)) return undefined;
+		if (isAtOrAboveHomeDir(dir, homeDir)) return;
 		for (const name of names) {
 			for (const binDir of binDirs) {
 				const full = path.join(dir, binDir, name);
-				if (fs.existsSync(full)) return full;
+				if (fs.existsSync(full)) yield full;
 			}
 		}
-		if (dir === root) break;
-		const parent = path.dirname(dir);
-		if (parent === dir) break;
-		dir = parent;
 	}
+}
+
+/**
+ * The nearest project-local `<binDir>/<tool>` at or above `startDir`, or
+ * `undefined`. See {@link localBinMatches} for the walk itself.
+ *
+ * Exported so callers that must NOT pay for global-bin discovery can reuse this
+ * walk instead of copying it. `findNodeToolBinary` below adds `findGlobalBinary`,
+ * which spawns a probe per package manager; a caller resolving a command on
+ * every run (knip, #1721) needs the filesystem half only.
+ */
+export function findLocalBinUpwards(
+	tool: string,
+	startDir: string,
+	options: LocalBinWalkOptions = {},
+): string | undefined {
+	for (const match of localBinMatches([tool], startDir, options)) return match;
 	return undefined;
+}
+
+/**
+ * EVERY project-local match for `tools` at or above `startDir`, nearest first.
+ *
+ * For the two callers that probe candidates rather than resolve one command:
+ * the ast-grep availability sweep (`runner-helpers.ts`, which spawns
+ * `--version` against each until one answers) and vulture's venv candidates
+ * (`dead-code-client.ts`). Both previously hand-rolled their own unceilinged
+ * climb precisely because the singular helper could not express "all of them"
+ * (#2544 review F1).
+ */
+export function findLocalBinsUpwards(
+	tools: readonly string[],
+	startDir: string,
+	options: LocalBinWalkOptions = {},
+): string[] {
+	return [...localBinMatches(tools, startDir, options)];
 }
 
 /**
@@ -611,10 +693,9 @@ export async function findNodeToolBinary(
 	tool: string,
 	cwd: string,
 	windowsExt = ".cmd",
-	homeDir?: string,
 ): Promise<string | undefined> {
 	return (
-		findLocalBinUpwards(tool, cwd, { windowsExt, homeDir }) ??
+		findLocalBinUpwards(tool, cwd, { windowsExt }) ??
 		(await findGlobalBinary(tool, windowsExt))
 	);
 }

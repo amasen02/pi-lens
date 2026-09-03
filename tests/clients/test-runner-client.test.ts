@@ -22,7 +22,10 @@ import { createTempFile, setupTestEnvironment } from "./test-utils.js";
 // test in this file never reaches a `findGlobalBinary` call.
 const findGlobalBinary =
 	vi.fn<(command: string) => Promise<string | undefined>>();
-vi.mock("../../clients/package-manager.js", () => ({
+vi.mock("../../clients/package-manager.js", async (importOriginal) => ({
+	...(await importOriginal<
+		typeof import("../../clients/package-manager.js")
+	>()),
 	findGlobalBinary: (command: string) => findGlobalBinary(command),
 }));
 

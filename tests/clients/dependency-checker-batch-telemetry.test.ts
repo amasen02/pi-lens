@@ -21,7 +21,12 @@ const findNodeToolBinary = vi.fn();
 const ensureTool = vi.fn();
 
 vi.mock("../../clients/safe-spawn.js", () => ({ safeSpawnAsync, safeSpawn }));
-vi.mock("../../clients/package-manager.js", () => ({ findNodeToolBinary }));
+vi.mock("../../clients/package-manager.js", async (importOriginal) => ({
+	...(await importOriginal<
+		typeof import("../../clients/package-manager.js")
+	>()),
+	findNodeToolBinary,
+}));
 vi.mock("../../clients/installer/index.js", () => ({
 	ensureTool,
 	getManagedToolsDir: () => path.join(os.tmpdir(), "pilens-fake-home", "tools"),

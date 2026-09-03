@@ -35,7 +35,13 @@ import {
 	getServersForFileWithConfig,
 	isServerDisabled,
 } from "../../../lsp/config.js";
-import { findGlobalBinary } from "../../../package-manager.js";
+import {
+	findGlobalBinary,
+	findLocalBinsUpwards,
+	findLocalBinUpwards,
+	VENDOR_BIN_DIRS,
+	VENV_BIN_DIRS,
+} from "../../../package-manager.js";
 import { safeSpawnAsync } from "../../../safe-spawn.js";
 import { compareOrdinal } from "../../../string-utils.js";
 import {
@@ -99,26 +105,6 @@ export function lspPrimaryCoversFile(
 		(s) => s.role !== "auxiliary",
 	);
 	return primary?.id === serverId;
-}
-
-/**
- * Walk up from startDir until we find a directory containing node_modules/.bin.
- * Returns all such roots found up to the filesystem root — not just the nearest —
- * so callers can search them all for a specific binary.
- */
-function findNodeBinRoots(startDir: string): string[] {
-	const roots: string[] = [];
-	let current = startDir;
-	const fsRoot = path.parse(current).root;
-	while (current !== fsRoot) {
-		if (fs.existsSync(path.join(current, "node_modules", ".bin"))) {
-			roots.push(current);
-		}
-		const parent = path.dirname(current);
-		if (parent === current) break;
-		current = parent;
-	}
-	return roots;
 }
 
 let _thisDir = path.dirname(fileURLToPath(import.meta.url));
@@ -345,6 +331,16 @@ export async function findManagedNodeToolBinary(
  * The resolved path is returned verbatim: every spawn consumer runs with
  * `shell: false` (safe-spawn, #817), so wrapping it in quotes would make it
  * a literal filename that ENOENTs on every platform (#1508).
+ *
+ * The venv directory list is `VENV_BIN_DIRS` (`package-manager.ts`), shared
+ * with `formatters.ts`'s `findInVenv` and `dead-code-client.ts`'s vulture
+ * candidates — three independent spellings of the same four directories before
+ * #2544 review F1. Resolution is the shared ANCESTOR walk, so a monorepo
+ * package whose venv lives at the repo root resolves the project's own tool
+ * instead of silently falling through to whatever `python` is active in the
+ * calling shell (#1731 discipline B, which this finder's own doc comment
+ * already claimed) — bounded by the same default-on HOME ceiling every
+ * tool-bin walk gets (#2514).
  */
 export function createVenvFinder(
 	command: string,
@@ -352,19 +348,11 @@ export function createVenvFinder(
 	verificationArgs: string[] = ["--version"],
 ): (cwd: string) => Promise<string> {
 	return async (cwd: string): Promise<string> => {
-		const venvPaths = [
-			`.venv/bin/${command}`,
-			`venv/bin/${command}`,
-			`.venv/Scripts/${command}${windowsExt}`,
-			`venv/Scripts/${command}${windowsExt}`,
-		];
-
-		for (const venvPath of venvPaths) {
-			const fullPath = path.join(cwd, venvPath);
-			if (fs.existsSync(fullPath)) {
-				return fullPath;
-			}
-		}
+		const venvBin = findLocalBinUpwards(command, cwd, {
+			windowsExt,
+			binDirs: VENV_BIN_DIRS,
+		});
+		if (venvBin) return venvBin;
 
 		// Managed-dir install (~/.pi-lens/tools/node_modules/.bin/<command>) — the
 		// same shim `ensureTool()` installs npm-strategy tools into. Checked BEFORE
@@ -1437,31 +1425,26 @@ export function resolveToolCommand(cwd: string, toolId: string): string | null {
 	return resolveNodeToolCommand(cwd, spec.command, spec.windowsExt ?? ".cmd");
 }
 
+/**
+ * Composer's `vendor/bin/<tool>` from the nearest ancestor that has one.
+ *
+ * Delegates to THE shared bin walker (#2544 review F1): this was a fifth
+ * private copy of that climb, unceilinged, so a `vendor/bin` at or above
+ * `$HOME` — which can never be this project's own Composer install — was
+ * resolved as the project's tool (#2514, same class as `findInVendorBin`,
+ * which had already been folded).
+ */
 export function resolveVendorToolCommand(
 	cwd: string,
 	toolName: string,
 	windowsExt = ".bat",
 ): string | null {
-	const isWin = process.platform === "win32";
-	const candidates = isWin
-		? [
-				path.join("vendor", "bin", `${toolName}${windowsExt}`),
-				path.join("vendor", "bin", toolName),
-			]
-		: [path.join("vendor", "bin", toolName)];
-	let dir = cwd;
-	const root = path.parse(dir).root;
-	while (true) {
-		for (const candidate of candidates) {
-			const full = path.join(dir, candidate);
-			if (fs.existsSync(full)) return full;
-		}
-		if (dir === root) break;
-		const parent = path.dirname(dir);
-		if (parent === dir) break;
-		dir = parent;
-	}
-	return null;
+	return (
+		findLocalBinUpwards(toolName, cwd, {
+			windowsExt,
+			binDirs: VENDOR_BIN_DIRS,
+		}) ?? null
+	);
 }
 
 export async function resolveToolCommandWithInstallFallback(
@@ -1773,17 +1756,32 @@ function buildSgLocalBins(): string[] {
 	const binaryCandidates = ["ast-grep", "sg"].flatMap((base) =>
 		extensions.map((ext) => `${base}${ext}`),
 	);
-	const binRoots = [
-		...findNodeBinRoots(_thisDir),
-		...findNodeBinRoots(process.cwd()),
-		_managedToolsDir,
+	// THE shared bin walk (#2544 review F1). This used to be a private
+	// `findNodeBinRoots` climb with no HOME ceiling, so on a box with a
+	// home-level `node_modules` (the pi-extensions manifest installs its own
+	// bins, #2514) `$HOME` itself came back as a bin root and an unrelated
+	// ast-grep was probed as if it were this project's. `windowsExt: ""`
+	// because the candidate names already carry their extensions — in a
+	// shell-dependent ORDER (`hasBash` above) that a single `windowsExt`
+	// cannot express.
+	//
+	// pi-lens's OWN bundled ast-grep still resolves: an installed extension
+	// lives UNDER `$HOME` (`~/.pi/extensions/…`), and the ceiling stops at
+	// `$HOME`, not below it. `_managedToolsDir` (`~/.pi-lens/tools`) is a
+	// fixed location, not a walk, so it is checked directly as before.
+	const walkOptions = { windowsExt: "" } as const;
+	const bins = [
+		...findLocalBinsUpwards(binaryCandidates, _thisDir, walkOptions),
+		...findLocalBinsUpwards(binaryCandidates, process.cwd(), walkOptions),
 	];
-	const bins: string[] = [];
-	for (const root of binRoots) {
-		for (const candidate of binaryCandidates) {
-			const localBin = path.join(root, "node_modules", ".bin", candidate);
-			if (fs.existsSync(localBin)) bins.push(localBin);
-		}
+	for (const candidate of binaryCandidates) {
+		const managedBin = path.join(
+			_managedToolsDir,
+			"node_modules",
+			".bin",
+			candidate,
+		);
+		if (fs.existsSync(managedBin)) bins.push(managedBin);
 	}
 	return bins;
 }

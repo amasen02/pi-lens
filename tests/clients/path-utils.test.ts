@@ -586,105 +586,240 @@ describe("findNearestMarkerRoot (refs #625)", () => {
 	});
 });
 
-describe("isAtOrAboveHomeDir (#253)", () => {
-	// Use a synthetic home so the assertions are platform-stable.
-	const home = path.resolve(path.join("tmp-home", "user"));
+/**
+ * The ceiling's whole defect class is WIN32 path semantics — drive-letter
+ * case-folding and cross-drive `path.relative` — and the authoritative Unit
+ * tests lane is ubuntu. Asserting through the ambient `path` module meant CI's
+ * diff for the #2544 F1 fix was structurally ZERO: the `isAbsolute` clause is
+ * a tautology on POSIX, the re-spelling is a genuinely different directory
+ * there, and every `process.platform === "win32"` expectation collapsed to the
+ * POSIX branch. The helper takes an injectable `pathImpl` for exactly this
+ * (#2544 review F2), so the SAME table below runs under `path.win32` and
+ * `path.posix` on EVERY lane — the ubuntu lane now exercises the win32
+ * case-folding semantics, and a Windows box exercises the POSIX ones.
+ *
+ * `path.win32`/`path.posix` are pure, host-independent implementations; nothing
+ * in this block reads `process.platform`. The lane-level gap (no Windows Unit
+ * tests lane at all) is tracked separately as #2536 — this makes the ubuntu
+ * lane able to catch the bug, it does not replace running on Windows.
+ */
+interface CeilingCase {
+	readonly what: string;
+	readonly dir: string;
+	readonly home: string;
+	readonly expected: boolean;
+}
 
-	it("treats the home directory itself as at-or-above home", () => {
-		expect(isAtOrAboveHomeDir(home, home)).toBe(true);
-	});
+interface CeilingTable {
+	readonly label: string;
+	readonly impl: typeof path;
+	readonly cases: readonly CeilingCase[];
+}
 
-	it("treats an ancestor of home as at-or-above home (the #253 escape)", () => {
-		const ancestor = path.dirname(home); // …/tmp-home
-		const grandAncestor = path.dirname(ancestor);
-		expect(isAtOrAboveHomeDir(ancestor, home)).toBe(true);
-		expect(isAtOrAboveHomeDir(grandAncestor, home)).toBe(true);
-	});
+const POSIX_HOME = "/home/user";
+const WIN32_HOME = "C:\\Users\\user";
 
-	it("treats the filesystem root as at-or-above home", () => {
-		const { root } = path.parse(home);
-		expect(isAtOrAboveHomeDir(root, home)).toBe(true);
-	});
+const CEILING_TABLES: readonly CeilingTable[] = [
+	{
+		label: "posix",
+		impl: path.posix,
+		cases: [
+			{
+				what: "home itself",
+				dir: POSIX_HOME,
+				home: POSIX_HOME,
+				expected: true,
+			},
+			{ what: "home's parent", dir: "/home", home: POSIX_HOME, expected: true },
+			{
+				what: "home's grandparent",
+				dir: "/",
+				home: POSIX_HOME,
+				expected: true,
+			},
+			{
+				what: "the filesystem root",
+				dir: "/",
+				home: "/home/user/nested",
+				expected: true,
+			},
+			{
+				what: "a project under home",
+				dir: "/home/user/code/app",
+				home: POSIX_HOME,
+				expected: false,
+			},
+			{
+				what: "a direct child of home",
+				dir: "/home/user/proj",
+				home: POSIX_HOME,
+				expected: false,
+			},
+			{
+				what: "a sibling tree",
+				dir: "/home/someone-else/proj",
+				home: POSIX_HOME,
+				expected: false,
+			},
+			{
+				what: "an unresolved path that normalizes TO home",
+				dir: "/home/user/x/..",
+				home: POSIX_HOME,
+				expected: true,
+			},
+			{
+				what: "an unresolved path that normalizes UNDER home",
+				dir: "/home/user/a/../b",
+				home: POSIX_HOME,
+				expected: false,
+			},
+			{
+				what: "a directory whose name merely PREFIXES home",
+				dir: "/home/user2",
+				home: POSIX_HOME,
+				expected: false,
+			},
+			{
+				what: "a project under a name that merely prefixes home",
+				dir: "/home/user2/proj",
+				home: POSIX_HOME,
+				expected: false,
+			},
+			// The cross-drive row's POSIX counterpart: an unrelated absolute root.
+			// `path.relative` answers with `..` segments here, so the
+			// `!isAbsolute(rel)` clause is inert — which is precisely why the
+			// win32 table below has to run on this lane too.
+			{
+				what: "an unrelated absolute tree",
+				dir: "/mnt",
+				home: POSIX_HOME,
+				expected: false,
+			},
+			// Re-spelling: POSIX is case-SENSITIVE, so `/home/USER` is a genuinely
+			// DIFFERENT directory and must NOT be ceilinged — over-folding here
+			// would block a legitimate `~/Code` vs `~/code` project.
+			{
+				what: "a re-cased home (case-sensitive: a different directory)",
+				dir: "/home/USER",
+				home: POSIX_HOME,
+				expected: false,
+			},
+			{
+				what: "a re-cased home in the HOME argument",
+				dir: POSIX_HOME,
+				home: "/home/USER",
+				expected: false,
+			},
+		],
+	},
+	{
+		label: "win32",
+		impl: path.win32,
+		cases: [
+			{
+				what: "home itself",
+				dir: WIN32_HOME,
+				home: WIN32_HOME,
+				expected: true,
+			},
+			{
+				what: "home's parent",
+				dir: "C:\\Users",
+				home: WIN32_HOME,
+				expected: true,
+			},
+			{
+				what: "home's grandparent",
+				dir: "C:\\",
+				home: WIN32_HOME,
+				expected: true,
+			},
+			{
+				what: "the filesystem root",
+				dir: "C:\\",
+				home: "C:\\Users\\user\\nested",
+				expected: true,
+			},
+			{
+				what: "a project under home",
+				dir: "C:\\Users\\user\\code\\app",
+				home: WIN32_HOME,
+				expected: false,
+			},
+			{
+				what: "a direct child of home",
+				dir: "C:\\Users\\user\\proj",
+				home: WIN32_HOME,
+				expected: false,
+			},
+			{
+				what: "a sibling tree",
+				dir: "C:\\Users\\someone-else\\proj",
+				home: WIN32_HOME,
+				expected: false,
+			},
+			{
+				what: "an unresolved path that normalizes TO home",
+				dir: "C:\\Users\\user\\x\\..",
+				home: WIN32_HOME,
+				expected: true,
+			},
+			{
+				what: "an unresolved path that normalizes UNDER home",
+				dir: "C:\\Users\\user\\a\\..\\b",
+				home: WIN32_HOME,
+				expected: false,
+			},
+			{
+				what: "a directory whose name merely PREFIXES home",
+				dir: "C:\\Users\\user2",
+				home: WIN32_HOME,
+				expected: false,
+			},
+			{
+				what: "a project under a name that merely prefixes home",
+				dir: "C:\\Users\\user2\\proj",
+				home: WIN32_HOME,
+				expected: false,
+			},
+			// Cross-drive: `path.relative` returns an ABSOLUTE path between drive
+			// letters, and an absolute `rel` has no leading `..` — without the
+			// `!isAbsolute(rel)` clause `C:\` reports itself at-or-above a `D:\`
+			// home and ceilings every walker on the wrong drive.
+			{
+				what: "the root of another drive",
+				dir: "C:\\",
+				home: "D:\\Users\\jane",
+				expected: false,
+			},
+			// The #2514/#2544 F1 defect itself: the lowercase-drive spelling VS
+			// Code URIs produce (and 46 records of a real `latency.log` carry) IS
+			// the home directory on win32, with the separator form flipped too per
+			// the repo's cross-form path rule (record one form, check the other).
+			{
+				what: "a re-spelled home (lowercase drive + forward slashes)",
+				dir: "c:/Users/user",
+				home: WIN32_HOME,
+				expected: true,
+			},
+			{
+				what: "a re-spelled home in the HOME argument",
+				dir: WIN32_HOME,
+				home: "c:/Users/user",
+				expected: true,
+			},
+		],
+	},
+];
 
-	it("treats a project UNDER home as not at-or-above home", () => {
-		expect(isAtOrAboveHomeDir(path.join(home, "code", "app"), home)).toBe(
-			false,
-		);
-		expect(isAtOrAboveHomeDir(path.join(home, "proj"), home)).toBe(false);
-	});
-
-	it("treats a sibling/unrelated tree as not at-or-above home", () => {
-		const sibling = path.join(path.dirname(home), "someone-else", "proj");
-		expect(isAtOrAboveHomeDir(sibling, home)).toBe(false);
-	});
-
-	it("normalizes unresolved paths before comparing", () => {
-		expect(isAtOrAboveHomeDir(path.join(home, "x", ".."), home)).toBe(true);
-		expect(isAtOrAboveHomeDir(path.join(home, "a", "..", "b"), home)).toBe(
-			false,
-		);
-	});
-
-	/**
-	 * lane: dev-box-only in effect. Asserted on EVERY platform (no skip, and the
-	 * expectation is the same everywhere), but only win32 can actually break it:
-	 * `path.relative` returns an ABSOLUTE path when the two paths sit on
-	 * different drive letters, and an absolute `rel` has no leading `..`, so
-	 * without the `!path.isAbsolute(rel)` clause `C:\` would report itself as
-	 * at-or-above a `D:\` home and ceiling every walker on the wrong drive. On
-	 * POSIX these are ordinary relative names and `..` already answers, so the
-	 * ubuntu Unit tests lane runs this as a plain regression assertion.
-	 */
-	it("does not treat a directory on another Windows drive as at-or-above home", () => {
-		expect(isAtOrAboveHomeDir("C:\\", "D:\\Users\\jane")).toBe(false);
-		expect(isAtOrAboveHomeDir("C:\\Users", "D:\\Users\\jane")).toBe(false);
-	});
-
-	it("does not treat a directory whose name merely PREFIXES home as at-or-above it", () => {
-		// `…/user2` → `path.relative` gives `../user`; a bare "is home a prefix of
-		// dir" test would call this the home directory itself.
-		expect(isAtOrAboveHomeDir(`${home}2`, home)).toBe(false);
-		expect(isAtOrAboveHomeDir(path.join(`${home}2`, "proj"), home)).toBe(false);
-	});
-
-	/**
-	 * #2544 review F1. `isAtOrAboveHomeDir` used to short-circuit on
-	 * `path.resolve(dir) === path.resolve(homeDir)`, a case-SENSITIVE string
-	 * compare, and then require `rel !== ""`. On win32 the two clauses
-	 * disagreed: `c:\Users\jane` (the lowercase-drive form VS Code URIs produce,
-	 * and the form 46 records of a real `latency.log` carry) failed the equality
-	 * test, `path.relative` folded the case to `""`, and `rel !== ""` rejected
-	 * it — so the helper answered "not at home" FOR THE HOME DIRECTORY, and
-	 * every ceilinged walker (#250/#253: findNearestMarkerRoot,
-	 * findLocalToolConfig, workspace-topology, startup-scan, project-lens-config,
-	 * and #2514's bin walkers) climbed straight past HOME.
-	 *
-	 * No skip: the assertion is two-sided, because BOTH platform behaviours are
-	 * load-bearing. win32 must fold (or the ceiling is bypassed); POSIX must NOT
-	 * fold (or a legitimately distinct `~/Code` vs `~/code` gets over-blocked).
-	 */
-	it("re-spelled home: folds drive-letter case on win32, stays case-sensitive on POSIX", () => {
-		// On win32 the re-spelling also flips the separator form, per the
-		// read-guard path-key rule (record one form, check the other); POSIX has
-		// only one separator form, so there is nothing to flip there.
-		const respelled =
-			process.platform === "win32"
-				? home
-						.replace(/^([A-Za-z]):/, (_m, d: string) => `${d.toLowerCase()}:`)
-						.split(path.sep)
-						.join("/")
-				: path.join(path.dirname(home), path.basename(home).toUpperCase());
-		expect(respelled).not.toBe(home);
-
-		expect(isAtOrAboveHomeDir(respelled, home)).toBe(
-			process.platform === "win32",
-		);
-		// …and symmetrically, with the re-spelled form as the HOME argument.
-		expect(isAtOrAboveHomeDir(home, respelled)).toBe(
-			process.platform === "win32",
-		);
-	});
-});
+describe.each(CEILING_TABLES)(
+	"isAtOrAboveHomeDir (#253) — $label path semantics on every lane (#2544 F2)",
+	({ impl, cases }) => {
+		it.each(cases)("$what → $expected", ({ dir, home, expected }) => {
+			expect(isAtOrAboveHomeDir(dir, home, impl)).toBe(expected);
+		});
+	},
+);
 
 describe("isExternalOrVendorFile", () => {
 	const root = "/home/user/project";

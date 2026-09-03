@@ -16,6 +16,7 @@ import { createSubsystemLogger } from "./extension-log.js";
 import { incrementDegradationCount } from "./degradation-ledger.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { findLocalBinsUpwards, VENV_BIN_DIRS } from "./package-manager.js";
 import { findNearestMarkerRoot } from "./path-utils.js";
 import { getScratchTreeFnmatchPatterns } from "./scratch-tree-policy.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
@@ -248,24 +249,23 @@ export class PythonDeadCodeClient implements DeadCodeClient {
 	 * whatever happens to be active in the CALLING shell, not the project's
 	 * (#1731, discipline B — the same venv-first shape sqlfluff's binary
 	 * resolution already uses, `runner-helpers.ts` `createVenvFinder`).
+	 *
+	 * The directory list is the shared `VENV_BIN_DIRS` and the search is the
+	 * shared ancestor walk, HOME-ceilinged (#2544 review F1): this was a third
+	 * private spelling of the same four venv directories, and its
+	 * `process.platform` branch meant the ubuntu lane never saw the `Scripts`
+	 * half at all (defect shape 30). `findLocalBinsUpwards` returns EVERY match
+	 * rather than the first, because `doEnsureAvailable` probes candidates in
+	 * order and must keep the `venv/` fallback when a `.venv/` vulture exists
+	 * but cannot run.
 	 */
 	private venvCandidates(
 		root: string,
 	): Array<{ cmd: string; prefix: string[] }> {
-		const isWin = process.platform === "win32";
-		const relPaths = isWin
-			? [
-					path.join(".venv", "Scripts", "vulture.exe"),
-					path.join("venv", "Scripts", "vulture.exe"),
-				]
-			: [
-					path.join(".venv", "bin", "vulture"),
-					path.join("venv", "bin", "vulture"),
-				];
-		return relPaths
-			.map((rel) => path.join(root, rel))
-			.filter((full) => fs.existsSync(full))
-			.map((full) => ({ cmd: full, prefix: [] }));
+		return findLocalBinsUpwards(["vulture"], root, {
+			windowsExt: ".exe",
+			binDirs: VENV_BIN_DIRS,
+		}).map((full) => ({ cmd: full, prefix: [] }));
 	}
 
 	private async doEnsureAvailable(root?: string): Promise<boolean> {

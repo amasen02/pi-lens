@@ -847,6 +847,85 @@ describe("oxlint runner", () => {
 		}
 	});
 
+	/**
+	 * #2514 / #2544 review F1, through the real runner.
+	 *
+	 * `resolveLocalVp` was a private, UNCEILINGED copy of the shared bin walk,
+	 * while `formatters.ts`'s `oxfmtFormatter` resolved the SAME binary — `vp` —
+	 * through the ceilinged `findInNodeModules`. So one `vp` resolver stopped at
+	 * `$HOME` and the other climbed past it, and which policy applied depended
+	 * on whether the format path or the lint path asked. A
+	 * `node_modules/.bin/vp` at or above `$HOME` can never be this project's own
+	 * Vite+ install: it is the home-level pi-extensions manifest's own bin.
+	 *
+	 * Two-sided on purpose — the run must fall through to the `vp --version`
+	 * PATH probe (the "vp is not installed" branch above), not merely skip.
+	 */
+	it("does not resolve a vp planted at HOME as the project's Vite+ binary (#2514)", async () => {
+		const env = setupTestEnvironment("pi-lens-oxlint-vp-home-ceiling-");
+		const originalHome = process.env.HOME;
+		const originalUserProfile = process.env.USERPROFILE;
+		try {
+			const fakeHome = env.tmpDir;
+			const projectDir = path.join(fakeHome, "project");
+			fs.mkdirSync(projectDir, { recursive: true });
+			const filePath = path.join(projectDir, "sample.ts");
+			fs.writeFileSync(filePath, "console.log('hi')\n");
+			fs.writeFileSync(
+				path.join(projectDir, "package.json"),
+				JSON.stringify({ devDependencies: { "vite-plus": "^0.1.0" } }),
+			);
+
+			const homeBinDir = path.join(fakeHome, "node_modules", ".bin");
+			fs.mkdirSync(homeBinDir, { recursive: true });
+			const homeVpCmd = path.join(homeBinDir, "vp.cmd");
+			const homeVp = path.join(homeBinDir, "vp");
+			fs.writeFileSync(homeVpCmd, "@ECHO off\r\n");
+			fs.writeFileSync(homeVp, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+
+			process.env.HOME = fakeHome;
+			process.env.USERPROFILE = fakeHome;
+
+			// vp --version (not found), then oxlint (clean).
+			safeSpawnAsync
+				.mockResolvedValueOnce({
+					error: new Error("not found"),
+					status: 1,
+					stdout: "",
+					stderr: "",
+				})
+				.mockResolvedValueOnce({
+					error: null,
+					status: 0,
+					stdout: "",
+					stderr: "",
+				});
+
+			const runner = (
+				await import("../../../../clients/dispatch/runners/oxlint.js")
+			).default;
+			const result = await runner.run(createCtx(filePath, projectDir) as never);
+
+			const spawned = safeSpawnAsync.mock.calls.map((call) => call[0]);
+			expect(spawned).not.toContain(homeVpCmd);
+			expect(spawned).not.toContain(homeVp);
+			// Pre-fix the home-level bin WAS the resolved command, so the PATH
+			// probe never happened at all.
+			expect(safeSpawnAsync).toHaveBeenCalledWith(
+				"vp",
+				["--version"],
+				expect.objectContaining({ timeout: 5000 }),
+			);
+			expect(result.status).toBe("succeeded");
+		} finally {
+			if (originalHome === undefined) delete process.env.HOME;
+			else process.env.HOME = originalHome;
+			if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+			else process.env.USERPROFILE = originalUserProfile;
+			env.cleanup();
+		}
+	});
+
 	it("promotes severity=error diagnostics to blocking semantic", async () => {
 		const env = setupTestEnvironment("pi-lens-oxlint-error-promotion-");
 		try {

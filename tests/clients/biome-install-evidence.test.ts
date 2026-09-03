@@ -33,7 +33,10 @@ vi.mock("../../clients/installer/index.js", () => ({
 	resetPathWalkMemo: vi.fn(),
 	getToolEnvironment: vi.fn(async () => ({})),
 }));
-vi.mock("../../clients/package-manager.js", () => ({
+vi.mock("../../clients/package-manager.js", async (importOriginal) => ({
+	...(await importOriginal<
+		typeof import("../../clients/package-manager.js")
+	>()),
 	findGlobalBinary: vi.fn(async () => undefined),
 }));
 

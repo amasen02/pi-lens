@@ -30,8 +30,10 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+	findLocalBinsUpwards,
 	findLocalBinUpwards,
 	type LocalBinWalkOptions,
+	VENV_BIN_DIRS,
 } from "../../clients/package-manager.js";
 import { removeTempDirSync, setupTestEnvironment } from "./test-utils.js";
 
@@ -59,13 +61,8 @@ const WALKERS: WalkerCase[] = [
 			path.join("vendor", "bin", isWin ? `${binary}.bat` : binary),
 	},
 	{
-		name: ".venv/venv — findInVenv (Python)",
-		options: {
-			windowsExt: ".exe",
-			binDirs: isWin
-				? [path.join(".venv", "Scripts"), path.join("venv", "Scripts")]
-				: [path.join(".venv", "bin"), path.join("venv", "bin")],
-		},
+		name: ".venv/venv — findInVenv / createVenvFinder / vulture (Python)",
+		options: { windowsExt: ".exe", binDirs: VENV_BIN_DIRS },
 		binSubpath: (binary) =>
 			isWin
 				? path.join(".venv", "Scripts", `${binary}.exe`)
@@ -195,3 +192,153 @@ describe.each(WALKERS)(
 		});
 	},
 );
+
+/**
+ * The candidate ORDER — EXT-OUTER, DIR-INNER — is documented in
+ * `findLocalBinUpwards`'s doc comment and in AGENTS.md, and until #2544 review
+ * F4 nothing asserted it: swapping the two loops left all 213 cases green.
+ *
+ * The order is only OBSERVABLE when there are two names, which under a live
+ * `process.platform` read means Windows only — exactly the shape that leaves
+ * the ubuntu Unit tests lane enforcing nothing. So the walker takes an
+ * injectable `isWindows` (defaulting to a LIVE platform read, never a
+ * module-load constant — defect shape 30) and BOTH orders are pinned here on
+ * EVERY lane.
+ */
+describe("findLocalBinUpwards candidate order (#2544 F4)", () => {
+	let tmpDir: string;
+
+	function fixture() {
+		const env = setupTestEnvironment("pi-lens-bin-walker-order-");
+		tmpDir = env.tmpDir;
+		const fakeHome = path.join(tmpDir, "home");
+		const project = path.join(fakeHome, "proj");
+		fs.mkdirSync(project, { recursive: true });
+		// The discriminating layout: the PREFERRED directory holds only the bare
+		// name, the less-preferred one holds the `.exe`. Ext-outer picks the
+		// `.exe` out of `venv/`; dir-inner would pick the bare name from `.venv/`.
+		plantBin(project, path.join(".venv", "Scripts", "ruff"));
+		plantBin(project, path.join("venv", "Scripts", "ruff.exe"));
+		return { fakeHome, project };
+	}
+
+	it("tries EVERY binDir with windowsExt before ANY of them with the bare name", () => {
+		const { fakeHome, project } = fixture();
+		try {
+			expect(
+				findLocalBinUpwards("ruff", project, {
+					windowsExt: ".exe",
+					binDirs: VENV_BIN_DIRS,
+					homeDir: fakeHome,
+					isWindows: true,
+				}),
+			).toBe(path.join(project, "venv", "Scripts", "ruff.exe"));
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
+	});
+
+	it("has one name per tool off Windows, so the binDir order alone decides", () => {
+		const { fakeHome, project } = fixture();
+		try {
+			expect(
+				findLocalBinUpwards("ruff", project, {
+					windowsExt: ".exe",
+					binDirs: VENV_BIN_DIRS,
+					homeDir: fakeHome,
+					isWindows: false,
+				}),
+			).toBe(path.join(project, ".venv", "Scripts", "ruff"));
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
+	});
+
+	/**
+	 * `windowsExt: ""` means "the caller already spelled every name it wants" —
+	 * the ast-grep sweep passes `ast-grep.cmd`/`ast-grep.exe`/`ast-grep` in a
+	 * shell-dependent order that a single `windowsExt` cannot express. Without
+	 * that case the expansion produces the bare name TWICE, and the collect-all
+	 * walker reports the same binary twice (one wasted `--version` spawn per
+	 * duplicate).
+	 */
+	it("does not double-expand a name when windowsExt is empty", () => {
+		const { fakeHome, project } = fixture();
+		try {
+			expect(
+				findLocalBinsUpwards(["ruff"], project, {
+					windowsExt: "",
+					binDirs: [path.join(".venv", "Scripts")],
+					homeDir: fakeHome,
+					isWindows: true,
+				}),
+			).toEqual([path.join(project, ".venv", "Scripts", "ruff")]);
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
+	});
+});
+
+/**
+ * `findLocalBinsUpwards` — the collect-all arity behind the ast-grep probe
+ * sweep (`runner-helpers.ts`) and vulture's venv candidates
+ * (`dead-code-client.ts`). Both hand-rolled their own UNCEILINGED climb before
+ * #2544 review F1 precisely because the singular helper could not say "all of
+ * them": `findNodeBinRoots` returned the maintainer's real `$HOME` as an
+ * ast-grep bin root on any box with a home-level `node_modules` (#2514).
+ */
+describe("findLocalBinsUpwards (#2544 F1)", () => {
+	let tmpDir: string;
+
+	function fixture() {
+		const env = setupTestEnvironment("pi-lens-bin-walker-all-");
+		tmpDir = env.tmpDir;
+		const fakeHome = path.join(tmpDir, "home");
+		const project = path.join(fakeHome, "proj");
+		const nested = path.join(project, "pkg");
+		fs.mkdirSync(nested, { recursive: true });
+		return { fakeHome, project, nested };
+	}
+
+	const binName = (binary: string) => (isWin ? `${binary}.cmd` : binary);
+
+	it("returns every ancestor match, nearest first, in tools order", () => {
+		const { fakeHome, project, nested } = fixture();
+		try {
+			plantBin(nested, path.join("node_modules", ".bin", binName("sg")));
+			plantBin(nested, path.join("node_modules", ".bin", binName("ast-grep")));
+			plantBin(project, path.join("node_modules", ".bin", binName("ast-grep")));
+
+			expect(
+				findLocalBinsUpwards(["ast-grep", "sg"], nested, {
+					homeDir: fakeHome,
+				}),
+			).toEqual([
+				path.join(nested, "node_modules", ".bin", binName("ast-grep")),
+				path.join(nested, "node_modules", ".bin", binName("sg")),
+				path.join(project, "node_modules", ".bin", binName("ast-grep")),
+			]);
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
+	});
+
+	it("stops at the HOME ceiling instead of collecting a home-level bin (#2514)", () => {
+		const { fakeHome, project, nested } = fixture();
+		try {
+			plantBin(project, path.join("node_modules", ".bin", binName("ast-grep")));
+			plantBin(
+				fakeHome,
+				path.join("node_modules", ".bin", binName("ast-grep")),
+			);
+
+			expect(
+				findLocalBinsUpwards(["ast-grep"], nested, { homeDir: fakeHome }),
+			).toEqual([
+				path.join(project, "node_modules", ".bin", binName("ast-grep")),
+			]);
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
+	});
+});

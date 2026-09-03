@@ -72,6 +72,80 @@ describe("PythonDeadCodeClient (vulture) — project-first resolution (#1731)", 
 		expect(cmd).toBe(venvVulture);
 	});
 
+	/**
+	 * #2544 review F1. `venvCandidates` joined its venv directories onto `root`
+	 * and nothing else — a third private spelling of the same four directories,
+	 * with a `process.platform` branch that hid the `Scripts` half from the
+	 * ubuntu lane entirely (defect shape 30). Folded onto the shared
+	 * ancestor walk, which is also where the #2514 HOME ceiling lives, so a
+	 * monorepo package resolves the repo-root venv's vulture instead of
+	 * falling through to whatever `vulture` answers on PATH.
+	 */
+	it("probes a .venv vulture from an ANCESTOR of the analyzed root", async () => {
+		const env = setupTestEnvironment("pi-lens-vulture-venv-ancestor-");
+		tmpDirs.push(env.tmpDir);
+		const isWin = process.platform === "win32";
+		const repoRoot = path.join(env.tmpDir, "repo");
+		const pkg = path.join(repoRoot, "services", "api");
+		fs.mkdirSync(pkg, { recursive: true });
+		const venvBin = isWin
+			? path.join(repoRoot, ".venv", "Scripts")
+			: path.join(repoRoot, ".venv", "bin");
+		fs.mkdirSync(venvBin, { recursive: true });
+		const venvVulture = path.join(venvBin, isWin ? "vulture.exe" : "vulture");
+		fs.writeFileSync(venvVulture, "");
+
+		const { PythonDeadCodeClient } =
+			await import("../../clients/dead-code-client.js");
+		const client = new PythonDeadCodeClient() as unknown as {
+			ensureAvailable(root?: string): Promise<boolean>;
+		};
+
+		expect(await client.ensureAvailable(pkg)).toBe(true);
+		const [cmd] = safeSpawnAsync.mock.calls[0] as [string, ...unknown[]];
+		expect(cmd).toBe(venvVulture);
+	});
+
+	it("never probes a .venv vulture planted at HOME (#2514)", async () => {
+		const env = setupTestEnvironment("pi-lens-vulture-venv-home-");
+		tmpDirs.push(env.tmpDir);
+		const originalHome = process.env.HOME;
+		const originalUserProfile = process.env.USERPROFILE;
+		try {
+			const isWin = process.platform === "win32";
+			const fakeHome = env.tmpDir;
+			const project = path.join(fakeHome, "project");
+			fs.mkdirSync(project, { recursive: true });
+			const venvBin = isWin
+				? path.join(fakeHome, ".venv", "Scripts")
+				: path.join(fakeHome, ".venv", "bin");
+			fs.mkdirSync(venvBin, { recursive: true });
+			const homeVulture = path.join(venvBin, isWin ? "vulture.exe" : "vulture");
+			fs.writeFileSync(homeVulture, "");
+			process.env.HOME = fakeHome;
+			process.env.USERPROFILE = fakeHome;
+
+			const { PythonDeadCodeClient } =
+				await import("../../clients/dead-code-client.js");
+			const client = new PythonDeadCodeClient() as unknown as {
+				ensureAvailable(root?: string): Promise<boolean>;
+			};
+
+			await client.ensureAvailable(project);
+
+			const probed = safeSpawnAsync.mock.calls.map((call) => call[0]);
+			expect(probed).not.toContain(homeVulture);
+			// …and the PATH candidates still ran, so this is a ceiling, not a
+			// short-circuit that skips resolution altogether.
+			expect(probed).toContain("vulture");
+		} finally {
+			if (originalHome === undefined) delete process.env.HOME;
+			else process.env.HOME = originalHome;
+			if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+			else process.env.USERPROFILE = originalUserProfile;
+		}
+	});
+
 	it("omits --min-confidence and --exclude when the project ships [tool.vulture] (discipline A)", async () => {
 		const env = setupTestEnvironment("pi-lens-vulture-config-");
 		tmpDirs.push(env.tmpDir);

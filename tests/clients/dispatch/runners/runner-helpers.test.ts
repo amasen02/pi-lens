@@ -179,6 +179,38 @@ describe("runner-helpers availability checker", () => {
 		}
 	});
 
+	/**
+	 * #2514 / #2544 review F1. `resolveVendorToolCommand` was a private,
+	 * unceilinged copy of the shared bin walk — the same shape #2514 fixed in
+	 * `formatters.ts`'s `findInVendorBin`, left behind in `runner-helpers.ts`.
+	 * A `vendor/bin` at or above `$HOME` can never be this project's own
+	 * Composer install.
+	 */
+	it("does not resolve a vendor/bin planted at HOME (#2514)", () => {
+		const env = setupTestEnvironment("pi-lens-vendor-bin-home-");
+		const originalHome = process.env.HOME;
+		const originalUserProfile = process.env.USERPROFILE;
+		try {
+			const fakeHome = env.tmpDir;
+			const nested = path.join(fakeHome, "project", "src");
+			fs.mkdirSync(nested, { recursive: true });
+			const homeVendorBin = path.join(fakeHome, "vendor", "bin");
+			fs.mkdirSync(homeVendorBin, { recursive: true });
+			fs.writeFileSync(path.join(homeVendorBin, "phpstan"), "#!/bin/sh\n");
+			fs.writeFileSync(path.join(homeVendorBin, "phpstan.bat"), "@echo off\n");
+			process.env.HOME = fakeHome;
+			process.env.USERPROFILE = fakeHome;
+
+			expect(resolveVendorToolCommand(nested, "phpstan", ".bat")).toBeNull();
+		} finally {
+			if (originalHome === undefined) delete process.env.HOME;
+			else process.env.HOME = originalHome;
+			if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+			else process.env.USERPROFILE = originalUserProfile;
+			env.cleanup();
+		}
+	});
+
 	it("resolves installed command after version check fallback", async () => {
 		const installerMod = await import("../../../../clients/installer/index.js");
 		vi.mocked(installerMod.isSpawnableCommand).mockResolvedValueOnce(false);
@@ -494,6 +526,63 @@ describe("runner-helpers availability checker", () => {
 		expect(await checker.isAvailableAsync(process.cwd())).toBe(false);
 		expect(safeSpawnMod.safeSpawnAsync).toHaveBeenCalledTimes(2);
 		expect(installerMod.resetPathWalkMemo).toHaveBeenCalledOnce();
+	});
+
+	/**
+	 * #2514 / #2544 review F1, through the real availability sweep.
+	 *
+	 * `buildSgLocalBins` collected its bin roots with a private
+	 * `findNodeBinRoots` climb that had NO home ceiling and ran to the
+	 * filesystem root, so on any box with a home-level `node_modules` (the
+	 * pi-extensions manifest installs its own bins) `$HOME` itself came back as
+	 * a bin root and an unrelated ast-grep was probed — and, if it answered,
+	 * used — as though it were this project's own. The reviewer's probe
+	 * reproduced exactly this against the maintainer's real home.
+	 */
+	it("never probes an ast-grep planted at HOME (#2514)", async () => {
+		const env = setupTestEnvironment("pi-lens-sg-home-ceiling-");
+		const originalHome = process.env.HOME;
+		const originalUserProfile = process.env.USERPROFILE;
+		const originalCwd = process.cwd();
+		try {
+			const fakeHome = env.tmpDir;
+			const project = path.join(fakeHome, "project");
+			fs.mkdirSync(project, { recursive: true });
+			const homeBinDir = path.join(fakeHome, "node_modules", ".bin");
+			fs.mkdirSync(homeBinDir, { recursive: true });
+			const planted = ["ast-grep", "ast-grep.cmd", "ast-grep.exe", "sg"].map(
+				(name) => path.join(homeBinDir, name),
+			);
+			for (const bin of planted) fs.writeFileSync(bin, "#!/bin/sh\nexit 0\n");
+
+			process.env.HOME = fakeHome;
+			process.env.USERPROFILE = fakeHome;
+			process.chdir(project);
+			resetDispatchAvailabilityState();
+
+			const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
+			vi.mocked(safeSpawnMod.safeSpawnAsync).mockReset();
+			vi.mocked(safeSpawnMod.safeSpawnAsync).mockResolvedValue({
+				stdout: "",
+				stderr: "missing",
+				status: 1,
+			});
+
+			expect(await isSgAvailableAsync()).toBe(false);
+
+			const probed = vi
+				.mocked(safeSpawnMod.safeSpawnAsync)
+				.mock.calls.map((call) => call[0]);
+			for (const bin of planted) expect(probed).not.toContain(bin);
+		} finally {
+			process.chdir(originalCwd);
+			if (originalHome === undefined) delete process.env.HOME;
+			else process.env.HOME = originalHome;
+			if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+			else process.env.USERPROFILE = originalUserProfile;
+			resetDispatchAvailabilityState();
+			env.cleanup();
+		}
 	});
 
 	it("resets the shared ast-grep availability memo at session start", async () => {
@@ -861,7 +950,18 @@ describe("runner-helpers availability checker", () => {
 			expect(checker.getCommand(dirA.tmpDir)).toBeNull();
 			// Exact path, not toContain: a quote-wrapped path still *contains*
 			// tmpDir but is a literal filename under shell:false (#1508).
-			expect(checker.getCommand(dirB.tmpDir)).toBe(ruffBUnix);
+			//
+			// This fixture plants BOTH venv layouts, which no real virtualenv
+			// does, so it also pins the candidate ORDER. Since #2544 review F1
+			// folded `createVenvFinder` onto the shared walker, that order is
+			// EXT-OUTER / DIR-INNER — the same order `formatters.ts`'s
+			// `findInVenv` always used, and the right one on Windows, where the
+			// `Scripts/*.exe` is the binary `shell: false` can actually spawn and
+			// `bin/ruff` would be an unrunnable shell script. The two resolvers
+			// used to disagree here; now they cannot.
+			expect(checker.getCommand(dirB.tmpDir)).toBe(
+				process.platform === "win32" ? ruffBWin : ruffBUnix,
+			);
 		} finally {
 			dirA.cleanup();
 			dirB.cleanup();
@@ -994,6 +1094,65 @@ describe("createVenvFinder: managed tools dir (#1638)", () => {
 			const resolved = await createVenvFinder("ruff")(env.tmpDir);
 			expect(resolved).toBe(venvBin);
 		} finally {
+			env.cleanup();
+		}
+	});
+
+	/**
+	 * #2544 review F1. `createVenvFinder` joined its four venv directories onto
+	 * `cwd` and nothing else, so the "project's own venv first" discipline its
+	 * own doc comment claims (#1731 discipline B) did not hold for a monorepo
+	 * package: the venv sits at the repo root, the dispatch cwd is the package,
+	 * and resolution fell straight through to whatever `python` happened to be
+	 * active in the CALLING shell. It now uses the shared ancestor walk, which
+	 * is where the HOME ceiling lives.
+	 */
+	it("resolves a venv from an ANCESTOR of cwd (monorepo package)", async () => {
+		const env = setupTestEnvironment("pi-lens-venv-ancestor-");
+		try {
+			const repoRoot = path.join(env.tmpDir, "repo");
+			const pkg = path.join(repoRoot, "packages", "api");
+			fs.mkdirSync(pkg, { recursive: true });
+			const venvBin =
+				process.platform === "win32"
+					? path.join(repoRoot, ".venv", "Scripts", "ruff.exe")
+					: path.join(repoRoot, ".venv", "bin", "ruff");
+			fs.mkdirSync(path.dirname(venvBin), { recursive: true });
+			fs.writeFileSync(venvBin, "#!/bin/sh\nexit 0\n");
+
+			expect(await createVenvFinder("ruff", ".exe")(pkg)).toBe(venvBin);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("does not resolve a venv planted at HOME (#2514)", async () => {
+		const env = setupTestEnvironment("pi-lens-venv-home-ceiling-");
+		const originalHome = process.env.HOME;
+		const originalUserProfile = process.env.USERPROFILE;
+		try {
+			const fakeHome = env.tmpDir;
+			const project = path.join(fakeHome, "project");
+			fs.mkdirSync(project, { recursive: true });
+			const homeVenvBin =
+				process.platform === "win32"
+					? path.join(fakeHome, ".venv", "Scripts", "homeonlytool.exe")
+					: path.join(fakeHome, ".venv", "bin", "homeonlytool");
+			fs.mkdirSync(path.dirname(homeVenvBin), { recursive: true });
+			fs.writeFileSync(homeVenvBin, "#!/bin/sh\nexit 0\n");
+			process.env.HOME = fakeHome;
+			process.env.USERPROFILE = fakeHome;
+
+			// Falls through to the bare name (PATH), never to `$HOME`'s venv —
+			// which can only be some unrelated user-level virtualenv.
+			expect(await createVenvFinder("homeonlytool", ".exe")(project)).toBe(
+				"homeonlytool",
+			);
+		} finally {
+			if (originalHome === undefined) delete process.env.HOME;
+			else process.env.HOME = originalHome;
+			if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+			else process.env.USERPROFILE = originalUserProfile;
 			env.cleanup();
 		}
 	});
