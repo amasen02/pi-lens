@@ -120,8 +120,25 @@ export interface MutationBridgeDeps {
 	 * Return `true` when the entry should be recorded. Called on EVERY
 	 * `recordMutation` invocation so flag and project-root changes take effect
 	 * immediately without re-registration.
+	 *
+	 * Path-scope ONLY (ignored/vendor/#project-root) — deliberately does not
+	 * consult `no-read-guard` (#2465). That flag decides whether the
+	 * read-guard staleness stamp fires (`shouldStampReadGuard` below), not
+	 * whether the write happened at all; folding it in here used to drop
+	 * turn-state and the change-log receipt along with the stamp, the same
+	 * conflation `clients/runtime-tool-result.ts` avoids by gating
+	 * `readGuard.recordWritten` alone.
 	 */
 	isRecordable(filePath: string): boolean;
+	/**
+	 * Whether the read-guard staleness stamp (`runtime.readGuard.recordWritten`)
+	 * should fire for this call. Optional — omitted (e.g. in tests that don't
+	 * care) defaults to `true`, preserving the stamp-always behavior every
+	 * existing caller had before #2465. `no-read-guard` is the ONLY thing that
+	 * should make this `false`; it must never also affect `isRecordable`
+	 * above, or turn-state/the receipt silently drop with it.
+	 */
+	shouldStampReadGuard?(): boolean;
 	dbg?: (msg: string) => void;
 }
 
@@ -241,8 +258,13 @@ export function recordMutationThroughSeam(
 
 	try {
 		// 1. Staleness stamp: the file changed under pi-lens, so a later edit is
-		//    judged by read coverage rather than by this write.
-		runtime.readGuard?.recordWritten?.(filePath);
+		//    judged by read coverage rather than by this write. #2465: gated on
+		//    `shouldStampReadGuard` (the `no-read-guard` flag) ALONE — the
+		//    `isRecordable` check above already passed, so the write itself is
+		//    still bookkept below whether or not the stamp fires.
+		if (deps.shouldStampReadGuard?.() ?? true) {
+			runtime.readGuard?.recordWritten?.(filePath);
+		}
 
 		// 2. Turn state: this is the insert that leaves `turn-state.json` `files`
 		//    non-empty for a mutation no `tool_result` described. `importsChanged`

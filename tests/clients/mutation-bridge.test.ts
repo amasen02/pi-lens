@@ -17,6 +17,11 @@ import {
 	registerMutationBridge,
 	type MutationBridgeDeps,
 } from "../../clients/mutation-bridge.js";
+import {
+	_observedMutationStateForTests,
+	resetObservedMutationNet,
+} from "../../clients/observed-mutation.js";
+import { normalizeMapKey } from "../../clients/path-utils.js";
 import { readChangesSince } from "../../clients/project-changes.js";
 import { countFileLines } from "../../clients/read-guard-tool-lines.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
@@ -31,6 +36,7 @@ function makeDeps(args: {
 	runtime: RuntimeCoordinator;
 	cacheManager: CacheManager;
 	isRecordable?: (filePath: string) => boolean;
+	shouldStampReadGuard?: () => boolean;
 }): MutationBridgeDeps {
 	return {
 		getRuntime: () => args.runtime as never,
@@ -39,6 +45,7 @@ function makeDeps(args: {
 		getDispatchCwd: () => args.tmpDir,
 		countFileLines,
 		isRecordable: args.isRecordable ?? (() => true),
+		shouldStampReadGuard: args.shouldStampReadGuard,
 		dbg: () => {},
 	};
 }
@@ -164,6 +171,76 @@ describe("mutation bridge bookkeeping", () => {
 		} finally {
 			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
 			else process.env.PILENS_DATA_DIR = previousDataDir;
+			env.cleanup();
+		}
+	});
+
+	it("#2465: under no-read-guard, a recordable write still gets turn-state + receipt + the observed-handled mark, but skips only the read-guard stamp", () => {
+		const env = setupTestEnvironment("pi-lens-2465-no-read-guard-");
+		const previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(env.tmpDir, "data");
+		try {
+			const filePath = path.join(env.tmpDir, "noguard.ts");
+			fs.writeFileSync(filePath, SOURCE);
+
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			runtime.setTelemetryIdentity({ sessionId: "s-bridge-no-read-guard" });
+			runtime.beginTurn();
+			const cacheManager = new CacheManager(false);
+
+			// #2423's own recordability gate (`isRecordable`) is the wiring
+			// `index.ts` produces AFTER #2465: path-scope only, no `no-read-guard`
+			// clause. `shouldStampReadGuard` is the live `getLensFlag("no-read-guard")`
+			// read `index.ts` threads separately — `false` here is the
+			// `--no-read-guard` case under test.
+			const recordWrittenSpy = vi.spyOn(runtime.readGuard, "recordWritten");
+			resetObservedMutationNet();
+
+			const accepted = recordMutationThroughSeam(
+				{
+					filePath,
+					kind: "edit",
+					touchedLines: [1, 2],
+					consumer: "my-extension",
+				},
+				makeDeps({
+					tmpDir: env.tmpDir,
+					runtime,
+					cacheManager,
+					isRecordable: () => true,
+					shouldStampReadGuard: () => false,
+				}),
+			);
+
+			expect(accepted).toBe(true);
+
+			// The stamp alone is suppressed.
+			expect(recordWrittenSpy).not.toHaveBeenCalled();
+
+			// Turn-state, the change-log receipt, and the deferred format queue —
+			// none of them consult the flag — are all still present.
+			const files = Object.keys(
+				cacheManager.readTurnState(env.tmpDir).files ?? {},
+			);
+			expect(files).toHaveLength(1);
+			expect(files[0]).toContain("noguard.ts");
+			expect(readChangesSince(env.tmpDir, 0)).toMatchObject([
+				{ source: "agent-tool:my-extension", filePath },
+			]);
+			expect(runtime.pendingDeferredFormatCount).toBe(1);
+
+			// The observed-mutation net's handled mark (#2430/#2449) — reached
+			// only when `isRecordable` lets the call through the early return —
+			// is present too, so the `agent_settled` sweep re-baselines this file
+			// instead of reporting it as unattributed drift.
+			expect(_observedMutationStateForTests().handled).toContain(
+				normalizeMapKey(path.resolve(filePath)),
+			);
+		} finally {
+			if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+			else process.env.PILENS_DATA_DIR = previousDataDir;
+			resetObservedMutationNet();
 			env.cleanup();
 		}
 	});

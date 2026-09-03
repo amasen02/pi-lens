@@ -912,9 +912,20 @@ function activateExtension(hostPi: ExtensionAPI) {
 					runtime.projectRoot || process.cwd(),
 				),
 			countFileLines,
+			// #2465: unlike the read bridge above (whose whole purpose IS the
+			// read-guard stamp, so `no-read-guard` correctly disables it
+			// entirely), this bridge also drives turn-state and the change-log
+			// receipt. `no-read-guard` gates ONLY the read-guard stamp — the same
+			// canonical split `clients/runtime-tool-result.ts` applies at
+			// `recordWritten` (:1859) — so it must not appear in the recordability
+			// gate `recordMutationThroughSeam` early-returns on. That gate stays
+			// path-scope only (ignored/vendor); the flag is threaded separately
+			// below via `shouldStampReadGuard`.
 			isRecordable(filePath: string): boolean {
-				if (_mutationBridgeGetFlag?.("no-read-guard")) return false;
 				return isRecordableProjectPath(filePath, runtime.projectRoot);
+			},
+			shouldStampReadGuard(): boolean {
+				return !_mutationBridgeGetFlag?.("no-read-guard");
 			},
 			dbg,
 		});
