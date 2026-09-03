@@ -143,6 +143,22 @@ const CONTROL_REAL_CALL_SITE = [
 	'advisoryParts.push("finding");',
 ].join("\n");
 
+/**
+ * #2502 P1c: a nested template literal inside an interpolation must not read
+ * as the outer template's closing backtick. Pre-fix, `stripSource` has no
+ * `${` nesting state: the backtick that opens `` `y(` `` (nested inside the
+ * ternary) hits the plain `ch === quote` check and is read as the OUTER
+ * template's own close. The outer template's real closing backtick, two
+ * tokens later, is then lexed as ordinary code instead — and the nested
+ * template's own stray `(` (from `` `y(` ``'s text) falls through unmasked.
+ */
+const ATTACK_NESTED_TEMPLATE_LAUNDERING = [
+	"function run(cond) {",
+	"\tconst label = `x ${cond ? `y(` : `z`} w`;",
+	"\tresetDegradationLedger();",
+	"}",
+].join("\n");
+
 const SEAM_PATTERN = /\b(blockerParts|advisoryParts|staleSecretParts)\.push\(/;
 const TAG = tagPattern("delivery-surface");
 
@@ -216,6 +232,33 @@ describe("sweep-kit: stripSource", () => {
 	it("an unterminated string recovers at the line break instead of eating the rest", () => {
 		const stripped = stripSource('const a = "oops\nconst b = 2;\n');
 		expect(stripped).toContain("const b = 2;");
+	});
+
+	it("ATTACK_NESTED_TEMPLATE_LAUNDERING: a nested template's backtick does not close the outer template early", () => {
+		const stripped = stripSource(ATTACK_NESTED_TEMPLATE_LAUNDERING);
+		expect(stripped).toHaveLength(ATTACK_NESTED_TEMPLATE_LAUNDERING.length);
+		// Pre-fix, the nested template's own `(` (from `` `y(` ``'s text)
+		// survives unmasked once the inner backtick prematurely closes the
+		// outer template's quote — every other paren in this fixture is
+		// naturally balanced, so a leaked, unmatched `(` is the tell.
+		const opens = stripped.split("(").length - 1;
+		const closes = stripped.split(")").length - 1;
+		expect(opens).toBe(closes);
+		expect(stripped).not.toContain("y(");
+		// The real call after the template must stay visible and untouched by
+		// the mis-lex — pre-fix, a lucky backtick parity can still leave
+		// `quote` cleared by here, but the leaked `(` above is what corrupts a
+		// downstream depth scan (see sync-child-process-timeout.test.ts P1c).
+		expect(stripped).toContain("resetDegradationLedger();");
+	});
+
+	it('ATTACK_NESTED_TEMPLATE_LAUNDERING: strings: "keep" preserves the whole nested template verbatim', () => {
+		const kept = stripSource(ATTACK_NESTED_TEMPLATE_LAUNDERING, {
+			strings: "keep",
+		});
+		expect(kept).toHaveLength(ATTACK_NESTED_TEMPLATE_LAUNDERING.length);
+		expect(kept).toContain("`x ${cond ? `y(` : `z`} w`");
+		expect(kept).toContain("resetDegradationLedger();");
 	});
 });
 
