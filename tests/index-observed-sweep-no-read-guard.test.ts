@@ -87,6 +87,7 @@ vi.mock("../clients/runtime-agent-end.js", () => ({
 import { CacheManager } from "../clients/cache-manager.js";
 import extension from "../index.js";
 import { resetObservedMutationNet } from "../clients/observed-mutation.js";
+import { normalizeFilePath } from "../clients/path-utils.js";
 import { readChangesSince } from "../clients/project-changes.js";
 import { ReadGuard } from "../clients/read-guard.js";
 import { createPiMock, makeCtx } from "./support/pi-mock.js";
@@ -153,8 +154,16 @@ describe("#2465 round 2: the observed-mutation settled sweep runs under --no-rea
 		// early return used to skip entirely.
 		await pi.emit("agent_settled", {}, ctx);
 
-		// The stamp alone is suppressed under --no-read-guard.
-		expect(recordWrittenSpy).not.toHaveBeenCalledWith(filePath);
+		// The stamp alone is suppressed under --no-read-guard. The sweep
+		// replays through the bridge with a NORMALIZED map key (`uriToPath`-
+		// style forward-slash form on win32), not the raw `path.join` spelling,
+		// so the comparison normalizes both sides the same way the guard's own
+		// key() does (#210 — a raw-string comparison here would pass
+		// vacuously regardless of whether the stamp fired).
+		const stampedPaths = recordWrittenSpy.mock.calls.map((call) =>
+			normalizeFilePath(String(call[0])),
+		);
+		expect(stampedPaths).not.toContain(normalizeFilePath(filePath));
 
 		// Turn-state and the change-log receipt are NOT dropped — this is what
 		// the blanket early return used to take down along with the stamp.
