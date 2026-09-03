@@ -160,9 +160,16 @@ describe("index.ts session_start: ONE config_resolved row per session (#2526 R2 
 		).toHaveLength(1);
 	}, 30000);
 
+	/**
+	 * The SAME root across two sessions, deliberately: index.ts's
+	 * process-lifetime `_lspConfigInitializedCwds` memo short-circuits session
+	 * 2's ensure, so the only thing that resolves config for it is the deferred
+	 * load — and the only thing that lets that load record is the re-arm. A
+	 * second root would claim independently under the per-root scoping (F3) and
+	 * would pass with no re-arm at all.
+	 */
 	it("a second session start re-arms the claim, so it gets its own row", async () => {
-		const rootA = freshRoot();
-		const rootB = freshRoot();
+		const root = freshRoot();
 		const pi = createPiMock();
 		extension(pi.asExtensionAPI());
 		clearLatencyLog();
@@ -171,18 +178,21 @@ describe("index.ts session_start: ONE config_resolved row per session (#2526 R2 
 		await pi.emit(
 			"session_start",
 			makeSessionStartEvent(),
-			makeCtx({ cwd: rootA, sessionId: "host-session-1" }),
+			makeCtx({ cwd: root, sessionId: "host-session-1" }),
 		);
 		expect(await configResolvedRows()).toHaveLength(1);
 
-		// A genuine new session in a different root. index.ts's closure re-arms
-		// before its own ensure, so this session records too.
+		// A genuine new session in the same root. index.ts's closure re-arms
+		// before its own (memoized, no-op) ensure, so the deferred load records.
 		_resetSessionLifecycleForTests();
 		await pi.emit(
 			"session_start",
 			makeSessionStartEvent({ reason: "new" }),
-			makeCtx({ cwd: rootB, sessionId: "host-session-2" }),
+			makeCtx({ cwd: root, sessionId: "host-session-2" }),
 		);
+		const { loadLSPConfig } = await import("../clients/lsp/config.js");
+		await loadLSPConfig(root);
+
 		const rows = await configResolvedRows();
 		expect(
 			rows,

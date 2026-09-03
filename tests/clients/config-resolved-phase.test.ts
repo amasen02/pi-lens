@@ -488,8 +488,16 @@ describe("handleSessionStart publishes the expectation, not a re-arm (#2526)", (
 		}
 	});
 
-	it("a --no-lsp session publishes expected=false", async () => {
-		const { projectDir } = canonicalOnlyLayout();
+	/**
+	 * The inverse F2 names: a session that never resolves config BY DESIGN still
+	 * writes a start line, and counting it produced a deficit no operator could
+	 * ever clear. Each `reason` below mirrors one real gate on the resolution
+	 * paths, and each is driven through that gate's own seam.
+	 */
+	async function expectationLineFor(
+		projectDir: string,
+		configure: (deps: { getFlag: (name: string) => boolean }) => void,
+	): Promise<string> {
 		const previousStartupMode = process.env.PI_LENS_STARTUP_MODE;
 		process.env.PI_LENS_STARTUP_MODE = "quick";
 		const globals = globalThis as { __piLensWarmupScheduled?: boolean };
@@ -502,22 +510,61 @@ describe("handleSessionStart publishes the expectation, not a re-arm (#2526)", (
 			const deps = makeDeps(projectDir, (msg) => lines.push(msg)) as {
 				getFlag: (name: string) => boolean;
 			};
-			deps.getFlag = (name: string) => name === "no-lsp";
-			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			configure(deps);
 			await handleSessionStart(deps as never);
-
 			const expectation = lines.filter((line) =>
 				line.startsWith("session_start config-resolution "),
 			);
 			expect(expectation).toHaveLength(1);
-			// The inverse F2 names: this session never resolves config by design,
-			// so counting it produced a deficit no operator could ever clear.
-			expect(expectation[0]).toContain("expected=false reason=no-lsp");
+			return expectation[0];
 		} finally {
 			globals.__piLensWarmupScheduled = previousWarmup;
 			if (previousStartupMode === undefined)
 				delete process.env.PI_LENS_STARTUP_MODE;
 			else process.env.PI_LENS_STARTUP_MODE = previousStartupMode;
+		}
+	}
+
+	it("a --no-lsp session publishes expected=false", async () => {
+		const { projectDir } = canonicalOnlyLayout();
+		const line = await expectationLineFor(projectDir, (deps) => {
+			deps.getFlag = (name: string) => name === "no-lsp";
+		});
+		expect(line).toContain("expected=false reason=no-lsp");
+	});
+
+	it("a subagent session publishes expected=false", async () => {
+		const { projectDir } = canonicalOnlyLayout();
+		const { _resetSubagentModeForTests } =
+			await import("../../clients/subagent-mode.js");
+		const previous = process.env.PI_SUBAGENT_CHILD;
+		process.env.PI_SUBAGENT_CHILD = "1";
+		_resetSubagentModeForTests();
+		try {
+			// #449 light mode skips the LSP pre-warm on both paths, so nothing
+			// resolves config for a subagent session.
+			const line = await expectationLineFor(projectDir, () => {});
+			expect(line).toContain("expected=false reason=subagent");
+		} finally {
+			if (previous === undefined) delete process.env.PI_SUBAGENT_CHILD;
+			else process.env.PI_SUBAGENT_CHILD = previous;
+			_resetSubagentModeForTests();
+		}
+	});
+
+	it("a warm-attached QUICK session publishes expected=false", async () => {
+		const { projectDir } = canonicalOnlyLayout();
+		const { _setWarmAttachForTests, _resetWarmAttachForTests } =
+			await import("../../clients/warm-attach.js");
+		_setWarmAttachForTests(projectDir, 4242);
+		try {
+			// Quick mode's deferred warmup skips the load when attached to an
+			// incumbent; the full path resolves regardless, which is why this
+			// reason is quick-mode-only.
+			const line = await expectationLineFor(projectDir, () => {});
+			expect(line).toContain("expected=false reason=warm-attach");
+		} finally {
+			_resetWarmAttachForTests();
 		}
 	});
 });
