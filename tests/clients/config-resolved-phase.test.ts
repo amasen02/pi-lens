@@ -24,8 +24,12 @@
  * resolution is deliberately deferred into a `setImmediate` (`runtime-session.
  * ts`, "the config walk … never runs on the interactive path"), and quick mode
  * returns before even that. So the record is written where the resolution
- * exists, and `handleSessionStart` only re-arms the once-per-session latch —
- * which is what the last describe block asserts, through the real handler.
+ * exists, and `handleSessionStart` only PUBLISHES this session's identity and
+ * its config-resolution expectation — which is what the `handleSessionStart`
+ * describe block asserts, through the real handler. The re-arm of the claim
+ * itself belongs to index.ts's `session_start` closure, ahead of its own
+ * `ensureLSPConfigInitialized`; `tests/index-config-resolved-session-wiring.
+ * test.ts` drives that ordering end-to-end (review round 2, F1).
  */
 
 import * as fs from "node:fs";
@@ -48,6 +52,7 @@ import {
 import { removeTempDirSync } from "./test-utils.js";
 
 interface ConfigResolvedMetadata {
+	sessionId: string;
 	documents: Array<{ tier: string; file: string; legacy: boolean }>;
 	countsByTier: Record<string, number>;
 	recordCount: number;
@@ -247,23 +252,101 @@ describe("config_resolved: the session's one positive config record (#2526)", ()
 		);
 	});
 
-	it("ONE row per session, not one per resolution", async () => {
+	it("ONE row per session and root, not one per resolution", async () => {
 		const { home, projectDir } = canonicalOnlyLayout();
 
 		const { loadLSPConfig, resetLSPConfigStateForTests } =
 			await import("../../clients/lsp/config.js");
 		resetLSPConfigStateForTests();
-		// Three resolutions — the session-start deferred load, a served root's
-		// init, and the first edit's ensure — collapse to one record.
+		// Repeated resolutions of the SAME root — the session-start deferred
+		// load and the first edit's ensure — collapse to one record.
 		await loadLSPConfig(projectDir, home);
 		await loadLSPConfig(projectDir, home);
-		await loadLSPConfig(path.join(projectDir, "nested"), home);
 		expect(await configResolvedRows()).toHaveLength(1);
 
 		// A new session re-arms it, so the next session gets its own row.
 		resetOncePerSessionPhases();
 		await loadLSPConfig(projectDir, home);
 		expect(await configResolvedRows()).toHaveLength(2);
+	});
+
+	/**
+	 * #2526 review round 2, F3. `mcp/server.ts`'s `ensureReady` calls
+	 * `ensureLspConfig` once per SERVED ROOT in one long-lived process. A claim
+	 * keyed on the phase name alone recorded the first root and silently
+	 * dropped every later one, so a legacy config document in project B could
+	 * never reach a row and its "legacy without records" smell structurally
+	 * could not fire.
+	 */
+	it("each served root records its own row (#2526 R2 F3)", async () => {
+		const home = tmpRoot("pi-lens-cfgres-roots-home-");
+		process.env.PI_LENS_HOME = tmpRoot("pi-lens-cfgres-roots-global-");
+		const canonicalRoot = path.join(home, "a");
+		const legacyRoot = path.join(home, "b");
+		write(path.join(canonicalRoot, ".pi-lens.json"), {
+			lsp: { disabledServers: ["gopls"] },
+		});
+		write(path.join(legacyRoot, "pi-lens.json"), {
+			warmFiles: ["src/main.ts"],
+		});
+
+		const { loadLSPConfig, resetLSPConfigStateForTests } =
+			await import("../../clients/lsp/config.js");
+		resetLSPConfigStateForTests();
+		await loadLSPConfig(canonicalRoot, home);
+		await loadLSPConfig(legacyRoot, home);
+
+		const rows = await configResolvedRows();
+		expect(rows, "the second served root never recorded").toHaveLength(2);
+		// Both rows belong to the SAME session, so the analyzer's join matches
+		// either one — the scoping widens coverage, it does not fork identity.
+		expect(rows[0].metadata.sessionId).toBe(rows[1].metadata.sessionId);
+		// Project B's legacy document is what the phase-only claim used to lose.
+		expect(rows[1].metadata.documents).toEqual([
+			{ tier: "project", file: "~/b/pi-lens.json", legacy: true },
+		]);
+		expect(rows[1].metadata.recordCount).toBeGreaterThan(0);
+	});
+
+	it("a /-vs-\\ spelling of one root does not buy a second row", async () => {
+		const { home, projectDir } = canonicalOnlyLayout();
+		const { loadLSPConfig, resetLSPConfigStateForTests } =
+			await import("../../clients/lsp/config.js");
+		resetLSPConfigStateForTests();
+		await loadLSPConfig(projectDir, home);
+		// The repo-wide path-key rule (#210): record one separator, resolve the
+		// other. A raw-string claim key would double-count here.
+		await loadLSPConfig(projectDir.split(path.sep).join("/"), home);
+		await loadLSPConfig(projectDir.split(path.sep).join("\\"), home);
+		expect(await configResolvedRows()).toHaveLength(1);
+	});
+
+	/**
+	 * #2526 review round 2, S1. The loader's test reset owns ONE phase; the
+	 * blanket `resetOncePerSessionPhases()` it used to call is the session
+	 * boundary's, and it also re-mints the session identity — so a producer
+	 * reaching for it wiped claims and identity that belong to other producers.
+	 */
+	it("resetLSPConfigStateForTests releases only its own phase (#2526 R2 S1)", async () => {
+		const { claimPhaseOncePerSession, currentSessionRecordId } =
+			await import("../../clients/latency-logger.js");
+		const { resetLSPConfigStateForTests } =
+			await import("../../clients/lsp/config.js");
+
+		const sibling = "config_resolved_sibling_probe";
+		expect(claimPhaseOncePerSession(sibling)).toBe(true);
+		const before = currentSessionRecordId();
+
+		resetLSPConfigStateForTests();
+
+		expect(
+			claimPhaseOncePerSession(sibling),
+			"the loader's reset released a phase it does not own",
+		).toBe(false);
+		expect(
+			currentSessionRecordId(),
+			"the loader's reset re-minted the session identity",
+		).toBe(before);
 	});
 
 	it("no second resolution: the record reads the resolution its caller performed", async () => {
@@ -289,20 +372,27 @@ describe("config_resolved: the session's one positive config record (#2526)", ()
 });
 
 /**
- * The session-start half: `handleSessionStart` re-arms the latch, so the NEXT
- * resolution of the new session writes its own record instead of inheriting
- * the previous session's "already recorded" claim (catalog shape 17). Quick
- * mode is used deliberately — it is the mode every process's first session
- * takes, and it resolves NO config on its interactive path, so it is also the
- * mode in which forgetting the re-arm would be invisible.
+ * The session-start half, AFTER review round 2 F1: `handleSessionStart` must
+ * NOT re-arm the claim. index.ts resolves this session's config in
+ * `ensureLSPConfigInitialized` before it calls the handler, so a re-arm inside
+ * the handler splits one session across two rows (the ensure's, then the
+ * deferred load's). The re-arm belongs to index.ts's session_start closure —
+ * `tests/index-config-resolved-session-wiring.test.ts` drives that ordering
+ * end-to-end.
+ *
+ * What the handler DOES own is publishing the session's identity and its
+ * config-resolution expectation, on both the quick and the full path. Quick
+ * mode is used here deliberately: it returns long before the `session_start
+ * cwd:` line, which is exactly why that line could never be the smell's
+ * denominator.
  */
-describe("handleSessionStart re-arms the record for the new session (#2526)", () => {
-	function makeDeps(ctxCwd: string): unknown {
+describe("handleSessionStart publishes the expectation, not a re-arm (#2526)", () => {
+	function makeDeps(ctxCwd: string, dbg: (msg: string) => void): unknown {
 		return withResidentBootstrap({
 			ctxCwd,
 			getFlag: () => false,
 			notify: () => {},
-			dbg: () => {},
+			dbg,
 			log: () => {},
 			runtime: new RuntimeCoordinator(),
 			metricsClient: { reset: () => {} },
@@ -346,31 +436,83 @@ describe("handleSessionStart re-arms the record for the new session (#2526)", ()
 		});
 	}
 
-	it("a second session gets its own row", async () => {
+	it("publishes this session's id and expectation, and re-arms nothing", async () => {
 		const { home, projectDir } = canonicalOnlyLayout();
 		const previousStartupMode = process.env.PI_LENS_STARTUP_MODE;
 		process.env.PI_LENS_STARTUP_MODE = "quick";
 		const globals = globalThis as { __piLensWarmupScheduled?: boolean };
 		const previousWarmup = globals.__piLensWarmupScheduled;
 		globals.__piLensWarmupScheduled = true;
+		const lines: string[] = [];
 		try {
 			const { loadLSPConfig, resetLSPConfigStateForTests } =
 				await import("../../clients/lsp/config.js");
+			const { currentSessionRecordId } =
+				await import("../../clients/latency-logger.js");
 			resetLSPConfigStateForTests();
 			await loadLSPConfig(projectDir, home);
-			expect(await configResolvedRows()).toHaveLength(1);
+			const rows = await configResolvedRows();
+			expect(rows).toHaveLength(1);
 
-			// A fresh session, through the REAL handler.
+			// The REAL handler, standing in for index.ts's call after its ensure.
 			const { handleSessionStart } =
 				await import("../../clients/runtime-session.js");
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any
-			await handleSessionStart(makeDeps(projectDir) as any);
+			await handleSessionStart(
+				makeDeps(projectDir, (msg) => lines.push(msg)) as never,
+			);
 
+			// The deferred load of the SAME session must not add a second row.
 			await loadLSPConfig(projectDir, home);
 			expect(
 				await configResolvedRows(),
-				"handleSessionStart did not re-arm the config_resolved latch",
-			).toHaveLength(2);
+				"handleSessionStart re-armed the claim mid-session",
+			).toHaveLength(1);
+
+			const expectation = lines.filter((line) =>
+				line.startsWith("session_start config-resolution "),
+			);
+			expect(
+				expectation,
+				"quick mode must still publish the expectation — it returns before `session_start cwd:`",
+			).toHaveLength(1);
+			expect(expectation[0]).toContain(
+				`session=${currentSessionRecordId()} expected=true reason=ok`,
+			);
+			expect(expectation[0]).toContain(`session=${rows[0].metadata.sessionId}`);
+		} finally {
+			globals.__piLensWarmupScheduled = previousWarmup;
+			if (previousStartupMode === undefined)
+				delete process.env.PI_LENS_STARTUP_MODE;
+			else process.env.PI_LENS_STARTUP_MODE = previousStartupMode;
+		}
+	});
+
+	it("a --no-lsp session publishes expected=false", async () => {
+		const { projectDir } = canonicalOnlyLayout();
+		const previousStartupMode = process.env.PI_LENS_STARTUP_MODE;
+		process.env.PI_LENS_STARTUP_MODE = "quick";
+		const globals = globalThis as { __piLensWarmupScheduled?: boolean };
+		const previousWarmup = globals.__piLensWarmupScheduled;
+		globals.__piLensWarmupScheduled = true;
+		const lines: string[] = [];
+		try {
+			const { handleSessionStart } =
+				await import("../../clients/runtime-session.js");
+			const deps = makeDeps(projectDir, (msg) => lines.push(msg)) as {
+				getFlag: (name: string) => boolean;
+			};
+			deps.getFlag = (name: string) => name === "no-lsp";
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			await handleSessionStart(deps as never);
+
+			const expectation = lines.filter((line) =>
+				line.startsWith("session_start config-resolution "),
+			);
+			expect(expectation).toHaveLength(1);
+			// The inverse F2 names: this session never resolves config by design,
+			// so counting it produced a deficit no operator could ever clear.
+			expect(expectation[0]).toContain("expected=false reason=no-lsp");
 		} finally {
 			globals.__piLensWarmupScheduled = previousWarmup;
 			if (previousStartupMode === undefined)

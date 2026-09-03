@@ -225,8 +225,18 @@ function createState(files) {
 		// counts `config_resolved` phase records; `legacyWithoutRecords` counts
 		// the rows that carry a deprecated document but produced no
 		// migration/notice record — the deprecation machinery gone silent.
+		//
+		// Round 2, F2: the session→row relation is a JOIN on the session id both
+		// sides carry, not a subtraction of two counts. `expectedSessions` holds
+		// the sessions whose own start line said a resolution was expected;
+		// `resolvedSessions` holds every session id a resolution actually
+		// reported, from EITHER sink (the latency row or the sessionstart line —
+		// one call writes both, so this is one fact surviving an independent
+		// rotation of either log, not a second source of truth).
 		config: {
 			resolved: 0,
+			expectedSessions: new Map(),
+			resolvedSessions: new Set(),
 			legacyDocuments: 0,
 			legacyWithoutRecords: 0,
 			examples: [],
@@ -367,6 +377,11 @@ async function analyzeLatency(files, state) {
 					// legacy/record cross-check reads the same row it counts.
 					state.config.resolved += 1;
 					const md = entry.metadata ?? {};
+					// #2526 R2 F2: the join key. A row from a build that predates the
+					// id carries none, and simply joins to no session.
+					if (typeof md.sessionId === "string" && md.sessionId.length > 0) {
+						state.config.resolvedSessions.add(md.sessionId);
+					}
 					const documents = Array.isArray(md.documents) ? md.documents : [];
 					const legacy = documents.filter((doc) => doc?.legacy === true);
 					state.config.legacyDocuments += legacy.length;
@@ -666,6 +681,30 @@ async function analyzeSessionStart(files, state) {
 				state.session.starts++;
 				state.session.cwds.inc(projectOf(cwd));
 				trackProject(state, cwd);
+			}
+
+			// #2526 R2 F2: this session's config-resolution expectation, published
+			// on BOTH the quick and the full path (the `session_start cwd:` line
+			// above is full-path only, which is exactly why it cannot be the
+			// denominator). `expected=false` names a session that never resolves
+			// config by design — `--no-lsp`, a subagent, a warm-attached quick
+			// start — and is recorded so a reader can see it was considered.
+			const expectation =
+				/session_start config-resolution session=(\S+) expected=(true|false)(?: reason=(\S+))?/.exec(
+					message,
+				);
+			if (expectation) {
+				state.config.expectedSessions.set(expectation[1], {
+					expected: expectation[2] === "true",
+					reason: expectation[3] ?? "unknown",
+					ts: iso(ts),
+				});
+			}
+			// The loader's own line is the second half of the join, so a rotated
+			// latency.log cannot manufacture a deficit on its own.
+			const resolvedSession = /config resolved .*\bsession=(\S+)/.exec(message);
+			if (resolvedSession) {
+				state.config.resolvedSessions.add(resolvedSession[1]);
 			}
 
 			const total = /session_start total:\s*(\d+)ms/.exec(message);
@@ -1254,24 +1293,33 @@ function buildReport(state) {
 	);
 	// #2526: config resolution has to prove it HAPPENED. Two shapes, one smell:
 	//
-	// (a) session starts with no `config_resolved` row. Counted as a DEFICIT
-	//     against `session_start cwd:` lines, because the two live in different
-	//     logs and a line-oriented analyzer cannot join them per session. A
-	//     session that never resolves config at all (`--no-lsp`, a one-shot
-	//     print run that touches no file) legitimately contributes here; the
-	//     signal worth acting on is a deficit that approaches the session count,
-	//     which is what "the config stack went silent" looks like.
+	// (a) a session that EXPECTED a config resolution and produced no
+	//     `config_resolved` row. Round 2, F2: a per-session JOIN on the id both
+	//     the start line and the record carry, never a subtraction of two
+	//     counts. Subtracting counted quick sessions' rows against full
+	//     sessions' start lines (different populations), which both masked
+	//     total silence and charged `--no-lsp`/subagent sessions with a
+	//     permanent deficit they can never clear.
 	// (b) a legacy document present with zero records — the deprecation
 	//     machinery went silent while the user is on a removal schedule.
-	const sessionsWithoutConfigResolution = Math.max(
-		0,
-		state.session.starts - state.config.resolved,
+	const expectingConfigResolution = [
+		...state.config.expectedSessions.entries(),
+	].filter(([, value]) => value.expected);
+	const unresolvedSessions = expectingConfigResolution.filter(
+		([id]) => !state.config.resolvedSessions.has(id),
 	);
+	for (const [id, value] of unresolvedSessions.slice(0, limit * 3)) {
+		state.config.examples.push({
+			ts: value.ts,
+			session: id,
+			note: "session expected a config resolution and produced no config_resolved row",
+		});
+	}
 	addSmell(
 		smells,
 		"config-resolution",
-		sessionsWithoutConfigResolution + state.config.legacyWithoutRecords,
-		`Session starts with no config_resolved row (${sessionsWithoutConfigResolution} of ${state.session.starts}) or a legacy config document that produced no migration record (${state.config.legacyWithoutRecords})`,
+		unresolvedSessions.length + state.config.legacyWithoutRecords,
+		`Sessions that expected config resolution but produced no config_resolved row (${unresolvedSessions.length} of ${expectingConfigResolution.length}) or a legacy config document that produced no migration record (${state.config.legacyWithoutRecords})`,
 		state.config.examples.slice(0, limit),
 	);
 	addSmell(
@@ -1438,7 +1486,8 @@ function buildReport(state) {
 		// it correctly did not) without re-deriving the deficit.
 		config: {
 			resolved: state.config.resolved,
-			sessionsWithoutResolution: sessionsWithoutConfigResolution,
+			sessionsExpectingResolution: expectingConfigResolution.length,
+			sessionsWithoutResolution: unresolvedSessions.length,
 			legacyDocuments: state.config.legacyDocuments,
 			legacyWithoutRecords: state.config.legacyWithoutRecords,
 		},

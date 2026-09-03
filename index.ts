@@ -226,6 +226,7 @@ import {
 	getRecentLoggedPhases,
 	logLatency,
 	resetCurrentPhaseForSession,
+	resetOncePerSessionPhases,
 } from "./clients/latency-logger.js";
 import { emitBounded } from "./clients/bounded-telemetry.js";
 import {
@@ -1962,6 +1963,18 @@ function activateExtension(hostPi: ExtensionAPI) {
 					// accepted cost on the other side (a torn-down secondary's own
 					// bracket goes stale until the next full session start).
 					resetCurrentPhaseForSession();
+					// #2526 review round 2, F1: the once-per-session phase claims
+					// (`config_resolved`) and the session record identity they are
+					// stamped with are re-armed HERE, not inside handleSessionStart.
+					// `ensureLSPConfigInitialized` below resolves this session's
+					// config BEFORE the handler runs, so a re-arm inside the handler
+					// fires between the session's own two resolutions and the
+					// deferred `loadLSPConfig` writes a SECOND row for one session.
+					// Same #473 gate and the same reason as the line above: the claim
+					// set is process-shared, and a concurrent secondary — which never
+					// reaches handleSessionStart and so never publishes an expectation
+					// line of its own — must not re-arm a live primary's claims.
+					resetOncePerSessionPhases();
 					// #2249: same gate — a declined bind's own session_start must never
 					// reach here (it returned above), so this only fires for a genuine
 					// new primary. A crash or forced kill can skip session_shutdown's

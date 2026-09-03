@@ -71,10 +71,12 @@ import {
 import { getGlobalPiLensDir } from "../file-utils.js";
 import {
 	claimPhaseOncePerSession,
+	currentSessionRecordId,
 	logLatency,
-	resetOncePerSessionPhases,
+	releaseOncePerSessionPhase,
 } from "../latency-logger.js";
 import { getPiLensGlobalConfigPath } from "../lens-config.js";
+import { normalizeFilePath } from "../path-utils.js";
 import { logSessionStart } from "../sessionstart-logger.js";
 import { launchLSP } from "./launch.js";
 import {
@@ -224,13 +226,21 @@ const CONFIG_RESOLVED_PHASE = "config_resolved";
  * `logSessionStart` are synchronous buffered writers — so the session-start
  * hook path gains nothing to wait on (#2523).
  *
- * ONE row per session, claimed through the logger's own session-scoped
- * bookkeeping rather than a latch kept here. `loadLSPConfig` is the funnel
- * every config resolution goes through (`initLSPConfig` at session start and
- * at each served root, the MCP `ensureReady` boot,
+ * ONE row per session AND SERVED ROOT, claimed through the logger's own
+ * session-scoped bookkeeping rather than a latch kept here. `loadLSPConfig` is
+ * the funnel every config resolution goes through (`initLSPConfig` at session
+ * start and at each served root, the MCP `ensureReady` boot,
  * `ensureLSPConfigInitialized` on the first edit), so an unconditional write
- * would emit one row per resolution and the "one row per session" the smell
- * analyzer counts against would be unrecoverable from the log.
+ * would emit one row per resolution and the per-session count the smell
+ * analyzer joins on would be unrecoverable from the log.
+ *
+ * The ROOT is part of the claim (#2526 review round 2, F3). A warm MCP server
+ * calls `ensureReady` per served root (`mcp/server.ts`), and a phase-only
+ * claim recorded the FIRST root's documents and nothing else — project B's
+ * legacy config document never reached a row, so the
+ * "legacy-document-with-no-records" smell structurally could not fire for it.
+ * `normalizeFilePath` keys it, the repo-wide rule for every path-keyed map
+ * (#210): a `/`-vs-`\` spelling of one root must not buy a second row.
  */
 function recordConfigResolved(
 	cwd: string,
@@ -239,8 +249,16 @@ function recordConfigResolved(
 	homeDir: string,
 	resolveMs: number,
 ): void {
-	if (!claimPhaseOncePerSession(CONFIG_RESOLVED_PHASE)) return;
+	if (
+		!claimPhaseOncePerSession(CONFIG_RESOLVED_PHASE, normalizeFilePath(cwd))
+	) {
+		return;
+	}
 	const summary = summarizeConfigResolution(resolution, homeDir);
+	// #2526 R2 F2: the session identity the analyzer joins on. Written on both
+	// sinks from this ONE call, so the latency row and the sessionstart line
+	// carry the same id by construction rather than by agreement.
+	const sessionId = currentSessionRecordId();
 	// The deny UNION's size, read off the same projection the gates consume
 	// (`lspConfigOf`) rather than re-read from the raw value — one definition of
 	// "which servers are denied", so the record cannot describe a different
@@ -255,6 +273,7 @@ function recordConfigResolved(
 		filePath: cwd,
 		durationMs: resolveMs,
 		metadata: {
+			sessionId,
 			documents: summary.documents,
 			countsByTier: summary.countsByTier,
 			recordCount: summary.recordCount,
@@ -264,7 +283,8 @@ function recordConfigResolved(
 	});
 	logSessionStart(
 		`config resolved documents=${summary.documents.length} legacy=${legacyDocuments} ` +
-			`records=${summary.recordCount} deniedServers=${deniedServers} resolveMs=${resolveMs}`,
+			`records=${summary.recordCount} deniedServers=${deniedServers} resolveMs=${resolveMs} ` +
+			`session=${sessionId}`,
 	);
 }
 
@@ -694,8 +714,12 @@ export function resetLSPConfigStateForTests(): void {
 	resetLSPConfigWarnCache();
 	// #2526: same reasoning for the per-session `config_resolved` claim — a
 	// test that resolves again after this reset must produce its record, not
-	// inherit a previous test's "already recorded" claim.
-	resetOncePerSessionPhases();
+	// inherit a previous test's "already recorded" claim. Narrowed to THIS
+	// loader's own phase (review round 2, S1): the blanket
+	// `resetOncePerSessionPhases()` this used to call is the SESSION boundary's
+	// call to make — it also re-mints the session identity — and reaching for
+	// it from one producer's test reset cleared claims this module does not own.
+	releaseOncePerSessionPhase(CONFIG_RESOLVED_PHASE);
 }
 
 /**
