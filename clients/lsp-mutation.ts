@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { BoundedSet } from "./bounded-cache.js";
 import {
 	createReadGuardEditBatchSummary,
 	getReadGuardCorrelationId,
@@ -115,7 +116,7 @@ export interface LspMutationContext {
 	/** True once the bounded per-request summary limit has been exceeded. */
 	summaryOverflowed?: boolean;
 	/** Bounded per-batch dedupe for the existing turn-summary autofix publisher. */
-	autofixRecordedPaths?: Set<string>;
+	autofixRecordedPaths?: BoundedSet<string>;
 	/**
 	 * Same recordability gate `clients/mutation-bridge.ts` applies internally
 	 * (`no-read-guard` / ignored / vendor) — optional so every existing caller
@@ -445,13 +446,10 @@ function bookkeepLspMutation(
 		// turn-summary publisher just because SOME other surface fell back.
 		if (context.recordAutofix && context.source === "autofix") {
 			const key = normalizeMapKey(filePath);
-			const seen = context.autofixRecordedPaths ?? new Set<string>();
+			const seen =
+				context.autofixRecordedPaths ?? new BoundedSet<string>(MAX_SAMPLES);
 			context.autofixRecordedPaths = seen;
 			if (!seen.has(key)) {
-				if (seen.size >= MAX_SAMPLES) {
-					const oldest = seen.values().next().value;
-					if (oldest) seen.delete(oldest);
-				}
 				seen.add(key);
 				context.recordAutofix(filePath);
 			}

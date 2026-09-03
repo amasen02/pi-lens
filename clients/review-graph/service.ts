@@ -1,8 +1,6 @@
-import * as path from "node:path";
-import { win32 } from "node:path";
 import type { FactStore } from "../dispatch/fact-store.js";
 import { recordDegradationOnce } from "../degradation-ledger.js";
-import { isWindowsPath, normalizeMapKey } from "../path-utils.js";
+import { isAbsoluteFilePath, normalizeMapKey } from "../path-utils.js";
 import {
 	computeImpactCascade as computeImpactCascadeImpl,
 	computeTransitiveImpact as computeTransitiveImpactImpl,
@@ -51,23 +49,6 @@ export function computeTransitiveImpact(
 	options?: Parameters<typeof computeTransitiveImpactImpl>[2],
 ): TransitiveImpactResult {
 	return computeTransitiveImpactImpl(graph, seedFile, options);
-}
-
-/**
- * Shape-based absolute check (mirrors `toProjectRelativePath`'s idiom): a
- * Windows-shaped path (drive-letter/UNC) is parsed with `win32.isAbsolute`
- * regardless of host OS, since the host-default `path.isAbsolute` returns
- * FALSE for a Windows-shaped path on POSIX (#1150 class) and would let a
- * cross-platform-persisted relative path slip past this guard on Linux CI.
- * MUST run on the RAW `filePath`, before `normalizeMapKey`: on Windows,
- * `normalizeMapKey`'s nonexistent-path fallback (`resolveNonExisting`) calls
- * `win32.resolve`, which silently makes any relative path absolute against
- * `process.cwd()` — checking the normalized value would defeat this guard
- * entirely on Windows.
- */
-function isAbsoluteFilePath(filePath: string): boolean {
-	const p = isWindowsPath(filePath) ? win32 : path;
-	return p.isAbsolute(filePath);
 }
 
 export function recordEntitySnapshotDiff(

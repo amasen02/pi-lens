@@ -97,7 +97,13 @@ instructions say so.
    list as not applying). Quote the file count you ran in the PR body. The full suite is CI's
    job.
 6. If the issue asks for a class sweep, run it and report coverage honestly:
-   what you searched, what you found, what you deliberately left.
+   what you searched, what you found, what you deliberately left. The sweep
+   covers the WHOLE repo — `clients/`, `tools/`, `mcp/`, `scripts/`,
+   `scripts/lib/`, `tests/support/`, `index.ts` — and greps for both the
+   symbol NAME and the literal VALUE of anything you introduce. #2550
+   declared "no consolidation opportunity" while `scripts/lib/merge-train-warden.mjs`
+   exported a byte-identical `REQUIRED_CHECKS` with a stricter tie policy;
+   the sweep had only looked in `clients/`.
 7. Ship: changelog fragment in `.changelog/` — validate it with
    `node scripts/check-changelog-fragments.mjs` (the CI gate: YAML front
    matter with one `section:`, exactly ONE top-level entry per file);
@@ -152,9 +158,11 @@ finding with its red-run evidence.
 
 ## Hard-won mechanics (2026-08-26 harvest — each cost a fix round)
 
-- **Screen the diff against shapes 28–32 before pushing** (hot-path hoist for a
+- **Screen the diff against shapes 28–35 before pushing** (hot-path hoist for a
   cold record, cap reset by its own selector, module-load platform const,
-  pull-only observability, mixed-case path predicate). Each cost a review round
+  pull-only observability, mixed-case path predicate, source-text assertion
+  in place of a runtime probe, spelling-enumerating guard, a guard that reds
+  only on a platform CI never runs). Each cost a review round
   on 2026-09-03; each has a one-line screen in AGENTS.md.
 - **You are a leaf. Never spawn agents.** A fixer that spawned two helper
   agents (#2526, 2026-09-03) returned an empty report while its children ran
@@ -206,6 +214,12 @@ finding with its red-run evidence.
   version if absent, `npx oxfmt --check` on every file you touched, format
   and re-test if it flags. Never attribute a red format check to the
   environment without reading which files it names.
+- **Small batches run vitest directly; the shared slot is for big ones.**
+  `npm run test:targeted` queues on a machine-wide slot that twelve
+  concurrent lanes keep busy; three fixers on 2026-09-03 backgrounded it and
+  parked. For up to ~15 files run `npx vitest run <files>` in the FOREGROUND
+  with an explicit timeout; reserve `test:targeted` for the governance batch,
+  and even then foreground it.
 - **Never park your turn behind a background command.** Two agents in one day
   went idle "waiting" on a backgrounded full `npm test` and had to be manually
   resumed. Run builds and test suites in the FOREGROUND with an explicit
@@ -216,6 +230,13 @@ finding with its red-run evidence.
   explicitly in your report that you delegated the full suite to CI and why.
   Ending your turn is for "deliverable produced" or "blocked on the
   orchestrator," never "waiting on a process."
+
+## Filing follow-up issues
+
+Any issue you file carries one TYPE label, at least one `area:*`, and exactly
+one `priority:p1|p2|p3` per the AGENTS.md triage rubric (`gh issue create
+--label bug --label area:lsp --label priority:p2 ...`). Missing priority is a
+defect the orchestrator will bounce.
 
 ## Probe hygiene (mandatory)
 

@@ -89,10 +89,10 @@ const MAX_FILE_FACT_CONTENT_BYTES = 64 * 1024 * 1024;
 // only, and carry the same cap, so the coldest of them fall off in turn and
 // that key reverts to first-dispatch semantics.
 //
-// Five per-file keys are minted per dispatched file today (absolute and
-// relative diagnostic baseline, cascade baseline, entity snapshot, changed
-// symbols), so 4096 records covers roughly 800 distinct files before the
-// coldest file's baseline starts degrading.
+// Four per-file keys are minted per dispatched file today (diagnostic
+// baseline, cascade baseline, entity snapshot, changed symbols), so 4096
+// records covers roughly 1024 distinct files before the coldest file's
+// baseline starts degrading.
 const MAX_SESSION_FACT_RECORDS = 4096;
 
 export interface ReadonlyFactStore {

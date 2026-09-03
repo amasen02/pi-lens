@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
 	BoundedFifoMap,
 	BoundedLruCache,
+	BoundedSet,
 } from "../../clients/bounded-cache.js";
 
 describe("BoundedLruCache", () => {
@@ -149,5 +150,76 @@ describe("BoundedFifoMap (#2442)", () => {
 		expect(map.size).toBe(1);
 		map.clear();
 		expect(map.size).toBe(0);
+	});
+});
+
+describe("BoundedSet (#2460)", () => {
+	it("evicts the oldest INSERTION once the set exceeds capacity", () => {
+		const set = new BoundedSet<string>(2);
+		set.add("a");
+		set.add("b");
+		expect(set.has("a")).toBe(true);
+		set.add("c");
+		expect(set.has("a")).toBe(false); // oldest, evicted
+		expect(set.has("b")).toBe(true);
+		expect(set.has("c")).toBe(true);
+	});
+
+	it("has() does not refresh recency — a read never postpones eviction", () => {
+		const set = new BoundedSet<string>(2);
+		set.add("a");
+		set.add("b");
+		for (let i = 0; i < 5; i++) set.has("a"); // repeated reads
+		set.add("c"); // "a" is still the oldest insertion — evicted
+		expect(set.has("a")).toBe(false);
+		expect(set.has("b")).toBe(true);
+	});
+
+	it("add() on an already-present member does not reorder it (matches native Set#add)", () => {
+		const set = new BoundedSet<string>(3);
+		set.add("a");
+		set.add("b");
+		set.add("c");
+		set.add("a"); // re-add — "a" stays the oldest position
+		set.add("d"); // pushes past capacity — evicts the oldest: "a"
+		expect(set.has("a")).toBe(false);
+		expect(set.has("b")).toBe(true);
+		expect(set.has("c")).toBe(true);
+		expect(set.has("d")).toBe(true);
+	});
+
+	it("add() returns the evicted values, oldest first", () => {
+		const set = new BoundedSet<string>(2);
+		expect(set.add("a")).toEqual([]);
+		expect(set.add("b")).toEqual([]);
+		expect(set.add("c")).toEqual(["a"]);
+	});
+
+	it("setMaxEntries() shrinks immediately and reports what it dropped", () => {
+		const set = new BoundedSet<string>(4);
+		set.add("a");
+		set.add("b");
+		set.add("c");
+		expect(set.setMaxEntries(8)).toEqual([]);
+		expect(set.getMaxEntries()).toBe(8);
+		expect(set.size).toBe(3);
+		expect(set.setMaxEntries(1)).toEqual(["a", "b"]);
+		expect(set.getMaxEntries()).toBe(1);
+		expect([...set]).toEqual(["c"]);
+	});
+
+	it("has/add/delete/clear/size/iteration behave as a bounded Set", () => {
+		const set = new BoundedSet<string>(5);
+		set.add("a");
+		set.add("b");
+		expect(set.size).toBe(2);
+		expect(set.has("a")).toBe(true);
+		expect([...set]).toEqual(["a", "b"]);
+		expect([...set.values()]).toEqual(["a", "b"]);
+		expect(set.delete("a")).toBe(true);
+		expect(set.has("a")).toBe(false);
+		expect(set.size).toBe(1);
+		set.clear();
+		expect(set.size).toBe(0);
 	});
 });
