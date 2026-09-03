@@ -19,12 +19,18 @@ import {
 	getDegradationSummary,
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
+import {
+	clearLatencyLog,
+	flushLatencyLog,
+	getLatencyLogPath,
+} from "../../clients/latency-logger.js";
 import { peekTestFindings } from "../../clients/runtime-context.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import {
 	TEST_RUNNER_BATCH_BUDGET_MS,
 	TEST_RUNNER_BATCH_CONCURRENCY,
 	TEST_RUNNER_MAX_DEFERRALS,
+	TEST_RUNNER_MAX_PERSISTED_TARGETS,
 	TEST_RUNNER_MAX_TARGETS,
 	handleTurnEnd,
 	runTestTargetsBounded,
@@ -106,27 +112,37 @@ describe("#2504 AC2 — bounded test-runner batch helper", () => {
 	});
 
 	/**
-	 * #2522 review round 3, F4 — "the batch closed" is not "the target was cut".
+	 * #2522 review round 3 F4, re-founded in round 4 (I4) — "the batch closed"
+	 * is not "the target was cut", and the answer must not depend on macrotask
+	 * ordering.
 	 *
-	 * A target whose `run` had ALREADY produced a value when the bound fired
-	 * (its continuation merely queued behind `finish()`) was dropped by the
-	 * close latch and returned in `deferred`. The caller then charged it an
-	 * attempt toward `TEST_RUNNER_MAX_DEFERRALS`, so a suite that kept
-	 * finishing INSIDE the budget could still be retired as "too slow".
+	 * A target that produced a real value BEFORE the bound fired must keep its
+	 * result and take no attempt toward `TEST_RUNNER_MAX_DEFERRALS`; otherwise a
+	 * suite that keeps finishing inside the budget is eventually retired as "too
+	 * slow". Round 3 got this by draining the queue with a `setImmediate` hop —
+	 * which is exactly the ordering dependence that then misclassified a spawn
+	 * aborted before it started (P3c). Round 4 stamps the answer in the `.then`
+	 * attached at dispatch instead.
 	 *
-	 * The abort is tripped from inside `run`, immediately before it returns:
-	 * the value is real, and its continuation is behind the latch by
-	 * construction — no sleep, no timing race.
+	 * The close is tripped the way production trips it — from a TIMER, i.e. a
+	 * macrotask strictly after this value exists — not synchronously from inside
+	 * `run`, which no spawn can do.
 	 */
-	it("keeps the result of a target that finished as the bound fired, instead of deferring it", async () => {
+	it("keeps the result of a target that finished before the bound fired", async () => {
 		const controller = new AbortController();
 		const outcome = await runTestTargetsBounded({
-			targets: ["already-done", "never-dispatched"],
+			targets: ["already-done", "still-running"],
 			concurrency: 1,
 			budgetMs: 60_000,
 			signal: controller.signal,
 			run: async (target: string) => {
-				controller.abort();
+				if (target === "already-done") {
+					setTimeout(() => controller.abort(), 0);
+					return `${target}-value`;
+				}
+				// Not abort-aware, exactly like a spawn that has not noticed the kill
+				// yet: it can only settle long after the close.
+				await delay(400);
 				return `${target}-value`;
 			},
 		});
@@ -137,8 +153,52 @@ describe("#2504 AC2 — bounded test-runner batch helper", () => {
 			{ status: "fulfilled", value: "already-done-value" },
 		]);
 		// ...and it is NOT counted as a cut, so it takes no attempt. Only the
-		// target that genuinely never ran is deferred.
-		expect(outcome.deferred).toEqual(["never-dispatched"]);
+		// target that had not produced anything when the bound fired is deferred.
+		expect(outcome.deferred).toEqual(["still-running"]);
+	});
+
+	/**
+	 * #2522 review round 4, P3c — abort BEFORE the spawn.
+	 *
+	 * `safeSpawnAsync` resolves SYNCHRONOUSLY when the signal it is handed is
+	 * already aborted, and `test-runner-client.ts` `await`s `resolveExec` before
+	 * it ever reaches the spawn. So a target dispatched just before the bound
+	 * comes back as a FULFILLED runner-error value — "Spawn aborted before
+	 * start" — describing work that never happened. Round 3's queue hop folded
+	 * exactly that value back into `results`, so the target counted as a
+	 * completed run, was never deferred, and never ran.
+	 *
+	 * The double is production-faithful on the axis under test: it awaits (as
+	 * `resolveExec` does) and then honours an already-aborted signal by
+	 * resolving with the runner-error shape. The shape itself is pinned against
+	 * the REAL client in `test-runner-client.test.ts`.
+	 */
+	it("defers a target whose spawn was aborted before it started", async () => {
+		const outcome = await runTestTargetsBounded({
+			targets: ["slow", "aborted-pre-spawn"],
+			concurrency: 2,
+			budgetMs: 30,
+			run: async (target: string, batchSignal: AbortSignal) => {
+				// Stands in for `await this.resolveExec(...)`: the batch bound can
+				// fire while this is pending.
+				await delay(target === "slow" ? 400 : 120);
+				if (batchSignal.aborted) {
+					return {
+						file: target,
+						runner: "vitest",
+						passed: 0,
+						failed: 0,
+						error: "Runner error: Spawn aborted before start",
+					};
+				}
+				return { file: target, runner: "vitest", passed: 1, failed: 0 };
+			},
+		});
+
+		expect(outcome.stopReason).toBe("budget");
+		// A value produced only because the batch was cut is not a result.
+		expect(outcome.results).toHaveLength(0);
+		expect(outcome.deferred).toEqual(["slow", "aborted-pre-spawn"]);
 	});
 
 	it("stops dispatching when the ambient abort signal fires", async () => {
@@ -1307,11 +1367,18 @@ describe("#2522 R2/R3 — a target that never fits the budget is retired, not ca
 
 		expect(ran).toContain(path.resolve(freshTest));
 		expect(ran).toContain(path.resolve(forever));
-		// And the foreign entry is pruned rather than carried forward.
+		// #2522 review round 4, I1: re-arming is a SELECTION decision. The other
+		// session's row is left exactly where it was — this session ignores it, it
+		// does not get to delete it. Round 3 wrote the filtered list straight back,
+		// which is how a turn taken through the MCP route erased the pi route's
+		// retirements (and vice versa) on the very same project.
 		const persisted = cacheManager.readCache<{
-			retiredTargets?: { testFile: string }[];
+			retiredTargets?: { testFile: string; sessionId?: string }[];
 		}>("test-runner-findings", env.tmpDir)?.data;
-		expect(persisted?.retiredTargets ?? []).toHaveLength(0);
+		expect(persisted?.retiredTargets ?? []).toHaveLength(1);
+		expect(persisted?.retiredTargets?.[0]?.sessionId).toBe(
+			`${runtime.telemetrySessionId}-a-previous-session`,
+		);
 	});
 
 	it("does not adopt a deferral list carried over from another session", async () => {
@@ -1357,7 +1424,16 @@ describe("#2522 R2/R3 — a target that never fits the budget is retired, not ca
 		expect(ran).toContain(path.resolve(freshTest));
 		expect(ran).not.toContain(path.resolve(strangerTest));
 		expect(
-			dbgLines.some((l) => l.includes("carried from an earlier session")),
+			dbgLines.some((l) => l.includes("belonging to another session")),
+		).toBe(true);
+		// I1: ignored, not deleted — the session that cut it still owes that run.
+		const persisted = cacheManager.readCache<{
+			deferredTargets?: { testFile: string }[];
+		}>("test-runner-findings", env.tmpDir)?.data;
+		expect(
+			(persisted?.deferredTargets ?? []).some(
+				(t) => path.resolve(t.testFile) === path.resolve(strangerTest),
+			),
 		).toBe(true);
 	});
 });
@@ -1506,5 +1582,602 @@ describe("#2522 R3 F3 — a superseded batch carries its cut targets forward", (
 		expect(
 			dbgLines.some((l) => l.includes("into the newer generation's deferral")),
 		).toBe(true);
+	});
+});
+
+/**
+ * #2522 review round 4 — the state-space round.
+ *
+ * Three rounds each fixed a finding on the `test-runner-findings` record and
+ * introduced the next one, so this block is written from the record's model
+ * rather than from the last diff. Four persisted concerns (`content`,
+ * `testRunGeneration`/`runnerErrorOnly`, `deferredTargets`, `retiredTargets`),
+ * seven writers, and four axes: session identity (own / foreign / absent),
+ * generation ordering, cut vs complete vs abort-before-spawn, and the per-turn
+ * target cap. The invariants pinned here:
+ *
+ *  I1 a foreign-session entry is never destroyed by a write — foreign entries
+ *     are filtered at SELECTION only;
+ *  I2 every `deferredTargets` write MERGES against the live record;
+ *  I3 `attempts` accumulates across turns and actually reaches the cap;
+ *  I5 a carried entry rejected only by the per-turn cap stays on the list.
+ *
+ * (I4 — cut vs complete decided by the dispatch-time stamp rather than by
+ * macrotask ordering — is pinned in the batch-helper describe at the top of
+ * this file.)
+ */
+describe("#2522 R4 — the deferral record across sessions, generations and caps", () => {
+	/** The identity `index.ts` passes; `clients/mcp/session.ts` passes none. */
+	const PI_SESSION = "pi-stable-session-2522";
+
+	function seedProject(names: string[]): Record<string, string> {
+		fs.mkdirSync(path.join(env.tmpDir, "src"), { recursive: true });
+		fs.writeFileSync(
+			path.join(env.tmpDir, "vitest.config.ts"),
+			"export default {}\n",
+		);
+		const out: Record<string, string> = {};
+		for (const name of names) {
+			const source = path.join(env.tmpDir, "src", `${name}.ts`);
+			const test = path.join(env.tmpDir, "src", `${name}.test.ts`);
+			fs.writeFileSync(source, `export const ${name} = 1;\n`);
+			fs.writeFileSync(test, "export {};\n");
+			out[name] = source;
+			out[`${name}Test`] = test;
+		}
+		return out;
+	}
+
+	function markEdited(
+		cacheManager: CacheManager,
+		runtime: RuntimeCoordinator,
+		sources: string[],
+	): void {
+		for (const source of sources) {
+			cacheManager.addModifiedRange(
+				source,
+				{ start: 1, end: 1 },
+				false,
+				env.tmpDir,
+				runtime.telemetrySessionId,
+			);
+		}
+	}
+
+	/** Settles immediately — an ordinary, complete run. */
+	function completingClient(ran: string[]): TestRunnerClient {
+		const client = new TestRunnerClient(false);
+		(client as unknown as { runTestFileAsync: unknown }).runTestFileAsync =
+			async (testFile: string) => {
+				ran.push(testFile);
+				return {
+					file: testFile,
+					runner: "vitest",
+					passed: 1,
+					failed: 0,
+					duration: 1,
+				};
+			};
+		return client;
+	}
+
+	/**
+	 * Settles only once the BATCH signal fires, then after a short delay —
+	 * production-faithful for a killed spawn, which resolves on the child's
+	 * `exit` event rather than in the abort listener's own tick.
+	 */
+	function killableClient(ran: string[]): TestRunnerClient {
+		const client = new TestRunnerClient(false);
+		(client as unknown as { runTestFileAsync: unknown }).runTestFileAsync =
+			async (
+				testFile: string,
+				_cwd: string,
+				request: { signal?: AbortSignal },
+			) => {
+				ran.push(testFile);
+				await new Promise<void>((resolve) => {
+					if (request.signal?.aborted) return resolve();
+					request.signal?.addEventListener("abort", () => resolve(), {
+						once: true,
+					});
+				});
+				await delay(20);
+				return {
+					file: testFile,
+					runner: "vitest",
+					passed: 0,
+					failed: 0,
+					error: "killed at the batch bound",
+				};
+			};
+		return client;
+	}
+
+	async function runTurn(args: {
+		cacheManager: CacheManager;
+		runtime: RuntimeCoordinator;
+		client: TestRunnerClient;
+		dbg?: (msg: string) => void;
+		sessionId?: string;
+	}): Promise<void> {
+		await handleTurnEnd({
+			ctxCwd: env.tmpDir,
+			getFlag: () => false,
+			dbg: args.dbg ?? (() => {}),
+			runtime: args.runtime,
+			cacheManager: args.cacheManager,
+			knipClient: {
+				ensureAvailable: async () => false,
+				analyze: async () => EMPTY_KNIP_RESULT,
+			},
+			deadCodeClients: [],
+			depChecker: { ensureAvailable: async () => false },
+			testRunnerClient: args.client,
+			resetLSPService: () => {},
+			resetFormatService: () => {},
+			...(args.sessionId ? { sessionId: args.sessionId } : {}),
+			// biome-ignore lint/suspicious/noExplicitAny: minimal turn_end deps
+		} as any);
+	}
+
+	interface PersistedEntry {
+		testFile: string;
+		attempts?: number;
+		sessionId?: string;
+	}
+
+	function readRecord(cacheManager: CacheManager): {
+		testRunGeneration?: number;
+		deferredTargets?: PersistedEntry[];
+		retiredTargets?: PersistedEntry[];
+	} {
+		return (
+			cacheManager.readCache<{
+				testRunGeneration?: number;
+				deferredTargets?: PersistedEntry[];
+				retiredTargets?: PersistedEntry[];
+			}>("test-runner-findings", env.tmpDir)?.data ?? {}
+		);
+	}
+
+	const entryFor = (
+		list: PersistedEntry[],
+		file: string,
+	): PersistedEntry | undefined =>
+		list.find((t) => path.resolve(t.testFile) === path.resolve(file));
+
+	/**
+	 * Cut ONE real turn-end batch and return once its outcome has been written.
+	 * The bound is the ambient abort signal, which is how `handleTurnEnd`'s own
+	 * caller cancels a turn — the same code path the 20 s wall budget takes,
+	 * with a timer in front of it instead of an event.
+	 */
+	async function runCutTurn(args: {
+		cacheManager: CacheManager;
+		runtime: RuntimeCoordinator;
+		dbg?: (msg: string) => void;
+		sessionId?: string;
+	}): Promise<string[]> {
+		const controller = new AbortController();
+		setAmbientAbortSignal(controller.signal);
+		const ran: string[] = [];
+		try {
+			await runTurn({ ...args, client: killableClient(ran) });
+			const deadline = Date.now() + 5000;
+			while (Date.now() < deadline && ran.length < 1) await delay(20);
+			controller.abort();
+			await delay(300);
+		} finally {
+			setAmbientAbortSignal(undefined);
+		}
+		return ran;
+	}
+
+	/**
+	 * P1 — the finding this round opened on.
+	 *
+	 * `index.ts` hands `handleTurnEnd` pi's stable session id;
+	 * `clients/mcp/session.ts:311` hands it none, so that route stamps
+	 * `runtime.telemetrySessionId` instead. Both routes fire against the same
+	 * project, so both identities are live at once. Round 3 filtered the two
+	 * persisted lists to the current session and then wrote the FILTERED lists
+	 * straight back, so a single turn taken through the other route erased
+	 * everything the first route had recorded: `retired: []`, `deferred: []`.
+	 */
+	it("does not destroy another session's deferral and retirement lists", async () => {
+		const runtime = new RuntimeCoordinator();
+		const cacheManager = new CacheManager(false);
+		const p = seedProject(["slow", "fresh"]);
+
+		// Turn 1, through the pi route: a REAL cut batch stamps PI_SESSION.
+		markEdited(cacheManager, runtime, [p.slow]);
+		await runCutTurn({ cacheManager, runtime, sessionId: PI_SESSION });
+		const afterPi = readRecord(cacheManager);
+		expect(entryFor(afterPi.deferredTargets ?? [], p.slowTest)?.sessionId).toBe(
+			PI_SESSION,
+		);
+
+		// Turn 2, through the MCP route: no sessionId, so `telemetrySessionId`.
+		const ran: string[] = [];
+		const dbgLines: string[] = [];
+		markEdited(cacheManager, runtime, [p.fresh]);
+		await runTurn({
+			cacheManager,
+			runtime,
+			client: completingClient(ran),
+			dbg: (m) => dbgLines.push(m),
+		});
+		const deadline = Date.now() + 5000;
+		while (Date.now() < deadline && ran.length < 1) await delay(20);
+		await delay(200);
+
+		// The MCP turn ran its own target and ignored the pi route's deferral...
+		expect(ran).toContain(path.resolve(p.freshTest));
+		expect(ran).not.toContain(path.resolve(p.slowTest));
+		expect(
+			dbgLines.some((l) => l.includes("belonging to another session")),
+		).toBe(true);
+		// ...and, the invariant: it did not delete it.
+		const afterMcp = readRecord(cacheManager);
+		const carried = entryFor(afterMcp.deferredTargets ?? [], p.slowTest);
+		expect(carried).toBeDefined();
+		expect(carried?.sessionId).toBe(PI_SESSION);
+	});
+
+	/**
+	 * P1b — the consequence. With the retirement erased by the other route's
+	 * turn, the pi route re-resolves the retired suite through `related` and
+	 * fires it again: the livelock `TEST_RUNNER_MAX_DEFERRALS` exists to end.
+	 */
+	it("keeps its own retirement across a foreign session's turn", async () => {
+		const runtime = new RuntimeCoordinator();
+		const cacheManager = new CacheManager(false);
+		const p = seedProject(["forever", "fresh"]);
+
+		// The pi route has already measured `forever.test.ts` as too slow.
+		cacheManager.writeCache(
+			"test-runner-findings",
+			{
+				content: "",
+				retiredTargets: [
+					{
+						testFile: p.foreverTest,
+						runner: "vitest",
+						attempts: TEST_RUNNER_MAX_DEFERRALS,
+						sessionId: PI_SESSION,
+					},
+				],
+			},
+			env.tmpDir,
+		);
+
+		// A turn on the MCP route (different identity) runs in between.
+		const mcpRan: string[] = [];
+		markEdited(cacheManager, runtime, [p.fresh, p.forever]);
+		await runTurn({
+			cacheManager,
+			runtime,
+			client: completingClient(mcpRan),
+		});
+		let deadline = Date.now() + 5000;
+		while (Date.now() < deadline && mcpRan.length < 1) await delay(20);
+		await delay(200);
+
+		// Back on the pi route: the retirement must still be standing.
+		const piRan: string[] = [];
+		const dbgLines: string[] = [];
+		markEdited(cacheManager, runtime, [p.fresh, p.forever]);
+		await runTurn({
+			cacheManager,
+			runtime,
+			client: completingClient(piRan),
+			dbg: (m) => dbgLines.push(m),
+			sessionId: PI_SESSION,
+		});
+		deadline = Date.now() + 5000;
+		while (Date.now() < deadline && piRan.length < 1) await delay(20);
+		await delay(200);
+
+		expect(piRan).toContain(path.resolve(p.freshTest));
+		expect(piRan).not.toContain(path.resolve(p.foreverTest));
+		expect(
+			dbgLines.some((l) => l.includes("retired earlier this session")),
+		).toBe(true);
+	});
+
+	/**
+	 * P6 — I2, through two REAL overlapping `handleTurnEnd` batches.
+	 *
+	 * Round 3's F3 test hand-wrote the newer generation's record, so it only
+	 * ever proved the older batch's hand-over. The write that actually loses the
+	 * hand-over is the NEWER batch's own publish: its clean branch wrote
+	 * `deferredTargets: []`, flattening the set the stale batch had just merged
+	 * in. Both batches here are real turns.
+	 */
+	it("keeps both batches' cut sets when two real turn-end batches overlap", async () => {
+		const runtime = new RuntimeCoordinator();
+		const cacheManager = new CacheManager(false);
+		const p = seedProject(["alpha", "beta"]);
+
+		const controllerA = new AbortController();
+		setAmbientAbortSignal(controllerA.signal);
+		const ranA: string[] = [];
+		let releaseB: () => void = () => {};
+		const bReleased = new Promise<void>((resolve) => {
+			releaseB = resolve;
+		});
+		try {
+			// Batch A: dispatched, still in flight, cut later.
+			markEdited(cacheManager, runtime, [p.alpha]);
+			await runTurn({ cacheManager, runtime, client: killableClient(ranA) });
+			let deadline = Date.now() + 5000;
+			while (Date.now() < deadline && ranA.length < 1) await delay(20);
+
+			// Batch B starts and takes the newer generation, but does not publish
+			// until it is released — so batch A's hand-over lands first.
+			setAmbientAbortSignal(undefined);
+			const clientB = new TestRunnerClient(false);
+			const ranB: string[] = [];
+			(clientB as unknown as { runTestFileAsync: unknown }).runTestFileAsync =
+				async (testFile: string) => {
+					ranB.push(testFile);
+					await bReleased;
+					return {
+						file: testFile,
+						runner: "vitest",
+						passed: 1,
+						failed: 0,
+						duration: 1,
+					};
+				};
+			markEdited(cacheManager, runtime, [p.beta]);
+			await runTurn({ cacheManager, runtime, client: clientB });
+			deadline = Date.now() + 5000;
+			while (Date.now() < deadline && ranB.length < 1) await delay(20);
+
+			// A is cut; superseded by B's generation, so it hands its cut set over
+			// rather than publishing.
+			controllerA.abort();
+			await delay(300);
+			expect(
+				entryFor(readRecord(cacheManager).deferredTargets ?? [], p.alphaTest),
+			).toBeDefined();
+
+			// Now B publishes — clean, with nothing of its own deferred.
+			releaseB();
+			await delay(300);
+		} finally {
+			releaseB();
+			setAmbientAbortSignal(undefined);
+			await delay(50);
+		}
+
+		const persisted = readRecord(cacheManager);
+		// B's clean publish must not flatten what A handed over.
+		const alpha = entryFor(persisted.deferredTargets ?? [], p.alphaTest);
+		expect(alpha).toBeDefined();
+		expect(alpha?.attempts).toBe(1);
+		// B's own target completed, so it owes nothing.
+		expect(
+			entryFor(persisted.deferredTargets ?? [], p.betaTest),
+		).toBeUndefined();
+	});
+
+	/**
+	 * I3 — the attempt counter has to survive real turns.
+	 *
+	 * Hard-coding `attempts: 1` at the batch outcome left the whole suite green
+	 * before this test existed: every other case seeded the count it wanted to
+	 * see. Three real turns, one cut batch each, and the cap must actually
+	 * arrive.
+	 */
+	it("accumulates a real attempt per cut turn until the cap retires the target", async () => {
+		const runtime = new RuntimeCoordinator();
+		const cacheManager = new CacheManager(false);
+		const p = seedProject(["forever"]);
+
+		expect(TEST_RUNNER_MAX_DEFERRALS).toBe(2);
+
+		markEdited(cacheManager, runtime, [p.forever]);
+		await runCutTurn({ cacheManager, runtime });
+		expect(
+			entryFor(readRecord(cacheManager).deferredTargets ?? [], p.foreverTest)
+				?.attempts,
+		).toBe(1);
+
+		markEdited(cacheManager, runtime, [p.forever]);
+		await runCutTurn({ cacheManager, runtime });
+		expect(
+			entryFor(readRecord(cacheManager).deferredTargets ?? [], p.foreverTest)
+				?.attempts,
+		).toBe(2);
+
+		// Third turn: the carried entry is at the cap, so it is retired instead of
+		// dispatched — and the candidate loop cannot re-resolve it either.
+		const ran: string[] = [];
+		const dbgLines: string[] = [];
+		markEdited(cacheManager, runtime, [p.forever]);
+		await runTurn({
+			cacheManager,
+			runtime,
+			client: completingClient(ran),
+			dbg: (m) => dbgLines.push(m),
+		});
+		await delay(300);
+
+		expect(ran).not.toContain(path.resolve(p.foreverTest));
+		const final = readRecord(cacheManager);
+		expect(entryFor(final.retiredTargets ?? [], p.foreverTest)?.attempts).toBe(
+			TEST_RUNNER_MAX_DEFERRALS,
+		);
+		expect(
+			dbgLines.some(
+				(l) => l.includes("retiring deferred") && l.includes("forever.test.ts"),
+			),
+		).toBe(true);
+	});
+
+	/**
+	 * P5 / I5 — a carried entry the per-turn cap has no room for.
+	 *
+	 * Round 3 folded that case in with "missing file, excluded, unknown runner"
+	 * and dropped the entry outright, under a `dbg` line that said the file no
+	 * longer resolved. A carry larger than `TEST_RUNNER_MAX_TARGETS` therefore
+	 * lost its tail on every turn: 16 carried in, 12 run, 4 gone.
+	 */
+	it("holds the carried targets it cannot fit under the per-turn cap", async () => {
+		const runtime = new RuntimeCoordinator();
+		const cacheManager = new CacheManager(false);
+		const CARRIED = TEST_RUNNER_MAX_TARGETS + 4;
+		const names = Array.from({ length: CARRIED }, (_, i) => `c${i}`);
+		const p = seedProject([...names, "edited"]);
+		// The turn needs at least one edited file to reach the test-runner block;
+		// this one's own companion is dropped by the missing-file guard, so it
+		// takes none of the cap's slots.
+		fs.rmSync(p.editedTest);
+		markEdited(cacheManager, runtime, [p.edited]);
+
+		cacheManager.writeCache(
+			"test-runner-findings",
+			{
+				content: "",
+				deferredTargets: names.map((n) => ({
+					testFile: p[`${n}Test`],
+					runner: "vitest",
+					attempts: 1,
+					sessionId: runtime.telemetrySessionId,
+				})),
+			},
+			env.tmpDir,
+		);
+
+		const ran: string[] = [];
+		const dbgLines: string[] = [];
+		await runTurn({
+			cacheManager,
+			runtime,
+			client: completingClient(ran),
+			dbg: (m) => dbgLines.push(m),
+		});
+		const deadline = Date.now() + 8000;
+		while (Date.now() < deadline && ran.length < TEST_RUNNER_MAX_TARGETS) {
+			await delay(20);
+		}
+		await delay(300);
+
+		expect(ran).toHaveLength(TEST_RUNNER_MAX_TARGETS);
+		const held = readRecord(cacheManager).deferredTargets ?? [];
+		expect(held).toHaveLength(CARRIED - TEST_RUNNER_MAX_TARGETS);
+		// Held, not run — so no attempt is charged and a target the turn simply
+		// had no room for is not walked toward retirement.
+		for (const entry of held) expect(entry.attempts).toBe(1);
+		// And the reason is its own, not "no longer resolves".
+		expect(
+			dbgLines.some((l) => l.includes("held") && l.includes("per-turn cap")),
+		).toBe(true);
+	});
+
+	/**
+	 * The bound that I1 makes necessary: nothing prunes another session's rows
+	 * any more, so without a ceiling the record grows by a few rows per session
+	 * forever, on a file read at every single turn_end.
+	 */
+	it("bounds the persisted target lists", async () => {
+		const runtime = new RuntimeCoordinator();
+		const cacheManager = new CacheManager(false);
+		const p = seedProject(["fresh"]);
+		markEdited(cacheManager, runtime, [p.fresh]);
+
+		const foreign = Array.from(
+			{ length: TEST_RUNNER_MAX_PERSISTED_TARGETS + 16 },
+			(_, i) => ({
+				testFile: path.join(env.tmpDir, "src", `ghost${i}.test.ts`),
+				runner: "vitest",
+				attempts: 1,
+				sessionId: `stale-session-${i}`,
+			}),
+		);
+		cacheManager.writeCache(
+			"test-runner-findings",
+			{ content: "", deferredTargets: foreign },
+			env.tmpDir,
+		);
+
+		const ran: string[] = [];
+		const dbgLines: string[] = [];
+		await runTurn({
+			cacheManager,
+			runtime,
+			client: completingClient(ran),
+			dbg: (m) => dbgLines.push(m),
+		});
+		const deadline = Date.now() + 5000;
+		while (Date.now() < deadline && ran.length < 1) await delay(20);
+		await delay(300);
+
+		const persisted = readRecord(cacheManager).deferredTargets ?? [];
+		expect(persisted).toHaveLength(TEST_RUNNER_MAX_PERSISTED_TARGETS);
+		expect(dbgLines.some((l) => l.includes("bounded to the newest"))).toBe(true);
+	});
+
+	/**
+	 * S1 — observability on the route that has none.
+	 *
+	 * `clients/mcp/session.ts` calls `handleTurnEnd` with `dbg: noop`, so every
+	 * `turn_end:` line the deferral machinery writes is invisible on the route
+	 * that fires it most. One pushed latency record says what happened to the
+	 * carried list.
+	 */
+	it("pushes one latency record for the deferral set on a route with no dbg", async () => {
+		const runtime = new RuntimeCoordinator();
+		const cacheManager = new CacheManager(false);
+		const p = seedProject(["carried", "fresh"]);
+		markEdited(cacheManager, runtime, [p.fresh]);
+		cacheManager.writeCache(
+			"test-runner-findings",
+			{
+				content: "",
+				deferredTargets: [
+					{
+						testFile: p.carriedTest,
+						runner: "vitest",
+						attempts: 1,
+						sessionId: runtime.telemetrySessionId,
+					},
+				],
+			},
+			env.tmpDir,
+		);
+
+		// `logLatency` short-circuits under `isTestMode()`, so the record can only
+		// be observed with the same opt-out the other latency-log tests in this
+		// repo use. `PI_LENS_HOME` stays pinned by the shared vitest setup, so
+		// this still writes into the per-worker temp home, never `~/.pi-lens`.
+		const previousTestMode = process.env.PI_LENS_TEST_MODE;
+		process.env.PI_LENS_TEST_MODE = "0";
+		clearLatencyLog();
+		const ran: string[] = [];
+		try {
+			// No `dbg` — exactly the MCP/Stop-hook shape.
+			await runTurn({ cacheManager, runtime, client: completingClient(ran) });
+			const deadline = Date.now() + 5000;
+			while (Date.now() < deadline && ran.length < 2) await delay(20);
+			await delay(300);
+			await flushLatencyLog();
+		} finally {
+			if (previousTestMode === undefined) delete process.env.PI_LENS_TEST_MODE;
+			else process.env.PI_LENS_TEST_MODE = previousTestMode;
+		}
+
+		const entry = fs
+			.readFileSync(getLatencyLogPath(), "utf8")
+			.split("\n")
+			.filter(Boolean)
+			.map((line) => JSON.parse(line) as Record<string, unknown>)
+			.find((e) => e.phase === "test_runner_deferral");
+		expect(entry).toBeDefined();
+		const metadata = entry?.metadata as Record<string, unknown> | undefined;
+		expect(metadata?.carried).toBe(1);
+		expect(metadata?.redispatched).toBe(1);
 	});
 });

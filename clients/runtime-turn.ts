@@ -217,20 +217,43 @@ export const TEST_RUNNER_BATCH_BUDGET_MS = 20_000;
 export const TEST_RUNNER_MAX_DEFERRALS = 2;
 
 /**
+ * Ceiling on how many entries either persisted target list may carry.
+ *
+ * #2522 review round 4, I1: a write may no longer destroy another session's
+ * entries, so nothing in the write path prunes them any more — each session
+ * that ever cut or retired a target in this project leaves its rows behind, on
+ * a record read at every single turn_end. The bound is applied at the one
+ * writer, on the whole list, and sheds FOREIGN rows first (the writer orders
+ * this session's entries last), so it can never evict the entries this turn
+ * depends on. Generous on purpose: it is a backstop against unbounded growth,
+ * not a scheduling policy.
+ */
+export const TEST_RUNNER_MAX_PERSISTED_TARGETS = 64;
+
+/**
  * Union two deferral sets by target identity, keeping the HIGHER attempt count
  * (#2522 review round 3, F3). Two overlapping batches can both be cut on the
  * same target; taking the lower count would let a target trade an attempt for
- * every overlap and never converge on `TEST_RUNNER_MAX_DEFERRALS`. Keyed
- * through `normalizeMapKey` so `/`- and `\`-separated spellings of one path are
- * one entry (AGENTS.md cross-form-path screen).
+ * every overlap and never converge on `TEST_RUNNER_MAX_DEFERRALS`.
+ *
+ * Identity is (session, path), not path alone (#2522 review round 4, I1): two
+ * sessions can each owe a run of the same file, and collapsing those into one
+ * row makes the surviving row's `sessionId` decide whose deferral is honoured
+ * and whose is silently dropped. The path half is keyed through
+ * `normalizeMapKey` so `/`- and `\`-separated spellings are one entry
+ * (AGENTS.md cross-form-path screen).
  */
+function deferralEntryKey(entry: DeferredTestTarget): string {
+	return `${entry.sessionId ?? ""} ${normalizeMapKey(path.resolve(entry.testFile))}`;
+}
+
 function mergeDeferredTargets(
 	existing: readonly DeferredTestTarget[],
 	incoming: readonly DeferredTestTarget[],
 ): DeferredTestTarget[] {
 	const byKey = new Map<string, DeferredTestTarget>();
 	for (const entry of [...existing, ...incoming]) {
-		const key = normalizeMapKey(path.resolve(entry.testFile));
+		const key = deferralEntryKey(entry);
 		const prior = byKey.get(key);
 		if (prior && (prior.attempts ?? 0) >= (entry.attempts ?? 0)) continue;
 		byKey.set(key, entry);
@@ -249,9 +272,11 @@ export interface BoundedTestBatchOutcome<R, T> {
 	 * pre-round-2 `skipped` field used to carry, so there is exactly one
 	 * source of truth for "what didn't run".
 	 *
-	 * Round 3, F4: a target that FINISHED and was only dropped by the close
-	 * latch is not in here — its result is folded back into `results` before
-	 * this returns, so it is never charged an attempt toward retirement.
+	 * A target that FINISHED before the batch closed is not in here — the stamp
+	 * that decides that is taken by the `.then` attached AT DISPATCH (see
+	 * `settledBeforeClose` below), so it is never charged an attempt toward
+	 * retirement (#2522 review round 3 F4, re-founded in round 4 on the stamp
+	 * instead of a queue hop).
 	 */
 	deferred: T[];
 	/** Which bound ended the batch early, if either did. */
@@ -293,19 +318,26 @@ export async function runTestTargetsBounded<T, R>(args: {
 	// after that: the caller has already consumed the array, and a late push
 	// would silently change a batch it has finished reasoning about.
 	let closed = false;
-	const settledIndexes = new Set<number>();
 	/**
-	 * #2522 review round 3, F4: a target whose `run` had ALREADY produced a
-	 * value when the bound fired — its continuation was merely queued behind
-	 * `finish()` — is not a target that was cut. Round 2 dropped that result and
-	 * returned the target in `deferred`, so the caller charged it an attempt
-	 * toward retirement and eventually retired a suite that had been finishing
-	 * inside the budget all along. Parked here and folded back in below, inside
-	 * this call, so the latch's real job (nothing lands in an array the CALLER
-	 * has already consumed) is untouched.
+	 * #2522 review round 4, I4: "was this target CUT, or did it FINISH?" is a
+	 * semantic question, and this set is the answer — stamped by the `.then`
+	 * attached to `run`'s promise AT DISPATCH, which is that promise's FIRST
+	 * continuation. Nothing but a microtask can run between the promise settling
+	 * and this stamp, and every path that closes the batch (`setTimeout`, the
+	 * ambient signal's `abort` event, the pool settling after every mapper has
+	 * returned) reaches `finish()` from a macrotask or later. So `closed` read
+	 * here is exactly "the batch was already cut when this value existed".
+	 *
+	 * Round 3 read the same flag from the mapper's own `await` continuation,
+	 * which is several continuations downstream of the settle — a macrotask CAN
+	 * interleave there — and papered over the resulting misclassification with a
+	 * `setImmediate` hop plus a `latchedOut` parking array. Both are gone: the
+	 * hop made the answer depend on queue ordering, which is the thing that kept
+	 * producing findings (a spawn aborted BEFORE it started resolves
+	 * synchronously, so the hop folded it back in as a completed run — round 4
+	 * P3c).
 	 */
-	const latchedOut: Array<{ index: number; result: PromiseSettledResult<R> }> =
-		[];
+	const settledBeforeClose = new Set<number>();
 	const budgetMs = Math.max(0, args.budgetMs);
 	const deadline = Date.now() + budgetMs;
 	const shouldStop = (): boolean => {
@@ -326,25 +358,28 @@ export async function runTestTargetsBounded<T, R>(args: {
 		Math.max(1, args.concurrency),
 		async ({ target, index }) => {
 			if (shouldStop()) return;
-			try {
-				const value = await args.run(target, batchAbort.signal);
-				// The batch may have closed while this target was in flight — a
-				// killed spawn still resolves (with its runner-error shape) and
-				// must not land in an array the caller already has.
-				if (closed) {
-					latchedOut.push({ index, result: { status: "fulfilled", value } });
-					return;
-				}
-				results.push({ status: "fulfilled", value });
-				settledIndexes.add(index);
-			} catch (reason) {
-				if (closed) {
-					latchedOut.push({ index, result: { status: "rejected", reason } });
-					return;
-				}
-				results.push({ status: "rejected", reason });
-				settledIndexes.add(index);
-			}
+			const running = args.run(target, batchAbort.signal);
+			// Attached HERE, at dispatch, so it is the promise's first
+			// continuation — see `settledBeforeClose`. A value that only exists
+			// because the batch was cut (a killed spawn's runner error, or
+			// `safeSpawnAsync`'s synchronous "Spawn aborted before start") settles
+			// strictly after the close and is therefore never recorded, so the
+			// caller defers that target instead of reading it as a completed run.
+			const stamp = running.then(
+				(value) => {
+					if (closed) return;
+					settledBeforeClose.add(index);
+					results.push({ status: "fulfilled", value });
+				},
+				(reason) => {
+					if (closed) return;
+					settledBeforeClose.add(index);
+					results.push({ status: "rejected", reason });
+				},
+			);
+			// The stamp swallows both settlements, so this only keeps the pool's
+			// concurrency slot held for as long as the work actually runs.
+			await stamp;
 		},
 	);
 	// The pool's mapper swallows every throw, so this can only reject on an
@@ -380,31 +415,11 @@ export async function runTestTargetsBounded<T, R>(args: {
 		);
 	});
 
-	// #2522 review round 3, F4: drain the queue ONCE, and ONLY when a bound
-	// actually fired. A target whose `run` had already resolved when `finish()`
-	// latched has its continuation sitting in the microtask queue right now; one
-	// macrotask hop lets every such continuation land in `latchedOut` before
-	// this call decides what "did not run" means. This waits on the QUEUE, not
-	// on the work: a target still genuinely in flight has nothing queued, and a
-	// spawn killed by `batchAbort.abort()` resolves on process exit — an I/O
-	// event, strictly after this hop — so it is still, correctly, counted as
-	// cut. The `stopReason` gate is not an optimisation: when `finish()` came
-	// from the pool settling, every mapper has already run and nothing CAN be
-	// latched out, so hopping there would only add a macrotask to the normal
-	// path — which callers that flush a completed batch with a single
-	// `setImmediate` observe directly.
-	if (stopReason !== undefined) {
-		await new Promise<void>((resolve) => setImmediate(resolve));
-		for (const { index, result } of latchedOut) {
-			if (settledIndexes.has(index)) continue;
-			results.push(result);
-			settledIndexes.add(index);
-		}
-	}
-
 	return {
 		results,
-		deferred: args.targets.filter((_, index) => !settledIndexes.has(index)),
+		deferred: args.targets.filter(
+			(_, index) => !settledBeforeClose.has(index),
+		),
 		stopReason,
 	};
 }
@@ -2223,6 +2238,8 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		const turnSessionId = sessionId ?? runtime.telemetrySessionId;
 		const isThisSession = (entry: DeferredTestTarget): boolean =>
 			entry.sessionId === turnSessionId;
+		const entryPathKey = (entry: DeferredTestTarget): string =>
+			normalizeMapKey(path.resolve(cwd, entry.testFile));
 		/**
 		 * #2522 review round 3, F1: the retirement, carried forward.
 		 *
@@ -2231,47 +2248,125 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		 * `related`/`self` in the SAME turn and ran it anyway with a fresh
 		 * (undefined) attempt count. Steady state was a 3-turn cycle that spawned
 		 * and cut the slow suite on every turn. The retired set is persisted on
-		 * the record instead — pruned to this session, so `session_start` re-arms
-		 * every target rather than inheriting another session's verdict.
+		 * the record instead.
+		 *
+		 * Round 4, I1: this is a SELECTION filter and nothing more. Round 3 also
+		 * wrote the filtered list straight back, so a turn taken by the other
+		 * entry point into the same project — `clients/mcp/session.ts` passes no
+		 * `sessionId` and falls back to `telemetrySessionId`, while `index.ts`
+		 * passes pi's stable id — erased the entries belonging to the other
+		 * route. Both lists survive every write now; see `writeTestFindings`.
 		 */
 		const retiredCarry: DeferredTestTarget[] = (
 			priorTestCache?.retiredTargets ?? []
 		).filter(isThisSession);
-		const retiredKeys = new Set(
-			retiredCarry.map((entry) =>
-				normalizeMapKey(path.resolve(cwd, entry.testFile)),
-			),
-		);
+		const retiredKeys = new Set(retiredCarry.map(entryPathKey));
 		/**
-		 * The ONE writer of `test-runner-findings` in this block, so "the
-		 * retirement survives every write" is stated once instead of at six call
-		 * sites that a seventh would silently not join (#2522 review round 3, F1;
-		 * same net-count rule as `retireTestFindings` in `runtime-context.ts`).
-		 * `retiredCarry` is applied LAST: several of those writes spread
-		 * `priorTestCache`, which would otherwise carry a previous SESSION's
-		 * retirements straight back in past the prune above.
+		 * Deferral entries of THIS session that this turn has settled: dispatched
+		 * into `targets`, retired at the cap, or dropped as unrunnable. Only
+		 * these may leave the persisted list, and only when this turn's own write
+		 * is not re-asserting them (a cut target comes straight back with
+		 * `attempts + 1`).
 		 */
-		const writeTestFindings = (record: TestRunnerFindingsCache): void => {
+		const resolvedDeferralKeys = new Set<string>();
+		/**
+		 * #2522 review round 4, I5: entries this turn could not fit under
+		 * `TEST_RUNNER_MAX_TARGETS`. They were not run, so they keep their attempt
+		 * count and stay on the list — round 3 folded the over-cap case in with
+		 * "no longer resolves" and dropped them outright, so a carry larger than
+		 * the cap lost its tail every turn under a dbg line that said the files
+		 * were gone.
+		 */
+		const heldDeferred: DeferredTestTarget[] = [];
+		/**
+		 * The ONE writer of `test-runner-findings` in this block, so the rules
+		 * about what survives a write are stated once instead of at six call sites
+		 * that a seventh would silently not join (#2522 review round 3, F1; same
+		 * net-count rule as `retireTestFindings` in `runtime-context.ts`).
+		 *
+		 * Three rules, all of them round-4 invariants:
+		 *  - I1: the LIVE record is re-read here and merged into, never replaced.
+		 *    A row belonging to another session is untouchable — this turn may
+		 *    ignore it, never delete it.
+		 *  - I2: every write merges. A batch that publishes clean, a batch that
+		 *    publishes failures and a superseded batch all go through this, so
+		 *    none of them can overwrite a concurrent batch's cut set. Removal is
+		 *    narrow by construction: an entry leaves only if it is this session's,
+		 *    this turn settled it, and this write is not re-asserting it.
+		 *  - the persisted lists are bounded (`TEST_RUNNER_MAX_PERSISTED_TARGETS`)
+		 *    with this session's rows ordered LAST, so the bound sheds foreign
+		 *    rows first and can never evict what this turn just recorded.
+		 */
+		const boundPersisted = (
+			entries: DeferredTestTarget[],
+			label: string,
+		): DeferredTestTarget[] => {
+			const ordered = [
+				...entries.filter((entry) => !isThisSession(entry)),
+				...entries.filter(isThisSession),
+			];
+			if (ordered.length <= TEST_RUNNER_MAX_PERSISTED_TARGETS) return ordered;
+			dbg(
+				`turn_end: ${label} test target list held ${ordered.length} entries, bounded to the newest ${TEST_RUNNER_MAX_PERSISTED_TARGETS} (oldest foreign-session rows dropped)`,
+			);
+			return ordered.slice(-TEST_RUNNER_MAX_PERSISTED_TARGETS);
+		};
+		const writeTestFindings = (
+			record: TestRunnerFindingsCache,
+			ownDeferred: readonly DeferredTestTarget[],
+		): void => {
+			const live = cacheManager.readCache<TestRunnerFindingsCache>(
+				"test-runner-findings",
+				cwd,
+			)?.data;
+			const own = mergeDeferredTargets(heldDeferred, ownDeferred);
+			const ownKeys = new Set(own.map(entryPathKey));
+			const merged = mergeDeferredTargets(
+				live?.deferredTargets ?? [],
+				own,
+			).filter((entry) => {
+				if (!isThisSession(entry)) return true;
+				const key = entryPathKey(entry);
+				return !resolvedDeferralKeys.has(key) || ownKeys.has(key);
+			});
 			cacheManager.writeCache(
 				"test-runner-findings",
-				{ ...record, retiredTargets: retiredCarry },
+				{
+					...record,
+					deferredTargets: boundPersisted(merged, "deferred"),
+					retiredTargets: boundPersisted(
+						mergeDeferredTargets(live?.retiredTargets ?? [], retiredCarry),
+						"retired",
+					),
+				},
 				cwd,
 			);
 		};
-		let deferredRetired = 0;
+		let deadDeferred = 0;
+		let heldOverCap = 0;
 		let foreignDeferred = 0;
+		let redispatchedDeferred = 0;
+		let retiredThisTurn = 0;
 		for (const carried of carriedDeferred) {
 			const testFile = path.resolve(cwd, carried.testFile);
 			const carriedKey = normalizeMapKey(testFile);
-			if (seen.has(carriedKey)) continue;
+			// I1: another session still owes this run. Skip it, leave it on the
+			// record — `writeTestFindings` never removes a row this turn does not
+			// own.
 			if (!isThisSession(carried)) {
 				foreignDeferred++;
 				continue;
 			}
+			if (seen.has(carriedKey)) {
+				resolvedDeferralKeys.add(carriedKey);
+				continue;
+			}
 			const attempts = carried.attempts ?? 0;
 			if (attempts >= TEST_RUNNER_MAX_DEFERRALS) {
+				resolvedDeferralKeys.add(carriedKey);
 				if (!retiredKeys.has(carriedKey)) {
 					retiredKeys.add(carriedKey);
+					retiredThisTurn++;
 					retiredCarry.push({
 						testFile,
 						runner: carried.runner,
@@ -2297,14 +2392,29 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			const config = RUNNERS[carried.runner];
 			if (
 				!config ||
-				targets.length >= TEST_RUNNER_MAX_TARGETS ||
 				isExcludedTestTarget(testFile, cwd) ||
 				!fs.existsSync(testFile)
 			) {
-				deferredRetired++;
+				resolvedDeferralKeys.add(carriedKey);
+				deadDeferred++;
 				continue;
 			}
+			if (targets.length >= TEST_RUNNER_MAX_TARGETS) {
+				// I5: not settled — held, with `attempts` UNCHANGED. It was never
+				// dispatched, so charging it toward retirement would retire a suite
+				// this turn simply had no room for.
+				heldOverCap++;
+				heldDeferred.push({
+					testFile,
+					runner: carried.runner,
+					attempts,
+					sessionId: turnSessionId,
+				});
+				continue;
+			}
+			resolvedDeferralKeys.add(carriedKey);
 			seen.add(carriedKey);
+			redispatchedDeferred++;
 			targets.push({
 				testFile,
 				runner: carried.runner,
@@ -2316,15 +2426,43 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				`turn_end: re-running deferred test target ${path.relative(cwd, testFile)} (${carried.runner}) from the previous turn's cut batch`,
 			);
 		}
-		if (deferredRetired > 0) {
+		if (deadDeferred > 0) {
 			dbg(
-				`turn_end: retired ${deferredRetired} deferred test target(s) that no longer resolve (missing file, excluded, unknown runner, or over the per-turn cap)`,
+				`turn_end: dropped ${deadDeferred} deferred test target(s) that no longer resolve (missing file, excluded, or unknown runner)`,
+			);
+		}
+		if (heldOverCap > 0) {
+			dbg(
+				`turn_end: held ${heldOverCap} deferred test target(s) over the per-turn cap of ${TEST_RUNNER_MAX_TARGETS} — kept on the deferral list for the next turn, attempts unchanged`,
 			);
 		}
 		if (foreignDeferred > 0) {
 			dbg(
-				`turn_end: dropped ${foreignDeferred} deferred test target(s) carried from an earlier session — a deferral is scoped to the session that cut it`,
+				`turn_end: ignored ${foreignDeferred} deferred test target(s) belonging to another session — left on the record for the session that cut them`,
 			);
+		}
+		if (carriedDeferred.length > 0) {
+			// #2522 review round 4, S1: the ONE pushed record for this path. The
+			// MCP / Stop-hook route calls `handleTurnEnd` with `dbg: noop`, so every
+			// line above is invisible there and the deferral machinery — the part
+			// that decides whether a suite runs at all — left no trace whatsoever
+			// on the route that fires it most.
+			logLatency({
+				type: "phase",
+				toolName: "turn_end",
+				filePath: cwd,
+				phase: "test_runner_deferral",
+				durationMs: 0,
+				metadata: {
+					carried: carriedDeferred.length,
+					redispatched: redispatchedDeferred,
+					heldOverCap,
+					retired: retiredThisTurn,
+					dropped: deadDeferred,
+					foreignSession: foreignDeferred,
+					sessionId: turnSessionId,
+				},
+			});
 		}
 
 		let overCapTargets = 0;
@@ -2452,13 +2590,16 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				generation: testRunGeneration,
 				files: provenanceFiles,
 			});
-			writeTestFindings({
-				...(priorTestCache ?? { content: "" }),
-				testRunGeneration,
-				// Consumed above into `targets` (or retired). The batch's own
-				// outcome writes the NEW deferral set below.
-				deferredTargets: [],
-			});
+			writeTestFindings(
+				{
+					...(priorTestCache ?? { content: "" }),
+					testRunGeneration,
+				},
+				// Consumed above into `targets` (or retired, or dropped). Anything
+				// this turn HELD is re-asserted by the writer itself; the batch's own
+				// outcome adds the NEW cut set below.
+				[],
+			);
 			runTestTargetsBounded({
 				targets,
 				concurrency: TEST_RUNNER_BATCH_CONCURRENCY,
@@ -2531,20 +2672,19 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 							);
 							// #2522 review round 3, F3: returning here USED to drop this
 							// batch's cut targets entirely. The newer batch's own pre-run
-							// write already reset `deferredTargets` to `[]`, and it never
-							// saw this set — so with two overlapping batches the targets
-							// the older one was cut on were never deferred, never
-							// re-selected, and the suite they belong to simply never ran
-							// again. Merge them into the live record instead; the newer
-							// batch's own `.then` merges by the same rule.
+							// write already cleared them, and it never saw this set — so
+							// with two overlapping batches the targets the older one was
+							// cut on were never deferred, never re-selected, and the suite
+							// they belong to simply never ran again. Hand them over
+							// instead. Round 4, I2: the merge is `writeTestFindings`'s own
+							// rule now, not a second copy of it here — every branch below
+							// merges the same way, so a NEWER batch publishing after this
+							// one no longer flattens what this hand-over just recorded.
 							if (deferredTargets.length > 0) {
-								writeTestFindings({
-									...(current ?? { content: "" }),
-									deferredTargets: mergeDeferredTargets(
-										current?.deferredTargets ?? [],
-										deferredTargets,
-									),
-								});
+								writeTestFindings(
+									{ ...(current ?? { content: "" }) },
+									deferredTargets,
+								);
 								dbg(
 									`turn_end: ${label}carried ${deferredTargets.length} cut target(s) into the newer generation's deferral set`,
 								);
@@ -2694,18 +2834,20 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 						// "fix before continuing", since the agent introduced
 						// nothing here to fix.
 						const runnerErrorOnly = !hasRealFailure;
-						writeTestFindings({
-							content,
-							stale,
-							results: resultValues,
-							testRunGeneration,
-							launchedFrom,
-							publishedAgainst,
-							provenance: publishedAgainst,
-							superseded,
-							runnerErrorOnly,
+						writeTestFindings(
+							{
+								content,
+								stale,
+								results: resultValues,
+								testRunGeneration,
+								launchedFrom,
+								publishedAgainst,
+								provenance: publishedAgainst,
+								superseded,
+								runnerErrorOnly,
+							},
 							deferredTargets,
-						});
+						);
 						try {
 							deps.onTestRunnerComplete?.({
 								cwd,
@@ -2767,21 +2909,23 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 						// exactly as it was, because nothing here proves anything
 						// passed that was not already proven.
 						if (supersededByNewerGeneration("deferred ")) return;
-						writeTestFindings({
-							content: deferralNote,
-							stale,
-							results: resultValues,
-							testRunGeneration,
-							launchedFrom,
-							publishedAgainst,
-							provenance: publishedAgainst,
-							superseded,
-							// Advisory framing: an unfinished batch is not a
-							// failure the agent introduced, exactly like a runner
-							// error. See `TestRunnerFindingsCache.runnerErrorOnly`.
-							runnerErrorOnly: true,
+						writeTestFindings(
+							{
+								content: deferralNote,
+								stale,
+								results: resultValues,
+								testRunGeneration,
+								launchedFrom,
+								publishedAgainst,
+								provenance: publishedAgainst,
+								superseded,
+								// Advisory framing: an unfinished batch is not a
+								// failure the agent introduced, exactly like a runner
+								// error. See `TestRunnerFindingsCache.runnerErrorOnly`.
+								runnerErrorOnly: true,
+							},
 							deferredTargets,
-						});
+						);
 						try {
 							deps.onTestRunnerComplete?.({
 								cwd,
@@ -2798,18 +2942,23 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 						);
 					} else if (results.length > 0) {
 						if (supersededByNewerGeneration("clean ")) return;
-						writeTestFindings({
-							...(priorTestCache ?? { content: "" }),
-							content: "",
-							stale: false,
-							results: resultValues,
-							testRunGeneration,
-							launchedFrom,
-							publishedAgainst,
-							provenance: publishedAgainst,
-							superseded,
-							deferredTargets: [],
-						});
+						writeTestFindings(
+							{
+								...(priorTestCache ?? { content: "" }),
+								content: "",
+								stale: false,
+								results: resultValues,
+								testRunGeneration,
+								launchedFrom,
+								publishedAgainst,
+								provenance: publishedAgainst,
+								superseded,
+							},
+							// Nothing was cut. This turn's own settled entries drop out;
+							// I2 keeps every row this batch does not own — including a
+							// concurrent older batch's hand-over.
+							[],
+						);
 						try {
 							deps.onTestRunnerComplete?.({
 								cwd,
@@ -2839,23 +2988,15 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				})
 				.catch(() => {});
 		} else if (carriedDeferred.length > 0) {
-			// Every carried target was retired above (deleted, excluded, its
-			// runner is gone, or it exhausted the deferral cap) and nothing new
-			// fired, so no batch outcome will write the list back. Drop the
-			// deferrals here rather than re-reading a set of dead paths on every
-			// future turn; `writeTestFindings` persists this turn's retirements
-			// alongside, which is what the deferral-cap branch above depends on
-			// when it retires the LAST carried target and fires nothing.
-			//
-			// Deliberately still gated on `carriedDeferred` alone: a non-empty
-			// `retiredCarry` with an empty `carriedDeferred` can only have come
-			// from the record itself, so the write would be a no-op — and an
-			// entry that is NOT this session's is already gone from
-			// `retiredCarry`, so it cannot be used to prune one either.
-			writeTestFindings({
-				...(priorTestCache ?? { content: "" }),
-				deferredTargets: [],
-			});
+			// Nothing fired, so no batch outcome will write the list back, but this
+			// turn still settled part of it (targets retired at the cap, or dropped
+			// because their file is gone). Persist that here rather than re-reading
+			// a set of dead paths on every future turn; `writeTestFindings` carries
+			// this turn's retirements alongside, which is what the deferral-cap
+			// branch above depends on when it retires the LAST carried target and
+			// fires nothing. Rows this turn only HELD (over the cap) or does not
+			// own (another session's) are re-asserted by the writer itself.
+			writeTestFindings({ ...(priorTestCache ?? { content: "" }) }, []);
 		}
 	}
 

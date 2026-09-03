@@ -2970,6 +2970,50 @@ describe("#2522 — turn-end selection excludes integration/e2e test targets", (
 		// it is ever added to the fire list.
 		expect(isExcludedTestTarget(target!.testFile, tmpDir)).toBe(true);
 	});
+
+	/**
+	 * #2522 review round 4, P3c — the contract the batch's deferral logic and
+	 * its doubles are built on.
+	 *
+	 * `runTestFileAsync` `await`s `resolveExec` BEFORE it reaches the spawn, and
+	 * `safeSpawnAsync` resolves SYNCHRONOUSLY when the signal it is handed is
+	 * already aborted. So a target dispatched moments before the batch bound
+	 * does not hang and does not reject: it comes back as an ordinary FULFILLED
+	 * result with `passed === 0`, `failed === 0` and a runner error describing
+	 * work that never happened. Anything downstream that reads "fulfilled" as
+	 * "ran" records a suite as complete when nothing was executed.
+	 *
+	 * This pins the shape against the REAL client, so the doubles in
+	 * `runtime-turn-test-runner-bounds.test.ts` that mirror it are not mirroring
+	 * an assumption (AGENTS.md: a test double must be production-faithful on the
+	 * axis under test).
+	 */
+	it("resolves an already-aborted run as a fulfilled runner error, not a completed run", async () => {
+		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-2522-p3c-");
+		exclusionCleanups.push(cleanup);
+		const testFile = path.join(tmpDir, "unit.test.ts");
+		fs.writeFileSync(
+			testFile,
+			"import { it } from 'vitest'; it('x', () => {});\n",
+		);
+		fs.writeFileSync(
+			path.join(tmpDir, "vitest.config.ts"),
+			"export default {}\n",
+		);
+
+		const controller = new AbortController();
+		controller.abort();
+		const client = new TestRunnerClient(false);
+		const result = await client.runTestFileAsync(testFile, tmpDir, {
+			runner: "vitest",
+			config: RUNNERS.vitest,
+			signal: controller.signal,
+		});
+
+		expect(result.passed).toBe(0);
+		expect(result.failed).toBe(0);
+		expect(result.error).toContain("aborted before start");
+	});
 });
 
 /**
