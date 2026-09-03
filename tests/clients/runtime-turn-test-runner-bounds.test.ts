@@ -606,10 +606,16 @@ describe("#2522 AC3 — delivery framing distinguishes runner errors from real f
 });
 
 describe("#2504 AC2 — cap constants", () => {
-	it("caps concurrency at 4", () => {
-		expect(TEST_RUNNER_BATCH_CONCURRENCY).toBe(4);
-	});
-
+	// `caps concurrency at 4` was deleted in the #2522 round-4 pass (AGENTS.md
+	// "Test assessment and removal"). It restated `TEST_RUNNER_BATCH_CONCURRENCY
+	// === 4` and nothing else: changing the constant to 3 reds that case and
+	// NOTHING in the whole file, because 4 is a tuning value, not an invariant.
+	// The behaviour that matters — the pool never exceeds whatever cap it is
+	// handed — is pinned by the named survivor `never exceeds the concurrency
+	// cap` at the top of this file, which drives the real
+	// `runTestTargetsBounded`. The relation below is different and is kept: it
+	// is a premise guard for the fan-out test in this file (the target cap has
+	// to bite before the worklist runs out, or that test proves nothing).
 	it("caps the per-turn target count", () => {
 		expect(TEST_RUNNER_MAX_TARGETS).toBeGreaterThan(0);
 		expect(TEST_RUNNER_MAX_TARGETS).toBeLessThan(SOURCE_COUNT);
@@ -2131,7 +2137,9 @@ describe("#2522 R4 — the deferral record across sessions, generations and caps
 
 		const persisted = readRecord(cacheManager).deferredTargets ?? [];
 		expect(persisted).toHaveLength(TEST_RUNNER_MAX_PERSISTED_TARGETS);
-		expect(dbgLines.some((l) => l.includes("bounded to the newest"))).toBe(true);
+		expect(dbgLines.some((l) => l.includes("bounded to the newest"))).toBe(
+			true,
+		);
 	});
 
 	/**

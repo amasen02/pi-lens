@@ -417,9 +417,7 @@ export async function runTestTargetsBounded<T, R>(args: {
 
 	return {
 		results,
-		deferred: args.targets.filter(
-			(_, index) => !settledBeforeClose.has(index),
-		),
+		deferred: args.targets.filter((_, index) => !settledBeforeClose.has(index)),
 		stopReason,
 	};
 }
