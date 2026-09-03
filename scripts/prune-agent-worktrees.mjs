@@ -211,14 +211,31 @@ export const REMOVE_TIMEOUT_MS = 60_000;
  * Per-hook override of `REMOVE_TIMEOUT_MS`, because a hook cannot reserve more
  * removal time than its own timeout allows. See `removeBoundMs` for the
  * measurement this is sized from; the invariant
- * `hookBudgetMs + removeBoundMs + HOOK_TIMEOUT_MARGIN_MS <= HOOK_TIMEOUT_MS`
- * is asserted for every registered hook in
- * tests/scripts/prune-agent-worktrees.test.ts.
+ * `hookBudgetMs + recheckBoundMs + removeBoundMs + HOOK_TIMEOUT_MARGIN_MS <=
+ * HOOK_TIMEOUT_MS` is asserted for every registered hook in
+ * tests/scripts/prune-agent-worktrees.test.ts — counting BOTH bounded `git()`
+ * calls the removal phase can make (PR #2493 round 4, N3: the pre-remove
+ * `isDirty()` recheck used to silently reuse this same reserve, which made
+ * the invariant an assertion rather than a real bound).
  */
 export const HOOK_REMOVE_RESERVE_MS = Object.freeze({
 	"subagent-stop": 5_000,
 	"session-start": REMOVE_TIMEOUT_MS,
 });
+/**
+ * Bound for the pre-remove `isDirty()` recheck (review round 3, F1's fix;
+ * PR #2493 round 4, N3). Deliberately its OWN small reserve rather than
+ * `removeBoundMs`'s: a `git status --porcelain` is far cheaper than a
+ * recursive `git worktree remove`, and reusing the removal-sized reserve
+ * made this a second removeBound-sized call `hookBudgetMs` never subtracted
+ * for, so the hook-timeout invariant no longer bounded what actually ran
+ * (subagent-stop's real worst case: budget + recheck + remove could reach
+ * 20s against a 15s timeout). A timeout here reads as `"unreadable"`, which
+ * the dirty rail treats exactly like `"dirty"` — fails safe, never
+ * destroys work — so a bound this tight costs nothing but a slightly more
+ * conservative reap under real contention.
+ */
+export const RECHECK_TIMEOUT_MS = 1_000;
 /** Grace period between SIGTERM and the hard kill (ms). */
 const KILL_GRACE_MS = 300;
 
@@ -476,16 +493,20 @@ export function resolveHookPolicy(hook, invocation = {}) {
  * The sweep's wall-clock budget for one invocation, derived from the hook
  * timeout that will kill it rather than guessed (#2486).
  *
- * A hook that CAN remove has to leave room for the removal it starts:
- * `git worktree remove` is bounded at REMOVE_TIMEOUT_MS and runs OUTSIDE the
- * sweep budget, because SIGKILLing a recursive delete halfway leaves a
- * half-removed tree. So the arithmetic is
- * `timeout - (removal reserve) - margin`, floored at DEFAULT_HOOK_BUDGET_MS.
+ * A hook that CAN remove has to leave room for BOTH bounded `git()` calls the
+ * removal phase can make: the pre-remove `isDirty()` recheck (`recheckBoundMs`,
+ * round 4, N3) and `git worktree remove` itself (`removeBoundMs`), both of
+ * which run OUTSIDE the sweep budget, because SIGKILLing either mid-flight is
+ * worse than overrunning (a recursive delete left half-removed, or a dirty
+ * check whose answer never mattered because the timeout already reads as
+ * "unreadable" -> kept, same as "dirty"). So the arithmetic is
+ * `timeout - (removal reserve) - (recheck reserve) - margin`, floored at
+ * DEFAULT_HOOK_BUDGET_MS.
  *
- * Today that gives session-start 25s (90 - 60 - 5) instead of the 2s that let
- * 6 of 12 trees go `not-evaluated` on the #2486 box, and the reaping
- * subagent-stop 5s (15 - 5 - 5). Which arithmetic applies is the policy's own
- * `budgetSource`, so the one table stays the single place the question is
+ * Today that gives session-start 24s (90 - 60 - 1 - 5) instead of the 2s that
+ * let 6 of 12 trees go `not-evaluated` on the #2486 box, and the reaping
+ * subagent-stop 4s (15 - 5 - 1 - 5). Which arithmetic applies is the policy's
+ * own `budgetSource`, so the one table stays the single place the question is
  * answered.
  *
  * @param {string|null|undefined} hook
@@ -498,7 +519,10 @@ export function hookBudgetMs(hook, policy) {
 	if (!timeoutMs) return DEFAULT_HOOK_BUDGET_MS;
 	return Math.max(
 		DEFAULT_HOOK_BUDGET_MS,
-		timeoutMs - removeBoundMs(hook, policy) - HOOK_TIMEOUT_MARGIN_MS,
+		timeoutMs -
+			removeBoundMs(hook, policy) -
+			recheckBoundMs(hook, policy) -
+			HOOK_TIMEOUT_MARGIN_MS,
 	);
 }
 
@@ -506,7 +530,8 @@ export function hookBudgetMs(hook, policy) {
  * The wall-clock bound put on ONE `git worktree remove` for this invocation,
  * and — for a hook — the removal reserve `hookBudgetMs` subtracts from the hook
  * timeout. The two must be the same number or the invariant
- * `budget + removal + margin <= hook timeout` is a claim nothing enforces.
+ * `budget + recheck + removal + margin <= hook timeout` is a claim nothing
+ * enforces.
  *
  * `REMOVE_TIMEOUT_MS` (60s) is the right bound where there is room for it: a
  * SIGKILLed recursive delete leaves a half-removed tree, so the bound should
@@ -516,7 +541,8 @@ export function hookBudgetMs(hook, policy) {
  * worktree on the #2486 box (2026-09-02, 5 runs) cost min 956ms / median
  * 1049ms / max 1171ms, and over a 300-file tree min 146ms / median 181ms /
  * max 755ms. `HOOK_REMOVE_RESERVE_MS["subagent-stop"]` is 5s, ~4.8x the
- * measured median, and leaves the sweep 5s with a 5s margin.
+ * measured median, and leaves the sweep 4s with a 1s recheck reserve and a
+ * 5s margin.
  *
  * @param {string|null|undefined} hook
  * @param {(typeof HOOK_POLICIES)["manual"]} policy
@@ -526,6 +552,29 @@ export function removeBoundMs(hook, policy) {
 	if (policy.budgetSource === "manual") return REMOVE_TIMEOUT_MS;
 	if (!policy.removeWorktrees) return 0;
 	return HOOK_REMOVE_RESERVE_MS[hook ?? ""] ?? REMOVE_TIMEOUT_MS;
+}
+
+/**
+ * The wall-clock bound put on the pre-remove `isDirty()` recheck (review
+ * round 3, F1's fix; PR #2493 round 4, N3) — deliberately its OWN small
+ * reserve, not `removeBoundMs`'s. `hookBudgetMs` subtracts this too, so the
+ * hook-timeout invariant counts BOTH bounded `git()` calls the removal phase
+ * can make, not just the one `git worktree remove` itself makes.
+ *
+ * A mode that cannot remove never runs the recheck at all and reserves
+ * nothing for it, mirroring `removeBoundMs`. A manual run, which no hook
+ * timeout kills, gets the ordinary per-`git`-call default rather than the
+ * tight hook reserve — there is no timeout pressure to justify a 1s bound
+ * there.
+ *
+ * @param {string|null|undefined} hook
+ * @param {(typeof HOOK_POLICIES)["manual"]} policy
+ * @returns {number}
+ */
+export function recheckBoundMs(hook, policy) {
+	if (policy.budgetSource === "manual") return DEFAULT_GIT_TIMEOUT_MS;
+	if (!policy.removeWorktrees) return 0;
+	return RECHECK_TIMEOUT_MS;
 }
 
 /**
@@ -1200,6 +1249,14 @@ async function main(argv) {
 	const budgetMs = options.budgetMs ?? hookBudgetMs(options.hook, policy);
 	const scanTimeoutMs = options.scanTimeoutMs ?? DEFAULT_SCAN_TIMEOUT_MS;
 	const removeBound = removeBoundMs(options.hook, policy);
+	// A SMALL, dedicated bound for the pre-remove `isDirty()` recheck (PR
+	// #2493 round 4, N3) -- it used to reuse `removeBound`, which made it a
+	// SECOND removeBound-sized `git()` call the hook-timeout invariant never
+	// counted (`hookBudgetMs` only ever reserved room for one). A timeout
+	// here reads as "unreadable", which the dirty rail treats exactly like
+	// "dirty" -- keeps the tree, never destroys it -- so a tight bound fails
+	// safe in the same direction a generous one does.
+	const recheckBound = recheckBoundMs(options.hook, policy);
 	const budgetLeft = () => Math.max(0, budgetMs - (Date.now() - startedAt));
 	// Read once, whichever path runs: stdin is a one-shot stream, and the
 	// ordinary path now serves `--hook subagent-stop --only` too.
@@ -1553,8 +1610,6 @@ async function main(argv) {
 					}),
 				);
 			}
-			const unlinked = unlinkTopLevelLinks(removal.path);
-			for (const link of unlinked) say(`    unlinked reparse point ${link}`);
 			// The enrichment `isDirty()` call and this removal are separated by
 			// two awaits above -- `readProcessTable` and one `terminatePid` per
 			// process the tree held, each with its own fixed grace period -- and
@@ -1564,7 +1619,19 @@ async function main(argv) {
 			// SAME check immediately before the one operation that actually
 			// destroys anything closes it, rather than trusting a verdict that
 			// can be a second or more stale by the time it is acted on.
-			if (isDirty(removal.path, removeBound) !== "clean") {
+			//
+			// Deliberately BEFORE `unlinkTopLevelLinks` (PR #2493 round 4, N1):
+			// the unlink is a one-way, silent (goes through `say()`, suppressed
+			// under `--quiet`) mutation of a tree this branch might still decide
+			// to KEEP. Unlinking first meant a tree kept for "became dirty" had
+			// already lost its shared `node_modules` junction with no record of
+			// it anywhere a `--quiet` hook run would surface -- kept in the
+			// ledger, broken on disk. Re-checking first means nothing touches the
+			// tree until this branch has committed to removing it. The recheck
+			// also uses its OWN small bound (`recheckBound`), not `removeBound`:
+			// see `recheckBoundMs` for why a second removeBound-sized call here
+			// blew the hook-timeout invariant (round 4, N3).
+			if (isDirty(removal.path, recheckBound) !== "clean") {
 				console.error(
 					`[hygiene] ${removal.path} became dirty after enrichment; ` +
 						"skipping removal",
@@ -1589,6 +1656,12 @@ async function main(argv) {
 				);
 				continue;
 			}
+			// Only reached once removal has been committed to: unlink the
+			// shared node_modules junction before `git worktree remove` walks the
+			// tree recursively (a recursive delete that followed the reparse
+			// point would wipe the SHARED node_modules).
+			const unlinked = unlinkTopLevelLinks(removal.path);
+			for (const link of unlinked) say(`    unlinked reparse point ${link}`);
 			// A locked worktree needs --force twice; passing it unconditionally
 			// is harmless for the unlocked case.
 			// Outside the SWEEP budget, but not unbounded: `git()` applies
@@ -1597,9 +1670,10 @@ async function main(argv) {
 			// round 3, F7 — the comment here used to claim otherwise). The
 			// bound is the SAME number `hookBudgetMs` reserved out of the hook
 			// timeout (`removeBoundMs`), so the invariant
-			// `budget + removal + margin <= timeout` is enforced rather than
-			// merely asserted: 60s inside SessionStart's 90s, 5s inside
-			// SubagentStop's 15s against a measured 1049ms median. SIGKILLing
+			// `budget + recheck + removal + margin <= timeout` is enforced
+			// rather than merely asserted: 60s inside SessionStart's 90s, 5s
+			// inside SubagentStop's 15s against a measured 1049ms median.
+			// SIGKILLing
 			// git partway through a recursive delete leaves a half-removed
 			// worktree plus a stale admin directory, so each bound is set well
 			// above its measured cost and only ever fires on a wedged git. The

@@ -17,6 +17,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+	DEFAULT_GIT_TIMEOUT_MS,
 	DEFAULT_HOOK_BUDGET_MS,
 	DEFAULT_MANUAL_BUDGET_MS,
 	DEFAULT_SCAN_TIMEOUT_MS,
@@ -25,12 +26,14 @@ import {
 	HOOK_TIMEOUT_MARGIN_MS,
 	HOOK_TIMEOUT_MS,
 	MIN_SCAN_BUDGET_MS,
+	RECHECK_TIMEOUT_MS,
 	REMOVE_TIMEOUT_MS,
 	getHygieneLogPath,
 	hookBudgetMs,
 	isDirty,
 	keptReasonFor,
 	parseArgs,
+	recheckBoundMs,
 	removeBoundMs,
 	resolveHookPolicy,
 	scanReserveMs,
@@ -373,11 +376,19 @@ describe(".claude/settings.json hook registration (review S8/S9)", () => {
 		expect(command).not.toContain("--only");
 		// ...and it must not ship with the operator opt-out baked in.
 		expect(command).not.toContain("--keep-agent-tree");
-		// The reap has to FIT: budget + one bounded removal + margin.
+		// The reap has to FIT: budget + BOTH bounded `git()` calls the removal
+		// phase can make (the pre-remove `isDirty()` recheck, then `git
+		// worktree remove` itself) + margin. PR #2493 round 4, N3: this used
+		// to count only the removal call, leaving the recheck's identical
+		// `removeBound` reserve entirely unaccounted for -- an assertion, not
+		// a bound, since nothing enforced it against what the code actually
+		// ran (subagent-stop's real worst case reached 20s against this same
+		// 15s timeout).
 		const policy = resolveHookPolicy("subagent-stop");
 		expect(policy.removeWorktrees).toBe(true);
 		expect(
 			hookBudgetMs("subagent-stop", policy) +
+				recheckBoundMs("subagent-stop", policy) +
 				removeBoundMs("subagent-stop", policy) +
 				HOOK_TIMEOUT_MARGIN_MS,
 		).toBeLessThanOrEqual(entry.timeout * 1000);
@@ -658,26 +669,31 @@ describe("hookBudgetMs (#2486)", () => {
 		expect(hookBudgetMs("session-start", sessionStart)).toBe(
 			HOOK_TIMEOUT_MS["session-start"] -
 				REMOVE_TIMEOUT_MS -
+				RECHECK_TIMEOUT_MS -
 				HOOK_TIMEOUT_MARGIN_MS,
 		);
 		const subagentStop = resolveHookPolicy("subagent-stop");
 		expect(hookBudgetMs("subagent-stop", subagentStop)).toBe(
 			HOOK_TIMEOUT_MS["subagent-stop"] -
 				HOOK_REMOVE_RESERVE_MS["subagent-stop"] -
+				RECHECK_TIMEOUT_MS -
 				HOOK_TIMEOUT_MARGIN_MS,
 		);
 
-		// THE invariant, for every hook that can remove: the sweep budget, the
-		// bound put on the one removal it may start, and the margin together
-		// fit inside the timeout Claude Code will kill it at. It is only an
-		// invariant because `removeBoundMs` is the SAME number the removal is
-		// actually given — a reserve that no `git()` call honors is a claim,
-		// not a bound.
+		// THE invariant, for every hook that can remove: the sweep budget, BOTH
+		// bounded `git()` calls the removal phase can make (the pre-remove
+		// `isDirty()` recheck, then `git worktree remove` itself), and the
+		// margin together fit inside the timeout Claude Code will kill it at.
+		// It is only an invariant because `recheckBoundMs`/`removeBoundMs` are
+		// the SAME numbers the removal phase is actually given — a reserve
+		// that no `git()` call honors is a claim, not a bound (PR #2493 round
+		// 4, N3: this used to count only ONE of the two calls).
 		for (const hook of ["subagent-stop", "session-start"] as const) {
 			const policy = resolveHookPolicy(hook);
 			expect(policy.removeWorktrees).toBe(true);
 			expect(
 				hookBudgetMs(hook, policy) +
+					recheckBoundMs(hook, policy) +
 					removeBoundMs(hook, policy) +
 					HOOK_TIMEOUT_MARGIN_MS,
 			).toBeLessThanOrEqual(HOOK_TIMEOUT_MS[hook]);
@@ -713,6 +729,36 @@ describe("hookBudgetMs (#2486)", () => {
 		// bound: SIGKILLing git mid-delete leaves a half-removed tree.
 		expect(removeBoundMs("subagent-stop", resolveHookPolicy(null))).toBe(
 			REMOVE_TIMEOUT_MS,
+		);
+	});
+
+	it("bounds the pre-remove recheck by its OWN small reserve, not removeBoundMs's (PR #2493 round 4, N3)", () => {
+		// The recheck used to silently reuse `removeBoundMs` -- a SECOND
+		// removeBound-sized `git()` call `hookBudgetMs` never subtracted room
+		// for, which is what let subagent-stop's real worst case reach 20s
+		// against its 15s timeout. It gets its own, much smaller reserve.
+		expect(RECHECK_TIMEOUT_MS).toBeGreaterThanOrEqual(1_000);
+		expect(RECHECK_TIMEOUT_MS).toBeLessThanOrEqual(2_000);
+		expect(RECHECK_TIMEOUT_MS).toBeLessThan(
+			HOOK_REMOVE_RESERVE_MS["subagent-stop"],
+		);
+		for (const hook of ["subagent-stop", "session-start"] as const) {
+			expect(recheckBoundMs(hook, resolveHookPolicy(hook))).toBe(
+				RECHECK_TIMEOUT_MS,
+			);
+		}
+		// A mode that cannot remove never runs the recheck either, and
+		// reserves nothing for it -- mirroring `removeBoundMs`.
+		expect(
+			recheckBoundMs(
+				"subagent-stop",
+				resolveHookPolicy("subagent-stop", { keepAgentTree: true }),
+			),
+		).toBe(0);
+		// A manual run gets the ordinary per-`git`-call default: no hook
+		// timeout is pressuring it down to a 1s bound.
+		expect(recheckBoundMs("subagent-stop", resolveHookPolicy(null))).toBe(
+			DEFAULT_GIT_TIMEOUT_MS,
 		);
 	});
 
@@ -1243,10 +1289,32 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 			try {
 				const lateFile = path.join(worktree, "late-write.txt");
 				let wrote = false;
+				// Deliberately `--only`, not the registered `--hook subagent-stop
+				// --quiet` form the sibling tests in this block drive (PR #2493
+				// round 4, S1 vs S2 in tension): the hook-derived path is built by
+				// `path.join`, which on POSIX only ever emits forward slashes -- the
+				// SAME separator `git worktree list` already reports, so on Linux CI
+				// the two strings are byte-identical before `toComparablePath` ever
+				// runs and a mutation that deleted the fold entirely would still
+				// pass. `--only` is the one form this test can put in a DELIBERATELY
+				// mismatched separator, so the fold is what actually closes the gap
+				// rather than a same-OS coincidence -- proven on the #2486 box
+				// (win32) already; forced here so it is proven on ubuntu CI too.
+				// Always backslash-form, on every host: git's own listing is always
+				// forward-slash, so backslash is the one form guaranteed to differ
+				// from it everywhere, not just on win32.
+				const mismatchedOnly = worktree.split(path.sep).join("\\");
 				const cliRun = new Promise<void>((resolve, reject) => {
 					const child = spawn(
 						process.execPath,
-						[cli, "--hook", "subagent-stop", "--only", worktree],
+						[
+							cli,
+							"--hook",
+							"subagent-stop",
+							"--quiet",
+							"--only",
+							mismatchedOnly,
+						],
 						{
 							cwd: repo,
 							env: {
@@ -1299,6 +1367,24 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 				expect(
 					ledgerRecords().find((record) => record.event === "hygiene.run"),
 				).toMatchObject({ removed: 0, keptReason: "dirty" });
+				// PR #2493 round 4, N2: `keptReason: "dirty"` on the run record alone
+				// does not discriminate this fix from round 1's ENRICHMENT-time
+				// `isDirty` catch -- an accidental hammer start early enough to land
+				// before enrichment finishes would satisfy the same assertions
+				// without ever exercising the late re-check this test targets. The
+				// `hygiene.worktree-removed` record's `error` string is written ONLY
+				// by the round-3 re-check branch (round 1's enrichment-time catch
+				// never reaches the removal loop at all -- the candidate goes
+				// straight to `plan.keep`), so asserting it pins the catch to the
+				// gap this test actually races.
+				expect(
+					ledgerRecords().find(
+						(record) => record.event === "hygiene.worktree-removed",
+					),
+				).toMatchObject({
+					removed: false,
+					error: "became dirty between enrichment and removal",
+				});
 			} finally {
 				// Await the actual exit, not just the kill signal: `afterEach`
 				// removes the whole fixture root right after this test returns,
