@@ -47,7 +47,9 @@ export declare function resolveGhTimeoutMs(
 export declare function pollVerdict(args: {
 	fetchPayload: (
 		remainingMs?: number,
-	) => Promise<{ total_count?: number; check_runs?: unknown[] } | null | undefined>;
+	) => Promise<
+		{ total_count?: number; check_runs?: unknown[] } | null | undefined
+	>;
 	waitSeconds: number | null;
 	mergeable?: string | null;
 	sleepImpl?: (ms: number) => Promise<void>;

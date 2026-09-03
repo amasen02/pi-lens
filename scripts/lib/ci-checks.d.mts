@@ -9,10 +9,7 @@ export interface CheckRunRecord {
 	[key: string]: unknown;
 }
 
-export declare function preferCheckRun<T extends CheckRunRecord>(
-	a: T,
-	b: T,
-): T;
+export declare function preferCheckRun<T extends CheckRunRecord>(a: T, b: T): T;
 
 export declare function resolveLatestByName<T extends CheckRunRecord>(
 	checkRuns: T[] | null | undefined,
