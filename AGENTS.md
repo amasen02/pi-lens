@@ -1191,7 +1191,14 @@ directly already yields its values) — any of those four spellings, newly
 added under `clients/`, `tools/`, `mcp/`, or `index.ts`, fails CI via
 `tests/config/bounded-eviction-idiom-sweep.test.ts` unless registered there
 with a `stableOccurrenceKey`-keyed exemption (content-derived, not
-`path:line` — #2475) and a reason. Path-root caches still normalize
+`path:line` — #2475) and a reason. The bare spelling's own gate is narrower
+than "any break+delete pair nearby": it requires a `.size` **comparison**
+(`>`/`>=`) within its window, not just a `.size` mention — a log line
+reporting the current size or a `size === 0` early-return guard does not gate
+it in (#2460 round-3 review F2) — but does NOT require the deleted
+identifier to be the loop variable itself; any `break`+`.delete(` pair in the
+window trips it, same as the accessor-call for-of spelling (#2460 round-3
+review F1). Path-root caches still normalize
 keys at the seam. Widget-state's file map remains a plain map because active
 diagnostic records must not be evicted; it opportunistically removes only
 records idle beyond the active window at one lifecycle size boundary (never

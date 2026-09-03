@@ -12,7 +12,7 @@
  * a repo-wide sweep found the idiom 27 times.
  *
  * ## Properties this sweep learned the hard way (#2442 review F5/F6, #2460
- * review S1)
+ * review S1, #2460 round-3 review F1/F2)
  *
  * 1. **Four spellings, not one.** The first draft matched only
  *    `.keys().next().value`, so `tree-sitter-client.ts`'s two live
@@ -56,6 +56,21 @@
  *    correctly, since `auditRegistry`'s stale-exemption check must still
  *    catch an exemption whose target moved or vanished; it now reports the
  *    drift by name/hash instead of by line number.
+ * 4. **A tighter-LOOKING check can be narrower, not stronger.** The bare
+ *    form's original delete check required the SAME pair
+ *    (`container.delete(loopVar)`), which read as a stricter guard against
+ *    false positives but was strictly narrower than spelling 2's own
+ *    `break`+`.delete(` window check — and vacuous besides, since a generic
+ *    `.delete(` catches every fixture the pair check did. It missed
+ *    assign-inside/delete-below (`oldest = v; …; set.delete(oldest)`, where
+ *    the deleted name is never the loop variable), `set.delete(loopVar!)`,
+ *    and `set?.delete(loopVar)` (#2460 round-3 review F1) — now matched by
+ *    dropping to spelling 2's semantics. Its `.size` gate had the mirror
+ *    problem: it matched a bare `.size` MENTION, not a bounded-loop
+ *    COMPARISON, so a `.size` log line or a `size === 0` early-return guard
+ *    sitting near an unrelated break+delete (find-first-match, drain-one)
+ *    was misread as the `while (set.size > cap)` shape (#2460 round-3 review
+ *    F2) — now gated on `SIZE_COMPARISON` (`>`/`>=`).
  *
  * Built on tests/support/sweep-kit.ts, same as this repo's other
  * registered-or-fail sweeps. `EXEMPT_SITES` below is the FULL, reasoned list
@@ -108,23 +123,28 @@ const FOR_OF_WINDOW = 12;
  * {@link ITERATOR_HEAD} and {@link FOR_OF_ITERATOR}, which both require an
  * explicit accessor call the bare form has no reason to make.
  *
- * Capturing the loop variable and the iterated container lets the delete
- * check below require the SAME pair (`container.delete(loopVar)`) rather than
- * just "a delete appeared somewhere nearby" — an ordinary `for...of` walk
- * that breaks and deletes an unrelated key from a different map must not be
- * misread as an eviction. And because a bare identifier iteration is common
- * for reasons that have nothing to do with eviction, this spelling ALSO
- * requires a `.size` comparison within {@link SIZE_LOOP_WINDOW} lines above
- * the `for` — the bounded-loop shape every real eviction site has
- * (`while (set.size > cap)` / `for (...; set.size > cap; ...)`).
+ * The window check below is spelling 2's own: `break`+`.delete(` somewhere in
+ * {@link FOR_OF_WINDOW} lines after the `for`. An earlier cut required the
+ * delete to name the SAME identifier as the loop variable
+ * (`container.delete(loopVar)`), which read as tighter but was both vacuous
+ * (dropping it to a generic `.delete(` catches every real fixture this file
+ * has) and narrower than spelling 2 — it missed `oldest = v; …
+ * set.delete(oldest)` (the deleted name is never the loop variable),
+ * `set.delete(oldest!)`, and `set?.delete(oldest)` (#2460 round-3 review F1).
+ * Because a bare identifier iteration is common for reasons that have nothing
+ * to do with eviction, this spelling ALSO requires a `.size` COMPARISON —
+ * not just a `.size` MENTION — within {@link SIZE_LOOP_WINDOW} lines above
+ * the `for`, gated to `>`/`>=`, the bounded-loop shape every real eviction
+ * site has (`while (set.size > cap)` / `for (...; set.size > cap; ...)`). A
+ * bare `.size` mention with no comparison — a log line reporting the current
+ * size, or a `size === 0` early-return guard in front of an unconditional
+ * single-item drain — is not a bounded loop and must not gate the flag in
+ * (#2460 round-3 review F2).
  */
 const BARE_FOR_OF_ITERATOR =
-	/\bfor\s*\(\s*(?:const|let|var)\s+([\w$]+)\s+of\s+([\w$.[\]]+)\s*\)/;
+	/\bfor\s*\(\s*(?:const|let|var)\s+[\w$]+\s+of\s+[\w$.[\]]+\s*\)/;
 const SIZE_LOOP_WINDOW = 6;
-
-function escapeRegExp(literal: string): string {
-	return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
+const SIZE_COMPARISON = /\.size\s*>=?/;
 
 /** The one file allowed to spell the idiom: the canonical implementation. */
 const DEFINITION_FILE = "clients/bounded-cache.ts";
@@ -185,20 +205,15 @@ export function findEvictionLines(stripped: string): number[] {
 			continue;
 		}
 
-		const bareMatch = BARE_FOR_OF_ITERATOR.exec(line);
-		if (bareMatch) {
-			const [, loopVar, container] = bareMatch;
+		if (BARE_FOR_OF_ITERATOR.test(line)) {
 			const window = lines.slice(i + 1, i + 1 + FOR_OF_WINDOW).join("\n");
-			const deleteRe = new RegExp(
-				`${escapeRegExp(container ?? "")}\\.delete\\(\\s*${escapeRegExp(loopVar ?? "")}\\s*\\)`,
-			);
 			const precedingWindow = lines
 				.slice(Math.max(0, i - SIZE_LOOP_WINDOW), i)
 				.join("\n");
 			if (
 				/\bbreak\b/.test(window) &&
-				deleteRe.test(window) &&
-				/\.size\b/.test(precedingWindow)
+				/\.delete\(/.test(window) &&
+				SIZE_COMPARISON.test(precedingWindow)
 			) {
 				hits.add(i + 1);
 			}
@@ -310,6 +325,110 @@ describe("#2442 no new hand-rolled evict-oldest idiom outside bounded-cache.ts",
 					"for (const oldest of set) {",
 					"  set.delete(oldest);",
 					"  break;",
+					"}",
+				].join("\n"),
+			),
+		).toEqual([]);
+	});
+
+	// (#2460 round-3 review F1) The first cut required the bare form's delete to
+	// name the EXACT loop variable (`container.delete(loopVar)`), which is both
+	// vacuous (dropping it to a generic `.delete(` still catches every fixture
+	// above) and narrower than spelling 2's own `break`+`.delete(` window check
+	// — so it missed three real shapes below. Each fixture is wrapped in a
+	// `.size`-bounded loop so only the pair-narrowing is under test.
+
+	it("bare form catches assign-inside/delete-below, where the deleted identifier is never the loop variable (#2460 round-3 review F1)", () => {
+		// The deleted identifier ("oldest") is never the loop variable ("v") at
+		// all, so a same-pair check can never match this shape regardless of
+		// syntax — this is the fixture that most directly proves the narrowing
+		// itself must go, not just be patched around.
+		expect(
+			findEvictionLines(
+				[
+					"while (set.size > cap) {",
+					"  let oldest;",
+					"  for (const v of set) {",
+					"    oldest = v;",
+					"    break;",
+					"  }",
+					"  if (oldest !== undefined) set.delete(oldest);",
+					"}",
+				].join("\n"),
+			),
+		).toEqual([3]);
+	});
+
+	it("bare form catches a non-null-asserted delete of the loop variable (#2460 round-3 review F1)", () => {
+		// `oldest!` is not the bare identifier `oldest` the old regex demanded
+		// immediately before `)`.
+		expect(
+			findEvictionLines(
+				[
+					"while (set.size > cap) {",
+					"  for (const oldest of set) {",
+					"    set.delete(oldest!);",
+					"    break;",
+					"  }",
+					"}",
+				].join("\n"),
+			),
+		).toEqual([2]);
+	});
+
+	it("bare form catches an optional-chain delete (#2460 round-3 review F1)", () => {
+		// `set?.delete(` is not the literal `set.delete(` the old regex demanded.
+		expect(
+			findEvictionLines(
+				[
+					"while (set.size > cap) {",
+					"  for (const oldest of set) {",
+					"    set?.delete(oldest);",
+					"    break;",
+					"  }",
+					"}",
+				].join("\n"),
+			),
+		).toEqual([2]);
+	});
+
+	// (#2460 round-3 review F2) The bare form's `.size` gate matched a bare
+	// mention, not a comparison, so a break+delete pair with nothing to do with
+	// bounded eviction rode through on an unrelated `.size` reference nearby.
+
+	it("bare form does NOT flag a break+delete guarded only by a `.size` log line above (#2460 round-3 review F2)", () => {
+		// find-first-match (a predicate, not evict-oldest) with a `.size` log
+		// line above it must not be misread as the bounded-eviction shape.
+		expect(
+			findEvictionLines(
+				[
+					"function removeFirstMatch(set, pred) {",
+					"  console.log(`size=${set.size}`);",
+					"  for (const item of set) {",
+					"    if (pred(item)) {",
+					"      set.delete(item);",
+					"      break;",
+					"    }",
+					"  }",
+					"}",
+				].join("\n"),
+			),
+		).toEqual([]);
+	});
+
+	it("bare form does NOT flag a break+delete guarded only by a `size === 0` early return (#2460 round-3 review F2)", () => {
+		// A `size === 0` early-return guard above an unconditional single-item
+		// drain is a `.size` mention too, but it is not a bounded LOOP — the
+		// drain runs once regardless of size, it does not loop "while too big".
+		expect(
+			findEvictionLines(
+				[
+					"function drainOne(set) {",
+					"  if (set.size === 0) return;",
+					"  for (const item of set) {",
+					"    set.delete(item);",
+					"    break;",
+					"  }",
 					"}",
 				].join("\n"),
 			),
