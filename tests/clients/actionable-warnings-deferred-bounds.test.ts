@@ -958,3 +958,114 @@ describe("#2504 r4 F1 — two back-to-back cold turns both deliver", () => {
 		expect(finalReport?.summary.files).toBe(2);
 	});
 });
+
+/**
+ * #2504 review round 4 (F1), the consumer half. A merged report is a NEW
+ * shape for everything that reads the actionable-warnings cache, so the
+ * freshness contract has to be pinned on the merged object, not only on the
+ * merge.
+ */
+describe("#2504 r4 F1 — consumers accept a merged report", () => {
+	it("passes checkActionableWarningsReportFresh with the deferred half included", async () => {
+		const {
+			writeDeferredActionableWarningsReport,
+			checkActionableWarningsReportFresh,
+		} = await loadWarnings();
+		const cacheManager = new CacheManager(false);
+		const [a, b] = makeSources(2);
+		const seqByPath = new Map([
+			[a, 5],
+			[b, 2],
+		]);
+
+		const entry = (filePath: string, id: string, generatedAt: string) => ({
+			filePath,
+			displayPath: path.basename(filePath),
+			fileSeq: seqByPath.get(filePath),
+			generatedAt,
+			warnings: [
+				{
+					id,
+					filePath,
+					displayPath: path.basename(filePath),
+					line: 1,
+					severity: "warning" as const,
+					tool: "typescript",
+					message: `finding ${id}`,
+					actions: [],
+					suppressed: false,
+					origin: "lsp" as const,
+				},
+			],
+		});
+		const report = (
+			over: Partial<ActionableWarningsReport>,
+		): ActionableWarningsReport =>
+			({
+				generatedAt: new Date(2_000_000).toISOString(),
+				scope: "turn_delta",
+				sessionId: "lens-test",
+				turnIndex: 7,
+				projectSeqStart: 39,
+				projectSeqEnd: 40,
+				deltaOnly: true,
+				includeLspCodeActions: true,
+				files: [],
+				summary: {
+					warnings: 0,
+					unsuppressed: 0,
+					byTier: { warning: 0, info: 0, hint: 0 },
+					suppressed: 0,
+					files: 0,
+					actions: 0,
+					autoFixEligible: 0,
+				},
+				...over,
+			}) as ActionableWarningsReport;
+
+		cacheManager.writeCache(
+			"actionable-warnings",
+			report({
+				turnIndex: 8,
+				projectSeqEnd: 41,
+				generatedAt: new Date(3_000_000).toISOString(),
+				files: [entry(b, "b1", new Date(3_000_000).toISOString())],
+			}),
+			env.tmpDir,
+		);
+		writeDeferredActionableWarningsReport({
+			cacheManager,
+			cwd: env.tmpDir,
+			report: report({
+				files: [entry(a, "a1", new Date(2_000_000).toISOString())],
+			}),
+			getFileSeq: (filePath) => seqByPath.get(filePath) ?? 0,
+		});
+
+		const merged = cacheManager.readCache<ActionableWarningsReport>(
+			"actionable-warnings",
+			env.tmpDir,
+		)?.data as ActionableWarningsReport;
+		expect(merged.files.map((f) => f.filePath).sort()).toEqual([a, b].sort());
+
+		// projectSeqEnd is the MAX of the parts, so exact equality with the live
+		// projectSeq still holds, and every entry's own fileSeq re-checks clean.
+		const freshness = checkActionableWarningsReportFresh({
+			report: merged,
+			currentProjectSeq: 41,
+			getFileSeq: (filePath) => seqByPath.get(filePath) ?? 0,
+		});
+		expect(freshness.reason).toBeUndefined();
+		expect(freshness.fresh).toBe(true);
+
+		// ...and one entry going stale still rejects the report, per file.
+		const stale = checkActionableWarningsReportFresh({
+			report: merged,
+			currentProjectSeq: 41,
+			getFileSeq: (filePath) => (filePath === a ? 6 : 2),
+		});
+		expect(stale.fresh).toBe(false);
+		expect(stale.reason).toBe("file_seq_mismatch");
+		expect(stale.filePath).toBe(a);
+	});
+});
