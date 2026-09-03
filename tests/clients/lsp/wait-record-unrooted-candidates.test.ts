@@ -95,8 +95,11 @@ describe("getClientForFile wait records — unrooted candidates (#2525)", () => 
 		});
 		// Mirrors the real DenoServer: fallbackFor "typescript", root gated on
 		// deno.json(c) which does not exist in this project, so root() resolves
-		// to undefined. Its spawn must NEVER be invoked — if the wait loop
-		// still spent a turn on this unrooted candidate, this throw proves it.
+		// to undefined. A throwing spawn keeps the double faithful — an unrooted
+		// server has no binary to launch — but the assertion that matters is on
+		// the record below; "spawn was not called" holds on the pre-fix code too
+		// (`ensureClientForServer` has always bailed at `!root`), so asserting it
+		// would be vacuous.
 		const denoSpawn = vi.fn(async () => {
 			throw new Error("deno must never be attempted without a resolved root");
 		});
@@ -237,9 +240,8 @@ describe("getClientForFile wait records — unrooted candidates (#2525)", () => 
 
 	it("lsp_client_wait_skipped names only rooted candidates on the known-slow shortcut", async () => {
 		vi.useFakeTimers();
-		const { recordSuccessfulLspSpawn } = await import(
-			"../../../clients/lsp/spawn-history.js"
-		);
+		const { recordSuccessfulLspSpawn } =
+			await import("../../../clients/lsp/spawn-history.js");
 		// Spawn history says typescript takes 6s; with a 750ms budget the
 		// known-slow shortcut fires the moment the spawn is noted in flight.
 		recordSuccessfulLspSpawn("typescript", 6_000);
