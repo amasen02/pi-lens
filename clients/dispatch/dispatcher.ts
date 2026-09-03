@@ -19,7 +19,10 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { FileKind } from "../file-kinds.js";
 import { recordRunner } from "../widget-state.js";
-import { incrementDegradationCount } from "../degradation-ledger.js";
+import {
+	incrementDegradationCount,
+	recordDegradationOnce,
+} from "../degradation-ledger.js";
 import { detectFileKind } from "../file-kinds.js";
 import { detectFileRole } from "../file-role.js";
 import {
@@ -31,7 +34,11 @@ import { getPrimaryDispatchGroup } from "../language-policy.js";
 import { resolveLanguageRootForFile } from "../language-profile.js";
 import { logLatency, phaseFinished, phaseStarted } from "../latency-logger.js";
 import { isSpawnableCommand } from "../installer/index.js";
-import { normalizeEphemeralMapKey, normalizeMapKey } from "../path-utils.js";
+import {
+	isAbsoluteFilePath,
+	normalizeEphemeralMapKey,
+	normalizeMapKey,
+} from "../path-utils.js";
 import { loadPiLensProjectConfig } from "../project-lens-config.js";
 import { RUNTIME_CONFIG, getRunnerTimeoutFloorMs } from "../runtime-config.js";
 import { safeSpawnAsync } from "../safe-spawn.js";
@@ -1199,10 +1206,32 @@ export async function dispatchForFile(
 	// writes always land together, the relative fallback is both unneeded
 	// and the sole source of the collision — removed rather than cwd-scoped
 	// (`cwd` is not a stable identity across this seam's callers, #2494).
+	//
+	// #2489 round 2: the #2016 invariant above is enforced by
+	// `createDispatchContext`, the sole real constructor, but nothing enforced
+	// it AT THIS SEAM — a hand-built `DispatchContext` (test scaffolding, a
+	// future caller) carrying a relative `filePath` would silently key the
+	// baseline under a value the constructor could never produce, and every
+	// subsequent same-session dispatch of the real (absolute-keyed) file would
+	// read back `undefined`, never the collision itself. Mirrors the sibling
+	// guard `recordEntitySnapshotDiff` already enforces for the entity-snapshot
+	// seam (`clients/review-graph/service.ts`, #2477): reject visibly and skip
+	// the baseline read/write for this dispatch rather than compute one under
+	// an unreachable key.
+	const baselinePathSafe = isAbsoluteFilePath(ctx.filePath);
+	if (ctx.deltaMode && !baselinePathSafe) {
+		recordDegradationOnce({
+			kind: "dispatch-non-absolute-baseline-path",
+			subject: ctx.filePath,
+			reason:
+				"dispatchForFile requires an absolute ctx.filePath to key the delta baseline (refs #2489)",
+		});
+	}
 	const baselineAbsKey = `session.baseline.${ctx.filePath}`;
-	const previousBaseline = ctx.deltaMode
-		? ctx.facts.getBoundedSessionFact<Diagnostic[]>(baselineAbsKey)
-		: undefined;
+	const previousBaseline =
+		ctx.deltaMode && baselinePathSafe
+			? ctx.facts.getBoundedSessionFact<Diagnostic[]>(baselineAbsKey)
+			: undefined;
 	const baselineWarnings = previousBaseline?.filter(
 		(d) => d.semantic === "warning" || d.semantic === "none",
 	);
@@ -1289,7 +1318,11 @@ export async function dispatchForFile(
 	}
 
 	// Persist full current snapshot for next run (not delta-filtered subset).
-	if (ctx.deltaMode) {
+	// Gated on `baselinePathSafe` too: a non-absolute `ctx.filePath` already
+	// skipped the read above (the degradation record fired there), and writing
+	// under that same unreachable key here would just seed a baseline no real
+	// reader (always absolute) could ever read back.
+	if (ctx.deltaMode && baselinePathSafe) {
 		ctx.facts.setBoundedSessionFact(baselineAbsKey, [...dedupedDiagnostics]);
 	}
 
@@ -1389,6 +1422,13 @@ export async function dispatchForFile(
 			})),
 			totalDiagnostics: visibleDiagnostics.length,
 			blockers: blockers.length,
+			// #2489 round 2: distinguishes a delta baseline HIT (a prior snapshot
+			// was read for this file this session) from a MISS (first dispatch, or
+			// the non-absolute-path guard above skipped the read) — `dispatch_start`
+			// (above, `metadata: { groupCount, kind, runners }`) fires before the
+			// baseline read ever runs and cannot carry either value.
+			baselineHit: previousBaseline !== undefined,
+			baselineWarningCount,
 		},
 	});
 

@@ -11,4 +11,9 @@ section: Fixed
   so a project's first-ever delta baseline read could silently return a
   different project's stored diagnostics. The relative fallback is removed;
   the baseline is now keyed on the absolute, normalized file path only,
-  which can never collide across projects.
+  which can never collide across projects. The absolute-path invariant is
+  now enforced at this seam too (a hand-built, non-absolute `filePath`
+  skips the baseline read/write with a visible degradation record, mirroring
+  the review-graph entity-snapshot guard from #2477), and the delta
+  baseline hit/miss and warning count are now surfaced on the
+  `dispatch_complete` latency record.
