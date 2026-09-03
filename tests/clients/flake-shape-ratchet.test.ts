@@ -16,18 +16,21 @@
  *
  * `FLAKE_SHAPE_BASELINE` (`tests/support/flake-shape-baseline.json`) is
  * today's population, content-keyed as `file → count` per detector — the
- * burn-down floor, not a target. The ratchet fails on:
+ * exact floor, kept in lockstep with the live scan, not a one-way ratchet
+ * that only ever tightens on its own. The ratchet is TWO-SIDED and fails on:
  *
  * - a NEW file the scan flags that the baseline does not name, in any
  *   detector;
  * - an allowlisted file whose count in a detector RISES above its pinned
- *   value.
- *
- * A count that FALLS is not a failure — improving a file is never penalized,
- * though the baseline is left un-tightened until someone edits it (the same
- * asymmetry `sweep-kit.ts`'s `auditRegistry` chooses for stale exemptions,
- * one layer up: this ratchet's "problem" direction is only ever "something
- * got worse").
+ *   value;
+ * - an allowlisted file whose count in a detector FALLS below its pinned
+ *   value — a stale ceiling. Left unpinned, a pinned-5/live-2 file can
+ *   regrow to 4 new instances of the flake shape without ever tripping the
+ *   RISES check above (2 < 5, then 4 < 5): the pin silently re-admits
+ *   everything the improvement burned down. Every other ratchet in this repo
+ *   refuses a stale entry the same way (`single-flight-ratchet.test.ts`,
+ *   `sweep-kit.ts`'s `auditRegistry`) — a fall is fixed by editing the
+ *   baseline down to the live count, not left to drift.
  *
  * Admission of a genuinely NEW entry (a new file, or a risen count in an
  * existing one) is a two-part gate, both required: the file carries a
@@ -118,22 +121,28 @@ function wallClockBudgetInclude(): string[] {
 interface RatchetProblem {
 	file: string;
 	detector: DetectorName;
-	kind: "new-file" | "count-risen";
+	kind: "new-file" | "count-risen" | "stale-ceiling";
 	before?: number;
 	after: number;
 }
 
 /**
  * Compare today's live counts against the pinned baseline for one detector.
- * Only two directions are problems: a file the baseline has never seen, and
- * an allowlisted file whose count exceeds its pin. A file that drops out
- * entirely, or whose count falls, is fine as-is.
+ * Three directions are problems: a file the baseline has never seen, an
+ * allowlisted file whose count exceeds its pin, and — two-sided — an
+ * allowlisted file whose count FALLS below its pin (a stale ceiling: left
+ * alone it silently re-admits regrowth up to the old, higher pin without
+ * ever tripping the RISES check). A file that drops out of the live scan
+ * entirely is handled separately (see "the baseline names no file that has
+ * vanished" below); this function only walks `live`, so a file no longer
+ * flagged at all is not iterated here.
  */
 function auditAgainstBaseline(
 	detector: DetectorName,
 	live: Readonly<Record<string, number>>,
+	baseline: Readonly<Baseline> = FLAKE_SHAPE_BASELINE,
 ): RatchetProblem[] {
-	const pinned = FLAKE_SHAPE_BASELINE[detector] ?? {};
+	const pinned = baseline[detector] ?? {};
 	const problems: RatchetProblem[] = [];
 	for (const [file, count] of Object.entries(live)) {
 		const before = pinned[file];
@@ -144,6 +153,14 @@ function auditAgainstBaseline(
 				file,
 				detector,
 				kind: "count-risen",
+				before,
+				after: count,
+			});
+		} else if (count < before) {
+			problems.push({
+				file,
+				detector,
+				kind: "stale-ceiling",
 				before,
 				after: count,
 			});
@@ -159,9 +176,16 @@ function describeProblem(p: RatchetProblem): string {
 		: " — admit it with a `// flake-shape: <detector> — <reason>` header " +
 			"and add the file to vitest.config.ts's wallClockBudgetInclude, or " +
 			"remove the real spawn / wall-clock assertion / raw timer wait";
-	return p.kind === "new-file"
-		? `${p.detector}: NEW flagged file ${p.file} (${p.after} hit(s))${admittedNote}`
-		: `${p.detector}: ${p.file} rose from ${p.before} to ${p.after} hit(s)${admittedNote}`;
+	if (p.kind === "new-file") {
+		return `${p.detector}: NEW flagged file ${p.file} (${p.after} hit(s))${admittedNote}`;
+	}
+	if (p.kind === "stale-ceiling") {
+		return (
+			`${p.detector}: ${p.file} fell from ${p.before} to ${p.after} hit(s) ` +
+			`— tighten the baseline to ${p.after}`
+		);
+	}
+	return `${p.detector}: ${p.file} rose from ${p.before} to ${p.after} hit(s)${admittedNote}`;
 }
 
 describe("flake-shape ratchet (#2547)", () => {
@@ -245,14 +269,53 @@ describe("flake-shape ratchet — the compare function", () => {
 		expect(problems[0].kind).toBe("count-risen");
 	});
 
-	it("does not flag a pinned file whose count fell (improvement is not a failure)", () => {
+	it("flags a pinned file whose count fell — a stale ceiling, not a free pass", () => {
+		// Two-sided ratchet (reviewer probe): a fall is NOT silently accepted.
+		// Left unpinned it is a stale ceiling that later re-admits regrowth
+		// without ever tripping the count-risen check.
 		const [firstFile, firstCount] = Object.entries(
 			FLAKE_SHAPE_BASELINE["raw-timer-wait"],
 		).find(([, count]) => count > 1)!;
 		const problems = auditAgainstBaseline("raw-timer-wait", {
 			[firstFile]: firstCount - 1,
 		});
-		expect(problems).toEqual([]);
+		expect(problems).toHaveLength(1);
+		expect(problems[0].kind).toBe("stale-ceiling");
+		expect(describeProblem(problems[0])).toContain(
+			`tighten the baseline to ${firstCount - 1}`,
+		);
+	});
+
+	it("ATTACK (reviewer probe): pinned 5, live drops to 2, regrows to 4 — still flagged, never silently re-admitted", () => {
+		// Drives the REAL auditAgainstBaseline via its injectable baseline
+		// param, not a re-derived copy of its logic.
+		const file = "clients/probe-fixture.test.ts";
+		const pinned5: Baseline = {
+			"real-process-spawn": {},
+			"elapsed-time-assertion": {},
+			"raw-timer-wait": { [file]: 5 },
+		};
+
+		// Drops to 2 (an improvement — but the ceiling is now stale at 5).
+		const dropped = auditAgainstBaseline(
+			"raw-timer-wait",
+			{ [file]: 2 },
+			pinned5,
+		);
+		expect(dropped).toHaveLength(1);
+		expect(dropped[0].kind).toBe("stale-ceiling");
+
+		// Regrows to 4 — still under the stale pin of 5, so the RISES check
+		// alone (pre-fix) would say nothing; the two-sided check still flags
+		// it because 4 < 5.
+		const regrown = auditAgainstBaseline(
+			"raw-timer-wait",
+			{ [file]: 4 },
+			pinned5,
+		);
+		expect(regrown).toHaveLength(1);
+		expect(regrown[0].kind).toBe("stale-ceiling");
+		expect(regrown[0].after).toBe(4);
 	});
 });
 
