@@ -382,8 +382,9 @@ export async function runTestTargetsBounded<T, R>(args: {
 			await stamp;
 		},
 	);
-	// The pool's mapper swallows every throw, so this can only reject on an
-	// internal fault — never leave it unhandled after the race below.
+	// The pool's mapper swallows every throw from an async `run`; a `run` that throws
+	// SYNCHRONOUSLY still rejects the pool and closes the whole batch (everything defers,
+	// nothing publishes clean). Production runners are async, so this is fail-safe, not reachable.
 	void pool.catch(() => {});
 
 	await new Promise<void>((resolve) => {
