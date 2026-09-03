@@ -195,8 +195,14 @@ running", without reading a log.
 Naming a `file` resolves the configuration **at that file's own directory**,
 which is where the runtime decides from — so a nested `repo/sub/.pi-lens.json`
 layer contributes to the answer, appears in the reported document list, and is
-named as the file behind any decision it made. The walk runs upward, so the
-workspace's own documents are always included too.
+named as the file behind any decision it made. The walk runs upward and is
+**confined to `cwd`**: a `file` that resolves outside `cwd` — including a
+sibling package in the same monorepo — is rejected rather than answered from
+its own unrelated tree, because the per-file answer is only ever correct when
+it is a superset of the workspace's own; the rejection names the `cwd` it was
+measured against and the remedy is to re-query with `cwd` set to that file's
+own workspace. A confined `file` always passes back through the workspace's
+own documents on its way up, so they are always included too.
 
 It reports **sources, never values**. Environment values never appear, a custom
 server's command line is cut to the binary itself, and every path is rewritten

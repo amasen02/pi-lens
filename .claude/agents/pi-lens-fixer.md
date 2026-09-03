@@ -164,10 +164,11 @@ finding with its red-run evidence.
 
 ## Hard-won mechanics (2026-08-26 harvest — each cost a fix round)
 
-- **Screen the diff against shapes 28–34 before pushing** (hot-path hoist for a
+- **Screen the diff against shapes 28–35 before pushing** (hot-path hoist for a
   cold record, cap reset by its own selector, module-load platform const,
   pull-only observability, mixed-case path predicate, source-text assertion
-  in place of a runtime probe, spelling-enumerating guard). Each cost a review round
+  in place of a runtime probe, spelling-enumerating guard, a guard that reds
+  only on a platform CI never runs). Each cost a review round
   on 2026-09-03; each has a one-line screen in AGENTS.md.
 - **You are a leaf. Never spawn agents.** A fixer that spawned two helper
   agents (#2526, 2026-09-03) returned an empty report while its children ran
@@ -219,6 +220,12 @@ finding with its red-run evidence.
   version if absent, `npx oxfmt --check` on every file you touched, format
   and re-test if it flags. Never attribute a red format check to the
   environment without reading which files it names.
+- **Small batches run vitest directly; the shared slot is for big ones.**
+  `npm run test:targeted` queues on a machine-wide slot that twelve
+  concurrent lanes keep busy; three fixers on 2026-09-03 backgrounded it and
+  parked. For up to ~15 files run `npx vitest run <files>` in the FOREGROUND
+  with an explicit timeout; reserve `test:targeted` for the governance batch,
+  and even then foreground it.
 - **Never park your turn behind a background command.** Two agents in one day
   went idle "waiting" on a backgrounded full `npm test` and had to be manually
   resumed. Run builds and test suites in the FOREGROUND with an explicit
