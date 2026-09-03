@@ -62,12 +62,22 @@ import path from "node:path";
 import { BoundedLruCache } from "../bounded-cache.js";
 import {
 	lspSectionOf,
+	type PiLensConfigResolution,
 	reportConfigReadFailure,
 	reportPiLensConfigRecords,
 	resolvePiLensConfig,
+	summarizeConfigResolution,
 } from "../config-resolve.js";
 import { getGlobalPiLensDir } from "../file-utils.js";
+import {
+	claimPhaseOncePerSession,
+	currentSessionRecordId,
+	logLatency,
+	releaseOncePerSessionPhase,
+} from "../latency-logger.js";
 import { getPiLensGlobalConfigPath } from "../lens-config.js";
+import { normalizeFilePath } from "../path-utils.js";
+import { logSessionStart } from "../sessionstart-logger.js";
 import { launchLSP } from "./launch.js";
 import {
 	registerSessionRoot,
@@ -195,12 +205,160 @@ export interface LoadLSPConfigOptions {
 	readonly report?: boolean;
 }
 
+/** The session-scoped phase this loader claims (#2526). */
+const CONFIG_RESOLVED_PHASE = "config_resolved";
+
+/**
+ * Write the session's ONE `config_resolved` record (#2526).
+ *
+ * Positive observability for the Phase 0 config stack: before this, a correct
+ * canonical-only resolution proved itself only by the ABSENCE of
+ * `PILENS_CFG_*` rows — the silent-success gap AGENTS.md warns about.
+ *
+ * REDACTED by construction, not by mode. Everything it can say comes from
+ * `summarizeConfigResolution`, the same projection `pilens_effective_config`
+ * embeds: document PATHS (home-relative), tiers, the legacy flag, per-tier
+ * leaf counts, and a record COUNT. No config value, and no absolute `$HOME`,
+ * can reach the log through it.
+ *
+ * NO SECOND RESOLUTION (#2513's facade rule): it reads the resolution its
+ * caller already performed. And it adds no `await` — `logLatency` and
+ * `logSessionStart` are synchronous buffered writers — so the session-start
+ * hook path gains nothing to wait on (#2523).
+ *
+ * ONE row per session AND SERVED ROOT, claimed through the logger's own
+ * session-scoped bookkeeping rather than a latch kept here. `loadLSPConfig` is
+ * the funnel every config resolution goes through (`initLSPConfig` at session
+ * start and at each served root, the MCP `ensureReady` boot,
+ * `ensureLSPConfigInitialized` on the first edit), so an unconditional write
+ * would emit one row per resolution and the per-session count the smell
+ * analyzer joins on would be unrecoverable from the log.
+ *
+ * The ROOT is part of the claim (#2526 review round 2, F3). A warm MCP server
+ * calls `ensureReady` per served root (`mcp/server.ts`), and a phase-only
+ * claim recorded the FIRST root's documents and nothing else — project B's
+ * legacy config document never reached a row, so the
+ * "legacy-document-with-no-records" smell structurally could not fire for it.
+ * `normalizeFilePath` keys it, the repo-wide rule for every path-keyed map
+ * (#210): a `/`-vs-`\` spelling of one root must not buy a second row.
+ */
+/**
+ * Announce, at the instant a resolution is actually about to be attempted,
+ * that THIS session expects a `config_resolved` row (#2526 review round 3,
+ * S1).
+ *
+ * Round 2 PREDICTED this from three flags in `runtime-session.ts`
+ * (`no-lsp`/`subagent`/`warm-attach`), each mirroring one gate the resolution
+ * paths themselves check — and the mirror drifted: quick and minimal mode's
+ * SECOND session in one process schedule no resolution at all
+ * (`ensureLSPConfigInitialized`'s `_lspConfigInitializedCwds` memo skips the
+ * synchronous resolve past the first session, and only FULL mode's deferred
+ * `setImmediate` reschedules one), so the predicate kept saying
+ * `expected=true` for a session that was never going to resolve, and the
+ * analyzer flagged a real session every time under `PI_LENS_STARTUP_MODE=quick`
+ * or `=minimal`. STOP PREDICTING: this function is called from `loadLSPConfig`
+ * itself rather than from any of its callers' decision points, because
+ * `loadLSPConfig` is the ONE funnel every production caller reaches —
+ * `initLSPConfig` (`ensureLSPConfigInitialized`'s first-session-per-cwd path
+ * in index.ts, the MCP `ensureReady` boot via `ensureLspConfig`,
+ * `igniteWarmFiles`/`igniteDominantLanguageWarm`) and the two direct calls in
+ * `runtime-session.ts` (the full-mode deferred `setImmediate` load and the
+ * quick-mode warm-up's LSP pre-warm). Placing the mark here rather than at
+ * each of those four sites buys three things: (a) it fires exactly when a
+ * resolution is genuinely attempted, never merely decided likely; (b) a
+ * session that never reaches ANY of those sites — quick or minimal mode's
+ * second-and-later session in a process, for the same root — never gets a
+ * mark, so the analyzer silently excludes it instead of counting it against;
+ * (c) this mark and {@link recordConfigResolved}'s row are stamped from the
+ * SAME `currentSessionRecordId()` read, a few lines apart in one function
+ * call, so they can never disagree about which session they belong to —
+ * writing the mark at each scheduling site instead (e.g. before a
+ * `setImmediate`) would let a session boundary between scheduling and
+ * execution attribute the two halves to different sessions.
+ *
+ * Written unconditionally — before {@link resolvePiLensConfig} can throw —
+ * so a resolution that is entered but fails mid-flight leaves a mark with no
+ * row, which the analyzer's join reads as "expected and never happened"
+ * rather than silently matching "never expected at all".
+ *
+ * Carries `root=<normalizeFilePath(cwd)>` (#2552 review round 4, MEDIUM): the
+ * warm MCP server keeps ONE session id for the life of the process but calls
+ * this once per SERVED ROOT (`ensureReady` per root, `mcp/server.ts`) — a
+ * session-id-only mark let one root's `config_resolved` row silently clear
+ * every OTHER root's deficit under the same id, reintroducing review round
+ * 2's F3 defect one layer up, at the analyzer's join instead of the claim.
+ * The value is the SAME `normalizeFilePath(cwd)` string
+ * {@link recordConfigResolved} uses for its claim scope and its row's
+ * `filePath`, so the mark and the row compare equal without the analyzer
+ * re-deriving any path normalization of its own.
+ */
+function publishConfigResolutionPending(cwd: string): void {
+	logSessionStart(
+		`session_start config_resolution_pending session=${currentSessionRecordId()} ` +
+			`root=${normalizeFilePath(cwd)}`,
+	);
+}
+
+function recordConfigResolved(
+	cwd: string,
+	resolution: PiLensConfigResolution,
+	lspConfig: LSPConfig,
+	homeDir: string,
+	resolveMs: number,
+): void {
+	// #2552 review round 4: computed ONCE and reused for the claim scope, the
+	// row's `filePath`, and the sessionstart line's `root=` — one normalization
+	// of `cwd`, so the pending mark, the row, and the claim can never disagree
+	// about which root they name.
+	const root = normalizeFilePath(cwd);
+	if (!claimPhaseOncePerSession(CONFIG_RESOLVED_PHASE, root)) {
+		return;
+	}
+	const summary = summarizeConfigResolution(resolution, homeDir);
+	// #2526 R2 F2: the session identity the analyzer joins on. Written on both
+	// sinks from this ONE call, so the latency row and the sessionstart line
+	// carry the same id by construction rather than by agreement.
+	const sessionId = currentSessionRecordId();
+	// The deny UNION's size, read off the same projection the gates consume
+	// (`lspConfigOf`) rather than re-read from the raw value — one definition of
+	// "which servers are denied", so the record cannot describe a different
+	// deny set than the one that actually suppresses a server.
+	const deniedServers = lspConfig.disabledServers?.length ?? 0;
+	const legacyDocuments = summary.documents.filter(
+		(document) => document.legacy,
+	).length;
+	logLatency({
+		type: "phase",
+		phase: CONFIG_RESOLVED_PHASE,
+		filePath: root,
+		durationMs: resolveMs,
+		metadata: {
+			sessionId,
+			documents: summary.documents,
+			countsByTier: summary.countsByTier,
+			recordCount: summary.recordCount,
+			deniedServers,
+			resolveMs,
+		},
+	});
+	logSessionStart(
+		`config resolved documents=${summary.documents.length} legacy=${legacyDocuments} ` +
+			`records=${summary.recordCount} deniedServers=${deniedServers} resolveMs=${resolveMs} ` +
+			`session=${sessionId} root=${root}`,
+	);
+}
+
 export async function loadLSPConfig(
 	cwd: string,
 	homeDir: string = os.homedir(),
 	options: LoadLSPConfigOptions = {},
 ): Promise<LSPConfig> {
 	const reporting = options.report !== false;
+	// #2526 review round 3, S1: announce the attempt before anything that
+	// resolves it can throw — see `publishConfigResolutionPending`'s doc
+	// comment for why this lives here rather than at each caller.
+	publishConfigResolutionPending(cwd);
+	const resolveStartedAt = Date.now();
 	const resolution = resolvePiLensConfig({
 		cwd,
 		globalDir: getGlobalPiLensDir(),
@@ -227,7 +385,21 @@ export async function loadLSPConfig(
 	// owned record from a document only this multi-file resolution discovered.
 	if (reporting) reportPiLensConfigRecords(resolution.records);
 
-	return lspConfigOf(resolution.value);
+	const config = lspConfigOf(resolution.value);
+	// #2526: the session's one positive record that config resolution HAPPENED,
+	// written where the resolution actually exists. `report: false` is not a
+	// gate here — the option suppresses USER-FACING notices, and a record in
+	// the latency log is not a notice; gating on it would let a session whose
+	// only resolution was a quiet one look, in the log, like a session that
+	// never resolved config at all.
+	recordConfigResolved(
+		cwd,
+		resolution,
+		config,
+		homeDir,
+		Date.now() - resolveStartedAt,
+	);
+	return config;
 }
 
 /**
@@ -604,6 +776,14 @@ export function resetLSPConfigStateForTests(): void {
 	// The warn latch is loader state too: a test that re-reads the same broken
 	// path after this reset must see the warning again, not a latched silence.
 	resetLSPConfigWarnCache();
+	// #2526: same reasoning for the per-session `config_resolved` claim — a
+	// test that resolves again after this reset must produce its record, not
+	// inherit a previous test's "already recorded" claim. Narrowed to THIS
+	// loader's own phase (review round 2, S1): the blanket
+	// `resetOncePerSessionPhases()` this used to call is the SESSION boundary's
+	// call to make — it also re-mints the session identity — and reaching for
+	// it from one producer's test reset cleared claims this module does not own.
+	releaseOncePerSessionPhase(CONFIG_RESOLVED_PHASE);
 }
 
 /**

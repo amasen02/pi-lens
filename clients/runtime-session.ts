@@ -1884,6 +1884,13 @@ export async function handleSessionStart(
 	// live anchor into one bounded previous slot so the queued event keeps the
 	// replaced session's attribution until a newer live message_end is seen.
 	rotateMessageEndAttribution();
+	// #2526: the once-per-session `config_resolved` claim is NOT re-armed here.
+	// index.ts resolves this session's config in `ensureLSPConfigInitialized`
+	// BEFORE it calls this handler, so a re-arm on this line would fire between
+	// the session's own two resolutions and the deferred `loadLSPConfig` below
+	// would write a second row for one session (review round 2, F1). The re-arm
+	// lives in index.ts's `session_start` closure, ahead of that ensure and
+	// behind the #473 gate — see `resetOncePerSessionPhases`'s doc comment.
 	const handlerEnteredAt = Date.now();
 	const sessionStartMs = deps.sessionStartFiredAt ?? handlerEnteredAt;
 	const cwdForTelemetry = deps.ctxCwd ?? process.cwd();
@@ -2406,6 +2413,12 @@ export async function handleSessionStart(
 
 	const hasWorkspaceCwd = typeof ctxCwd === "string" && ctxCwd.length > 0;
 	const cwd = ctxCwd ?? process.cwd();
+	// #2526 review round 3, S1: this handler no longer predicts whether config
+	// will resolve. `loadLSPConfig` itself publishes a `config_resolution_pending`
+	// mark, from inside the function, at the instant a resolution is actually
+	// attempted — see that function's doc comment (`clients/lsp/config.ts`) for
+	// why a prediction mirrored against this handler's own gates drifted from
+	// what index.ts and this handler's callers actually schedule.
 	// #1228: generic atomic-write stages are shared by several project stores,
 	// so the review-graph-specific sweep cannot own this namespace. Sweep the
 	// project data roots and machine-global registry root once per session start;

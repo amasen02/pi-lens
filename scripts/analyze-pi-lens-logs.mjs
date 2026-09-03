@@ -221,6 +221,35 @@ function createState(files) {
 				progress: [],
 			},
 		},
+		// #2526: the config stack's positive-observability rows. `resolved`
+		// counts `config_resolved` phase records; `legacyWithoutRecords` counts
+		// the rows that carry a deprecated document but produced no
+		// migration/notice record — the deprecation machinery gone silent.
+		//
+		// Round 2, F2: the session->row relation is a JOIN on the session id both
+		// sides carry, not a subtraction of two counts.
+		//
+		// Round 3, S1: the session-side half of the join is no longer a
+		// PREDICTION. `pendingSessions` holds every session id that published a
+		// `config_resolution_pending` mark — written by `loadLSPConfig` itself,
+		// at the instant a resolution is actually attempted, never by a
+		// `runtime-session.ts` handler guessing from `no-lsp`/subagent/warm-attach
+		// flags ahead of time. A session that never reaches that call (quick or
+		// minimal mode's second-and-later session in a process, for the same
+		// root) never gets a mark, so it is silently excluded rather than
+		// counted against. `resolvedSessions` holds every session id a
+		// resolution actually reported, from EITHER sink (the latency row or the
+		// sessionstart line — one call writes both, so this is one fact
+		// surviving an independent rotation of either log, not a second source
+		// of truth).
+		config: {
+			resolved: 0,
+			pendingSessions: new Map(),
+			resolvedSessions: new Set(),
+			legacyDocuments: 0,
+			legacyWithoutRecords: 0,
+			examples: [],
+		},
 		diagnostics: {
 			bySeverity: counter(),
 			byTool: counter(),
@@ -352,6 +381,43 @@ async function analyzeLatency(files, state) {
 				const phase = entry.phase ?? "unknown";
 				state.latency.phaseCounts.inc(phase);
 				if (phase.endsWith("_timeout")) state.latency.phaseTimeouts.inc(phase);
+				if (phase === "config_resolved") {
+					// #2526. Counted here rather than derived from phaseCounts so the
+					// legacy/record cross-check reads the same row it counts.
+					state.config.resolved += 1;
+					const md = entry.metadata ?? {};
+					// #2526 R2 F2 / #2552 R4: the join key is (session, root), not
+					// session alone — see `configJoinKey`'s doc comment. `entry.filePath`
+					// is this row's root (the same `normalizeFilePath(cwd)` value the
+					// pending mark's `root=` carries); a row from a build that predates
+					// the session id carries none, and simply joins to nothing.
+					if (
+						typeof md.sessionId === "string" &&
+						md.sessionId.length > 0 &&
+						typeof entry.filePath === "string" &&
+						entry.filePath.length > 0
+					) {
+						state.config.resolvedSessions.add(
+							configJoinKey(md.sessionId, entry.filePath),
+						);
+					}
+					const documents = Array.isArray(md.documents) ? md.documents : [];
+					const legacy = documents.filter((doc) => doc?.legacy === true);
+					state.config.legacyDocuments += legacy.length;
+					// A deprecated document that produced NO record means the
+					// migration notices went silent — the user is on a removal
+					// schedule and is never told. Zero records with zero legacy
+					// documents is the correct canonical-only answer, not a smell.
+					if (legacy.length > 0 && Number(md.recordCount ?? 0) === 0) {
+						state.config.legacyWithoutRecords += 1;
+						pushTop(
+							state.config.examples,
+							summarizeConfigResolved(entry, "legacy document with 0 records"),
+							limit * 3,
+							byDuration,
+						);
+					}
+				}
 				if (
 					phase === "total" &&
 					(entry.durationMs ?? 0) >= thresholds.totalSlowMs
@@ -636,6 +702,40 @@ async function analyzeSessionStart(files, state) {
 				trackProject(state, cwd);
 			}
 
+			// #2526 R3 S1: this session's config-resolution PENDING mark, published
+			// by `loadLSPConfig` itself at the instant a resolution is actually
+			// attempted — never a start-line prediction from `no-lsp`/subagent/
+			// warm-attach flags. A session that never calls `loadLSPConfig` (quick
+			// or minimal mode's second-and-later session in a process, for the
+			// same root) never writes this line, and is correctly absent from the
+			// join rather than counted against.
+			//
+			// #2552 R4: `root=` is REQUIRED in the match — a warm MCP process keeps
+			// one session id for its whole life but marks once per served root
+			// (`configJoinKey`'s doc comment), so a line missing it cannot be
+			// attributed to a specific root and is left out of the join rather than
+			// guessed into a wrong one.
+			const pending =
+				/session_start config_resolution_pending session=(\S+) root=(.*)$/.exec(
+					message,
+				);
+			if (pending) {
+				const [, sessionId, root] = pending;
+				state.config.pendingSessions.set(configJoinKey(sessionId, root), {
+					ts: iso(ts),
+					sessionId,
+					root,
+				});
+			}
+			// The loader's own line is the second half of the join, so a rotated
+			// latency.log cannot manufacture a deficit on its own.
+			const resolvedSession =
+				/config resolved .*\bsession=(\S+) root=(.*)$/.exec(message);
+			if (resolvedSession) {
+				const [, sessionId, root] = resolvedSession;
+				state.config.resolvedSessions.add(configJoinKey(sessionId, root));
+			}
+
 			const total = /session_start total:\s*(\d+)ms/.exec(message);
 			if (total && Number(total[1]) >= thresholds.startupSlowMs) {
 				state.smellTotals.inc("slow-session-start");
@@ -899,6 +999,21 @@ function iso(date) {
 	return date?.toISOString?.() ?? "unknown";
 }
 
+/**
+ * The config-resolution join key (#2552 review round 4). A warm MCP process
+ * keeps ONE session id for its entire life but calls `loadLSPConfig` once per
+ * SERVED ROOT (#2526 review round 2, F3's premise, reintroduced one layer up
+ * here) — joining on session id alone let one root's row silently clear every
+ * OTHER root's deficit under the same session id. `root` is whatever string
+ * the producer already wrote (the pending mark's `root=`, or the row's own
+ * `filePath` — both come from the SAME `normalizeFilePath(cwd)` call in
+ * `clients/lsp/config.ts`, so they compare equal without this script
+ * re-deriving any path normalization of its own).
+ */
+function configJoinKey(sessionId, root) {
+	return `${sessionId} ${root}`;
+}
+
 function counter() {
 	const map = new Map();
 	return {
@@ -982,6 +1097,33 @@ function summarizeLatency(entry) {
 			"totalDiagnostics",
 			"blockers",
 		]),
+	};
+}
+
+/**
+ * A `config_resolved` row (#2526), summarised for a smell example.
+ *
+ * Deliberately NOT `summarizeLatency`: that helper's metadata whitelist would
+ * drop every field this row carries, so the example would print a phase name
+ * and nothing a reader could act on.
+ */
+function summarizeConfigResolved(entry, note) {
+	const md = entry.metadata ?? {};
+	const documents = Array.isArray(md.documents) ? md.documents : [];
+	return {
+		ts: entry.ts,
+		durationMs: entry.durationMs,
+		phase: entry.phase,
+		project: projectOf(entry.filePath),
+		note,
+		documents: documents
+			.map(
+				(doc) =>
+					`${doc?.tier ?? "?"}:${doc?.file ?? "?"}${doc?.legacy ? " (legacy)" : ""}`,
+			)
+			.slice(0, 8),
+		recordCount: md.recordCount,
+		deniedServers: md.deniedServers,
 	};
 }
 
@@ -1193,6 +1335,43 @@ function buildReport(state) {
 		`session_start background tasks >= ${thresholds.backgroundSlowMs}ms`,
 		state.session.slowTasks.slice(0, limit),
 	);
+	// #2526: config resolution has to prove it HAPPENED. Two shapes, one smell:
+	//
+	// (a) a session that has a `config_resolution_pending` mark and produced no
+	//     `config_resolved` row. Round 3, S1: the pending mark is written by
+	//     `loadLSPConfig` itself, at the instant a resolution is actually
+	//     attempted — never predicted from a handler's own flags ahead of time.
+	//     Round 2, F2 established the JOIN itself: on the session id both sides
+	//     carry, never a subtraction of two counts (subtracting counted quick
+	//     sessions' rows against full sessions' start lines — different
+	//     populations — which both masked total silence and charged
+	//     `--no-lsp`/subagent sessions with a permanent deficit they could never
+	//     clear).
+	//     Round 4, #2552 review: the join is on (session, root), not session
+	//     alone — a warm MCP process keeps one session id for its whole life but
+	//     marks once per SERVED ROOT (`configJoinKey`'s doc comment), so one
+	//     root's row must not clear another root's deficit under the same id.
+	// (b) a legacy document present with zero records — the deprecation
+	//     machinery went silent while the user is on a removal schedule.
+	const pendingConfigResolution = [...state.config.pendingSessions.entries()];
+	const unresolvedSessions = pendingConfigResolution.filter(
+		([key]) => !state.config.resolvedSessions.has(key),
+	);
+	for (const [, value] of unresolvedSessions.slice(0, limit * 3)) {
+		state.config.examples.push({
+			ts: value.ts,
+			session: value.sessionId,
+			root: value.root,
+			note: "session had a config_resolution_pending mark and produced no config_resolved row",
+		});
+	}
+	addSmell(
+		smells,
+		"config-resolution",
+		unresolvedSessions.length + state.config.legacyWithoutRecords,
+		`Sessions with a config_resolution_pending mark but no config_resolved row (${unresolvedSessions.length} of ${pendingConfigResolution.length}) or a legacy config document that produced no migration record (${state.config.legacyWithoutRecords})`,
+		state.config.examples.slice(0, limit),
+	);
 	addSmell(
 		smells,
 		"cascade-fallbacks",
@@ -1351,6 +1530,16 @@ function buildReport(state) {
 			cwds: state.session.cwds.top(limit),
 			rotations: state.session.rotations.toJSON(),
 			errors: state.session.errors.slice(0, limit),
+		},
+		// #2526: the positive-observability counters behind the
+		// `config-resolution` smell, so a reader can see WHY it fired (or that
+		// it correctly did not) without re-deriving the deficit.
+		config: {
+			resolved: state.config.resolved,
+			sessionsPendingResolution: pendingConfigResolution.length,
+			sessionsWithoutResolution: unresolvedSessions.length,
+			legacyDocuments: state.config.legacyDocuments,
+			legacyWithoutRecords: state.config.legacyWithoutRecords,
 		},
 		actionable: {
 			events: state.actionable.events.toJSON(),

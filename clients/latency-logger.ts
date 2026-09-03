@@ -629,6 +629,146 @@ export function resetCurrentPhaseForSession(): void {
 	closedBrackets = [];
 }
 
+/**
+ * Phases already written ONCE for the current session (#2526).
+ *
+ * Session-scoped telemetry bookkeeping, which is this module's own domain —
+ * the same reason `liveBrackets` and `recentPhases` live here rather than in
+ * each producer. A producer that is called many times per session but whose
+ * record is a SESSION fact (`config_resolved`: `loadLSPConfig` runs at session
+ * start, per served root, and on the first edit, all resolving the same
+ * config) asks here instead of keeping its own latch, so the "one row per
+ * session" a log reader counts against is a property of the logger rather than
+ * a convention each producer re-implements.
+ */
+const oncePerSessionPhases = new Set<string>();
+
+/**
+ * The identity every once-per-session record of THIS session is stamped with
+ * (#2526 review round 2, F2).
+ *
+ * A line-oriented log reader cannot join two files by adjacency: sessionstart.
+ * log's start lines and latency.log's phase rows interleave differently, rotate
+ * independently, and (for the warm MCP server) can span days. The first round
+ * therefore SUBTRACTED row counts from start-line counts, which silently
+ * assumed the two counted the same population — they do not, and the
+ * mismatch both masked total silence and manufactured a permanent false
+ * deficit. An id makes the join explicit: `handleSessionStart` publishes it
+ * beside its expectation, the record carries it, and the analyzer matches.
+ *
+ * It is minted HERE, beside the claim set it identifies, so "which session is
+ * this record from" and "has this session already recorded" can never answer
+ * from different sessions.
+ *
+ * Minted at module load too, not only on re-arm: the warm MCP server resolves
+ * config through `ensureReady` without any session boundary of its own, and a
+ * record with no id at all would be unjoinable rather than merely unmatched.
+ */
+let sessionRecordSeq = 0;
+
+function mintSessionRecordId(): string {
+	sessionRecordSeq += 1;
+	return `${process.pid.toString(36)}-${Date.now().toString(36)}-${sessionRecordSeq.toString(36)}`;
+}
+
+let sessionRecordId = mintSessionRecordId();
+
+/**
+ * The current session's record identity — an opaque, process-local token.
+ *
+ * Deliberately NOT the host's session id: that is user-facing conversation
+ * identity pi-lens does not otherwise write to disk, and the join only needs
+ * "the same session", not "which conversation".
+ */
+export function currentSessionRecordId(): string {
+	return sessionRecordId;
+}
+
+/**
+ * The claim key. A phase is claimed per SCOPE (#2526 review round 2, F3):
+ * `config_resolved` is a fact about a (session, project root) pair, and the
+ * warm MCP server serves N roots from one process — keying on the phase name
+ * alone recorded the first root's documents and silently dropped every other
+ * root's, so a legacy config in project B could never surface its smell.
+ *
+ * `scope` is REQUIRED (#2526 review round 3, S3 — narrowed from optional):
+ * the one production caller always passes one, and an unscoped claim is the
+ * exact shape F3 found unsafe — a phase-only key recording the first caller
+ * and silently dropping every later one under a different scope. A future
+ * producer with no natural scope can pass a constant string; that is still an
+ * explicit choice, not a silently-defaulted one.
+ */
+function claimKey(phase: string, scope: string): string {
+	return `${phase}\0${scope}`;
+}
+
+/**
+ * Claim the session's one record for `phase` within `scope`.
+ *
+ * Returns true exactly once per session and scope; every later call for the
+ * same pair returns false until {@link resetOncePerSessionPhases} re-arms it.
+ * Callers should claim BEFORE building the payload, so a claim that loses the
+ * race costs nothing.
+ */
+export function claimPhaseOncePerSession(
+	phase: string,
+	scope: string,
+): boolean {
+	const key = claimKey(phase, scope);
+	if (oncePerSessionPhases.has(key)) return false;
+	oncePerSessionPhases.add(key);
+	return true;
+}
+
+/**
+ * Release every scope's claim for ONE phase, without touching the others
+ * (#2526 review round 2, S1).
+ *
+ * A producer's own `resetForTests` needs its own phase re-armed, not a blanket
+ * clear of a shared session-scoped structure: the blanket call reached into
+ * claims other producers own and, worse, re-minted the session identity as a
+ * side effect of an unrelated module's reset.
+ */
+export function releaseOncePerSessionPhase(phase: string): void {
+	const prefix = `${phase}\0`;
+	for (const key of oncePerSessionPhases) {
+		if (key.startsWith(prefix)) oncePerSessionPhases.delete(key);
+	}
+}
+
+/**
+ * Re-arm every once-per-session phase claim for a new session, and mint the
+ * new session's record identity.
+ *
+ * PLACEMENT (#2526 review round 2, F1): this is called from index.ts's
+ * `session_start` closure, from BEHIND the #473 concurrent-secondary gate,
+ * beside `resetCurrentPhaseForSession` — and NOT from inside
+ * `handleSessionStart`. index.ts resolves this session's config in
+ * `ensureLSPConfigInitialized` BEFORE it calls the handler, so a re-arm inside
+ * the handler fires between the session's own two resolutions: the ensure
+ * writes a row, the handler wipes the claim, and the deferred `loadLSPConfig`
+ * writes a second row for the same session. The first session of a process got
+ * two rows and every later one (whose ensure the process-lifetime
+ * `_lspConfigInitializedCwds` memo short-circuits) got one, which is
+ * unrecoverable for any per-session count.
+ *
+ * A latch that is never re-armed silences its record for the rest of the
+ * PROCESS (AGENTS.md catalog shape 17), which for a positive-observability
+ * record is the exact silence it exists to end — so the re-arm must exist; it
+ * just has to sit ahead of the session's first resolution rather than in the
+ * middle of them.
+ *
+ * The warm MCP server (`clients/mcp/session.ts` calls `handleSessionStart`
+ * directly, never through index.ts) therefore keeps ONE identity for the life
+ * of the process. That is the honest answer for it: a warm server has no
+ * session boundary, its "session" is the process, and F3's per-root scoping is
+ * what gives it one record per served root.
+ */
+export function resetOncePerSessionPhases(): void {
+	oncePerSessionPhases.clear();
+	sessionRecordId = mintSessionRecordId();
+}
+
 export function logLatency(entry: LatencyEntry): void {
 	const ts = new Date().toISOString();
 	if (

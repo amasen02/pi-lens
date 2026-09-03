@@ -360,6 +360,18 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 		reason:
 			"#1723 review F4: the in-flight-phase live-bracket map is process-shared state that only a confirmed full session start may re-arm - the reset must sit INSIDE the #473 concurrent-secondary gate, yet outside handleSessionStart's own body (it runs before handleSessionStart), so it is called directly in index.ts's session_start closure, unreachable from the handleSessionStart walk. #2319 adds the closure-site evidence and this entry replaces the file's exemption. See resetCurrentPhaseForSession's own doc comment for the full placement reasoning.",
 	},
+	// ── #2526 once-per-session phase claims ─────────────────────────────
+	{
+		id: "latency-logger:oncePerSessionPhases",
+		module: "latency-logger.ts",
+		state:
+			"oncePerSessionPhases (which SESSION-fact phase rows have already been written this session) plus sessionRecordId, the identity those rows are stamped with; sessionRecordSeq is a monotonic mint counter, not session state",
+		policy: "session_start",
+		resetName: "resetOncePerSessionPhases",
+		sessionStartClosureReset: true,
+		reason:
+			"#2526: `config_resolved` is a SESSION fact written by `loadLSPConfig`, which runs many times per session (session start, each served root, the MCP `ensureReady` boot, the first edit's ensure). The claim set is what collapses those to one row per session and served root. Review round 2 F1 MOVED the re-arm out of handleSessionStart's body into index.ts's session_start closure, beside resetCurrentPhaseForSession and behind the same #473 gate: index.ts's ensureLSPConfigInitialized resolves this session's config BEFORE handleSessionStart runs, so a re-arm inside the handler fired between the session's own two resolutions and the deferred loadLSPConfig wrote a second row for one session. Behind the #473 gate for the same reason as liveBrackets - a concurrent secondary never reaches handleSessionStart, so it never publishes an expectation line and must not re-arm a live primary's claims. Catalog shape 17 still applies in the other direction: a claim never re-armed silences a positive-observability record for the rest of the process.",
+	},
 	// #2319 survey catch: the session_start closure ALSO resets the
 	// #1999 rising-edge memory-sample cadence. Its state is two module-scope
 	// SCALARS, so the container scan cannot flag the file (SWEEP_HEURISTIC_LIMITS
@@ -1485,7 +1497,7 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	// BoundedLruCache, so this file's module-level bounded cache is counted.
 	"installer/index.ts": 13,
 	"instance-registry.ts": 0,
-	"latency-logger.ts": 2,
+	"latency-logger.ts": 3,
 	// #2418 removed lens-config.ts's row: its only module-scope state was the
 	// warn-once set, now owned by config-warn.ts, so the scan no longer flags
 	// the file at all.

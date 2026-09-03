@@ -38,14 +38,15 @@ import {
 	type ProvenanceViewEntry,
 	provenanceView,
 	type Resolved,
-	SOURCE_TIERS,
 	type SourceTier,
 } from "./config-core/provenance.js";
 import { LSP_NAMESPACE_KEY } from "./config-locations.js";
 import {
+	type ConfigDocumentSummary,
 	lspSectionOf,
 	type PiLensConfigResolution,
 	resolvePiLensConfig,
+	summarizeConfigResolution,
 } from "./config-resolve.js";
 import { getToolPlan } from "./dispatch/plan.js";
 import { getAvailableRunners } from "./dispatch/integration.js";
@@ -97,13 +98,7 @@ export interface EffectiveConfigOptions {
  * list is taken at `cwd` itself, exactly as if no `file` had been asked
  * about at all.
  */
-export interface EffectiveConfigDocument {
-	readonly tier: SourceTier;
-	/** Home-relative when the file is under `$HOME`. */
-	readonly file: string;
-	/** True for a location on a removal schedule (`DEPRECATED_CONFIG_SURFACES`). */
-	readonly legacy: boolean;
-}
+export type EffectiveConfigDocument = ConfigDocumentSummary;
 
 /** A custom server's definition, reduced to what cannot carry a secret. */
 export interface RedactedServerSpec {
@@ -184,14 +179,6 @@ export interface EffectiveConfigView {
 	 * workspace this answer is `cwd`-labelled as (#2520).
 	 */
 	readonly file?: EffectiveFileView | EffectiveFileViewError;
-}
-
-/** A zero for every tier, so a consumer never has to test for an absent key. */
-function emptyTierCounts(): Record<SourceTier, number> {
-	return Object.fromEntries(SOURCE_TIERS.map((tier) => [tier, 0])) as Record<
-		SourceTier,
-		number
-	>;
 }
 
 function countBy<T>(items: readonly T[], key: (item: T) => string) {
@@ -434,8 +421,12 @@ export async function effectiveConfig(
 		provenance: resolution.provenance,
 	};
 
-	const counts = emptyTierCounts();
-	for (const entry of resolution.provenance.values()) counts[entry.tier] += 1;
+	// The redacted document list and the per-tier counts come from the SHARED
+	// projection (#2526), not from a second copy of the mapping here: the
+	// `config_resolved` latency phase writes the same summary at session start,
+	// and a surface that answers "what is my config" must not be able to
+	// disagree with the record that says what was resolved.
+	const summary = summarizeConfigResolution(resolution, homeDir);
 
 	// Home-relative, like every path this module reports (rule 3) — including
 	// the one named back in the rejection message below, so an agent reading
@@ -445,13 +436,9 @@ export async function effectiveConfig(
 
 	const view: EffectiveConfigView = {
 		cwd: homeRelativeCwd,
-		documents: resolution.documents.map((document) => ({
-			tier: document.tier,
-			file: homeRelativePath(document.file, homeDir),
-			legacy: document.location.legacy,
-		})),
+		documents: summary.documents,
 		provenance: provenanceView(resolved, homeDir).entries,
-		provenanceCounts: counts,
+		provenanceCounts: summary.countsByTier,
 		recordCounts: countBy(resolution.records, (record) => record.code),
 		...(fileOutsideCwd
 			? {
