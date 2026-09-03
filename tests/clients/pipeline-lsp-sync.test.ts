@@ -1,3 +1,4 @@
+// flake-shape: raw-timer-wait — "records NOTHING when Escape aborts mid-flight" (#2523 slice 2) schedules `setTimeout(() => controller.abort(), 20)` to fire the caller's abort DURING an in-flight, never-resolving `resyncLspFile` call; the subject is the ordering (abort arrives mid-await, not before or after), which a fake clock cannot exercise against a real never-settling mock without a manual `vi.advanceTimersByTimeAsync` that would just re-encode the same real ordering (#2557 review round 3).
 /**
  * The pre-dispatch LSP sync (`resyncLspFile`) must never let a wedged language
  * server hang the edit. Its didChange/didOpen write can backpressure forever

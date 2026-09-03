@@ -521,6 +521,15 @@ async function withBounds<T extends object>(
 	}
 }
 
+/**
+ * Test-only alias so `tests/clients/hook-await-fold-bounds.test.ts` can pin
+ * `withBounds`'s `T extends object` constraint at compile time (#2557 review
+ * F-B). `withBounds` itself is module-private -- there is no other way for a
+ * test file to reference it in a `@ts-expect-error` probe. Never called
+ * outside that probe.
+ */
+export const _withBoundsForTests = withBounds;
+
 /** `splitLines` semantics from `read-guard.ts`, kept identical on purpose. */
 function splitLines(text: string): string[] {
 	return text.split(/\r?\n/);

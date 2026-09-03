@@ -1,3 +1,4 @@
+// flake-shape: elapsed-time-assertion — the subject IS the wall-clock margin: "settles on the caller's abort without waiting the budget out" asserts `Date.now() - startedAt < 5_000` against a real 30_000ms `timeoutMs`, turning #2523's own probe measurement (`still-blocked after 30011ms` when the abort fired at t=2s) into a regression guard; fake timers collapse "settled on the signal" and "settled on the deadline" to the same synchronous tick, which is exactly the distinction this case exists to catch (#2557 review round 3).
 /**
  * #2523 slice 2: the private "deadline AND abort signal" implementations are
  * folded onto `clients/deadline-utils.ts#bounded`, and this is what makes the
@@ -27,8 +28,28 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { gatedPromise } from "../support/fault-injection.js";
+import { _withBoundsForTests } from "../../clients/observed-mutation.js";
 
 type LedgerModule = typeof import("../../clients/degradation-ledger.js");
+
+/**
+ * Never CALLED — only type-checked (template:
+ * `tests/clients/bounded-hook-await.test.ts:63-87`,
+ * `_oneBoundCallsDoNotTypeCheck`). `withBounds<T extends object>` is
+ * load-bearing (#2557 review F6): `bounded()` spells "a bound fired" as a
+ * bare `undefined`, so a `work` that could itself resolve `undefined` would
+ * be indistinguishable from a timeout unless the type forbids it outright.
+ * Weakening the constraint to plain `T` compiles, and this directive becomes
+ * an unused suppression — `tsc` reports TS2578 on it.
+ */
+async function _weakenedWithBoundsWorkDoesNotTypeCheck(): Promise<void> {
+	// @ts-expect-error #2557 review F-B: `work` resolves `undefined`, which
+	// `T extends object` forbids.
+	await _withBoundsForTests(async () => undefined, 10, undefined, {
+		hook: "tool_call",
+		label: "fold-probe",
+	});
+}
 
 /**
  * The subject of the most recent `hook-await-exceeded` row, or `undefined`
@@ -197,6 +218,12 @@ describe("#2523 slice 2 — clients/observed-mutation.ts#withBounds folded onto 
 		} finally {
 			gate.release();
 		}
+	});
+
+	it("keeps withBounds's T extends object constraint referenced (see _weakenedWithBoundsWorkDoesNotTypeCheck above)", () => {
+		// The compile-time half is the load-bearing assertion; this reference
+		// only keeps `noUnusedLocals` from flagging the probe function above.
+		expect(typeof _weakenedWithBoundsWorkDoesNotTypeCheck).toBe("function");
 	});
 
 	it("reports `aborted`, not `timeout`, when the signal fires mid-capture", async () => {

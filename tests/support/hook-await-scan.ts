@@ -17,6 +17,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { jsTsCandidatePaths } from "../../clients/review-graph/import-resolvers.js";
 import { lineContentHash } from "../../clients/read-guard.js";
 import {
 	listSourceFiles,
@@ -280,21 +281,42 @@ const LOCAL_SPECIFIER =
 	/(?:\bfrom\s*|\bimport\s*\(\s*|\brequire\s*\(\s*)["'](\.\.?\/[^"']*)["']/g;
 
 /**
+ * A whole `import type { … } from "…"` / `export type { … } from "…"`
+ * DECLARATION — one where the `type` keyword sits immediately after `import`/
+ * `export`, not a per-specifier `{ type Foo, bar }` inline modifier inside an
+ * otherwise-real import (#2557 review friction). A hook handler that imports
+ * only a TYPE from a helper never calls into it at runtime, so counting that
+ * edge as "reached" is a false positive: the reviewer measured 9 modules /
+ * 128 unbounded-await entries (`clients/lsp/client.ts` alone contributing 75)
+ * that existed in the helper set ONLY through an edge like this, and that 22%
+ * of recently merged PRs would have tripped the pin on one. `[^;]*?`
+ * non-greedy up to the clause's own `from "…"` — it stops at the first match,
+ * so it cannot swallow a later, unrelated `import` on the next line.
+ */
+const TYPE_ONLY_IMPORT_CLAUSE =
+	/\b(?:import|export)\s+type\b[^;]*?\bfrom\s*["'](\.\.?\/[^"']*)["']/g;
+
+/**
  * Resolve one relative specifier written the way this repo writes them —
  * `nodenext`, so `./x.js` names the SOURCE `./x.ts` — to an absolute `.ts`
  * path, or `undefined` when nothing exists there.
+ *
+ * Candidate generation is `clients/review-graph/import-resolvers.ts`'s
+ * `jsTsCandidatePaths` (#2557 review F-C): this file used to hand-roll the
+ * SAME `./x.js` → sibling `.ts`/`.tsx`/`index.ts` mapping that the review
+ * graph's warm jsts builder and cold `module_report` path already share
+ * (#694's single-source-of-truth rule for exactly this resolution). The
+ * existence check and return shape (a raw `path.resolve()`-based, OS-native
+ * path — not `resolveImportToFiles`'s realpath-canonicalized one, which
+ * `hookHelperModules`'s `target.startsWith(repoRoot)` check below is not
+ * written to survive) stay local, so this module's callers see no behaviour
+ * change.
  */
 function resolveLocalSpecifier(
 	fromFile: string,
 	specifier: string,
 ): string | undefined {
-	const base = path.resolve(path.dirname(fromFile), specifier);
-	const candidates = base.endsWith(".js")
-		? [`${base.slice(0, -3)}.ts`, `${base.slice(0, -3)}.tsx`]
-		: base.endsWith(".ts")
-			? [base]
-			: [`${base}.ts`, path.join(base, "index.ts")];
-	for (const candidate of candidates) {
+	for (const candidate of jsTsCandidatePaths(fromFile, specifier)) {
 		if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
 			return candidate;
 		}
@@ -311,8 +333,21 @@ export function localImportTargets(absolute: string): string[] {
 	const stripped = stripSource(fs.readFileSync(absolute, "utf8"), {
 		strings: "keep",
 	});
+	// Every `import type …` / `export type …` declaration's span — a type
+	// edge is not a call, so a `from "…"` match landing inside one of these
+	// spans is skipped below (#2557 review friction).
+	const typeOnlySpans = [...stripped.matchAll(TYPE_ONLY_IMPORT_CLAUSE)].map(
+		(match) => [match.index, match.index + match[0].length] as const,
+	);
 	const targets = new Set<string>();
 	for (const match of stripped.matchAll(LOCAL_SPECIFIER)) {
+		if (
+			typeOnlySpans.some(
+				([start, end]) => match.index >= start && match.index < end,
+			)
+		) {
+			continue;
+		}
 		const resolved = resolveLocalSpecifier(absolute, match[1] ?? "");
 		if (resolved !== undefined && !resolved.endsWith(".d.ts")) {
 			targets.add(resolved);
@@ -341,11 +376,15 @@ export function localImportTargets(absolute: string): string[] {
  * calls DIRECTLY, which is where the work a hook actually awaits lives. The
  * limit is stated in `SWEEP_HEURISTIC_LIMITS`.
  *
- * Type-only imports are NOT excluded. `stripSource` leaves `import type`
- * lines intact, so a module reached only for its types still appears here.
- * That over-includes rather than under-includes, which for a guard is the
- * direction that fails loudly: a spurious module shows up as a table entry a
- * reviewer reads, not as a hole.
+ * A whole `import type …` / `export type …` DECLARATION is excluded (#2557
+ * review friction) — a type edge is not a call, so a hook handler that
+ * imports only a TYPE from a helper never actually calls into it. Measured
+ * before this exclusion: 9 modules / 128 unbounded-await entries
+ * (`clients/lsp/client.ts` alone contributing 75) existed in this set ONLY
+ * through an edge like this, and 22% of recently merged PRs would have
+ * tripped the pin below on one. A MIXED clause (`import { type A, b } from
+ * "…"`) is not excluded — the declaration itself does not start with `type`,
+ * and `b` is a real value import, so the module genuinely is called into.
  */
 export function hookHelperModules(repoRoot: string): string[] {
 	const handlers = hookPathFiles(repoRoot);

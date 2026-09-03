@@ -12,7 +12,11 @@ import type { LSPCodeAction, LSPDiagnostic } from "./lsp/client.js";
 import { applyWorkspaceEdit } from "./lsp/edits.js";
 import { getLSPService } from "./lsp/index.js";
 import { isUnderDir, normalizeMapKey } from "./path-utils.js";
-import { bounded, combineAbortSignals } from "./deadline-utils.js";
+import {
+	bounded,
+	combineAbortSignals,
+	withDeadline,
+} from "./deadline-utils.js";
 import type { LedgerHookKey } from "./hook-budgets.js";
 import {
 	armDeferredLspWork,
@@ -711,6 +715,31 @@ interface LspEnrichmentDeps {
  * that lived in prose is gone rather than enforced — plus the abandonment now
  * reaching the ledger, and the leg's listener now being released per call
  * instead of living as long as the loop's signal does.
+ *
+ * ## The loop's residual budget is a THIRD bound, and it must not reach the
+ * ledger (#2557 review F-A)
+ *
+ * Round 1 clamped `bounded()`'s own timer to
+ * `Math.min(pullTimeoutMs, remainingMs)`, so whenever the LOOP's own wall
+ * budget was already low, `bounded()` armed at the shrunken value and — on
+ * firing — recorded `hook-await-exceeded` naming THAT value as "the budget".
+ * A healthy pull that simply started late in a big batch was reported as
+ * exceeding a budget that exists in no configuration (measured: 400 ms
+ * pulls, 12 files, "exceeded 65ms budget after 77ms"), and because
+ * `recordDegradationOnce` is rising-edge, that benign row could silence a
+ * genuinely wedged server later in the same session.
+ *
+ * `bounded()`'s OWN timer is now always armed at the full `pullTimeoutMs`, so
+ * it only ever fires — and only ever records — when a call outlives its own
+ * configured per-trip budget (`metadata.budgetMs === pullTimeoutMs`, always).
+ * The loop's shrinking residual is enforced SEPARATELY, by racing `bounded()`
+ * against `withDeadline(…, { onTimeout: "undefined" })` keyed to the loop's
+ * own `deadlineAt` — a deadline-only wait with no ledger connection of its
+ * own, the same primitive `bounded()` itself is built to replace when a
+ * caller needs BOTH bounds. The still-running `bounded()` call is not
+ * cancelled (nothing here can cancel already-started work); if it later
+ * genuinely outlives `pullTimeoutMs`, it still records, correctly, on its own
+ * clock.
  */
 async function boundedLspCall<T>(
 	call: () => Promise<T>,
@@ -728,13 +757,12 @@ async function boundedLspCall<T>(
 	// exceedance would attribute the loop's spent budget to whichever call
 	// happened to be next.
 	if (remainingMs !== undefined && remainingMs <= 0) return undefined;
-	const boxed = await bounded(
+	const inner = bounded(
 		call().then((value) => ({ value })),
 		{
-			ms:
-				remainingMs !== undefined
-					? Math.min(deps.pullTimeoutMs, remainingMs)
-					: deps.pullTimeoutMs,
+			// Always the FULL per-trip budget -- never clamped to the loop's own
+			// residual. The residual is enforced below, off the ledger.
+			ms: deps.pullTimeoutMs,
 			// Optional for the in-band caller; `bounded()` reads a missing signal
 			// as one that never aborts, so the deadline half stays live.
 			signal: deps.signal,
@@ -744,6 +772,13 @@ async function boundedLspCall<T>(
 			label: deps.site.label,
 		},
 	);
+	const boxed =
+		deps.deadlineAt !== undefined
+			? await withDeadline(inner, {
+					deadlineAt: deps.deadlineAt,
+					onTimeout: "undefined",
+				})
+			: await inner;
 	// Boxed because an LSP pull legitimately resolves `undefined` (no
 	// diagnostics for this file), which must stay distinguishable from a bound
 	// firing even though both currently mean "not checked" to the caller.

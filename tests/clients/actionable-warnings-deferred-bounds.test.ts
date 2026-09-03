@@ -331,6 +331,78 @@ describe("#2504 r2 F3 — per-round-trip bound on the deferred loop", () => {
 		expect(subjects).toContain("off_hook:deferredLspEnrichmentRoundTrip");
 		expect(subjects).toContain("turn_end:lspEnrichmentRoundTrip");
 	});
+
+	// #2557 review F-A. `boundedLspCall` passed `ms: Math.min(pullTimeoutMs,
+	// remainingMs)` into `bounded()`, so whenever the LOOP's own residual wall
+	// budget was smaller than the configured per-pull timeout, `bounded()`
+	// armed its timer at the SHRUNKEN value and — on firing — recorded
+	// `hook-await-exceeded` naming that shrunken value as the budget. A
+	// perfectly healthy pull that simply started late in the batch (the loop's
+	// OWN accounting running low, not the server being slow) was reported as
+	// an exceedance of a budget "65ms" that exists in no configuration.
+	// Reproduced here with three healthy 200 ms pulls against a 460 ms loop
+	// budget: the third pull starts with ~60 ms of loop budget left but a
+	// 10 s configured `lspPullTimeoutMs` — nowhere near exceeded.
+	it("does not record hook-await-exceeded for a healthy pull the loop's own shrinking residual cut short", async () => {
+		const { buildActionableWarningsReport } = await loadWarnings();
+		const files = makeSources(4);
+		// One cached file keeps the batch IN BAND (primed.length > 0), so the
+		// cold files below run through `inBandDeps` — the awaited `turn_end`
+		// loop, not the deferred one.
+		primedByFile.set("f0.ts", []);
+		pullDelayMs = 200;
+
+		await buildActionableWarningsReport({
+			cwd: env.tmpDir,
+			sessionId: "lens-test",
+			turnIndex: 1,
+			files,
+			modifiedRangesByFile: new Map(),
+			dispatchWarnings: [],
+			includeLspCodeActions: true,
+			// Far larger than any single healthy pull -- a call is a genuine
+			// exceedance only if IT outlives this, never the loop's residual.
+			lspPullTimeoutMs: 10_000,
+			// f1 + f2 healthy pulls cost ~400ms; f3 starts with ~60ms of loop
+			// budget left, well under its own 200ms pull time but nowhere near
+			// its 10s per-call timeout.
+			lspBudgetMs: 460,
+			onDeferredReport: () => {},
+		});
+
+		expect(getDegradationSummary()).toEqual([]);
+	});
+
+	// The companion half of the F-A fix: not recording on a residual clamp
+	// must not regress into not ENFORCING one either. `bounded()`'s own timer
+	// is armed at the full `pullTimeoutMs` (10 s below); only the outer
+	// `withDeadline` keyed to the loop's own `deadlineAt` can cut a wedged
+	// pull off after ~60 ms instead of the full per-call timeout. Raced with
+	// a generous ceiling (not an elapsed-time delta) so the assertion is the
+	// settle/pending outcome, not a wall-clock number.
+	it("still cuts a wedged pull off at the loop's own shrinking residual, not the full per-call timeout", async () => {
+		const { buildActionableWarningsReport } = await loadWarnings();
+		const files = makeSources(2);
+		primedByFile.set("f0.ts", []);
+		wedgedFiles.add("f1.ts");
+
+		const settled = await settlesWithin(
+			buildActionableWarningsReport({
+				cwd: env.tmpDir,
+				sessionId: "lens-test",
+				turnIndex: 1,
+				files,
+				modifiedRangesByFile: new Map(),
+				dispatchWarnings: [],
+				includeLspCodeActions: true,
+				lspPullTimeoutMs: 10_000,
+				lspBudgetMs: 60,
+				onDeferredReport: () => {},
+			}),
+			2_500,
+		);
+		expect(settled).toBe("settled");
+	});
 });
 
 describe("#2504 r2 F3 — session_shutdown aborts the deferred loop", () => {

@@ -109,6 +109,7 @@
  */
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -202,11 +203,18 @@ export const SWEEP_HEURISTIC_LIMITS = [
 		"read 'slice 3 owns bounding this', which is the hand-maintained mirror " +
 		"the single-source rule exists to prevent. #2523's deps-type threading " +
 		"removes the need for the coarser half.",
-	"Type-only imports are NOT excluded from the helper walk: `stripSource` " +
-		"leaves `import type` lines intact, so a module reached only for its " +
-		"types still appears. That over-includes rather than under-includes, " +
-		"which for a guard is the direction that fails loudly — a spurious " +
-		"module is a table entry a reviewer reads, not a hole.",
+	"A whole `import type …` / `export type …` DECLARATION is excluded from " +
+		"the helper walk (#2557 review friction) — a type edge is not a call. " +
+		'A MIXED clause (`import { type A, b } from "…"`) is NOT excluded: the ' +
+		"declaration itself does not start with `type`, and `b` is a real value " +
+		"import, so the module genuinely is called into. The detector does not " +
+		"walk INSIDE a multi-line clause for a per-specifier `type` modifier — " +
+		"only the declaration's own leading keyword decides it, which is the " +
+		"same 'over-inclusion within a file is the safe direction' trade the " +
+		"line-granular limit above states: a mixed clause with every named " +
+		'specifier `type`-prefixed (`import { type A, type B } from "…"`, no ' +
+		"plain specifier at all) still counts as reached, because nothing here " +
+		"parses the specifier list.",
 	"The `bounded()` call registry does NOT decide whether a call's `signal` " +
 		"argument can be `undefined`. That is a type question, and a regex for " +
 		"`??`/`||`/`undefined` would call `signal: options.signal` — the " +
@@ -2125,17 +2133,45 @@ const HELPER_EXEMPTION_REASON =
  * Pinned through `auditSymbolCounts`, the kit's own file-count mechanism
  * (#1817), rather than a bespoke comparison — same machinery the session-state
  * sweep pins ~72 files with.
+ *
+ * Round-3 deltas (2026-09-03), all measured, none hand-picked:
+ *
+ * - `clients/actionable-warnings.ts` 12 → 14. Review F-A's fix adds an outer
+ *   `await withDeadline(inner, …)` deadline-only cap around the existing
+ *   `await bounded(…)` call in `boundedLspCall`, so the loop's own shrinking
+ *   residual budget stops reaching the ledger as a false
+ *   `hook-await-exceeded`. `isBoundedAwait` only recognizes the literal
+ *   `bounded(` call head (by design — see its own doc comment on why
+ *   `withDeadline` was deliberately dropped from that list in round 1), so
+ *   the new deadline-only await is honestly unbounded by this heuristic even
+ *   though it composes correctly with the still-present `bounded()` call.
+ * - `clients/formatters.ts` 118 → 115, from `origin/master`'s #2514
+ *   (`05df8268`..`4cd8bdb6`, folding formatters' tool-bin walkers onto one
+ *   ceilinged walker), merged into this branch — not a change this PR made.
+ * - Eight modules REMOVED entirely (their one-hop edge was ONLY an `import
+ *   type`, per the friction fix above): `clients/biome-client.ts` (9),
+ *   `clients/complexity-client.ts` (1), `clients/dependency-checker.ts` (21),
+ *   `clients/jscpd-client.ts` (4), `clients/knip-client.ts` (6),
+ *   `clients/lsp/client.ts` (75), `clients/opengrep-client.ts` (2),
+ *   `clients/ruff-client.ts` (6) — 8 modules, 124 awaits, measured with
+ *   `scripts/.probe-measure-helpers.mjs` (not committed) against this
+ *   branch's `hookHelperModules`. Every one of these is a linter/analyzer
+ *   CLIENT class only reached from a hook handler for its exported TYPE
+ *   (`clients/runtime-turn.ts`'s `import type { DependencyChecker,
+ *   MadgeBatchStats } from "./dependency-checker.js"`, confirmed by hand for
+ *   this entry); the actual VALUE-level construction is `bootstrap.ts`'s
+ *   dynamic `await import(...)` inside `requestBootstrapClients`, which is
+ *   TWO hops from a hook handler (hook handler → `bootstrap.ts` →
+ *   the client) and correctly outside the one-hop walk. 202 modules / 1255
+ *   awaits (the PR's round-1 baseline) is now 190 modules / 1130 awaits.
  */
 const HELPER_UNBOUNDED: Readonly<Record<string, number>> = {
-	"clients/actionable-warnings.ts": 12,
+	"clients/actionable-warnings.ts": 14,
 	"clients/ast-grep-client.ts": 15,
-	"clients/biome-client.ts": 9,
 	"clients/blocker-freshness.ts": 13,
 	"clients/bootstrap.ts": 23,
-	"clients/complexity-client.ts": 1,
 	"clients/cooperative-budget.ts": 3,
 	"clients/dead-code-client.ts": 4,
-	"clients/dependency-checker.ts": 21,
 	"clients/dispatch/integration.ts": 20,
 	"clients/dispatch/pending-runner-findings.ts": 2,
 	"clients/dispatch/runners/psscriptanalyzer.ts": 7,
@@ -2144,29 +2180,25 @@ const HELPER_UNBOUNDED: Readonly<Record<string, number>> = {
 	"clients/file-time.ts": 1,
 	"clients/file-utils.ts": 1,
 	"clients/format-service.ts": 5,
-	"clients/formatters.ts": 118,
+	"clients/formatters.ts": 115,
 	"clients/gitleaks-client.ts": 4,
 	"clients/govulncheck-client.ts": 6,
 	"clients/installer/index.ts": 192,
 	"clients/installer/managed-tool-refresh.ts": 29,
 	"clients/instance-reaper.ts": 26,
 	"clients/instance-registry.ts": 23,
-	"clients/jscpd-client.ts": 4,
-	"clients/knip-client.ts": 6,
 	"clients/language-profile.ts": 3,
 	"clients/lens-engine.ts": 1,
 	"clients/lens-map.ts": 2,
 	"clients/lsp-budget.ts": 1,
 	"clients/lsp-document-symbols.ts": 2,
 	"clients/lsp/cascade-tier.ts": 2,
-	"clients/lsp/client.ts": 75,
 	"clients/lsp/config.ts": 3,
 	"clients/lsp/index.ts": 151,
 	"clients/lsp/server.ts": 111,
 	"clients/map-with-concurrency.ts": 2,
 	"clients/observed-mutation.ts": 18,
 	"clients/opaque-mutation-scan.ts": 10,
-	"clients/opengrep-client.ts": 2,
 	"clients/package-manager.ts": 8,
 	"clients/partial-edit-apply.ts": 2,
 	"clients/performance-report.ts": 8,
@@ -2177,7 +2209,6 @@ const HELPER_UNBOUNDED: Readonly<Record<string, number>> = {
 	"clients/read-expansion.ts": 2,
 	"clients/recent-touches.ts": 8,
 	"clients/review-graph/builder.ts": 41,
-	"clients/ruff-client.ts": 6,
 	"clients/safe-spawn.ts": 9,
 	"clients/session-state-store.ts": 4,
 	"clients/shared-checkout-guard.ts": 7,
@@ -2533,9 +2564,67 @@ describe("#2523 AC1 every hook-path await is bounded, and no new hand-rolled rac
 				path.join(REPO_ROOT, "clients/dispatch/integration.ts"),
 			).map((absolute) => relativePosix(REPO_ROOT, absolute)),
 		).toContain("clients/dispatch/dispatcher.ts");
+		// ...and one the TYPE-ONLY exclusion above wrongly included before this
+		// PR: `clients/lsp/client.ts` is reached from a hook handler only for
+		// its exported TYPES (`LSPDiagnostic`/`LSPCodeAction` in signatures);
+		// the actual value-level LSP client is `clients/lsp/index.ts`'s
+		// `getLSPService()`.
+		expect(helpers).not.toContain("clients/lsp/client.ts");
 		// A hook handler is not its own helper.
 		for (const handler of hookPathFiles(REPO_ROOT)) {
 			expect(helpers).not.toContain(relativePosix(REPO_ROOT, handler));
+		}
+	});
+
+	// #2557 review friction: 9 modules / 128 awaits (`clients/lsp/client.ts`
+	// alone contributing 75) reached the one-hop set ONLY through an
+	// `import type` clause, never a value import — a hook handler that
+	// imports a TYPE from a helper never actually calls into it, so counting
+	// it as a hook-reached module is a false positive the reviewer measured
+	// tripping 22% of recently merged PRs. A type edge is not a call.
+	it("does not count a module reached only through import type / export type", () => {
+		const dir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-hook-await-type-only-"),
+		);
+		try {
+			fs.writeFileSync(
+				path.join(dir, "type-only-target.ts"),
+				"export interface A {}\n",
+			);
+			fs.writeFileSync(
+				path.join(dir, "value-target.ts"),
+				"export const B = 1;\n",
+			);
+			fs.writeFileSync(
+				path.join(dir, "mixed-target.ts"),
+				"export interface C {}\nexport const D = 1;\n",
+			);
+			fs.writeFileSync(
+				path.join(dir, "importer.ts"),
+				[
+					'import type { A } from "./type-only-target.js";',
+					'import { B } from "./value-target.js";',
+					// A mixed clause: an inline `type` specifier alongside a real
+					// value one. The whole DECLARATION does not start with `type`,
+					// so this stays a real edge (the module IS called into).
+					'import { type C, D } from "./mixed-target.js";',
+					'export type { A as AReExport } from "./type-only-target.js";',
+					"",
+					"export function use(): void {",
+					"  void B;",
+					"  void D;",
+					"}",
+					"",
+				].join("\n"),
+			);
+			const targets = localImportTargets(path.join(dir, "importer.ts")).map(
+				(absolute) => path.basename(absolute),
+			);
+			expect(targets).not.toContain("type-only-target.ts");
+			expect(targets).toContain("value-target.ts");
+			expect(targets).toContain("mixed-target.ts");
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
 		}
 	});
 
