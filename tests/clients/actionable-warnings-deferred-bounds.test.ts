@@ -124,7 +124,16 @@ beforeEach(() => {
 	resetDegradationLedger();
 });
 
-afterEach(() => {
+afterEach(async () => {
+	// Slot isolation. A case that leaves a deferral in flight -- a FAILING
+	// case, above all, which never reaches its own drain -- would otherwise
+	// hand the next case an occupied slot, and the incumbent-wins rule would
+	// DECLINE its arm. That turns an unrelated red into "no report delivered",
+	// which is a red for the wrong reason.
+	const { abortDeferredLspWork } = await import(
+		"../../clients/deferred-lsp-work.js"
+	);
+	abortDeferredLspWork("test-teardown");
 	env.cleanup();
 	resetDegradationLedger();
 });
