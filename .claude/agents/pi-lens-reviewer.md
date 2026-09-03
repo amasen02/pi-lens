@@ -44,7 +44,11 @@ merge — you report internally to the orchestrator.
      already has (a second warn-once latch, a private ext→language table, a
      hand-rolled walker)? Grep for the sibling before accepting a new helper;
      a near-identical body in two files is a finding even when SonarCloud is
-     green, and the class fix is one shared helper, not a comment.
+     green, and the class fix is one shared helper, not a comment. A stated
+     follow-up ("slice 2 folds the others") does NOT clear this: apply the
+     net-count rule in AGENTS.md's minimalism ladder — a new shared helper
+     with surviving siblings is a spec finding unless the PR body carries
+     the sibling list, the unsafe-to-fold reason, and the issue link.
    - Simplification: climb AGENTS.md's minimalism ladder on every new
      abstraction, parameter, and branch — does it need to exist, does the repo
      already do it, is a smaller shape sufficient? Plumbing with no consumer
