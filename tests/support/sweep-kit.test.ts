@@ -287,27 +287,13 @@ describe("sweep-kit: stripSource", () => {
 		expect(stripped).toContain("resetDegradationLedger();");
 	});
 
-	it('ATTACK_NESTED_TEMPLATE_LAUNDERING: strings: "keep" preserves the whole nested template verbatim', () => {
-		const kept = stripSource(ATTACK_NESTED_TEMPLATE_LAUNDERING, {
-			strings: "keep",
-		});
-		expect(kept).toHaveLength(ATTACK_NESTED_TEMPLATE_LAUNDERING.length);
-		expect(kept).toContain("`x ${cond ? `y(` : `z`} w`");
-		expect(kept).toContain("resetDegradationLedger();");
-	});
-
-	// #2502 review F1.
-	it('ATTACK_TEMPLATE_EXPRESSION_CALL: a call inside a template\'s ${...} expression stays visible under strings: "blank"', () => {
-		const stripped = stripSource(ATTACK_TEMPLATE_EXPRESSION_CALL);
-		expect(stripped).toContain("resetThing()");
-	});
-
-	// #2502 review F2 — replaces a prior "keep" assertion that could not fail:
-	// its fixture had no `/` and no comment, so `strings: "keep"` (which only
-	// ever blanks comments) left it byte-identical to source under BOTH the
-	// pre-#2502 lexer and the fixed one. This fixture's trailing comment
-	// actually distinguishes them (see ATTACK_ESCAPED_BACKTICK_COMMENT_LEAK's
-	// doc for the real-world divergence this reproduces).
+	// #2502 review F2 — this test used to run ATTACK_NESTED_TEMPLATE_LAUNDERING
+	// under `strings: "keep"`, but that fixture has no `/` and no comment, so
+	// `"keep"` (which only ever blanks comments) leaves it byte-identical to
+	// source under BOTH the pre-#2502 lexer and the fixed one — the assertion
+	// could not fail. Replaced with ATTACK_ESCAPED_BACKTICK_COMMENT_LEAK, whose
+	// trailing comment actually distinguishes the two lexers (see its doc for
+	// the real-world divergence this reproduces).
 	it('ATTACK_ESCAPED_BACKTICK_COMMENT_LEAK: strings: "keep" still blanks a comment after a nested template with an escaped backtick', () => {
 		const kept = stripSource(ATTACK_ESCAPED_BACKTICK_COMMENT_LEAK, {
 			strings: "keep",
@@ -315,6 +301,12 @@ describe("sweep-kit: stripSource", () => {
 		expect(kept).toHaveLength(ATTACK_ESCAPED_BACKTICK_COMMENT_LEAK.length);
 		expect(kept).not.toContain("trailing comment must stay blanked");
 		expect(kept).toContain("resetDegradationLedger();");
+	});
+
+	// #2502 review F1.
+	it('ATTACK_TEMPLATE_EXPRESSION_CALL: a call inside a template\'s ${...} expression stays visible under strings: "blank"', () => {
+		const stripped = stripSource(ATTACK_TEMPLATE_EXPRESSION_CALL);
+		expect(stripped).toContain("resetThing()");
 	});
 });
 
