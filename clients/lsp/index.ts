@@ -2806,6 +2806,28 @@ export class LSPService {
 		const servers = getServersForFileWithConfig(filePath).filter(
 			(s) => s.role !== "auxiliary",
 		);
+		// #2525: resolve every candidate's root ONCE, up front — the same
+		// pattern `getClientsForFile`/`getWarmClientForFile` already use. A
+		// server with no resolvable root (e.g. DenoServer's `fallbackFor:
+		// "typescript"`, root gated on deno.json(c)) never had a spawn slot to
+		// wait on, so it must not be tried by the sequential loop below, be
+		// re-resolved by the known-slow shortcut, or be named as a wait
+		// candidate in the `lsp_client_wait_*` records — a record's subject
+		// must be its producer (#1550), and this is the #2524 shape recurring.
+		const rootedServers = (
+			await Promise.all(
+				servers.map(async (server) => ({
+					server,
+					root: await this.resolveServerRoot(server, filePath),
+				})),
+			)
+		).filter(
+			(entry): entry is { server: LSPServerInfo; root: string } =>
+				entry.root !== undefined,
+		);
+		const unrootedServerIds = servers
+			.filter((server) => !rootedServers.some((r) => r.server === server))
+			.map((server) => server.id);
 		// hardCapMs is a caller-imposed ceiling (e.g. pipeline budget) that
 		// prevents tool_result from blocking the TUI for the full LSP cold-start
 		// window. When no server config sets a wait (serverWaitOverrideMs = 0),
@@ -2849,8 +2871,12 @@ export class LSPService {
 			let erroredServerId: string | undefined;
 			let erroredOutcome: LSPClientAcquisitionOutcome | undefined;
 
-			// Try each matching server
-			for (const server of servers) {
+			// Try each matching server with a resolved root. #2525: a candidate
+			// with no root (deno's fallbackFor:"typescript" without deno.json)
+			// never gets a spawn slot, so the sequential trial loop must not
+			// spend a turn resolving/re-checking it before reaching a real
+			// candidate.
+			for (const { server } of rootedServers) {
 				// A box, not a `let`: control-flow analysis cannot see the callback
 				// write and would narrow a plain local to its initializer.
 				const acquisition: { outcome: LSPClientAcquisitionOutcome } = {
@@ -2987,11 +3013,15 @@ export class LSPService {
 			// `inFlight` is cleared in ensureClientForServer's finally block, so a
 			// settled acquisition can still be present here. Re-read the published
 			// clients at the decision point; a usable client outranks the sentinel.
-			for (const server of servers) {
-				const root = await this.resolveServerRoot(server, filePath);
-				const client = root
-					? this.state.clients.get(`${server.id}:${normalizeMapKey(root)}`)
-					: undefined;
+			// #2525: iterate the already-resolved `rootedServers` rather than
+			// re-resolving `server.root(filePath)` per candidate here — an
+			// unrooted fallback (deno) can never have a client keyed under its
+			// (non-existent) root, so re-checking it on every touch that takes
+			// this shortcut was wasted work, not just a mislabeled record.
+			for (const { server, root } of rootedServers) {
+				const client = this.state.clients.get(
+					`${server.id}:${normalizeMapKey(root)}`,
+				);
 				if (client?.isAlive()) return { client, info: server };
 			}
 			waitSkipReasons?.add("budget_skipped_known_slow");
@@ -3002,7 +3032,11 @@ export class LSPService {
 				durationMs: 0,
 				metadata: {
 					maxWaitMs: effectiveMaxWaitMs,
-					serverIds: servers.map((server) => server.id),
+					serverIds: rootedServers.map(({ server }) => server.id),
+					unrootedCandidates: {
+						count: unrootedServerIds.length,
+						ids: unrootedServerIds,
+					},
 					reason: "budget_skipped_known_slow",
 				},
 			});
@@ -3012,7 +3046,9 @@ export class LSPService {
 		if (waitResult === timeoutSentinel) {
 			// Snapshot known client health — scan by serverId prefix (no root needed)
 			const knownHealth = [...this.state.clients.entries()]
-				.filter(([k]) => servers.some((s) => k.startsWith(`${s.id}:`)))
+				.filter(([k]) =>
+					rootedServers.some(({ server }) => k.startsWith(`${server.id}:`)),
+				)
 				.map(([k, c]) => ({
 					serverId: k.split(":")[0],
 					alive: c.isAlive(),
@@ -3025,7 +3061,11 @@ export class LSPService {
 				durationMs: effectiveMaxWaitMs,
 				metadata: {
 					maxWaitMs: effectiveMaxWaitMs,
-					serverIds: servers.map((s) => s.id),
+					serverIds: rootedServers.map(({ server }) => server.id),
+					unrootedCandidates: {
+						count: unrootedServerIds.length,
+						ids: unrootedServerIds,
+					},
 					// servers absent from knownHealth were never spawned or are still spawning
 					knownClientHealth: knownHealth,
 				},
