@@ -428,6 +428,27 @@ export type DegradationKind =
 	 */
 	| "orphan-backstop-scanner-escalated"
 	/**
+	 * #2524: the resource sampler's OWN process-table scanner (heartbeat CPU/RSS
+	 * sampling, `RESOURCE_SAMPLE_QUERY_TIMEOUT_MS` 2000ms — a much tighter and
+	 * far more frequent budget than the orphan backstop's one-per-cooldown
+	 * 5000ms scan) blew its timeout and was tree-killed, the sampler-path
+	 * sibling of `orphan-backstop-scanner-escalated`. Before this kind existed,
+	 * `terminateScannerChild` hardcoded the backstop's kind for BOTH callers, so
+	 * every sampler escalation was misattributed to a backstop sweep that had
+	 * provably not run (defect shape: a record's subject must be its producer).
+	 * Informational, not a `⚠`: `terminateScannerChild` fires the instant its
+	 * caller's timer elapses, strictly before `spawnCollectStdoutResult` knows
+	 * which of "close" or the timeout handler's own settle will win — so this
+	 * kind can and does fire on a query that goes on to settle `status: "ok"`
+	 * (no matching `resource-sampler-query-failed` row), i.e. a kill attempt
+	 * against a scanner that was already about to finish successfully. The
+	 * sampler already treats a lost tick as ordinary best-effort data loss
+	 * (self-healing on the next heartbeat), so this rising/falling noise
+	 * doesn't warrant the same attention as the backstop's rare, single-sweep
+	 * escalation.
+	 */
+	| "resource-sampler-scanner-escalated"
+	/**
 	 * `session_start`'s bounded change-log sequence read (#1162) blew its
 	 * budget and a project snapshot existed on disk, but the freshness gate
 	 * could not tell whether that snapshot was current (#1785). Hydration was
@@ -1086,6 +1107,10 @@ const INFORMATIONAL_DEGRADATION_KINDS: ReadonlySet<string> = new Set([
 	// would.
 	"actionable-warnings-inband-superseded",
 	"actionable-warnings-deferred-superseded",
+	// #2524: can fire on a query that ultimately settles `ok` (see the kind's
+	// doc comment above) and is frequent/self-healing by design — a `⚠` would
+	// cry wolf on the sampler's ordinary best-effort data loss.
+	"resource-sampler-scanner-escalated",
 ]);
 
 export function renderDegradationLines(

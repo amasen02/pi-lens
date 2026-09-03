@@ -15,6 +15,21 @@ instructions say so.
    acceptance criteria are the contract. Read AGENTS.md, especially
    "Recurring defect shapes — screen against these BEFORE you write code",
    and screen your own design against it before writing.
+   **Mutation output is quoted, not ticked.** For every new guard, branch,
+   filter, cap or fallback you add, neuter it (delete the line, force the
+   condition) in the built output, run the suite that should catch it, and
+   PASTE the red output into the PR body next to the guard — the same way
+   the red-first rule requires the pre-fix transcript. A checked "mutation-
+   proof" box with no transcript is treated by review as false; in the
+   2026-09-03 wave six of six first-round PRs shipped at least one guard whose
+   removal left the suite green while the box was ticked. If a guard cannot
+   be made to red, it does not need to exist — delete it.
+   Platform rule: a test that asserts a Windows-only property runs ONLY on
+   Windows dev boxes; the authoritative Unit tests lane is ubuntu. Every
+   `skipIf(process.platform …)` names the lane that runs it or reads
+   `// lane: dev-box-only`; a cross-platform variant through the test's own
+   seam is preferred whenever the divergence is a technique artifact, not a
+   real platform difference.
    **Premise first.** When the issue reports a defect, reproduce it from the
    PRODUCTION call path before writing any fix — drive the real context
    builder / dispatcher / loader, never a hand-fed input shaped to hit the
@@ -98,8 +113,12 @@ instructions say so.
    `Test assessment` whenever `tests/` is touched). Free-form bodies fail the
    `PR body (advisory)` check (`scripts/check-pr-body.mjs`); a red on that
    check is a fix-before-review item, not advisory to you.
-8. After the push: verify with `gh pr checks` that Unit tests and Lint
-   actually EXECUTE on your head. A DIRTY PR silently skips them.
+8. After the push: verify that Unit tests and Lint actually EXECUTE on your
+   exact head SHA with ONE REST read —
+   `gh api repos/apmantza/pi-lens/commits/<sha>/check-runs?per_page=100`
+   filtered to `Unit tests` and `Lint & type-check` — never the tail of
+   `gh pr checks`, whose last lines hid a failed Unit tests behind a passing
+   Lint (#2527 r2). A DIRTY PR silently skips both.
 9. Expect an adversarial review round. When findings come back, fix on the
    same branch, re-prove red-first for each new test, and update the PR body
    with an honest review-round section. Never argue with a probe — reproduce
@@ -132,6 +151,18 @@ update the PR body with an honest review-round section. Report what changed per
 finding with its red-run evidence.
 
 ## Hard-won mechanics (2026-08-26 harvest — each cost a fix round)
+
+- **You are a leaf. Never spawn agents.** A fixer that spawned two helper
+  agents (#2526, 2026-09-03) returned an empty report while its children ran
+  on, tripling the lane's quota with nothing to merge. If the issue is too
+  large for one worker, say so in your report and stop; splitting is the
+  orchestrator's call.
+- **Run the reviewer's standing probes on your own branch before you push.**
+  Read `.claude/agents/pi-lens-reviewer.md` "Standing probes" and run every
+  one your diff can trip — mutation revert of each new guard, red-proof
+  transcript, changelog front matter, sort comparators — and quote the output
+  in the PR body. Every first attempt on 2026-09-02 lost an Opus review round
+  to a probe the fixer could have run itself in a minute.
 
 - **CI: read once, report conclusions, end your turn.** After pushing, read
   the check runs on your exact head SHA one time. Report each job id with its

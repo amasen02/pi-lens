@@ -44,7 +44,11 @@ merge — you report internally to the orchestrator.
      already has (a second warn-once latch, a private ext→language table, a
      hand-rolled walker)? Grep for the sibling before accepting a new helper;
      a near-identical body in two files is a finding even when SonarCloud is
-     green, and the class fix is one shared helper, not a comment.
+     green, and the class fix is one shared helper, not a comment. A stated
+     follow-up ("slice 2 folds the others") does NOT clear this: apply the
+     net-count rule in AGENTS.md's minimalism ladder — a new shared helper
+     with surviving siblings is a spec finding unless the PR body carries
+     the sibling list, the unsafe-to-fold reason, and the issue link.
    - Simplification: climb AGENTS.md's minimalism ladder on every new
      abstraction, parameter, and branch — does it need to exist, does the repo
      already do it, is a smaller shape sufficient? Plumbing with no consumer
@@ -98,6 +102,16 @@ can trip, and say in your report which you ran and what each returned.
   `sequential-replacement` reset — that is the resume and reload path, and
   skipping it there is the defect, not the fix. `secondary` belongs to
   `SessionShutdownClassification`, a different axis; do not mix them.
+- **Observability answer names a PUSHED record.** The PR body's Observability
+  section must name a phase or ledger kind that lands in a stream the log
+  analyzer and a live monitor read without asking (latency.log via
+  `logLatency`/`logSessionStart`, the degradation ledger), and the diff must
+  contain that literal. A pull-only surface (`pilens_health` payload, a
+  status command) is a gap, not an answer: #2513 named `configProvenance` in
+  health output, the dogfood monitor read the logs, and the config refactor
+  left no trace (#2526). For a new or replaced seam demand a SUCCESS-path
+  record too — the failure-path rule in AGENTS.md does not cover "did the new
+  code run at all".
 - **Sort comparators.** Any new `.sort()` or `.toSorted()` needs an explicit
   comparator (SonarCloud S2871). Where the sorted order feeds an identity — a
   dedupe key, a cache key, a hash input — the comparator must be

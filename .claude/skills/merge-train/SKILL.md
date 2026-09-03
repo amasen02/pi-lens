@@ -74,6 +74,15 @@ merges first (the consumer then rebases and wires the new surface). Two PRs
 editing the same file get an explicit order decided up front. Log-schema
 changes must extend exact-key pins (`BASELINE_KEYS`-style), never loosen them.
 
+## Brief contract (orchestrator)
+
+Before dispatching any issue that adds a shared helper or seam: grep for
+same-shape siblings yourself and write the fold into the SAME slice, or write
+the sibling list, the reason folding is unsafe in one PR, and the follow-up
+issue into the brief. AGENTS.md's net-count rule binds the brief author; the
+fixer and reviewer only enforce what the brief scoped. #2530 shipped a fifth
+bound helper because the brief deferred the fold without a reason.
+
 ## Honesty rules
 
 - A finding is real when a probe proves it; a fix is real when the same probe

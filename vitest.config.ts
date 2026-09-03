@@ -318,6 +318,17 @@ const wallClockBudgetInclude = [
 	// the fully serialized, dead-last phase.
 	"tests/clients/lsp/service-notify-cpu-liveness.test.ts",
 ];
+// #2512 round 2: runtime-turn-session.test.ts's "retires a deleted failed
+// target through the real client and records real telemetry" spawns a REAL
+// child process, and was seen timing out at vitest's 5000ms default under a
+// 47-file parallel batch (5153/5013ms) — but it asserts no elapsed-time
+// budget at all, only that the spawn completes and its telemetry lands. That
+// fails this list's own charter (above: "carry a wall-clock budget assertion,
+// not just slowness"), so it does not belong here. An explicit per-test
+// timeout (20_000ms, 4× the observed 5013ms worst case) absorbs the same
+// contention without pulling 49 unrelated synthetic/mocked tests in the same
+// file into the serialized, dead-last phase — see the timeout at that test's
+// call site in runtime-turn-session.test.ts.
 
 export default defineConfig({
 	test: {
