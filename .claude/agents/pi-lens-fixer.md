@@ -152,6 +152,10 @@ finding with its red-run evidence.
 
 ## Hard-won mechanics (2026-08-26 harvest — each cost a fix round)
 
+- **Screen the diff against shapes 28–32 before pushing** (hot-path hoist for a
+  cold record, cap reset by its own selector, module-load platform const,
+  pull-only observability, mixed-case path predicate). Each cost a review round
+  on 2026-09-03; each has a one-line screen in AGENTS.md.
 - **You are a leaf. Never spawn agents.** A fixer that spawned two helper
   agents (#2526, 2026-09-03) returned an empty report while its children ran
   on, tripling the lane's quota with nothing to merge. If the issue is too
