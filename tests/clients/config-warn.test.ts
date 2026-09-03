@@ -475,3 +475,191 @@ describe("warnIgnoredConfigOnce parse-error reason redaction (#2431)", () => {
 		expect(group?.latestReasons[0]?.reason).not.toContain(TOKEN);
 	});
 });
+
+/**
+ * #2451: after #2431's fix, the position-free `Unexpected token` shape (the
+ * exact one #2431's own evidence hit) degraded to a bare `SyntaxError` — LESS
+ * locality than a hand-editing user had before #2431. `normalizeParseErrorReason`
+ * now accepts the source text the loaders already hold and locates the error
+ * IN IT, so `line L col C` survives for this shape too — derived from the
+ * source by scanning it, never by trusting a digit or a snippet straight out
+ * of the message.
+ */
+describe("normalizeParseErrorReason locates a position-free SyntaxError in its source (#2451)", () => {
+	const TOKEN = `ghp_${"A".repeat(36)}`;
+
+	function realJsonParseError(content: string): SyntaxError {
+		try {
+			JSON.parse(content);
+		} catch (error) {
+			if (error instanceof SyntaxError) return error;
+			throw error;
+		}
+		throw new Error("expected JSON.parse to throw for this fixture");
+	}
+
+	it("recovers line/col for a single-line document, only digits escape", () => {
+		const content = `{"piToken": ${TOKEN}}`;
+		const error = realJsonParseError(content);
+		// Pre-#2451 (no sourceText): bare class name, no locality at all — the
+		// exact regression this issue reports.
+		expect(normalizeParseErrorReason(error)).toBe("SyntaxError");
+
+		const reason = normalizeParseErrorReason(error, { sourceText: content });
+		expect(reason).toBe("SyntaxError at line 1 col 13");
+		expect(reason).not.toContain(TOKEN);
+		expect(reason).not.toContain("ghp_");
+		expect(reason).not.toContain("piToken");
+	});
+
+	it("recovers the correct LINE across a multi-line document, not just the correct file", () => {
+		const content = `{\n  "a": 1,\n  "piToken": ${TOKEN}\n}`;
+		const error = realJsonParseError(content);
+		const reason = normalizeParseErrorReason(error, { sourceText: content });
+		expect(reason).toBe("SyntaxError at line 3 col 14");
+		expect(reason).not.toContain(TOKEN);
+		expect(reason).not.toContain("ghp_");
+	});
+
+	it("still recomputes line/col from the source for the position-stated shape, not from the message", () => {
+		// `{` alone: V8 states `at position 1 (line 1 column 2)`. With source
+		// text, the position is derived by SCANNING the source at offset 1,
+		// never by trusting the digits V8 put in its own message text.
+		const content = "{";
+		const error = realJsonParseError(content);
+		expect(normalizeParseErrorReason(error, { sourceText: content })).toBe(
+			"SyntaxError at line 1 col 2",
+		);
+	});
+
+	it("falls back to the bare class name when the snippet is not a unique match in the source", () => {
+		// A synthetic message in V8's exact position-free shape. `sourceText`
+		// contains the quoted snippet TWICE — the located position would be a
+		// coin flip, so the safe answer is no location at all, not a guess.
+		const error = {
+			name: "SyntaxError",
+			message: `Unexpected token 'w', "hello world" is not valid JSON`,
+		};
+		const sourceText = "hello world, and also: hello world again";
+		expect(normalizeParseErrorReason(error, { sourceText })).toBe(
+			"SyntaxError",
+		);
+	});
+
+	it("degrades to the snippet's own start when the offending token repeats inside it", () => {
+		// Snippet ("hello world") is UNIQUE in the source, but the token 'o'
+		// inside it is not (it appears in both "hello" and "world"), so the
+		// exact character cannot be picked out — the snippet's own (unambiguous)
+		// start position stands in, still the correct line.
+		const error = {
+			name: "SyntaxError",
+			message: `Unexpected token 'o', "hello world" is not valid JSON`,
+		};
+		const sourceText = "xxx hello world yyy";
+		// snippet starts at index 4 -> line 1, col 5.
+		expect(normalizeParseErrorReason(error, { sourceText })).toBe(
+			"SyntaxError at line 1 col 5",
+		);
+	});
+
+	it("does not misparse a message that only superficially resembles the shape", () => {
+		const notReallyThatShape = {
+			name: "SyntaxError",
+			message: "Unexpected token missing the quoted snippet entirely",
+		};
+		expect(
+			normalizeParseErrorReason(notReallyThatShape, { sourceText: "anything" }),
+		).toBe("SyntaxError");
+	});
+
+	it("requires the shape at the START of the message, not merely present somewhere in it", () => {
+		// A hand-authored `name: "SyntaxError"` object (not a real JSON.parse
+		// error at all) whose message happens to CONTAIN this shape's marker
+		// after some other prefix text. Locating a snippet from unrelated,
+		// caller-controlled prose is not this function's contract.
+		const notFromJsonParse = {
+			name: "SyntaxError",
+			message: `zzzzz Unexpected token 'q', "hello" is not valid JSON`,
+		};
+		expect(
+			normalizeParseErrorReason(notFromJsonParse, {
+				sourceText: "xxx hello yyy",
+			}),
+		).toBe("SyntaxError");
+	});
+
+	it("requires the message to end in one of V8's two known suffixes, not just be quoted", () => {
+		// Properly quoted, but the tail is neither `" is not valid JSON` nor
+		// `"... is not valid JSON` — not a shape this function recognizes, so it
+		// must not guess a snippet out of whatever text happens to follow.
+		const unknownTail = {
+			name: "SyntaxError",
+			message: `Unexpected token 'q', "hello" this is a weird ending`,
+		};
+		expect(
+			normalizeParseErrorReason(unknownTail, {
+				sourceText: `xxx hello" this is a weird ending yyy`,
+			}),
+		).toBe("SyntaxError");
+	});
+
+	it("requires the snippet to actually be quoted, not just followed by a trailing suffix", () => {
+		// The marker (`', `) is present and the message DOES end with the
+		// "is not valid JSON" suffix, but there is no opening `"` — V8 never
+		// emits that shape, so this is not a real snippet to trust.
+		const noOpeningQuote = {
+			name: "SyntaxError",
+			message: `Unexpected token 'q', Xhello" is not valid JSON`,
+		};
+		expect(
+			normalizeParseErrorReason(noOpeningQuote, {
+				sourceText: "xxx hello yyy",
+			}),
+		).toBe("SyntaxError");
+	});
+
+	it("classOnly overrides source-derived locality too, for a SyntaxError", () => {
+		const content = `{"piToken": ${TOKEN}}`;
+		const error = realJsonParseError(content);
+		const reason = normalizeParseErrorReason(error, {
+			sourceText: content,
+			classOnly: true,
+		});
+		expect(reason).toBe("SyntaxError");
+	});
+
+	it("classOnly strips the message from a non-SyntaxError too — config-core's own guarantee (#2451)", () => {
+		const error = new TypeError(`unexpected value ${TOKEN}`);
+		const reason = normalizeParseErrorReason(error, { classOnly: true });
+		expect(reason).toBe("TypeError");
+		expect(reason).not.toContain(TOKEN);
+		expect(reason).not.toContain("unexpected value");
+		// Contrast with the DEFAULT (non-classOnly) behavior for the same error:
+		// this is the one branch where the (redacted) message DOES survive —
+		// proof `classOnly` is doing real work, not a no-op flag.
+		expect(normalizeParseErrorReason(error)).toContain("unexpected value");
+	});
+
+	it("warnIgnoredConfigOnce threads sourceText through to recover locality end to end", () => {
+		const content = `{"piToken": ${TOKEN}}`;
+		const error = realJsonParseError(content);
+
+		warnIgnoredConfigOnce({
+			subsystem: "project-lens-config",
+			file: "/tmp/.pi-lens.json",
+			reason: { parseError: error, sourceText: content },
+		});
+
+		expect(notified).toHaveLength(1);
+		expect(notified[0].message).toContain(
+			"ignoring invalid project config /tmp/.pi-lens.json: SyntaxError at line 1 col 13",
+		);
+		expect(notified[0].message).not.toContain(TOKEN);
+		expect(notified[0].message).not.toContain("ghp_");
+
+		const group = configIgnoredGroup();
+		expect(group?.latestReasons[0]?.reason).toBe(
+			"SyntaxError at line 1 col 13",
+		);
+	});
+});

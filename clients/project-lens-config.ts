@@ -585,6 +585,7 @@ function discoverPiLensProjectConfig(startDir: string): DiscoveryCacheEntry {
 					location,
 					tier: "project",
 					error: outcome.error,
+					sourceText: outcome.sourceText,
 				});
 				continue;
 			}
@@ -744,7 +745,7 @@ function parseConfigFile(configPath: string): ParsedConfigFile {
 		// reaches one seam, which decides how much of a `JSON.parse`
 		// `SyntaxError#message` (which embeds a snippet of the file being parsed)
 		// survives into the sinks.
-		note({ parseError: outcome.error });
+		note({ parseError: outcome.error, sourceText: outcome.sourceText });
 		return {
 			config: EMPTY_PROJECT_CONFIG,
 			records: NO_RECORDS,

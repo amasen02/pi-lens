@@ -191,6 +191,10 @@ describe("loadLSPConfig global configuration (#870)", () => {
 		expect(ledgerEntry).toBeDefined();
 		expect(ledgerEntry?.reason).not.toContain(TOKEN);
 		expect(ledgerEntry?.reason).not.toContain("ghp_");
+		// #2451: locality recovered end to end through the real production
+		// wiring (`readConfigDocument` -> `reportConfigReadFailure`), not just
+		// at the `normalizeParseErrorReason` unit level.
+		expect(ledgerEntry?.reason).toBe("SyntaxError at line 1 col 13");
 	});
 
 	it("warns once per broken file, and again after the latch is reset", async () => {
