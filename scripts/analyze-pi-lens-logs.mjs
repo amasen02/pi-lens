@@ -226,16 +226,25 @@ function createState(files) {
 		// the rows that carry a deprecated document but produced no
 		// migration/notice record — the deprecation machinery gone silent.
 		//
-		// Round 2, F2: the session→row relation is a JOIN on the session id both
-		// sides carry, not a subtraction of two counts. `expectedSessions` holds
-		// the sessions whose own start line said a resolution was expected;
-		// `resolvedSessions` holds every session id a resolution actually
-		// reported, from EITHER sink (the latency row or the sessionstart line —
-		// one call writes both, so this is one fact surviving an independent
-		// rotation of either log, not a second source of truth).
+		// Round 2, F2: the session->row relation is a JOIN on the session id both
+		// sides carry, not a subtraction of two counts.
+		//
+		// Round 3, S1: the session-side half of the join is no longer a
+		// PREDICTION. `pendingSessions` holds every session id that published a
+		// `config_resolution_pending` mark — written by `loadLSPConfig` itself,
+		// at the instant a resolution is actually attempted, never by a
+		// `runtime-session.ts` handler guessing from `no-lsp`/subagent/warm-attach
+		// flags ahead of time. A session that never reaches that call (quick or
+		// minimal mode's second-and-later session in a process, for the same
+		// root) never gets a mark, so it is silently excluded rather than
+		// counted against. `resolvedSessions` holds every session id a
+		// resolution actually reported, from EITHER sink (the latency row or the
+		// sessionstart line — one call writes both, so this is one fact
+		// surviving an independent rotation of either log, not a second source
+		// of truth).
 		config: {
 			resolved: 0,
-			expectedSessions: new Map(),
+			pendingSessions: new Map(),
 			resolvedSessions: new Set(),
 			legacyDocuments: 0,
 			legacyWithoutRecords: 0,
@@ -683,22 +692,17 @@ async function analyzeSessionStart(files, state) {
 				trackProject(state, cwd);
 			}
 
-			// #2526 R2 F2: this session's config-resolution expectation, published
-			// on BOTH the quick and the full path (the `session_start cwd:` line
-			// above is full-path only, which is exactly why it cannot be the
-			// denominator). `expected=false` names a session that never resolves
-			// config by design — `--no-lsp`, a subagent, a warm-attached quick
-			// start — and is recorded so a reader can see it was considered.
-			const expectation =
-				/session_start config-resolution session=(\S+) expected=(true|false)(?: reason=(\S+))?/.exec(
-					message,
-				);
-			if (expectation) {
-				state.config.expectedSessions.set(expectation[1], {
-					expected: expectation[2] === "true",
-					reason: expectation[3] ?? "unknown",
-					ts: iso(ts),
-				});
+			// #2526 R3 S1: this session's config-resolution PENDING mark, published
+			// by `loadLSPConfig` itself at the instant a resolution is actually
+			// attempted — never a start-line prediction from `no-lsp`/subagent/
+			// warm-attach flags. A session that never calls `loadLSPConfig` (quick
+			// or minimal mode's second-and-later session in a process, for the
+			// same root) never writes this line, and is correctly absent from the
+			// join rather than counted against.
+			const pending =
+				/session_start config_resolution_pending session=(\S+)/.exec(message);
+			if (pending) {
+				state.config.pendingSessions.set(pending[1], { ts: iso(ts) });
 			}
 			// The loader's own line is the second half of the join, so a rotated
 			// latency.log cannot manufacture a deficit on its own.
@@ -1293,33 +1297,34 @@ function buildReport(state) {
 	);
 	// #2526: config resolution has to prove it HAPPENED. Two shapes, one smell:
 	//
-	// (a) a session that EXPECTED a config resolution and produced no
-	//     `config_resolved` row. Round 2, F2: a per-session JOIN on the id both
-	//     the start line and the record carry, never a subtraction of two
-	//     counts. Subtracting counted quick sessions' rows against full
-	//     sessions' start lines (different populations), which both masked
-	//     total silence and charged `--no-lsp`/subagent sessions with a
-	//     permanent deficit they can never clear.
+	// (a) a session that has a `config_resolution_pending` mark and produced no
+	//     `config_resolved` row. Round 3, S1: the pending mark is written by
+	//     `loadLSPConfig` itself, at the instant a resolution is actually
+	//     attempted — never predicted from a handler's own flags ahead of time.
+	//     Round 2, F2 established the JOIN itself: on the session id both sides
+	//     carry, never a subtraction of two counts (subtracting counted quick
+	//     sessions' rows against full sessions' start lines — different
+	//     populations — which both masked total silence and charged
+	//     `--no-lsp`/subagent sessions with a permanent deficit they could never
+	//     clear).
 	// (b) a legacy document present with zero records — the deprecation
 	//     machinery went silent while the user is on a removal schedule.
-	const expectingConfigResolution = [
-		...state.config.expectedSessions.entries(),
-	].filter(([, value]) => value.expected);
-	const unresolvedSessions = expectingConfigResolution.filter(
+	const pendingConfigResolution = [...state.config.pendingSessions.entries()];
+	const unresolvedSessions = pendingConfigResolution.filter(
 		([id]) => !state.config.resolvedSessions.has(id),
 	);
 	for (const [id, value] of unresolvedSessions.slice(0, limit * 3)) {
 		state.config.examples.push({
 			ts: value.ts,
 			session: id,
-			note: "session expected a config resolution and produced no config_resolved row",
+			note: "session had a config_resolution_pending mark and produced no config_resolved row",
 		});
 	}
 	addSmell(
 		smells,
 		"config-resolution",
 		unresolvedSessions.length + state.config.legacyWithoutRecords,
-		`Sessions that expected config resolution but produced no config_resolved row (${unresolvedSessions.length} of ${expectingConfigResolution.length}) or a legacy config document that produced no migration record (${state.config.legacyWithoutRecords})`,
+		`Sessions with a config_resolution_pending mark but no config_resolved row (${unresolvedSessions.length} of ${pendingConfigResolution.length}) or a legacy config document that produced no migration record (${state.config.legacyWithoutRecords})`,
 		state.config.examples.slice(0, limit),
 	);
 	addSmell(
@@ -1486,7 +1491,7 @@ function buildReport(state) {
 		// it correctly did not) without re-deriving the deficit.
 		config: {
 			resolved: state.config.resolved,
-			sessionsExpectingResolution: expectingConfigResolution.length,
+			sessionsPendingResolution: pendingConfigResolution.length,
 			sessionsWithoutResolution: unresolvedSessions.length,
 			legacyDocuments: state.config.legacyDocuments,
 			legacyWithoutRecords: state.config.legacyWithoutRecords,

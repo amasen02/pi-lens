@@ -40,7 +40,7 @@ import {
 	detectProjectLanguageProfile,
 	getDefaultStartupTools,
 } from "./language-profile.js";
-import { currentSessionRecordId, logLatency } from "./latency-logger.js";
+import { logLatency } from "./latency-logger.js";
 import { runLogCleanup } from "./log-cleanup.js";
 import { resetCascadeTierSessionState } from "./lsp/cascade-tier.js";
 import type { LSPShutdownOptions } from "./lsp/client.js";
@@ -1856,59 +1856,6 @@ export const SESSION_START_GUIDANCE: string[] = [
 		"• Situational (activate via pi_lens_activate_tools): lsp_navigation, ast_grep_search, ast_grep_replace, ast_grep_dump.",
 ];
 
-/**
- * Why THIS session will or will not resolve config — the join key and the
- * expectation the `config-resolution` smell reads (#2526 review round 2, F2).
- *
- * The smell used to subtract `config_resolved` rows from `session_start cwd:`
- * lines, and those two count different populations. The start line is written
- * on the FULL path only, well past quick mode's early return, while a QUICK
- * session does resolve config and does write a row — so a quick session's row
- * cancelled a full session's missing one and total silence summed to zero. The
- * inverse was worse: a `--no-lsp` or subagent session emits the start line and
- * legitimately never resolves, contributing a permanent deficit that trains a
- * reader to ignore the smell.
- *
- * Publishing an id plus an expectation, on BOTH paths, replaces the
- * subtraction with a join. `reason` is DERIVED from the same three predicates
- * the resolution paths themselves gate on, each named here beside the call
- * site it mirrors:
- *
- *   - `no-lsp`     — the flag both the deferred full-path load (`!getFlag
- *                    ("no-lsp") && allowBootstrapTasks`) and the quick-mode
- *                    warmup check first.
- *   - `subagent`   — #449 light mode: both paths skip the LSP pre-warm, so
- *                    nothing resolves config for a subagent session.
- *   - `warm-attach`— quick mode only; the full path resolves regardless.
- *
- * Any of them makes the expectation FALSE, which is the safe direction: an
- * un-expected session that resolves anyway is simply an unmatched row (the
- * analyzer counts only expectations without rows), while a wrongly-expected
- * one is a false positive that costs the smell its credibility.
- *
- * Written through `dbg`, so it lands in sessionstart.log beside the other
- * session-start lines and — like every other `dbg` line — is silent for the
- * warm MCP server, whose `runSessionStart` passes a no-op. That is correct:
- * a warm server has no session boundary to expect a resolution for.
- */
-function publishConfigResolutionExpectation(
-	dbg: (msg: string) => void,
-	getFlag: (name: string) => boolean | string | undefined,
-	startupMode: string,
-): void {
-	const reason = getFlag("no-lsp")
-		? "no-lsp"
-		: isSubagentSession()
-			? "subagent"
-			: startupMode === "quick" && isWarmAttached()
-				? "warm-attach"
-				: "ok";
-	dbg(
-		`session_start config-resolution session=${currentSessionRecordId()} ` +
-			`expected=${reason === "ok"} reason=${reason} mode=${startupMode}`,
-	);
-}
-
 export async function handleSessionStart(
 	deps: SessionStartDeps,
 ): Promise<void> {
@@ -2466,7 +2413,12 @@ export async function handleSessionStart(
 
 	const hasWorkspaceCwd = typeof ctxCwd === "string" && ctxCwd.length > 0;
 	const cwd = ctxCwd ?? process.cwd();
-	publishConfigResolutionExpectation(dbg, getFlag, startupMode);
+	// #2526 review round 3, S1: this handler no longer predicts whether config
+	// will resolve. `loadLSPConfig` itself publishes a `config_resolution_pending`
+	// mark, from inside the function, at the instant a resolution is actually
+	// attempted — see that function's doc comment (`clients/lsp/config.ts`) for
+	// why a prediction mirrored against this handler's own gates drifted from
+	// what index.ts and this handler's callers actually schedule.
 	// #1228: generic atomic-write stages are shared by several project stores,
 	// so the review-graph-specific sweep cannot own this namespace. Sweep the
 	// project data roots and machine-global registry root once per session start;

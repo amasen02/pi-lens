@@ -242,6 +242,51 @@ const CONFIG_RESOLVED_PHASE = "config_resolved";
  * `normalizeFilePath` keys it, the repo-wide rule for every path-keyed map
  * (#210): a `/`-vs-`\` spelling of one root must not buy a second row.
  */
+/**
+ * Announce, at the instant a resolution is actually about to be attempted,
+ * that THIS session expects a `config_resolved` row (#2526 review round 3,
+ * S1).
+ *
+ * Round 2 PREDICTED this from three flags in `runtime-session.ts`
+ * (`no-lsp`/`subagent`/`warm-attach`), each mirroring one gate the resolution
+ * paths themselves check — and the mirror drifted: quick and minimal mode's
+ * SECOND session in one process schedule no resolution at all
+ * (`ensureLSPConfigInitialized`'s `_lspConfigInitializedCwds` memo skips the
+ * synchronous resolve past the first session, and only FULL mode's deferred
+ * `setImmediate` reschedules one), so the predicate kept saying
+ * `expected=true` for a session that was never going to resolve, and the
+ * analyzer flagged a real session every time under `PI_LENS_STARTUP_MODE=quick`
+ * or `=minimal`. STOP PREDICTING: this function is called from `loadLSPConfig`
+ * itself rather than from any of its callers' decision points, because
+ * `loadLSPConfig` is the ONE funnel every production caller reaches —
+ * `initLSPConfig` (`ensureLSPConfigInitialized`'s first-session-per-cwd path
+ * in index.ts, the MCP `ensureReady` boot via `ensureLspConfig`,
+ * `igniteWarmFiles`/`igniteDominantLanguageWarm`) and the two direct calls in
+ * `runtime-session.ts` (the full-mode deferred `setImmediate` load and the
+ * quick-mode warm-up's LSP pre-warm). Placing the mark here rather than at
+ * each of those four sites buys three things: (a) it fires exactly when a
+ * resolution is genuinely attempted, never merely decided likely; (b) a
+ * session that never reaches ANY of those sites — quick or minimal mode's
+ * second-and-later session in a process, for the same root — never gets a
+ * mark, so the analyzer silently excludes it instead of counting it against;
+ * (c) this mark and {@link recordConfigResolved}'s row are stamped from the
+ * SAME `currentSessionRecordId()` read, a few lines apart in one function
+ * call, so they can never disagree about which session they belong to —
+ * writing the mark at each scheduling site instead (e.g. before a
+ * `setImmediate`) would let a session boundary between scheduling and
+ * execution attribute the two halves to different sessions.
+ *
+ * Written unconditionally — before {@link resolvePiLensConfig} can throw —
+ * so a resolution that is entered but fails mid-flight leaves a mark with no
+ * row, which the analyzer's join reads as "expected and never happened"
+ * rather than silently matching "never expected at all".
+ */
+function publishConfigResolutionPending(): void {
+	logSessionStart(
+		`session_start config_resolution_pending session=${currentSessionRecordId()}`,
+	);
+}
+
 function recordConfigResolved(
 	cwd: string,
 	resolution: PiLensConfigResolution,
@@ -294,6 +339,10 @@ export async function loadLSPConfig(
 	options: LoadLSPConfigOptions = {},
 ): Promise<LSPConfig> {
 	const reporting = options.report !== false;
+	// #2526 review round 3, S1: announce the attempt before anything that
+	// resolves it can throw — see `publishConfigResolutionPending`'s doc
+	// comment for why this lives here rather than at each caller.
+	publishConfigResolutionPending();
 	const resolveStartedAt = Date.now();
 	const resolution = resolvePiLensConfig({
 		cwd,

@@ -8,7 +8,6 @@
  *
  *   index.ts   ensureLSPConfigInitialized(ctx.cwd)   -> loadLSPConfig -> ROW
  *   index.ts   handleSessionStart(...)               -> (re-arm lived here)
- *   deferred   loadLSPConfig(cwd)                    -> ROW AGAIN
  *
  * so a re-arm inside the handler fires BETWEEN the session's own two config
  * resolutions and the first session of a process writes TWO rows while every
@@ -19,12 +18,38 @@
  * This file replays index.ts's own ordering through the pi mock, so a re-arm
  * that drifts back inside the handler reds here.
  *
- * The "deferred load" is driven as a direct `loadLSPConfig(cwd)` call after the
- * emit resolves: that is literally the function `runtime-session.ts`'s
- * `setImmediate(() => loadLSPConfig(cwd))` calls, and the property under test
- * is only that it runs AFTER `handleSessionStart` returned. Forcing full
- * startup mode to get the real `setImmediate` would drag the whole scan
- * bootstrap (knip/jscpd/dep) into a wiring test for no added fidelity.
+ * ## Round 3, S1: no more hand-calling `loadLSPConfig` under quick mode
+ *
+ * The previous version of this file simulated "the deferred load" as a direct
+ * `loadLSPConfig(cwd)` call after each emit, framed as standing in for
+ * `runtime-session.ts`'s full-mode-only `setImmediate(() => loadLSPConfig(cwd))`.
+ * That framing was WRONG under the `PI_LENS_STARTUP_MODE=quick` this file
+ * forces in `beforeEach`: `allowBootstrapTasks = startupMode === "full"` gates
+ * that `setImmediate` — under quick mode it is never scheduled at all, so the
+ * hand-call exercised a code path that does not correspond to anything
+ * production quick-mode sessions actually do. It also PAPERED OVER the real
+ * defect the reviewer's own probe found: under quick (or minimal) mode, a
+ * SECOND session in the same process for the SAME root schedules NO
+ * resolution anywhere — `ensureLSPConfigInitialized`'s process-lifetime
+ * `_lspConfigInitializedCwds` memo short-circuits the ensure, and neither the
+ * quick-mode warm-up (gated on the ALREADY-tripped `__piLensWarmupScheduled`
+ * process latch) nor the full-mode `setImmediate` (gated on `allowBootstrapTasks`,
+ * false for quick/minimal) ever fires — so that session gets no
+ * `config_resolution_pending` mark and no row, and the OLD `expected=true`
+ * PREDICTION (deleted this round) called that session a defect every time.
+ *
+ * The tests below drive the REAL closure with no hand-calls standing in for
+ * anything: a second quick-mode (and separately, minimal-mode) session in the
+ * same process gets NEITHER a mark NOR a row, which is what makes the
+ * analyzer's pending-mark join correctly exclude it. Forcing full startup mode
+ * to get the real `setImmediate` deferred load would drag the whole scan
+ * bootstrap (knip/jscpd/dep) into a wiring test for no added fidelity — the
+ * "pending mark survives a resolution that fails mid-flight" case is instead
+ * covered at the `loadLSPConfig` unit level
+ * (`tests/clients/config-resolved-phase.test.ts`) and the "smell fires on a
+ * pending mark with no row" case at the analyzer level
+ * (`tests/scripts/analyze-config-resolution-smell.test.ts`), where mode is
+ * irrelevant to what is under test.
  */
 
 import * as fs from "node:fs";
@@ -130,7 +155,7 @@ function freshRoot(): string {
 }
 
 describe("index.ts session_start: ONE config_resolved row per session (#2526 R2 F1)", () => {
-	it("ensure -> session_start -> deferred load writes exactly one row", async () => {
+	it("ensure -> session_start writes exactly the session's one row", async () => {
 		const root = freshRoot();
 		const pi = createPiMock();
 		extension(pi.asExtensionAPI());
@@ -144,31 +169,26 @@ describe("index.ts session_start: ONE config_resolved row per session (#2526 R2 
 			makeSessionStartEvent(),
 			makeCtx({ cwd: root, sessionId: "host-session-1" }),
 		);
-		const afterStart = await configResolvedRows();
-		expect(
-			afterStart,
-			"the session_start ensure must write the session's row",
-		).toHaveLength(1);
-
-		// The deferred load `runtime-session.ts` schedules for this same session.
-		const { loadLSPConfig } = await import("../clients/lsp/config.js");
-		await loadLSPConfig(root);
-
 		expect(
 			await configResolvedRows(),
-			"handleSessionStart re-armed the claim mid-session: the deferred load wrote a SECOND row",
+			"the session_start ensure must write the session's row",
 		).toHaveLength(1);
 	}, 30000);
 
 	/**
-	 * The SAME root across two sessions, deliberately: index.ts's
-	 * process-lifetime `_lspConfigInitializedCwds` memo short-circuits session
-	 * 2's ensure, so the only thing that resolves config for it is the deferred
-	 * load — and the only thing that lets that load record is the re-arm. A
-	 * second root would claim independently under the per-root scoping (F3) and
-	 * would pass with no re-arm at all.
+	 * #2526 review round 3, S1 — the reviewer's exact probe. The SAME root
+	 * across two sessions, deliberately: index.ts's process-lifetime
+	 * `_lspConfigInitializedCwds` memo short-circuits session 2's ensure, and
+	 * under quick mode NOTHING else in `handleSessionStart` reaches
+	 * `loadLSPConfig` either (the warm-up timer's own `__piLensWarmupScheduled`
+	 * process latch is already tripped by session 1, and the full-mode-only
+	 * `setImmediate` deferred load never applies). So session 2 gets neither a
+	 * `config_resolution_pending` mark nor a `config_resolved` row — which is
+	 * the CORRECT, healthy outcome the analyzer's pending-mark join must
+	 * silently exclude, not the false "expected and missing" the deleted
+	 * `expected=true` prediction used to report for every such session.
 	 */
-	it("a second session start re-arms the claim, so it gets its own row", async () => {
+	it("a second quick-mode session in the same process schedules no load: no mark, no row", async () => {
 		const root = freshRoot();
 		const pi = createPiMock();
 		extension(pi.asExtensionAPI());
@@ -182,29 +202,67 @@ describe("index.ts session_start: ONE config_resolved row per session (#2526 R2 
 		);
 		expect(await configResolvedRows()).toHaveLength(1);
 
-		// A genuine new session in the same root. index.ts's closure re-arms
-		// before its own (memoized, no-op) ensure, so the deferred load records.
+		const offset = sessionStartOffset();
 		_resetSessionLifecycleForTests();
 		await pi.emit(
 			"session_start",
 			makeSessionStartEvent({ reason: "new" }),
 			makeCtx({ cwd: root, sessionId: "host-session-2" }),
 		);
-		const { loadLSPConfig } = await import("../clients/lsp/config.js");
-		await loadLSPConfig(root);
 
-		const rows = await configResolvedRows();
 		expect(
-			rows,
-			"the second session never recorded its resolution",
-		).toHaveLength(2);
+			await configResolvedRows(),
+			"a second quick-mode session for the same root must not add a row",
+		).toHaveLength(1);
 		expect(
-			rows[0].metadata.sessionId,
-			"each session's row must carry its OWN session identity",
-		).not.toBe(rows[1].metadata.sessionId);
+			await sessionStartLinesSince(offset, "config_resolution_pending"),
+			"a second quick-mode session for the same root must publish no pending mark",
+		).toHaveLength(0);
 	}, 30000);
 
-	it("the row's session id matches the session-start expectation line's", async () => {
+	/**
+	 * #2526 review round 3, S1 fixture: minimal mode behaves the same way as
+	 * quick mode here, for a different reason — `allowBootstrapTasks` (gates the
+	 * full-mode deferred load) and `quickMode` (gates the warm-up timer) are
+	 * BOTH false for `startupMode === "minimal"`, so `handleSessionStart` never
+	 * reaches `loadLSPConfig` at all, on ANY session. Only
+	 * `ensureLSPConfigInitialized`'s first-session-per-cwd path in index.ts ever
+	 * resolves config in minimal mode.
+	 */
+	it("a second minimal-mode session in the same process schedules no load: no mark, no row", async () => {
+		const root = freshRoot();
+		process.env.PI_LENS_STARTUP_MODE = "minimal";
+		const pi = createPiMock();
+		extension(pi.asExtensionAPI());
+		clearLatencyLog();
+		await flushLatencyLog();
+
+		await pi.emit(
+			"session_start",
+			makeSessionStartEvent(),
+			makeCtx({ cwd: root, sessionId: "host-session-1" }),
+		);
+		expect(await configResolvedRows()).toHaveLength(1);
+
+		const offset = sessionStartOffset();
+		_resetSessionLifecycleForTests();
+		await pi.emit(
+			"session_start",
+			makeSessionStartEvent({ reason: "new" }),
+			makeCtx({ cwd: root, sessionId: "host-session-2" }),
+		);
+
+		expect(
+			await configResolvedRows(),
+			"a second minimal-mode session for the same root must not add a row",
+		).toHaveLength(1);
+		expect(
+			await sessionStartLinesSince(offset, "config_resolution_pending"),
+			"a second minimal-mode session for the same root must publish no pending mark",
+		).toHaveLength(0);
+	}, 30000);
+
+	it("the row's session id matches the pending mark's", async () => {
 		const root = freshRoot();
 		const pi = createPiMock();
 		extension(pi.asExtensionAPI());
@@ -227,15 +285,12 @@ describe("index.ts session_start: ONE config_resolved row per session (#2526 R2 
 
 		const lines = await sessionStartLinesSince(
 			offset,
-			"session_start config-resolution",
+			"config_resolution_pending",
 		);
 		expect(
 			lines,
-			"handleSessionStart must publish this session's config-resolution expectation",
+			"ensureLSPConfigInitialized's loadLSPConfig call must publish this session's pending mark",
 		).toHaveLength(1);
 		expect(lines[0]).toContain(`session=${rowSessionId}`);
-		// LSP is enabled and this is not a subagent session, so a resolution IS
-		// expected — the analyzer counts this session against its row.
-		expect(lines[0]).toContain("expected=true");
 	}, 30000);
 });

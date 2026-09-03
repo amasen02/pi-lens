@@ -685,18 +685,25 @@ export function currentSessionRecordId(): string {
 }
 
 /**
- * The claim key. A phase may be claimed per SCOPE (#2526 review round 2, F3):
+ * The claim key. A phase is claimed per SCOPE (#2526 review round 2, F3):
  * `config_resolved` is a fact about a (session, project root) pair, and the
  * warm MCP server serves N roots from one process — keying on the phase name
  * alone recorded the first root's documents and silently dropped every other
  * root's, so a legacy config in project B could never surface its smell.
+ *
+ * `scope` is REQUIRED (#2526 review round 3, S3 — narrowed from optional):
+ * the one production caller always passes one, and an unscoped claim is the
+ * exact shape F3 found unsafe — a phase-only key recording the first caller
+ * and silently dropping every later one under a different scope. A future
+ * producer with no natural scope can pass a constant string; that is still an
+ * explicit choice, not a silently-defaulted one.
  */
-function claimKey(phase: string, scope: string | undefined): string {
-	return scope === undefined ? phase : `${phase}\0${scope}`;
+function claimKey(phase: string, scope: string): string {
+	return `${phase}\0${scope}`;
 }
 
 /**
- * Claim the session's one record for `phase` (optionally per `scope`).
+ * Claim the session's one record for `phase` within `scope`.
  *
  * Returns true exactly once per session and scope; every later call for the
  * same pair returns false until {@link resetOncePerSessionPhases} re-arms it.
@@ -705,7 +712,7 @@ function claimKey(phase: string, scope: string | undefined): string {
  */
 export function claimPhaseOncePerSession(
 	phase: string,
-	scope?: string,
+	scope: string,
 ): boolean {
 	const key = claimKey(phase, scope);
 	if (oncePerSessionPhases.has(key)) return false;
@@ -725,8 +732,7 @@ export function claimPhaseOncePerSession(
 export function releaseOncePerSessionPhase(phase: string): void {
 	const prefix = `${phase}\0`;
 	for (const key of oncePerSessionPhases) {
-		if (key === phase || key.startsWith(prefix))
-			oncePerSessionPhases.delete(key);
+		if (key.startsWith(prefix)) oncePerSessionPhases.delete(key);
 	}
 }
 

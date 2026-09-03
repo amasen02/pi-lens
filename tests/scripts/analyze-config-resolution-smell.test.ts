@@ -6,7 +6,7 @@
  * `analyze-pi-lens-logs.test.ts` uses, kept in its own file so the shared
  * fixture's existing count assertions stay untouched:
  *
- * 1. A session that EXPECTED config resolution and produced no
+ * 1. A session that has a `config_resolution_pending` mark and produced no
  *    `config_resolved` row.
  * 2. A `config_resolved` row carrying a LEGACY document that produced zero
  *    migration records — the deprecation machinery gone silent while the user
@@ -27,12 +27,24 @@
  * emits the start line and never resolves, so it contributed a PERMANENT false
  * deficit that a reader learns to ignore.
  *
- * Both disappear once each session carries an identity. `handleSessionStart`
- * publishes one `session_start config-resolution session=<id> expected=<bool>`
- * line per session — on both paths, before quick mode's early return — and the
- * `config_resolved` record carries the same id. The analyzer joins on it: a
- * session counts as unresolved only when its own start said a resolution was
- * expected and no row bearing its id exists.
+ * ## Round 3, S1: no more prediction, no more `expected`/`reason`
+ *
+ * Round 2 fixed the JOIN but kept a PREDICTION on the session side:
+ * `handleSessionStart` published `session_start config-resolution
+ * session=<id> expected=<bool> reason=<...>`, with `expected` mirrored from
+ * the same `no-lsp`/subagent/warm-attach flags the resolution paths gate on.
+ * That mirror drifted: quick and minimal mode's SECOND session in a process
+ * schedule no resolution at all (a process-lifetime memo short-circuits it),
+ * so the prediction said `expected=true` for a session that could never
+ * resolve, and the smell flagged a healthy session every time.
+ *
+ * `loadLSPConfig` now publishes its own `session_start config_resolution_pending
+ * session=<id>` mark, as the FIRST thing it does, so the mark fires exactly
+ * when a resolution is genuinely ATTEMPTED — never predicted. A session that
+ * never reaches `loadLSPConfig` publishes no mark and is silently excluded,
+ * not counted against. The smell now joins pending marks against rows,
+ * exactly like round 2's row-vs-start-line join, but on real evidence instead
+ * of a guess.
  */
 
 import { execFileSync } from "node:child_process";
@@ -67,7 +79,7 @@ interface Report {
 	smells: Smell[];
 	config: {
 		resolved: number;
-		sessionsExpectingResolution: number;
+		sessionsPendingResolution: number;
 		sessionsWithoutResolution: number;
 		legacyDocuments: number;
 		legacyWithoutRecords: number;
@@ -97,30 +109,21 @@ function configResolvedRow(options: {
 }
 
 /**
- * One session's sessionstart.log footprint.
- *
- * `full` decides whether the `session_start cwd:` line is written at all —
- * quick mode returns before it, which is precisely the asymmetry the old
- * subtraction could not see.
+ * One session's sessionstart.log footprint. Byte-for-byte the same line shape
+ * `publishConfigResolutionPending` writes (`clients/lsp/config.ts`) — a
+ * fixture that diverges from the real line format proves nothing about the
+ * real parser.
  */
 interface SessionFixture {
 	id: string;
-	expected: boolean;
-	/** Quick mode never reaches the `session_start cwd:` line. */
-	full: boolean;
-	/** Why no resolution is expected — `ok` when one is. */
-	reason?: string;
+	/** Whether this session's `loadLSPConfig` call ever happened at all. */
+	pending: boolean;
 }
 
 function sessionLines(session: SessionFixture): string[] {
-	const lines = [
-		`[${NOW}] session_start config-resolution session=${session.id} ` +
-			`expected=${session.expected} reason=${session.reason ?? "ok"}`,
-	];
-	if (session.full) {
-		lines.push(`[${NOW}] session_start cwd: /home/u/Desktop/proj`);
-	}
-	return lines;
+	return session.pending
+		? [`[${NOW}] session_start config_resolution_pending session=${session.id}`]
+		: [];
 }
 
 function buildRoot(options: {
@@ -165,12 +168,12 @@ const LEGACY_DOCUMENT = {
 };
 
 describe("config-resolution smell (#2526)", () => {
-	it("stays silent when every session that expected a resolution has its row", () => {
+	it("stays silent when every pending session has its row", () => {
 		const report = runReport(
 			buildRoot({
 				sessions: [
-					{ id: "s1", expected: true, full: true },
-					{ id: "s2", expected: true, full: true },
+					{ id: "s1", pending: true },
+					{ id: "s2", pending: true },
 				],
 				latency: [
 					configResolvedRow({
@@ -189,20 +192,20 @@ describe("config-resolution smell (#2526)", () => {
 		expect(smell(report)).toBeUndefined();
 		expect(report.config).toMatchObject({
 			resolved: 2,
-			sessionsExpectingResolution: 2,
+			sessionsPendingResolution: 2,
 			sessionsWithoutResolution: 0,
 			legacyDocuments: 0,
 			legacyWithoutRecords: 0,
 		});
 	});
 
-	it("flags the sessions that expected a resolution and produced no row", () => {
+	it("flags the pending sessions that produced no row", () => {
 		const report = runReport(
 			buildRoot({
 				sessions: [
-					{ id: "s1", expected: true, full: true },
-					{ id: "s2", expected: true, full: true },
-					{ id: "s3", expected: true, full: true },
+					{ id: "s1", pending: true },
+					{ id: "s2", pending: true },
+					{ id: "s3", pending: true },
 				],
 				latency: [
 					configResolvedRow({
@@ -223,50 +226,25 @@ describe("config-resolution smell (#2526)", () => {
 	});
 
 	/**
-	 * F2's masking probe, verbatim: two FULL sessions resolve nothing while two
-	 * QUICK sessions each write a row. `starts - resolved` is 2 - 2 = 0, so the
-	 * old smell reported total silence in the full path as perfectly healthy.
+	 * #2526 review round 3, S1 — the exact fixture the reviewer's probe names:
+	 * a session that never reaches `loadLSPConfig` at all (quick/minimal mode's
+	 * second-and-later session in a process) publishes no pending mark and
+	 * must not be counted against — the false positive the deleted `expected`
+	 * PREDICTION produced every time under `PI_LENS_STARTUP_MODE=quick` or
+	 * `=minimal`.
 	 */
-	it("a quick session's row cannot cancel a full session's missing one", () => {
+	it("a session with no pending mark is never counted against (quick/minimal mode session 2)", () => {
 		const report = runReport(
 			buildRoot({
 				sessions: [
-					{ id: "full-1", expected: true, full: true },
-					{ id: "full-2", expected: true, full: true },
-					{ id: "quick-1", expected: true, full: false },
-					{ id: "quick-2", expected: true, full: false },
+					{ id: "s1", pending: true },
+					// session 2: no `loadLSPConfig` call anywhere, so no pending line —
+					// this is what `sessionLines({pending:false})` produces (nothing).
+					{ id: "s2", pending: false },
 				],
 				latency: [
 					configResolvedRow({
-						sessionId: "quick-1",
-						documents: [CANONICAL_DOCUMENT],
-						recordCount: 0,
-					}),
-					configResolvedRow({
-						sessionId: "quick-2",
-						documents: [CANONICAL_DOCUMENT],
-						recordCount: 0,
-					}),
-				],
-			}),
-		);
-		const found = smell(report);
-		expect(
-			found,
-			"two full sessions resolved nothing and the smell stayed silent",
-		).toBeDefined();
-		expect(found?.count).toBe(2);
-		expect(report.config.sessionsWithoutResolution).toBe(2);
-	});
-
-	/** The clean quick session on its own: a row, no `session_start cwd:` line. */
-	it("a quick session with its row is not a smell", () => {
-		const report = runReport(
-			buildRoot({
-				sessions: [{ id: "quick-1", expected: true, full: false }],
-				latency: [
-					configResolvedRow({
-						sessionId: "quick-1",
+						sessionId: "s1",
 						documents: [CANONICAL_DOCUMENT],
 						recordCount: 0,
 					}),
@@ -275,38 +253,42 @@ describe("config-resolution smell (#2526)", () => {
 		);
 		expect(smell(report)).toBeUndefined();
 		expect(report.config).toMatchObject({
-			sessionsExpectingResolution: 1,
+			resolved: 1,
+			sessionsPendingResolution: 1,
 			sessionsWithoutResolution: 0,
 		});
 	});
 
 	/**
-	 * The inverse F2 names: a session that never resolves config by DESIGN
-	 * (`--no-lsp`, or a subagent whose LSP pre-warm is skipped by #449) still
-	 * writes its start line. Counting it produced a permanent false deficit.
+	 * #2526 review round 3, S1 — "full mode session with the load scheduled but
+	 * no row": a resolution that was genuinely ATTEMPTED (the pending mark
+	 * exists) but never finished (no row — e.g. it threw mid-flight, as
+	 * `tests/clients/config-resolved-phase.test.ts`'s "a resolution that throws
+	 * still leaves a pending mark with no row" proves at the `loadLSPConfig`
+	 * level). The analyzer does not care WHICH startup mode scheduled the
+	 * attempt — only that a mark exists with no matching row.
 	 */
-	it("a --no-lsp or subagent session is never counted against", () => {
+	it("a pending mark with no row at all is flagged (resolution attempted, never finished)", () => {
 		const report = runReport(
 			buildRoot({
-				sessions: [
-					{ id: "nolsp", expected: false, full: true, reason: "no-lsp" },
-					{ id: "sub", expected: false, full: true, reason: "subagent" },
-				],
+				sessions: [{ id: "s1", pending: true }],
 				latency: [],
 			}),
 		);
-		expect(smell(report)).toBeUndefined();
+		const found = smell(report);
+		expect(found, "a pending mark with zero rows must flag").toBeDefined();
+		expect(found?.count).toBe(1);
 		expect(report.config).toMatchObject({
 			resolved: 0,
-			sessionsExpectingResolution: 0,
-			sessionsWithoutResolution: 0,
+			sessionsPendingResolution: 1,
+			sessionsWithoutResolution: 1,
 		});
 	});
 
 	it("flags a legacy document that produced zero migration records", () => {
 		const report = runReport(
 			buildRoot({
-				sessions: [{ id: "s1", expected: true, full: true }],
+				sessions: [{ id: "s1", pending: true }],
 				latency: [
 					configResolvedRow({
 						sessionId: "s1",
@@ -334,7 +316,7 @@ describe("config-resolution smell (#2526)", () => {
 	it("does not flag a legacy document that DID produce records", () => {
 		const report = runReport(
 			buildRoot({
-				sessions: [{ id: "s1", expected: true, full: true }],
+				sessions: [{ id: "s1", pending: true }],
 				latency: [
 					configResolvedRow({
 						sessionId: "s1",
@@ -363,7 +345,7 @@ describe("config-resolution smell (#2526)", () => {
 		fs.writeFileSync(path.join(dir, "latency.log"), "");
 		fs.writeFileSync(
 			path.join(dir, "sessionstart.log"),
-			`[${NOW}] session_start config-resolution session=s1 expected=true reason=ok\n` +
+			`[${NOW}] session_start config_resolution_pending session=s1\n` +
 				`[${NOW}] config resolved documents=1 legacy=0 records=0 deniedServers=0 resolveMs=2 session=s1\n`,
 		);
 		const report = runReport(dir);

@@ -35,7 +35,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { withResidentBootstrap } from "../support/bootstrap-access.js";
 import { resetIgnoredConfigWarnCache } from "../../clients/config-warn.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
@@ -115,7 +115,10 @@ function sessionStartOffset(): number {
 		: 0;
 }
 
-async function sessionStartLinesSince(offset: number): Promise<string[]> {
+async function sessionStartLinesSince(
+	offset: number,
+	needle = "config resolved ",
+): Promise<string[]> {
 	await flushSessionStartLog();
 	if (!fs.existsSync(SESSIONSTART_LOG_FILE)) return [];
 	const buffer = fs.readFileSync(SESSIONSTART_LOG_FILE);
@@ -125,7 +128,30 @@ async function sessionStartLinesSince(offset: number): Promise<string[]> {
 	return tail
 		.toString("utf8")
 		.split(/\r?\n/)
-		.filter((line) => line.includes("config resolved "));
+		.filter((line) => line.includes(needle));
+}
+
+/**
+ * Every `config resolved …` or `config_resolution_pending` line since
+ * `offset`, in file order — the two exact markers this issue's records write.
+ * A bare substring like `"config"` would also match unrelated `dbg` noise
+ * (`... warm file(s) configured`, `... config/init error`), so this pins the
+ * two real markers rather than a fragile catch-all; a single pass preserves
+ * write order, which the ordering assertion below depends on.
+ */
+async function configResolutionLinesSince(offset: number): Promise<string[]> {
+	await flushSessionStartLog();
+	if (!fs.existsSync(SESSIONSTART_LOG_FILE)) return [];
+	const buffer = fs.readFileSync(SESSIONSTART_LOG_FILE);
+	const tail = buffer.length < offset ? buffer : buffer.subarray(offset);
+	return tail
+		.toString("utf8")
+		.split(/\r?\n/)
+		.filter(
+			(line) =>
+				line.includes("config resolved ") ||
+				line.includes("config_resolution_pending"),
+		);
 }
 
 let previousTestMode: string | undefined;
@@ -224,6 +250,96 @@ describe("config_resolved: the session's one positive config record (#2526)", ()
 		expect(lines[0]).toContain(
 			"config resolved documents=1 legacy=0 records=0 deniedServers=2",
 		);
+	});
+
+	/**
+	 * #2526 review round 3, S1. The pending mark is what lets the analyzer tell
+	 * "never expected" apart from "expected and never happened" — see
+	 * `publishConfigResolutionPending`'s doc comment (`clients/lsp/config.ts`).
+	 */
+	it("publishes a pending mark before the row, both carrying this session's id", async () => {
+		const { home, projectDir } = canonicalOnlyLayout();
+		const offset = sessionStartOffset();
+
+		const { loadLSPConfig, resetLSPConfigStateForTests } =
+			await import("../../clients/lsp/config.js");
+		const { currentSessionRecordId } =
+			await import("../../clients/latency-logger.js");
+		resetLSPConfigStateForTests();
+		await loadLSPConfig(projectDir, home);
+
+		const pendingLines = await sessionStartLinesSince(
+			offset,
+			"config_resolution_pending",
+		);
+		expect(pendingLines).toHaveLength(1);
+		const sessionId = currentSessionRecordId();
+		expect(pendingLines[0]).toContain(
+			`config_resolution_pending session=${sessionId}`,
+		);
+
+		const resolvedLines = await sessionStartLinesSince(offset);
+		expect(resolvedLines).toHaveLength(1);
+		expect(resolvedLines[0]).toContain(`session=${sessionId}`);
+
+		// Ordering: the pending mark is written BEFORE resolution starts, so it
+		// precedes the resolved line in the log.
+		const all = await configResolutionLinesSince(offset);
+		const pendingIndex = all.findIndex((line) =>
+			line.includes("config_resolution_pending"),
+		);
+		const resolvedIndex = all.findIndex((line) =>
+			line.includes("config resolved "),
+		);
+		expect(pendingIndex).toBeGreaterThanOrEqual(0);
+		expect(resolvedIndex).toBeGreaterThan(pendingIndex);
+	});
+
+	/**
+	 * #2526 review round 3, S1 mutation anchor. The pending mark is written
+	 * BEFORE resolution can throw, so a resolution that is entered but fails
+	 * mid-flight still leaves a mark — with no row. Deleting the
+	 * `publishConfigResolutionPending()` call would make this scenario
+	 * indistinguishable from "never attempted", which is exactly the false
+	 * negative the analyzer's join exists to avoid.
+	 */
+	it("a resolution that throws still leaves a pending mark with no row", async () => {
+		const { home, projectDir } = canonicalOnlyLayout();
+		const offset = sessionStartOffset();
+		const boom = new Error("simulated resolution failure");
+
+		// Spy on the ALREADY-cached `config-resolve.js` instance (the same one
+		// `lsp/config.js` statically imports and calls) — Vitest's ESM transform
+		// makes named function exports mutable, so `resolvePiLensConfig` throwing
+		// here is exactly what a genuine crash inside resolution looks like from
+		// `loadLSPConfig`'s point of view.
+		const configResolve = await import("../../clients/config-resolve.js");
+		const spy = vi
+			.spyOn(configResolve, "resolvePiLensConfig")
+			.mockImplementation(() => {
+				throw boom;
+			});
+		try {
+			const { loadLSPConfig, resetLSPConfigStateForTests } =
+				await import("../../clients/lsp/config.js");
+			resetLSPConfigStateForTests();
+			await expect(loadLSPConfig(projectDir, home)).rejects.toThrow(boom);
+
+			expect(
+				await configResolvedRows(),
+				"a failed resolution must not write a row",
+			).toHaveLength(0);
+			const pendingLines = await sessionStartLinesSince(
+				offset,
+				"config_resolution_pending",
+			);
+			expect(
+				pendingLines,
+				"the pending mark must survive the failure",
+			).toHaveLength(1);
+		} finally {
+			spy.mockRestore();
+		}
 	});
 
 	it("legacy layout: the document is flagged legacy and records are produced", async () => {
@@ -334,13 +450,15 @@ describe("config_resolved: the session's one positive config record (#2526)", ()
 			await import("../../clients/lsp/config.js");
 
 		const sibling = "config_resolved_sibling_probe";
-		expect(claimPhaseOncePerSession(sibling)).toBe(true);
+		// #2526 review round 3, S3: `scope` is now REQUIRED.
+		const siblingScope = "sibling-probe-scope";
+		expect(claimPhaseOncePerSession(sibling, siblingScope)).toBe(true);
 		const before = currentSessionRecordId();
 
 		resetLSPConfigStateForTests();
 
 		expect(
-			claimPhaseOncePerSession(sibling),
+			claimPhaseOncePerSession(sibling, siblingScope),
 			"the loader's reset released a phase it does not own",
 		).toBe(false);
 		expect(
@@ -372,21 +490,28 @@ describe("config_resolved: the session's one positive config record (#2526)", ()
 });
 
 /**
- * The session-start half, AFTER review round 2 F1: `handleSessionStart` must
- * NOT re-arm the claim. index.ts resolves this session's config in
+ * The session-start half, AFTER review round 3 S1: `handleSessionStart` must
+ * NOT re-arm the claim (round 2 F1, unchanged) AND must not predict a
+ * config-resolution expectation (round 3 S1, new). The whole
+ * `no-lsp`/subagent/warm-attach -> `expected`/`reason` ternary that used to
+ * live in this handler is gone; the pending mark now comes from
+ * `loadLSPConfig` itself (see the top-level `describe` block above, "publishes
+ * a pending mark before the row"). index.ts resolves this session's config in
  * `ensureLSPConfigInitialized` before it calls the handler, so a re-arm inside
- * the handler splits one session across two rows (the ensure's, then the
- * deferred load's). The re-arm belongs to index.ts's session_start closure —
- * `tests/index-config-resolved-session-wiring.test.ts` drives that ordering
- * end-to-end.
+ * the handler would still split one session across two rows (the ensure's,
+ * then the deferred load's) — the re-arm belongs to index.ts's session_start
+ * closure; `tests/index-config-resolved-session-wiring.test.ts` drives that
+ * ordering, and the quick/minimal "no load scheduled" cases, end-to-end.
  *
- * What the handler DOES own is publishing the session's identity and its
- * config-resolution expectation, on both the quick and the full path. Quick
- * mode is used here deliberately: it returns long before the `session_start
- * cwd:` line, which is exactly why that line could never be the smell's
- * denominator.
+ * What this block proves is the NEGATIVE: the handler itself writes nothing
+ * about config resolution, on the quick path, regardless of the flags that
+ * used to change what it predicted. Quick mode is used here deliberately: the
+ * pre-existing `__piLensWarmupScheduled` latch keeps this handler's own
+ * internal call sites (the warm-up timer, the full-mode-only deferred
+ * `setImmediate`) from firing, isolating "does the HANDLER publish anything"
+ * from "does some resolution eventually happen".
  */
-describe("handleSessionStart publishes the expectation, not a re-arm (#2526)", () => {
+describe("handleSessionStart publishes nothing about config resolution (#2526 round 3, S1)", () => {
 	function makeDeps(ctxCwd: string, dbg: (msg: string) => void): unknown {
 		return withResidentBootstrap({
 			ctxCwd,
@@ -436,31 +561,43 @@ describe("handleSessionStart publishes the expectation, not a re-arm (#2526)", (
 		});
 	}
 
-	it("publishes this session's id and expectation, and re-arms nothing", async () => {
+	/**
+	 * Real sinks, not the handler's `dbg` capture: the pending mark and the
+	 * `config resolved` line are written by `logSessionStart` directly from
+	 * `loadLSPConfig`, never through the handler's `dbg` callback — even in the
+	 * OLD design the handler's own `dbg` line went through the SAME sink. So
+	 * "did the handler cause a NEW config-resolution line" has to be read off
+	 * `sessionstart.log` itself, between an offset taken before the handler
+	 * runs and after — a `dbg`-capture assertion would trivially pass without
+	 * proving anything, since `dbg` was never the seam these lines travel.
+	 */
+	it("re-arms nothing and publishes no config-resolution line of its own", async () => {
 		const { home, projectDir } = canonicalOnlyLayout();
 		const previousStartupMode = process.env.PI_LENS_STARTUP_MODE;
 		process.env.PI_LENS_STARTUP_MODE = "quick";
 		const globals = globalThis as { __piLensWarmupScheduled?: boolean };
 		const previousWarmup = globals.__piLensWarmupScheduled;
 		globals.__piLensWarmupScheduled = true;
-		const lines: string[] = [];
 		try {
 			const { loadLSPConfig, resetLSPConfigStateForTests } =
 				await import("../../clients/lsp/config.js");
-			const { currentSessionRecordId } =
-				await import("../../clients/latency-logger.js");
 			resetLSPConfigStateForTests();
+			// Standing in for index.ts's `ensureLSPConfigInitialized`, which always
+			// resolves this session's config BEFORE the handler runs.
 			await loadLSPConfig(projectDir, home);
 			const rows = await configResolvedRows();
 			expect(rows).toHaveLength(1);
 
+			const offset = sessionStartOffset();
 			// The REAL handler, standing in for index.ts's call after its ensure.
 			const { handleSessionStart } =
 				await import("../../clients/runtime-session.js");
-			// eslint-disable-next-line @typescript-eslint/no-explicit-any
-			await handleSessionStart(
-				makeDeps(projectDir, (msg) => lines.push(msg)) as never,
-			);
+			await handleSessionStart(makeDeps(projectDir, () => {}) as never);
+
+			expect(
+				await configResolutionLinesSince(offset),
+				"the handler must publish nothing about config resolution on its own",
+			).toHaveLength(0);
 
 			// The deferred load of the SAME session must not add a second row.
 			await loadLSPConfig(projectDir, home);
@@ -468,18 +605,6 @@ describe("handleSessionStart publishes the expectation, not a re-arm (#2526)", (
 				await configResolvedRows(),
 				"handleSessionStart re-armed the claim mid-session",
 			).toHaveLength(1);
-
-			const expectation = lines.filter((line) =>
-				line.startsWith("session_start config-resolution "),
-			);
-			expect(
-				expectation,
-				"quick mode must still publish the expectation — it returns before `session_start cwd:`",
-			).toHaveLength(1);
-			expect(expectation[0]).toContain(
-				`session=${currentSessionRecordId()} expected=true reason=ok`,
-			);
-			expect(expectation[0]).toContain(`session=${rows[0].metadata.sessionId}`);
 		} finally {
 			globals.__piLensWarmupScheduled = previousWarmup;
 			if (previousStartupMode === undefined)
@@ -489,82 +614,40 @@ describe("handleSessionStart publishes the expectation, not a re-arm (#2526)", (
 	});
 
 	/**
-	 * The inverse F2 names: a session that never resolves config BY DESIGN still
-	 * writes a start line, and counting it produced a deficit no operator could
-	 * ever clear. Each `reason` below mirrors one real gate on the resolution
-	 * paths, and each is driven through that gate's own seam.
+	 * The three gates that used to change the OLD prediction (`no-lsp`,
+	 * subagent, warm-attach) no longer change anything the handler itself
+	 * writes — under quick mode with the warm-up latch already tripped, the
+	 * handler's own internal call sites never fire regardless of these flags,
+	 * so all three collapse to the SAME "publishes nothing" outcome as the
+	 * test above, with no config resolved beforehand this time. Kept as one
+	 * representative case, through the real `no-lsp` seam, to guard against a
+	 * regression that makes the handler start writing a config-resolution line
+	 * again under any flag combination — not three near-duplicates of the same
+	 * assertion for the other two gates, which round 2 tested only because the
+	 * (now deleted) `reason` ternary branched on them.
 	 */
-	async function expectationLineFor(
-		projectDir: string,
-		configure: (deps: { getFlag: (name: string) => boolean }) => void,
-	): Promise<string> {
+	it("still publishes nothing under --no-lsp", async () => {
+		const { projectDir } = canonicalOnlyLayout();
 		const previousStartupMode = process.env.PI_LENS_STARTUP_MODE;
 		process.env.PI_LENS_STARTUP_MODE = "quick";
 		const globals = globalThis as { __piLensWarmupScheduled?: boolean };
 		const previousWarmup = globals.__piLensWarmupScheduled;
 		globals.__piLensWarmupScheduled = true;
-		const lines: string[] = [];
 		try {
+			const offset = sessionStartOffset();
 			const { handleSessionStart } =
 				await import("../../clients/runtime-session.js");
-			const deps = makeDeps(projectDir, (msg) => lines.push(msg)) as {
+			const deps = makeDeps(projectDir, () => {}) as {
 				getFlag: (name: string) => boolean;
 			};
-			configure(deps);
+			deps.getFlag = (name: string) => name === "no-lsp";
 			await handleSessionStart(deps as never);
-			const expectation = lines.filter((line) =>
-				line.startsWith("session_start config-resolution "),
-			);
-			expect(expectation).toHaveLength(1);
-			return expectation[0];
+			expect(await configResolutionLinesSince(offset)).toHaveLength(0);
 		} finally {
 			globals.__piLensWarmupScheduled = previousWarmup;
 			if (previousStartupMode === undefined)
 				delete process.env.PI_LENS_STARTUP_MODE;
 			else process.env.PI_LENS_STARTUP_MODE = previousStartupMode;
-		}
-	}
-
-	it("a --no-lsp session publishes expected=false", async () => {
-		const { projectDir } = canonicalOnlyLayout();
-		const line = await expectationLineFor(projectDir, (deps) => {
-			deps.getFlag = (name: string) => name === "no-lsp";
-		});
-		expect(line).toContain("expected=false reason=no-lsp");
-	});
-
-	it("a subagent session publishes expected=false", async () => {
-		const { projectDir } = canonicalOnlyLayout();
-		const { _resetSubagentModeForTests } =
-			await import("../../clients/subagent-mode.js");
-		const previous = process.env.PI_SUBAGENT_CHILD;
-		process.env.PI_SUBAGENT_CHILD = "1";
-		_resetSubagentModeForTests();
-		try {
-			// #449 light mode skips the LSP pre-warm on both paths, so nothing
-			// resolves config for a subagent session.
-			const line = await expectationLineFor(projectDir, () => {});
-			expect(line).toContain("expected=false reason=subagent");
-		} finally {
-			if (previous === undefined) delete process.env.PI_SUBAGENT_CHILD;
-			else process.env.PI_SUBAGENT_CHILD = previous;
-			_resetSubagentModeForTests();
-		}
-	});
-
-	it("a warm-attached QUICK session publishes expected=false", async () => {
-		const { projectDir } = canonicalOnlyLayout();
-		const { _setWarmAttachForTests, _resetWarmAttachForTests } =
-			await import("../../clients/warm-attach.js");
-		_setWarmAttachForTests(projectDir, 4242);
-		try {
-			// Quick mode's deferred warmup skips the load when attached to an
-			// incumbent; the full path resolves regardless, which is why this
-			// reason is quick-mode-only.
-			const line = await expectationLineFor(projectDir, () => {});
-			expect(line).toContain("expected=false reason=warm-attach");
-		} finally {
-			_resetWarmAttachForTests();
 		}
 	});
 });
@@ -589,6 +672,11 @@ describe("MCP parity: the warm boot's config resolution records too (#2526)", ()
 		expect(rows[0].metadata.documents.length).toBeGreaterThanOrEqual(1);
 		expect(rows[0].metadata.deniedServers).toBeGreaterThanOrEqual(2);
 		expect(await sessionStartLinesSince(offset)).toHaveLength(1);
+		// The MCP boot goes through `initLSPConfig` -> `loadLSPConfig`, the same
+		// funnel the pending mark is written from — no MCP-specific wiring needed.
+		expect(
+			await sessionStartLinesSince(offset, "config_resolution_pending"),
+		).toHaveLength(1);
 		// `lens-engine.js` is the widest import in the tree; a cold transform of
 		// it alone can exceed the 5s default before the assertion is reached.
 	}, 30000);
