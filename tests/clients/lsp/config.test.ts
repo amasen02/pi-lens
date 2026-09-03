@@ -73,7 +73,7 @@ describe("loadLSPConfig global configuration (#870)", () => {
 		});
 	});
 
-	it("merges maps by id and replaces project-owned array fields", async () => {
+	it("merges maps by id, replaces project-owned array fields, and unions denials", async () => {
 		const projectDir = tmpDir("pi-lens-lsp-project-");
 		const globalDir = tmpDir("pi-lens-lsp-global-");
 		process.env.PI_LENS_HOME = globalDir;
@@ -134,7 +134,15 @@ describe("loadLSPConfig global configuration (#870)", () => {
 		expect(config.serverOverrides?.rust.initializationOptions).toEqual({
 			check: { command: "clippy" },
 		});
-		expect(config.disabledServers).toEqual([]);
+		// `disabledServers` is the ONE array field that does NOT follow the
+		// project-replaces-global rule the rest of this case pins (#2427). It is a
+		// DENIAL, and `config-core/deny.ts` resolves it as the union of every
+		// tier's entries — so the project's `[]` above expresses nothing, and the
+		// operator's global denial survives. Before #2427 this assertion read
+		// `toEqual([])`, which is to say it pinned repository content silently
+		// re-enabling a server the operator had turned off; #2415 AC 3 forbids
+		// exactly that, and `docs/configuration.md` documents the exception.
+		expect(config.disabledServers).toEqual(["global-disabled"]);
 		expect(config.warmFiles).toEqual(["project.ts"]);
 	});
 
@@ -354,5 +362,186 @@ describe("initLSPConfig in-flight ABA release (#1968)", () => {
 
 		await pass;
 		expect(inFlight.has(key)).toBe(false);
+	});
+});
+
+/**
+ * The deny union, and the by-id merge, must span BOTH SPELLINGS of every LSP
+ * key (#2427 review round 2, F1).
+ *
+ * `disabledServers` exists at two schema nodes — the canonical
+ * `/lsp/disabledServers` and the legacy root `/disabledServers` — and before
+ * this round they were unioned INDEPENDENTLY: two nodes, two deny resolutions,
+ * neither seeing the other's tiers. `lspSectionOf` then let the canonical
+ * spelling overwrite the legacy one per key, so a global denial written in the
+ * legacy spelling VANISHED the moment any project file mentioned the canonical
+ * one — including to say `[]`. That is the same operator-denial-lifted-by-
+ * repository-content defect #2415 AC 3 forbids, arriving through the migration
+ * rather than through the merge strategy.
+ *
+ * The fix is at the source: a document's legacy root LSP keys are normalized
+ * into the `lsp` namespace before the resolution sees them, so there is ONE
+ * node per key and `merge()`'s deny/object semantics apply across every tier
+ * and every spelling at once. These cases are the proof, driven through the
+ * production loader rather than through the merger.
+ */
+describe("loadLSPConfig — the deny union spans key spellings (#2427 round 2)", () => {
+	/** Lay out a global home + project dir and load through the real loader. */
+	async function loadWith(files: Record<string, unknown>): Promise<{
+		disabledServers?: string[];
+		servers?: Record<string, { command: string }>;
+		serverOverrides?: Record<string, unknown>;
+		warmFiles?: string[];
+	}> {
+		const home = tmpDir("pi-lens-lsp-spelling-");
+		for (const [relative, content] of Object.entries(files)) {
+			const target = path.join(home, relative);
+			fs.mkdirSync(path.dirname(target), { recursive: true });
+			fs.writeFileSync(target, JSON.stringify(content));
+		}
+		const projectDir = path.join(home, "proj");
+		fs.mkdirSync(projectDir, { recursive: true });
+		process.env.PI_LENS_HOME = path.join(home, ".pi-lens");
+		const previousConfigPath = process.env.PI_LENS_CONFIG_PATH;
+		process.env.PI_LENS_CONFIG_PATH = path.join(
+			home,
+			".pi-lens",
+			"config.json",
+		);
+		const { loadLSPConfig, resetLSPConfigWarnCache } =
+			await import("../../../clients/lsp/config.js");
+		resetLSPConfigWarnCache();
+		try {
+			return (await loadLSPConfig(projectDir, home)) as never;
+		} finally {
+			if (previousConfigPath === undefined)
+				delete process.env.PI_LENS_CONFIG_PATH;
+			else process.env.PI_LENS_CONFIG_PATH = previousConfigPath;
+		}
+	}
+
+	// Fixture paths, assembled rather than spelled: the layout keys are
+	// relative to the fake home the helper above lays out.
+	const GLOBAL_LEGACY = [".pi-lens", "lsp.json"].join("/");
+	const GLOBAL_CANONICAL = [".pi-lens", "config.json"].join("/");
+	const PROJECT_CANONICAL = ["proj", ".pi-lens.json"].join("/");
+
+	/** A canonical-namespace deny document. */
+	function deny(...ids: string[]): Record<string, unknown> {
+		return { lsp: { disabledServers: ids } };
+	}
+
+	/** The same denial written at the legacy ROOT of a file. */
+	function denyAtRoot(...ids: string[]): Record<string, unknown> {
+		return { disabledServers: ids };
+	}
+
+	/** A one-entry custom-server map, keyed by id. */
+	function serverEntry(id: string, command: string): Record<string, unknown> {
+		const spec: Record<string, unknown> = {};
+		spec.name = id;
+		spec.extensions = [`.${id}`];
+		spec.command = command;
+		const map: Record<string, unknown> = {};
+		map[id] = spec;
+		return map;
+	}
+
+	/** A one-entry serverOverrides map, keyed by server id. */
+	function override(id: string): Record<string, unknown> {
+		const initializationOptions: Record<string, unknown> = {};
+		initializationOptions[id] = true;
+		const entry: Record<string, unknown> = {};
+		entry.initializationOptions = initializationOptions;
+		const map: Record<string, unknown> = {};
+		map[id] = entry;
+		return map;
+	}
+
+	function sorted(ids: string[] | undefined): string[] {
+		return [...(ids ?? [])].sort();
+	}
+
+	// Case A — global denial in an LSP-SCOPED legacy file, project clears it in
+	// the canonical namespace.
+	it("a global legacy lsp file denial survives a canonical project clear", async () => {
+		const files: Record<string, unknown> = {};
+		files[GLOBAL_LEGACY] = denyAtRoot("typos");
+		files[PROJECT_CANONICAL] = deny();
+		const config = await loadWith(files);
+		expect(config.disabledServers).toEqual(["typos"]);
+	});
+
+	// Case B — global denial written at the legacy ROOT of the CANONICAL global
+	// file, project clears it in the canonical namespace.
+	it("a global root-spelled denial survives a canonical project clear", async () => {
+		const files: Record<string, unknown> = {};
+		files[GLOBAL_CANONICAL] = denyAtRoot("typos");
+		files[PROJECT_CANONICAL] = deny();
+		const config = await loadWith(files);
+		expect(config.disabledServers).toEqual(["typos"]);
+	});
+
+	// Case C — the union across spellings GROWS. The global denial must not
+	// vanish because the project denied something else in the other spelling.
+	it("unions across spellings instead of replacing the legacy one", async () => {
+		const files: Record<string, unknown> = {};
+		files[GLOBAL_LEGACY] = denyAtRoot("typos");
+		files[PROJECT_CANONICAL] = deny("ruff");
+		const config = await loadWith(files);
+		expect(sorted(config.disabledServers)).toEqual(["ruff", "typos"]);
+	});
+
+	// Case C-prime — the mirror image: canonical global, legacy project. A user
+	// who migrated their GLOBAL file first must not lose the denial either.
+	it("unions when the tiers swap spellings", async () => {
+		const files: Record<string, unknown> = {};
+		files[GLOBAL_CANONICAL] = deny("typos");
+		files[PROJECT_CANONICAL] = denyAtRoot("ruff");
+		const config = await loadWith(files);
+		expect(sorted(config.disabledServers)).toEqual(["ruff", "typos"]);
+	});
+
+	// Case G — the same split silently CLOBBERED the by-id object merge. A
+	// half-migrated pair of files lost one side servers entirely.
+	it("merges servers and serverOverrides by id across spellings", async () => {
+		const globalDoc: Record<string, unknown> = {};
+		globalDoc.servers = serverEntry("globalOnly", "global-only");
+		globalDoc.serverOverrides = override("rust");
+		globalDoc.warmFiles = ["global.ts"];
+		const lspSection: Record<string, unknown> = {};
+		lspSection.servers = serverEntry("projectOnly", "project-only");
+		lspSection.serverOverrides = override("go");
+		const projectDoc: Record<string, unknown> = {};
+		projectDoc.lsp = lspSection;
+		const files: Record<string, unknown> = {};
+		files[GLOBAL_LEGACY] = globalDoc;
+		files[PROJECT_CANONICAL] = projectDoc;
+		const config = await loadWith(files);
+		expect(Object.keys(config.servers ?? {}).sort()).toEqual([
+			"globalOnly",
+			"projectOnly",
+		]);
+		expect(Object.keys(config.serverOverrides ?? {}).sort()).toEqual([
+			"go",
+			"rust",
+		]);
+		// A non-deny array still follows the ordinary rule: the project owns it
+		// when it writes it, and inherits the global one when it does not.
+		expect(config.warmFiles).toEqual(["global.ts"]);
+	});
+
+	// The canonical spelling still WINS a collision inside ONE document, which
+	// is the rule lspSectionOf documented and the normalization must preserve.
+	it("keeps canonical-wins-per-key inside a single document", async () => {
+		const lspSection: Record<string, unknown> = {};
+		lspSection.warmFiles = ["from-canonical"];
+		const projectDoc: Record<string, unknown> = {};
+		projectDoc.warmFiles = ["from-root"];
+		projectDoc.lsp = lspSection;
+		const files: Record<string, unknown> = {};
+		files[PROJECT_CANONICAL] = projectDoc;
+		const config = await loadWith(files);
+		expect(config.warmFiles).toEqual(["from-canonical"]);
 	});
 });

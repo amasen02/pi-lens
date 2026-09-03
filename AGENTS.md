@@ -1623,11 +1623,12 @@ and unit-tested; workflow YAML supplies the token required by the live fetch.
 ```
 index.ts                  Extension entry point (async factory) — the pi host adapter
 mcp/                      Second host adapter: MCP server + hook bin (see "MCP mirror")
-  server.ts               Hand-rolled stdio JSON-RPC MCP server (16 tools) + warm IPC listener
+  server.ts               Hand-rolled stdio JSON-RPC MCP server (18 tools) + warm IPC listener
   worker.ts               fresh-mode child (loads freshly-built code from disk)
   analyze-cli.ts          pi-lens-analyze bin — PostToolUse hook + CLI (warm channel → cold fallback), plus the Stop-hook turn-end mode (warm-only)
 clients/
   lens-engine.ts          THE internal seam — host adapters import only this for pi-lens functionality
+  effective-config.ts     "why is X running/selected" — resolved config + provenance + per-file server/tool decisions (#2427)
   mcp/                     host-neutral facades: analyze, session, review, ipc, host-shim
   runtime-session.ts      session_start handler — snapshot hydrate, tool preinstall, background scans, LSP warm
   project-snapshot.ts     Versioned seq-stamped project snapshot cache
@@ -1959,7 +1960,7 @@ a *second host adapter* alongside `index.ts`. Design rationale + progress: `mcp.
   `npm install --omit=dev` does **not** omit `optionalDependencies` (only
   `--omit=optional` does, which pi doesn't pass), so even an "optional" SDK would
   weigh every pi-lens install. ~200 LOC beats a dep for a tools-only server.
-- **16 tools in a source checkout (15 in an installed package):** `pilens_analyze`
+- **18 tools in a source checkout (17 in an installed package):** `pilens_analyze`
   (per-edit; `mode: warm|fresh`), `pilens_diagnostics`,
   `pilens_project_scan`, `pilens_latency`, `pilens_health`, `pilens_rebuild`
   (source checkouts only: `clients/mcp/review.ts`'s shared
@@ -2092,6 +2093,28 @@ a *second host adapter* alongside `index.ts`. Design rationale + progress: `mcp.
   engine seam and returns the identical #517-slimmed payload; unlike read_symbol/
   read_enclosing it does not feed the read-guard (a ranked file list is discovery,
   not a body read).
+  `pilens_effective_config` (#2427, dual-surface — `tools/effective-config.ts`,
+  wired in `index.ts`) is the 18th tool and the answer to **"why is X running /
+  why is X NOT running"**, which used to cost log forensics across
+  `lsp/config.ts`, `language-policy.ts` and the trust state. It returns the
+  resolved config with every leaf's provenance (tier / file / key / trust), and
+  for a named `file` its canonical language plus every LSP server with the
+  reason it was selected or denied and every runner that would dispatch.
+  `clients/effective-config.ts` is a FACADE, not a computation: it reads the
+  answers back from `resolvePiLensConfig`, `explainServersForFile`,
+  `detectFileKind`/`getToolPlan`/`getAvailableRunners`, and decides nothing
+  itself — an introspection surface with its own copy of the selection rule
+  would eventually describe a runtime that no longer exists. `pilens_health`
+  embeds the same provenance as per-tier COUNTS only. Redaction is structural,
+  not a mode: paths are `~`-relative, a custom server's argv is cut to
+  `argv[0]`, env is reduced to NAMES, and there is no `redact: false` to
+  spell. Two seams it forced, both single-source moves rather than new copies:
+  `explainServersForFile` in `clients/lsp/config.ts` is now THE server-selection
+  evaluation and `getServersForFileWithConfig` is a projection of it (the three
+  gates — disabled / extension-or-basename / `pathFilter` — are evaluated once
+  and reported twice), and `tests/support/public-surface-drift.ts` holds the
+  generalized drift-guard harness that `lsp-fixture-coverage.test.ts` now
+  consumes and that #2416/#2383 register their catalogs against.
 - **MCP-only vs pi-lens-internal (a real gap to close, not a finished story).**
   Likewise `module_report`'s blast-radius (#304) uses
   *transitive* BFS (`computeTransitiveImpact`) while

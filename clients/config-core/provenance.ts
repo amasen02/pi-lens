@@ -171,15 +171,24 @@ export interface ProvenanceView {
  * the operator's account name into every diagnostic that named it — a value the
  * projection was never asked to carry and the one piece of environment a shared
  * log reliably leaks.
+ *
+ * `homeDir` is a test seam only, matching `loadLSPConfig`'s: production passes
+ * nothing and gets `os.homedir()`. Without it a redaction test can only prove
+ * the rewrite against the machine's REAL home, which means either writing
+ * fixtures into the operator's home directory or asserting nothing at all
+ * (#2427).
  */
-export function provenanceView(resolved: Resolved<unknown>): ProvenanceView {
+export function provenanceView(
+	resolved: Resolved<unknown>,
+	homeDir?: string,
+): ProvenanceView {
 	const entries = [...resolved.provenance.values()]
 		.map((entry) => ({
 			key: entry.key,
 			tier: entry.tier,
 			...(entry.file === undefined
 				? {}
-				: { file: homeRelativePath(entry.file) }),
+				: { file: homeRelativePath(entry.file, homeDir) }),
 			...(entry.trust === undefined ? {} : { trust: entry.trust }),
 		}))
 		.sort((left, right) => compareKeys(left.key, right.key));

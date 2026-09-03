@@ -29,13 +29,32 @@
  * story in one line: a legacy file is still read, and it loses to the file the
  * user is being told to move to.
  *
- * NO COMPAT REWRITING HAPPENS TO A VALUE. An earlier draft normalized legacy
- * root keys into the `lsp` namespace before merging, which would have injected
- * an `lsp` key into `PiLensProjectConfig.raw` that was never in the user's file.
- * Instead the legacy root keys stay where they are, are merged as themselves,
- * and `lspSectionOf` below combines them with the canonical `lsp` namespace at
- * PROJECTION time, canonical winning. The value a projection reads is therefore
- * always a value some file actually contained.
+ * LEGACY ROOT LSP KEYS ARE NORMALIZED INTO THE `lsp` NAMESPACE HERE, at source
+ * injection, and nowhere else (#2427 review round 2, F1). Every LSP setting has
+ * two spellings during the deprecation window — `disabledServers` at a
+ * document's root and `lsp.disabledServers` inside it — and leaving both in
+ * place gave the schema TWO nodes for one setting. `merge()` then resolved each
+ * node independently: two deny unions that never saw each other's tiers, and
+ * two object merges that never saw each other's entries. A projection could
+ * only pick one, and picking the canonical one meant a global denial written in
+ * the legacy spelling disappeared the moment any project file mentioned the
+ * canonical one — the operator-denial-lifted-by-repository-content defect
+ * #2415 AC 3 forbids, arriving through the migration instead of through the
+ * merge strategy.
+ *
+ * An earlier draft rejected this rewrite because it would inject an `lsp` key
+ * into `PiLensProjectConfig.raw` that was never in the user's file. That
+ * objection is why the normalization lives HERE and not in
+ * `resolveOnePiLensConfigDocument`: `.raw` comes from the single-document path,
+ * which still merges a document exactly as written. Only this multi-document
+ * resolution — whose two consumers are `loadLSPConfig` and `effectiveConfig`,
+ * both of which read the `lsp` section and nothing else — normalizes.
+ *
+ * The mapping is `canonicalKeyFor`'s, the one the deprecation records already
+ * publish, so "where does this key move to" is answered once. Within a single
+ * document the canonical spelling still wins a collision, which is the rule
+ * `lspSectionOf` used to apply at projection time; across documents `merge()`
+ * now applies the ordinary tier precedence and the deny union to ONE node.
  */
 
 import * as fs from "node:fs";
@@ -272,11 +291,7 @@ export function resolvePiLensConfig(
 	options: ResolvePiLensConfigOptions,
 ): PiLensConfigResolution {
 	const documents = collectPiLensConfigDocuments(options);
-	const sources: RawConfigSource[] = documents.map((document) => ({
-		tier: document.tier,
-		file: document.file,
-		value: document.value,
-	}));
+	const sources = configSources(documents);
 	const resolution = resolveConfig<Record<string, unknown>>({
 		sources,
 		schema: PI_LENS_CONFIG_SCHEMA,
@@ -310,6 +325,22 @@ export function resolvePiLensConfig(
  * against the canonical schema (depth bound, prototype-key policy, the declared
  * `lsp.*` types) and merged from one source, so a single-file loader and the
  * multi-file one cannot disagree about what a value means.
+ *
+ * It deliberately does NOT normalize legacy root LSP keys into the `lsp`
+ * namespace the way `resolvePiLensConfig` does (#2427 review round 2, F1).
+ * This path's two callers project the pi-lens sections of ONE file and hand
+ * the resolved value out as `PiLensProjectConfig.raw`, which is documented and
+ * tested as the parsed document; relocating a key inside it would put an `lsp`
+ * section in `raw` that the user's file never contained. The relocation exists
+ * so that ONE key seen at SEVERAL tiers reaches one schema node, and a
+ * single-document resolution has no tiers to reconcile.
+ *
+ * The visible consequence is small and worth naming: a wrong-TYPED legacy root
+ * LSP key (`warmFiles: true`) is validated against the typed `lsp.*` node only
+ * in the multi-document path, so the LSP loader reports it and the two
+ * single-file loaders do not. A session runs both, and the warn-once latch
+ * unions their notices, so a user loses nothing — they gain one accurate
+ * notice.
  */
 export function resolveOnePiLensConfigDocument(
 	document: ConfigDocument,
@@ -413,6 +444,105 @@ function canonicalDestination(
 }
 
 /**
+ * The `lsp`-namespace key a document ROOT key normalizes to, or `undefined`
+ * when the key stays where it is.
+ *
+ * THE mapping, shared with `canonicalKeyFor` below so the key a deprecation
+ * record tells the user to move to and the key the resolution actually merges
+ * under are the same key by construction. An LSP-SCOPED legacy file
+ * (`pi-lsp.json`, `.pi-lens/lsp.json`) is wholly what a canonical file now
+ * carries under `lsp`, so every RECOGNIZED root key of one moves; a canonical
+ * or non-LSP legacy file moves only the four registry-derived legacy root keys.
+ * An unrecognized key is left alone in both cases — it is not a pi-lens
+ * setting, and relocating it would invent a meaning for it.
+ */
+function lspNamespaceKeyFor(
+	document: ConfigDocument,
+	key: string,
+): string | undefined {
+	if (key === LSP_NAMESPACE_KEY) return undefined;
+	if (document.location.lspScoped) {
+		return recognizedKeysFor(document.location).has(key) ? key : undefined;
+	}
+	return LEGACY_ROOT_LSP_KEYS.includes(key) ? key : undefined;
+}
+
+/**
+ * Assign one raw, not-yet-validated value under a user-chosen key.
+ *
+ * `defineProperty` rather than `=` for the reason `config-core/safe-object.ts`
+ * spells out: `out["__proto__"] = x` runs an inherited SETTER instead of
+ * creating a property. This split runs BEFORE `validate()`, so it is the one
+ * place in this module that touches user-chosen key names, and it hands every
+ * such key through untouched for the core to reject and record.
+ */
+function assignRaw(
+	target: Record<string, unknown>,
+	key: string,
+	value: unknown,
+): void {
+	Object.defineProperty(target, key, {
+		value,
+		writable: true,
+		enumerable: true,
+		configurable: true,
+	});
+}
+
+/**
+ * The sources a resolution merges, with every document's legacy root LSP keys
+ * moved into the `lsp` namespace (#2427 review round 2, F1).
+ *
+ * A document that carries none is passed through UNCHANGED — the overwhelming
+ * majority, and the case that must cost nothing. One that does becomes TWO
+ * sources at the same tier and file: the relocated keys first, the rest of the
+ * document (its own `lsp` namespace included) second. Two sources rather than
+ * one merged object because the second still carries whatever the document
+ * spelled at `lsp`, so a malformed `lsp` keeps producing its `PILENS_CFG_0004`
+ * while the relocated keys survive beside it; and because caller order at an
+ * equal tier is what `merge()` uses to break a tie, putting the canonical
+ * spelling second is exactly the canonical-wins-per-key rule `lspSectionOf`
+ * used to apply at projection time.
+ *
+ * The relocated keys are STRIPPED from the second source rather than left in
+ * place. Leaving them would keep the legacy schema node populated, and a
+ * malformed legacy key would then record the same `PILENS_CFG_0004` twice —
+ * once per spelling — for one mistake in one file.
+ *
+ * A deny key is the one place the intra-document tie is not "canonical wins":
+ * `merge()` sends `lsp.disabledServers` to `config-core/deny.ts`, which unions
+ * every contribution. A file spelling BOTH `disabledServers` and
+ * `lsp.disabledServers` therefore denies both lists. That is the monotonic
+ * answer and the only safe one — a denial silently dropped because the user
+ * half-migrated the file it was written in is the defect this whole change
+ * exists to remove.
+ */
+export function configSources(
+	documents: readonly ConfigDocument[],
+): RawConfigSource[] {
+	const sources: RawConfigSource[] = [];
+	for (const document of documents) {
+		const value = document.value;
+		const namespaced: Record<string, unknown> = {};
+		const rest: Record<string, unknown> = {};
+		for (const key of topLevelKeys(value)) {
+			const entry = (value as Record<string, unknown>)[key];
+			const target = lspNamespaceKeyFor(document, key);
+			if (target === undefined) assignRaw(rest, key, entry);
+			else assignRaw(namespaced, target, entry);
+		}
+		const base = { tier: document.tier, file: document.file };
+		if (Object.keys(namespaced).length === 0) {
+			sources.push({ ...base, value });
+			continue;
+		}
+		sources.push({ ...base, value: { [LSP_NAMESPACE_KEY]: namespaced } });
+		sources.push({ ...base, value: rest });
+	}
+	return sources;
+}
+
+/**
  * The canonical KEY a legacy key moves to.
  *
  * Carried on the record (`canonicalKey`) rather than only rendered into the
@@ -420,10 +550,8 @@ function canonicalDestination(
  * over these records instead of re-parsing prose.
  */
 function canonicalKeyFor(document: ConfigDocument, key: string): string {
-	if (document.location.lspScoped) return `${LSP_NAMESPACE_KEY}.${key}`;
-	return LEGACY_ROOT_LSP_KEYS.includes(key)
-		? `${LSP_NAMESPACE_KEY}.${key}`
-		: key;
+	const namespaced = lspNamespaceKeyFor(document, key);
+	return namespaced === undefined ? key : `${LSP_NAMESPACE_KEY}.${namespaced}`;
 }
 
 function topLevelKeys(value: unknown): string[] {
@@ -820,28 +948,30 @@ export function ignoredRecordCollector(
 /**
  * The effective `lsp` section of a resolved configuration.
  *
- * Canonical `lsp.*` wins over a legacy root key of the same name, per #2426's
- * "canonical wins on collision" — per KEY, so a file that has migrated
- * `servers` into `lsp` but still spells `warmFiles` at the root keeps both. The
- * combination is deliberately not deeper than that: a half-migrated `servers`
- * merged entry-by-entry with its own legacy twin would make the migrated file's
- * meaning depend on the file it was migrated FROM, which is the opposite of
- * what a user completing a migration expects.
+ * One lookup, because the combination it used to perform now happens at source
+ * injection (`configSources`): by the time a value reaches here, every legacy
+ * root LSP key a document carried is already inside the namespace and has been
+ * resolved against every tier through the SAME schema node as its canonical
+ * spelling. Canonical still wins a collision inside one document — that is
+ * caller order in `configSources` — but the winner is now chosen by `merge()`,
+ * which is the only place that can see all the tiers at once.
+ *
+ * "Wins" is PER LEAF, not per key. A document that spells both root `servers`
+ * and `lsp.servers` no longer has one object replace the other: the two are
+ * merged by server id, and canonical wins only the ids they both define. A
+ * server defined only in the legacy root spelling therefore survives beside
+ * the canonical ones instead of disappearing — which is the same fix, one
+ * level down, as the vanishing legacy denial below (#2427 review round 3).
+ *
+ * The projection-time combination this used to do could only ever see two
+ * independently resolved nodes, and picking one of them is how a global denial
+ * written in the legacy spelling used to vanish (#2427 review round 2, F1).
  */
 export function lspSectionOf(
 	value: Record<string, unknown>,
 ): Record<string, unknown> {
-	const section: Record<string, unknown> = {};
-	for (const key of LEGACY_ROOT_LSP_KEYS) {
-		if (value[key] !== undefined) section[key] = value[key];
-	}
 	const namespace = value[LSP_NAMESPACE_KEY];
-	if (namespace && typeof namespace === "object" && !Array.isArray(namespace)) {
-		for (const [key, entry] of Object.entries(
-			namespace as Record<string, unknown>,
-		)) {
-			if (entry !== undefined) section[key] = entry;
-		}
-	}
-	return section;
+	return namespace && typeof namespace === "object" && !Array.isArray(namespace)
+		? (namespace as Record<string, unknown>)
+		: {};
 }

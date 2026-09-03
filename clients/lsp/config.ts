@@ -117,7 +117,14 @@ export interface LSPConfig {
 	warmFiles?: string[];
 }
 
-interface RegisteredLSPConfig {
+/**
+ * A workspace's LSP config in the shape the gates consume: custom servers
+ * already constructed, the deny set already a `Set`, overrides already a `Map`.
+ *
+ * Exported since #2427 review round 3 because `effectiveConfig` derives one
+ * rather than reading the session registry — see `registerLSPConfig`.
+ */
+export interface RegisteredLSPConfig {
 	customServers: LSPServerInfo[];
 	disabledServerIds: Set<string>;
 	serverOverrides: Map<string, ServerInitOverride>;
@@ -167,11 +174,33 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
  *    since #783.
  *
  * `homeDir` is a test seam only, matching `findNestedProjectMutationValue`'s.
+ *
+ * `report: false` performs the same resolution and returns the same config
+ * WITHOUT firing a user-facing notice (#2427 review round 2, F6). It exists for
+ * `effectiveConfig`, whose whole contract is that asking what your
+ * configuration is must not warn you about it or consume the warn-once latch
+ * that the session-start load needs. Suppressing means suppressing BOTH sinks —
+ * the record report and the per-document read-failure report — because a
+ * question that answers "your global config is unreadable" by emitting the
+ * loader's own degradation notice has reported all the same.
+ *
+ * It lives HERE and only here. `initLSPConfig` used to take the same option so
+ * that `effectiveConfig` could initialize a workspace quietly; round 3 removed
+ * that call outright, which removed the option, the parallel "which run is
+ * silent" set beside `configInFlight`, and the reporting-caller-never-joins-a-
+ * silent-run rule the two of them needed.
  */
+export interface LoadLSPConfigOptions {
+	/** Fire the user-facing config notices. Defaults to true. */
+	readonly report?: boolean;
+}
+
 export async function loadLSPConfig(
 	cwd: string,
 	homeDir: string = os.homedir(),
+	options: LoadLSPConfigOptions = {},
 ): Promise<LSPConfig> {
+	const reporting = options.report !== false;
 	const resolution = resolvePiLensConfig({
 		cwd,
 		globalDir: getGlobalPiLensDir(),
@@ -188,7 +217,7 @@ export async function loadLSPConfig(
 		// `.pi-lens.json` as well as the LSP-scoped files, and reporting all of
 		// them as `lsp-config` announced an "invalid LSP config" for a file whose
 		// contents are pi-lens settings. An LSP-scoped file still reports here.
-		onReadError: reportConfigReadFailure,
+		...(reporting ? { onReadError: reportConfigReadFailure } : {}),
 	});
 	// EVERY record this resolution produced (#2426 review round 3, F1) — not
 	// filtered to what this loader "owns". `reportPiLensConfigRecords` derives
@@ -196,9 +225,30 @@ export async function loadLSPConfig(
 	// loader's report with the pi-lens loaders' report of the SAME record into
 	// one notice. Filtering here (as round 2 did) silently dropped a pi-lens-
 	// owned record from a document only this multi-file resolution discovered.
-	reportPiLensConfigRecords(resolution.records);
+	if (reporting) reportPiLensConfigRecords(resolution.records);
 
-	const section = lspSectionOf(resolution.value);
+	return lspConfigOf(resolution.value);
+}
+
+/**
+ * THE resolved-value → {@link LSPConfig} projection: read the `lsp` namespace
+ * and keep the four keys the gates consume, each only when the resolution
+ * actually produced it in the right shape.
+ *
+ * Exported and named in #2427 review round 5 (F-R4-1). `effectiveConfig`
+ * needs the LSP config AND the provenance of the same resolution, and
+ * `loadLSPConfig` returns only the former — it discards the resolution it
+ * just performed. Round 4 therefore had the query call `loadLSPConfig` for
+ * the gates and run a SECOND `resolvePiLensConfig` for the provenance, at a
+ * different root, and the two disagreed: the gates answered from the file's
+ * own directory while the reported spec, provenance and document list came
+ * from the workspace root. With the projection spelled here the query performs
+ * ONE resolution and derives both halves from it, and the projection is still
+ * a single definition, so a derived config and a session-registered one cannot
+ * disagree about what a document means.
+ */
+export function lspConfigOf(value: Record<string, unknown>): LSPConfig {
+	const section = lspSectionOf(value);
 	const config: LSPConfig = {};
 	const servers = asRecord(section.servers);
 	if (servers) config.servers = servers as Record<string, CustomServerConfig>;
@@ -280,8 +330,72 @@ function getConfigForFile(filePath: string): RegisteredLSPConfig {
 }
 
 /**
- * Initialize LSP configuration (call at session start)
+ * THE `LSPConfig` → `RegisteredLSPConfig` conversion: construct the custom
+ * servers, index the deny list, index the overrides. Pure — it reads no
+ * module state and writes none.
+ *
+ * Extracted from `initLSPConfig`'s body in #2427 review round 3 so that
+ * `effectiveConfig` can build the config its question needs WITHOUT calling
+ * `initLSPConfig`. That call was the finding: a read-only query ran a full
+ * session initialization, which (a) registered the caller's cwd as a served
+ * session root, widening the #2052 access gate for a tree the session never
+ * opened, and (b) wrote the 32-entry `workspaceConfigs` LRU, so ~40 queries
+ * against other directories evicted a live root's config and silently lifted
+ * the operator's `disabledServers` denial — the exact inversion the surface
+ * promises cannot happen. With the conversion spelled here, both writes stop
+ * being something the query has to opt out of: it never reaches them.
+ *
+ * Still ONE definition, so the derived config and the session-registered one
+ * cannot disagree about what a document means.
+ */
+export function registerLSPConfig(config: LSPConfig): RegisteredLSPConfig {
+	const customServers: LSPServerInfo[] = [];
+	const disabledServerIds = new Set(config.disabledServers ?? []);
+
+	if (config.servers) {
+		for (const [id, serverConfig] of Object.entries(config.servers)) {
+			try {
+				const server = createCustomServer(serverConfig, id);
+				customServers.push(server);
+			} catch {
+				// pi-lens-ignore: missing-error-propagation — per-server registration, skip bad entries
+			}
+		}
+	}
+
+	const serverOverrides = new Map<string, ServerInitOverride>();
+	if (config.serverOverrides) {
+		for (const [id, entry] of Object.entries(config.serverOverrides)) {
+			if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+				const initOpts = (entry as Record<string, unknown>)
+					.initializationOptions;
+				if (
+					initOpts !== undefined &&
+					typeof initOpts === "object" &&
+					initOpts !== null &&
+					!Array.isArray(initOpts)
+				) {
+					serverOverrides.set(id, {
+						initializationOptions: initOpts as Record<string, unknown>,
+					});
+				}
+			}
+		}
+	}
+
+	return { customServers, disabledServerIds, serverOverrides };
+}
+
+/**
+ * Initialize LSP configuration (call at session start).
  * Deduplicates concurrent calls for the same workspace.
+ *
+ * It takes no options on purpose. Every one of its callers is a session
+ * DECLARING a root it will serve — `ensureLSPConfigInitialized`, `ensureReady`,
+ * `runtime-session.ts`, `lens-engine.ts` — and a session-start load is exactly
+ * the caller that must report its config notices. There is no mode in which
+ * this function runs silently, because there is no caller that is not a
+ * session (#2427 review round 3).
  */
 export async function initLSPConfig(cwd: string): Promise<void> {
 	const normalizedCwd = normalizeWorkspacePath(cwd);
@@ -294,46 +408,10 @@ export async function initLSPConfig(cwd: string): Promise<void> {
 	if (existing) return existing;
 
 	const promise = (async () => {
-		const config = await loadLSPConfig(cwd);
-		const customServers: LSPServerInfo[] = [];
-		const disabledServerIds = new Set(config.disabledServers ?? []);
-
-		if (config.servers) {
-			for (const [id, serverConfig] of Object.entries(config.servers)) {
-				try {
-					const server = createCustomServer(serverConfig, id);
-					customServers.push(server);
-				} catch {
-					// pi-lens-ignore: missing-error-propagation — per-server registration, skip bad entries
-				}
-			}
-		}
-
-		const serverOverrides = new Map<string, ServerInitOverride>();
-		if (config.serverOverrides) {
-			for (const [id, entry] of Object.entries(config.serverOverrides)) {
-				if (entry && typeof entry === "object" && !Array.isArray(entry)) {
-					const initOpts = (entry as Record<string, unknown>)
-						.initializationOptions;
-					if (
-						initOpts !== undefined &&
-						typeof initOpts === "object" &&
-						initOpts !== null &&
-						!Array.isArray(initOpts)
-					) {
-						serverOverrides.set(id, {
-							initializationOptions: initOpts as Record<string, unknown>,
-						});
-					}
-				}
-			}
-		}
-
-		workspaceConfigs.set(normalizedCwd, {
-			customServers,
-			disabledServerIds,
-			serverOverrides,
-		});
+		workspaceConfigs.set(
+			normalizedCwd,
+			registerLSPConfig(await loadLSPConfig(cwd, os.homedir())),
+		);
 	})();
 
 	configInFlight.set(normalizedCwd, promise);
@@ -351,12 +429,26 @@ export async function initLSPConfig(cwd: string): Promise<void> {
 }
 
 /**
+ * Every server a workspace knows about, in registry-then-custom order and
+ * BEFORE any gate is applied.
+ *
+ * Spelled once because two callers need the same list for opposite purposes:
+ * `getAllServers` DROPS the disabled ones, `explainServersForFile` REPORTS
+ * them. A custom server that only one of the two composed would be a server
+ * the runtime runs and the introspection cannot see, or the reverse.
+ */
+function registeredServers(config: RegisteredLSPConfig): LSPServerInfo[] {
+	return [...LSP_SERVERS, ...config.customServers];
+}
+
+/**
  * Get all available servers (built-in + custom, minus disabled)
  */
 export function getAllServers(filePath?: string): LSPServerInfo[] {
 	const config = filePath ? getConfigForFile(filePath) : EMPTY_CONFIG;
-	const all = [...LSP_SERVERS, ...config.customServers];
-	return all.filter((s) => !config.disabledServerIds.has(s.id));
+	return registeredServers(config).filter(
+		(s) => !config.disabledServerIds.has(s.id),
+	);
 }
 
 /**
@@ -369,20 +461,101 @@ export function isServerDisabled(serverId: string, filePath?: string): boolean {
 
 // --- Override getServersForFile to include custom servers
 
-export function getServersForFileWithConfig(filePath: string): LSPServerInfo[] {
+/**
+ * Why a server did or did not attach to a file. A closed union: it is public
+ * API the moment `pilens_effective_config` renders it, so a new member arrives
+ * through `docs/public-api-stability.md`.
+ */
+export type ServerSelectionReason =
+	| "selected"
+	| "disabled-by-config"
+	| "extension-mismatch"
+	| "path-filter";
+
+/** One server's selection decision for a file. */
+export interface ServerSelection {
+	readonly server: LSPServerInfo;
+	readonly selected: boolean;
+	readonly reason: ServerSelectionReason;
+}
+
+/**
+ * THE server-selection gate: why this server does or does not attach to this
+ * file (#2427).
+ *
+ * One evaluation, two projections. `getServersForFileWithConfig` asks it for a
+ * verdict and `explainServersForFile` asks it for a reason; before #2427 the
+ * verdict lived here and the reason did not exist, so answering "why is server
+ * X not running" meant re-implementing these three gates at the asking site —
+ * a second copy of a filter is a copy that drifts, which is what AGENTS.md's
+ * single-source-of-truth rule forbids.
+ *
+ * Returning a REASON rather than a boolean is also what keeps the verdict path
+ * allocation-free: `getServersForFileWithConfig` runs per file on the dispatch
+ * and cascade paths, and materializing one decision object per registered
+ * server per call would put ~46 short-lived objects on a hot path to serve a
+ * question only the introspection surface asks.
+ *
+ * Gate order is the ANSWER order, not just an implementation detail: a server
+ * the operator disabled reports `disabled-by-config` even when the file's
+ * extension would not have matched it anyway, because "you turned it off" is
+ * the fact the asker can act on.
+ */
+function selectionReason(
+	server: LSPServerInfo,
+	config: RegisteredLSPConfig,
+	filePath: string,
+	ext: string,
+	base: string,
+): ServerSelectionReason {
+	if (config.disabledServerIds.has(server.id)) return "disabled-by-config";
+	let matched = false;
+	for (const value of server.extensions) {
+		const lower = value.toLowerCase();
+		if (lower === ext || lower === base) {
+			matched = true;
+			break;
+		}
+	}
+	if (!matched) return "extension-mismatch";
+	// #636: a server's extension match can be intentionally broader than what
+	// it can usefully act on (zizmor attaches to "yaml" but only ever reports
+	// on GitHub Actions workflow/action/dependabot paths). `pathFilter`, when
+	// present, is an ADDITIONAL narrowing gate — never a widening one.
+	if (server.pathFilter && !server.pathFilter(filePath)) return "path-filter";
+	return "selected";
+}
+
+/**
+ * Every registered server's decision for a file, with the reason for each.
+ *
+ * `config` defaults to the SESSION's registered config for the file's tree —
+ * what the runtime would actually use. An explicit one is for a caller that
+ * must not touch session state to ask: `effectiveConfig` derives its own from
+ * `loadLSPConfig(..., { report: false })` rather than initializing the
+ * workspace (#2427 review round 3). Both spellings run the identical gate, and
+ * `tests/clients/effective-config.test.ts` pins them equal for the same cwd.
+ */
+export function explainServersForFile(
+	filePath: string,
+	config: RegisteredLSPConfig = getConfigForFile(filePath),
+): ServerSelection[] {
 	const ext = path.extname(filePath).toLowerCase();
 	const base = path.basename(filePath).toLowerCase();
-	return getAllServers(filePath).filter((server) => {
-		const extensions = server.extensions.map((value) => value.toLowerCase());
-		const extensionMatch =
-			extensions.includes(ext) || extensions.includes(base);
-		if (!extensionMatch) return false;
-		// #636: a server's extension match can be intentionally broader than what
-		// it can usefully act on (zizmor attaches to "yaml" but only ever reports
-		// on GitHub Actions workflow/action/dependabot paths). `pathFilter`, when
-		// present, is an ADDITIONAL narrowing gate — never a widening one.
-		return server.pathFilter ? server.pathFilter(filePath) : true;
+	return registeredServers(config).map((server) => {
+		const reason = selectionReason(server, config, filePath, ext, base);
+		return { server, selected: reason === "selected", reason };
 	});
+}
+
+export function getServersForFileWithConfig(filePath: string): LSPServerInfo[] {
+	const config = getConfigForFile(filePath);
+	const ext = path.extname(filePath).toLowerCase();
+	const base = path.basename(filePath).toLowerCase();
+	return registeredServers(config).filter(
+		(server) =>
+			selectionReason(server, config, filePath, ext, base) === "selected",
+	);
 }
 
 /**

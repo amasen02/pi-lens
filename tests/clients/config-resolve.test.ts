@@ -242,12 +242,20 @@ describe("canonical wins on collision (#2426)", () => {
 
 	/**
 	 * #2426 review round 2, F4. The case above spells `warmFiles` at the ROOT of
-	 * the legacy files and under `lsp` in the canonical one, so `lspSectionOf`'s
-	 * namespace-over-root rule decides it and the LOCATION ORDER is never
-	 * exercised. Here both files spell the key the SAME way, which leaves the
-	 * table's ordering — canonical added last, `merge` keeping caller order on a
-	 * precedence tie — as the only thing that can decide. It goes red under a
+	 * the legacy files and under `lsp` in the canonical one, so the namespace
+	 * rule decides it and the LOCATION ORDER is never exercised. Here both files
+	 * spell the key the SAME way, which leaves the table's ordering — canonical
+	 * added last, `merge` keeping caller order on a precedence tie — as the only
+	 * thing that can decide. It goes red under a
 	 * `PROJECT_CONFIG_LOCATIONS.reverse()` mutation.
+	 *
+	 * The assertion reads the `lsp` SECTION rather than the resolved root
+	 * (#2427 review round 2, F1). `resolvePiLensConfig` now moves a document's
+	 * legacy root LSP keys into the `lsp` namespace at source injection, so the
+	 * root spelling no longer survives into the resolved value — one key, one
+	 * schema node. The location-order property this case exists for is
+	 * unchanged, and `lspSectionOf` is how both production consumers of this
+	 * resolution read the value anyway.
 	 */
 	it("prefers the canonical file on an identically spelled key", () => {
 		const root = tmpRoot();
@@ -261,7 +269,7 @@ describe("canonical wins on collision (#2426)", () => {
 			warmFiles: ["from-canonical"],
 		});
 		const resolved = resolvePiLensConfig({ cwd: projectRoot, homeDir: home });
-		expect(resolved.value.warmFiles).toEqual(["from-canonical"]);
+		expect(resolved.value.warmFiles).toBeUndefined();
 		expect(lspSectionOf(resolved.value).warmFiles).toEqual(["from-canonical"]);
 	});
 

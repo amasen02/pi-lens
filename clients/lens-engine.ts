@@ -109,6 +109,22 @@ export {
 	type HostPorts,
 	type HostPortsOverrides,
 } from "./host-ports.js";
+// Effective-config introspection (#2427). A facade rather than a wrapper for
+// the same reason the others are: the computation reaches into the config
+// resolution, the LSP registry and the dispatch plan at once, and putting that
+// composition here would make this file the fourth place that knows how a
+// server is selected. Adapters route to it; nobody re-derives it.
+export {
+	effectiveConfig,
+	type EffectiveConfigDocument,
+	type EffectiveConfigOptions,
+	type EffectiveConfigView,
+	type EffectiveFileView,
+	type EffectiveServerDecision,
+	type EffectiveToolDecision,
+	type RedactedServerSpec,
+	type ToolSelectionReason,
+} from "./effective-config.js";
 
 // --- Query wrappers (own the remaining internal reach-ins) -------------------
 

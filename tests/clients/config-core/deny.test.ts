@@ -331,7 +331,7 @@ describe("deny resolvers in isolation (#2425)", () => {
 				{ tier: "global", value: true },
 				{ tier: "project", value: true },
 			]),
-		).toEqual({ value: true, winner: 1, denied: false });
+		).toEqual({ value: true, winner: 1, denied: false, memberWinners: [] });
 	});
 
 	it("reports no winner for an empty contribution list", () => {
@@ -339,6 +339,9 @@ describe("deny resolvers in isolation (#2425)", () => {
 			value: undefined,
 			winner: -1,
 			denied: false,
+			// A boolean deny has no members, so the per-member attribution added
+			// for #2427 review round 2 F2 is empty rather than absent.
+			memberWinners: [],
 		});
 	});
 
@@ -348,7 +351,27 @@ describe("deny resolvers in isolation (#2425)", () => {
 				{ tier: "global", value: "not-a-list" },
 				{ tier: "project", value: ["x"] },
 			]),
-		).toEqual({ value: ["x"], winner: 1, denied: true });
+			// `memberWinners` is positionally parallel to `value`: the one surviving
+			// member came from contribution 1, the non-array contribution nothing.
+		).toEqual({
+			value: ["x"],
+			winner: 1,
+			denied: true,
+			memberWinners: [1],
+		});
+	});
+
+	it("attributes each surviving union member to the tier that contributed it", () => {
+		const resolution = resolveArrayDeny([
+			{ tier: "global", value: ["typos"] },
+			{ tier: "project", value: ["marksman"] },
+		]);
+		expect(resolution.value).toEqual(["typos", "marksman"]);
+		// Positionally parallel: member 0 came from the global contribution,
+		// member 1 from the project one. `winner` alone says 0 for both, which is
+		// what reported a project denial as a global one (round 2, F2).
+		expect(resolution.memberWinners).toEqual([0, 1]);
+		expect(resolution.winner).toBe(0);
 	});
 
 	it("keeps structurally equal object members rather than folding them", () => {

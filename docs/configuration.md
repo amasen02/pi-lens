@@ -77,6 +77,32 @@ Subsystem-specific env overrides follow the same shape: a
 `reviewGraph.maxFiles`. `docs/environment-variables.md` and `docs/settings.md`
 are the per-setting references.
 
+### One exception: `lsp.disabledServers` is a denial, not a value
+
+Ordinary settings are last-tier-wins. A **denial** is not, because the tier
+that made it is usually the one you control and the tier that would override it
+is usually one that arrived with somebody else's checkout.
+
+`lsp.disabledServers` resolves as the **union of every tier's entries**. A
+project `.pi-lens.json` can add to it and can never subtract from it, so a
+repository cannot re-enable a server you turned off in
+`~/.pi-lens/config.json`. There is no vocabulary for un-denying an entry: if
+you change your mind, edit the file that denied. The provenance reports, per
+denied server, the tier that contributed it.
+
+```console
+$ # which servers run for this file, and why
+$ pilens_effective_config file=src/main.rs
+  ✗ typos — disabled-by-config (global ~/.pi-lens/config.json → /lsp/disabledServers/0)
+```
+
+The union spans **both spellings**: a document's deprecated root keys
+(`servers`, `serverOverrides`, `disabledServers`, `warmFiles`) are read
+into the `lsp` namespace before any tier is merged, so one setting is resolved
+once no matter which spelling each file uses. Migrating does not change the
+answer, staying un-migrated is not a way around the denial, and a half-migrated
+pair of files merges rather than one clobbering the other.
+
 Two rules make the rest of the table unambiguous:
 
 - **The search stops at `$HOME`.** pi-lens never reads a config file in your
@@ -155,6 +181,31 @@ One notice is never suppressed by that bound: `PILENS_CFG_0008`, which says the
 whole file is out of effect. It is not one more rejected key competing for a
 slot — it is what tells you the rejections above it are no longer the whole
 story — so it is kept however full the list already was.
+
+## Asking what is actually in effect
+
+You never have to reconstruct the table above by hand. `pilens_effective_config`
+(MCP) and `effective_config` (pi) return the resolved configuration with the
+provenance of **every** leaf — the tier, the file, the key, and the trust
+decision that applied — plus, for a file you name, its language, every LSP
+server with the reason it was selected or denied, and the runners that would
+dispatch. That is the answer to "why is this running" and to "why is this *not*
+running", without reading a log.
+
+Naming a `file` resolves the configuration **at that file's own directory**,
+which is where the runtime decides from — so a nested `repo/sub/.pi-lens.json`
+layer contributes to the answer, appears in the reported document list, and is
+named as the file behind any decision it made. The walk runs upward, so the
+workspace's own documents are always included too.
+
+It reports **sources, never values**. Environment values never appear, a custom
+server's command line is cut to the binary itself, and every path is rewritten
+`~`-relative. There is no un-redacted mode: the un-redacted data is the config
+file you already have.
+
+`pilens_health` embeds the same provenance as **counts per tier** — how many
+settings each source decided, and which `PILENS_CFG_*` notices the resolution
+produced — so a session's config posture is visible without the detail.
 
 ## See also
 

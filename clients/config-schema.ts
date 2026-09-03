@@ -46,7 +46,11 @@ import { LEGACY_ROOT_LSP_KEYS, LSP_NAMESPACE_KEY } from "./config-locations.js";
 // From the owning module, not the barrel — same reason as `config-resolve.ts`:
 // the barrel's width would drag `process-spec.js` -> `project-trust.js` into
 // every config loader's import graph for one type alias.
-import type { ConfigSchemaNode } from "./config-core/schema.js";
+import {
+	type ConfigSchemaNode,
+	DENY_KEY,
+	type DenyPolicy,
+} from "./config-core/schema.js";
 import {
 	flagConfigSectionKeys,
 	GLOBAL_NON_FLAG_CONFIG_SECTIONS,
@@ -101,6 +105,41 @@ const LSP_KEY_TYPES: Readonly<Record<string, "object" | "array">> = {
 
 export { LSP_KEY_TYPES };
 
+/**
+ * The canonical `lsp.*` keys that carry a DENIAL rather than an ordinary value
+ * (#2427).
+ *
+ * `config-core/deny.ts` has shipped monotonic deny precedence since #2440 and
+ * `merge()` has consulted it since — but it only fires for a node the SCHEMA
+ * annotates, and no production node did. The consequence was live and
+ * measurable: with `~/.pi-lens/config.json` saying
+ * `lsp.disabledServers: ["typos"]` and a repository's `.pi-lens.json` saying
+ * `lsp.disabledServers: []`, the resolution returned `[]` attributed to the
+ * `project` tier and `loadLSPConfig` handed `initLSPConfig` an empty disable
+ * set — repository content silently re-enabling a server the operator turned
+ * off, which is the exact scenario `deny.ts`'s module doc says it exists to
+ * prevent and #2415 AC 3 forbids. One annotation is the whole fix: the union
+ * of every tier's members, attributed to the tier that first denied.
+ *
+ * `enabled` is deliberately NOT annotated here. `boolean-false` pins an
+ * operator denial against every higher tier including `cli`, and `env`/`cli`
+ * are still unpopulated (`docs/configuration.md`), so annotating it now would
+ * decide what `--lsp` means against a global `lsp.enabled: false` in a slice
+ * that cannot test the tiers involved. That belongs to the slice that
+ * populates them.
+ */
+const LSP_KEY_DENY: Readonly<Record<string, DenyPolicy>> = {
+	disabledServers: "array-union",
+};
+
+export { LSP_KEY_DENY };
+
+/** The `x-deny` annotation for a key, or nothing when it carries no denial. */
+function denyAnnotation(key: string): { [DENY_KEY]?: DenyPolicy } {
+	const policy = LSP_KEY_DENY[key];
+	return policy === undefined ? {} : { [DENY_KEY]: policy };
+}
+
 function lspNamespace(): ConfigSchemaNode {
 	const properties: Record<string, ConfigSchemaNode> = {
 		// Reserved but deliberately UNTYPED. `lens-config.ts` already rejects a
@@ -118,6 +157,7 @@ function lspNamespace(): ConfigSchemaNode {
 			...(declared ? { type: declared } : {}),
 			[STABILITY_TIER_KEY]: "experimental",
 			...(declared === "object" ? { additionalProperties: true } : {}),
+			...denyAnnotation(key),
 		};
 	}
 	return {
@@ -154,6 +194,15 @@ function buildConfigSchema(): ConfigSchemaNode {
 	// (#2418 registry), and `experimental` because they are scheduled for
 	// removal — a `stable` tier on a key with a `removeNotBefore` would be two
 	// registries contradicting each other.
+	//
+	// NO deny annotation, unlike round 1 of #2427 (review round 2, F1). Round 1
+	// annotated BOTH spellings and got two independent deny unions for one
+	// setting, neither seeing the other tiers. Both resolution entry points now
+	// normalize a document legacy root LSP keys into the `lsp` namespace before
+	// merging, so this node never receives a contribution at all and a policy on
+	// it could not fire. The denial is resolved once, at the canonical node,
+	// over every tier and every spelling — which is what the second annotation
+	// was trying to achieve and structurally could not.
 	for (const key of LEGACY_ROOT_LSP_KEYS) {
 		properties[key] = opaque("experimental");
 	}
