@@ -11,6 +11,7 @@ import {
 	getDegradationSummary,
 	incrementDegradationCount,
 	recordDegradation,
+	renderDegradationLines,
 } from "./clients/degradation-ledger.js";
 import {
 	adoptProjectTrustFromPorts,
@@ -1421,9 +1422,15 @@ function activateExtension(hostPi: ExtensionAPI) {
 				const report = await collectLatencyPerformance({
 					sessionStartedAt: runtime.sessionStartedAt,
 				});
-				const degradations = getDegradationSummary();
-				const degradationText = degradations.length
-					? `\n\nDegradations:\n${degradations.map((group) => `  ${group.kind}: ${group.count} (${group.latestReasons.at(-1)?.subject}: ${group.latestReasons.at(-1)?.reason})`).join("\n")}`
+				// Shared with the MCP `pilens_health` path (#2515 review, S3): a
+				// hand-rolled renderer here used to diverge from
+				// `renderDegradationLines()` (e.g. printing `log-sink-rotated` with
+				// a fabricated subject/reason instead of the bare informational
+				// count the shared renderer gives it), so the two surfaces
+				// disagreed about the exact same ledger.
+				const degradationLines = renderDegradationLines(getDegradationSummary());
+				const degradationText = degradationLines.length
+					? `\n\n${degradationLines.join("\n")}`
 					: "";
 				notifyUi(
 					ctx,

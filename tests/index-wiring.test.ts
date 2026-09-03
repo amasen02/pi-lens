@@ -38,6 +38,8 @@ import {
 } from "../clients/bus-publish.js";
 import {
 	getDegradationSummary,
+	recordDegradation,
+	renderDegradationLines,
 	resetDegradationLedger,
 } from "../clients/degradation-ledger.js";
 import { _resetSessionLifecycleForTests } from "../clients/session-lifecycle.js";
@@ -1030,6 +1032,41 @@ describe("index.ts extension wiring", () => {
 			expect(out).toContain("Current process session");
 			expect(out).toContain("Machine-wide active log window");
 			expect(out).toContain("wiring-fixture: p50 100ms, p99 100ms, n=3");
+		});
+
+		it("renders degradations through the shared renderDegradationLines seam, agreeing with pilens_health (#2515 S3)", async () => {
+			resetDegradationLedger();
+			try {
+				// `log-sink-rotated` is an INFORMATIONAL kind (see
+				// `INFORMATIONAL_DEGRADATION_KINDS` in degradation-ledger.ts): the
+				// shared renderer prints it as a bare count with no subject/reason.
+				// A hand-rolled renderer that always interpolates
+				// `latestReasons.at(-1)` (the pre-fix shape here) would print a
+				// fabricated "(subject: reason)" suffix even for this kind — the
+				// exact divergence from the MCP `pilens_health` path (which already
+				// uses `renderDegradationLines`) that #2515 S3 flags.
+				recordDegradation({
+					kind: "log-sink-rotated",
+					subject: "test.log",
+					reason: "rotated",
+				});
+
+				const pi = createPiMock();
+				extension(pi.asExtensionAPI());
+				const ctx = makeCtx();
+
+				await pi.runCommand("lens-perf", "", ctx);
+
+				const out = ctx.notifications.map((n) => n.message).join("\n");
+				const expectedLines = renderDegradationLines(getDegradationSummary());
+				expect(expectedLines).toEqual(["Degradations:", "  log-sink-rotated: 1"]);
+				for (const line of expectedLines) {
+					expect(out).toContain(line);
+				}
+				expect(out).not.toContain("log-sink-rotated: 1 (test.log: rotated)");
+			} finally {
+				resetDegradationLedger();
+			}
 		});
 	});
 });

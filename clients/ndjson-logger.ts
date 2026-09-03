@@ -490,11 +490,9 @@ function createWriterState(
 		// A state adopted from a pre-#1970 module graph predates this field.
 		if (typeof existing.writeFailures !== "number") existing.writeFailures = 0;
 		// A state adopted from a pre-#2505 module graph predates these fields.
-		if (
-			typeof existing.knownSize !== "number" &&
-			existing.knownSize !== undefined
-		)
-			existing.knownSize = undefined;
+		// (`knownSize` itself needs no adoption shim: its type is
+		// `number | undefined`, so a value that is neither is unreachable —
+		// #2515 review S2.)
 		if (typeof existing.writesSinceStatSync !== "number")
 			existing.writesSinceStatSync = 0;
 		if (typeof existing.lastStatSyncMs !== "number")
