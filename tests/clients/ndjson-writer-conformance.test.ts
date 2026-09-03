@@ -183,14 +183,25 @@ describe("NDJSON writer conformance (#2505)", () => {
 			12,
 		);
 
-		const violations = population
-			.map((file) => ({
-				file: relativeToClients(file),
-				source: fs.readFileSync(file, "utf8"),
-			}))
+		const sources = population.map((file) => ({
+			file: relativeToClients(file),
+			source: fs.readFileSync(file, "utf8"),
+		}));
+
+		const wrongResolver = sources
 			.filter(({ source }) => /\bgetGlobalPiLensDir\s*\(/.test(source))
 			.map(({ file }) => file);
+		expect(wrongResolver).toEqual([]);
 
-		expect(violations).toEqual([]);
+		// #2516 round 2, F4: banning the WRONG resolver is only half the rule.
+		// A logger that hand-rolls `path.join(os.homedir(), ".pi-lens")` — or
+		// takes any other route to a log root — names neither resolver and
+		// passed the ban above while missing the redirect entirely. Require the
+		// RIGHT one positively, so the only way into this population is through
+		// the seam that carries the redirect.
+		const noResolver = sources
+			.filter(({ source }) => !/\bgetGlobalPiLensLogDir\s*\(/.test(source))
+			.map(({ file }) => file);
+		expect(noResolver).toEqual([]);
 	});
 });

@@ -13,7 +13,7 @@
  */
 import * as path from "node:path";
 import { isTestMode } from "./env-utils.js";
-import { getGlobalPiLensLogDir } from "./file-utils.js";
+import { getGlobalPiLensLogDir } from "./probe-home-state.js";
 import { createNdjsonLogger } from "./ndjson-logger.js";
 
 const DISPOSITION_LOG_DIR = getGlobalPiLensLogDir();

@@ -80,10 +80,15 @@ describe("lsp launch", () => {
 		}));
 		vi.doMock("../../../clients/file-utils.js", () => ({
 			getGlobalPiLensDir: () => tempDir,
-			// #2506: sessionstart.log now resolves through the LOG dir, so the
-			// double must move it too — the assertion below reads
-			// `<tempDir>/sessionstart.log`, which is only where launch.ts writes
-			// if this resolver points at tempDir as well.
+		}));
+		// #2506: sessionstart.log resolves through the LOG dir, so the double
+		// must move that too — the assertion below reads
+		// `<tempDir>/sessionstart.log`, which is only where launch.ts writes if
+		// this resolver points at tempDir as well. #2516 round 2 moved the log
+		// resolver off `file-utils.ts` onto the cycle-free `probe-home-state.ts`
+		// leaf, so this doubles THAT module; doubling file-utils.js alone leaves
+		// launch.ts writing to the real (vitest-pinned) log root.
+		vi.doMock("../../../clients/probe-home-state.js", () => ({
 			getGlobalPiLensLogDir: () => tempDir,
 		}));
 

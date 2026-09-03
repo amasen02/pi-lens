@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 // `tests/config/git-fixture-governance.test.ts` requires every direct Git
 // spawn under tests/ to route through this helper. It is also the RIGHT
 // wrapper here rather than a concession: it pins GIT_CONFIG_NOSYSTEM and
@@ -11,14 +11,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 // own `core.excludesFile` cannot be what makes the assertion below pass —
 // the repo's committed `.gitignore` has to do the work on its own.
 import { execFileSync } from "../support/git-fixture-env.js";
-import {
-	getGlobalPiLensDir,
-	getGlobalPiLensLogDir,
-} from "../../clients/file-utils.js";
+import { getGlobalPiLensDir } from "../../clients/file-utils.js";
 import {
 	_resetProbeHomeRedirectStateForTests,
+	getGlobalPiLensLogDir,
 	getProbeHomeResolution,
-	PROBE_HOME_RESOLUTION_KEY,
 } from "../../clients/probe-home-state.js";
 
 // #2506: an ad-hoc probe against the BUILT `clients/*.js` (a bare `node -e`, a
@@ -401,27 +398,124 @@ describe("the probe home is gitignored (#2506 F2)", () => {
 	});
 });
 
-describe("the shared globalThis slot has exactly one key (#2506)", () => {
-	// file-utils.ts cannot IMPORT probe-home-state.ts — log-cleanup.ts reaches
-	// the resolver through the pre-existing cycle while file-utils.ts is still
-	// mid-init, and an import binding is uninitialized in that window (this
-	// issue hit that ReferenceError twice). The two modules therefore each name
-	// the key as a literal. That duplication is safe only while they are
-	// IDENTICAL: two different literals would give the writer and the reader
-	// two silent slots, and the ledger would never see a redirect that happened.
-	it("file-utils.ts writes the same literal probe-home-state.ts reads", () => {
-		const fileUtils = fs.readFileSync(
-			path.join(REPO_ROOT, "clients/file-utils.ts"),
-			"utf8",
-		);
-		expect(fileUtils).toContain(`Symbol.for("${PROBE_HOME_RESOLUTION_KEY}")`);
-		// ...and file-utils.ts really does NOT import the leaf, which is the
-		// constraint forcing the duplication in the first place.
-		expect(fileUtils).not.toMatch(/^import .*probe-home-state/m);
+describe("a VITEST-marked process with no PI_LENS_HOME pin (#2516 round 2)", () => {
+	// THE hermeticity hole round 2 opened. `computeProbeHomeDir` opened with
+	// `if (isTestMode()) return undefined;`, and `isTestMode()` is true for
+	// anything carrying `VITEST` — including processes vitest starts that
+	// `tests/support/vitest-setup.ts` never reaches: globalSetup, and any child
+	// they spawn. Those have `VITEST` set and NO `PI_LENS_HOME`, so the guard
+	// sent every one of them straight to the developer's real `~/.pi-lens` —
+	// the exact leak #2506 exists to stop, re-opened by the fix for it.
+	//
+	// A real spawned child is load-bearing: `VITEST` present with no home pin
+	// is a property of a process's environment at import time, and this worker
+	// has the pin. Deleting the redirect (the pre-round-2 state) makes this
+	// case resolve to `<fakeHome>/.pi-lens` instead.
+	it("still redirects to the probe home rather than the real home", async () => {
+		const { root, fakeHome, isolatedTmp } = makeFixture("probe-vitest-marked");
+		const worktree = path.join(root, ".claude", "worktrees", "agent-vitest");
+		const probeCwd = path.join(worktree, "clients");
+		fs.mkdirSync(probeCwd, { recursive: true });
+
+		try {
+			const facts = await runChild(probeCwd, fakeHome, isolatedTmp, {
+				VITEST: "1",
+			});
+			// Neither the tmpdir branch nor the PILENS_PROBE force can be what
+			// satisfies this: `runChild` deletes PILENS_PROBE, and the child's
+			// own os.tmpdir() is a sibling of the fixture cwd.
+			expectCwdOutsideChildTmpdir(facts, probeCwd);
+
+			expect(facts.logDir).toBe(path.join(worktree, ".pi-lens-probe-home"));
+			expect(facts.logDir).not.toBe(path.join(fakeHome, ".pi-lens"));
+			// ...and nothing was written into the stand-in for the real home.
+			expect(
+				fs.existsSync(path.join(fakeHome, ".pi-lens", "latency.log")),
+			).toBe(false);
+			// Machine-global state is still NOT redirected, VITEST or not.
+			expect(facts.globalDir).toBe(path.join(fakeHome, ".pi-lens"));
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	}, 40_000);
+});
+
+describe("the log-dir resolver is reachable without a cycle (#2516 round 2)", () => {
+	// WHY THIS IS A TEST AND NOT A COMMENT. Round 2 kept the resolver in
+	// `file-utils.ts` and made it survive by placing an `isTestMode()` early
+	// return ahead of the first module-scope binding it dereferenced. That is
+	// load-order luck: `file-utils.ts` is on an import cycle, its FIFTH import
+	// (`spawn-timeout-cooldown.js`) is what re-enters it, and moving the guard's
+	// own `isTestMode` import after that point makes the GUARD LINE throw
+	// `ReferenceError: Cannot access '__vite_ssr_import_N__' before
+	// initialization`. Reproduced both ways while writing this.
+	//
+	// The invariant that makes import order irrelevant is structural: the
+	// resolver lives in a module that is off every cycle, so it is fully
+	// evaluated before any importer's body runs. These cases pin exactly that,
+	// derived from the source rather than hand-listed.
+	const CLIENTS = path.join(REPO_ROOT, "clients");
+
+	/** Every relative specifier a `clients/` module imports, as repo paths. */
+	function localImportsOf(relative: string): string[] {
+		const source = fs.readFileSync(path.join(CLIENTS, relative), "utf8");
+		const dir = path.dirname(relative);
+		const found: string[] = [];
+		for (const match of source.matchAll(
+			/^\s*(?:import|export)[\s\S]*?from\s+"(\.[^"]+)";/gm,
+		)) {
+			const resolved = path
+				.normalize(path.join(dir, match[1].replace(/\.js$/, ".ts")))
+				.replace(/\\/g, "/");
+			if (fs.existsSync(path.join(CLIENTS, resolved))) found.push(resolved);
+		}
+		return found;
+	}
+
+	it("probe-home-state.ts's transitive imports never reach file-utils.ts", () => {
+		const seen = new Set<string>();
+		const queue = ["probe-home-state.ts"];
+		while (queue.length > 0) {
+			const next = queue.shift() as string;
+			if (seen.has(next)) continue;
+			seen.add(next);
+			queue.push(...localImportsOf(next));
+		}
+		// Anti-vacuity: the walk really did traverse something.
+		expect(seen.size).toBeGreaterThan(1);
+		expect([...seen].sort()).not.toContain("file-utils.ts");
+		// The cycle file-utils.ts sits on, named explicitly so that pulling any
+		// one of these in fails loudly rather than silently re-arming the TDZ.
+		for (const onCycle of [
+			"file-utils.ts",
+			"safe-spawn.ts",
+			"degradation-ledger.ts",
+			"extension-log.ts",
+			"log-cleanup.ts",
+			"spawn-timeout-cooldown.ts",
+		]) {
+			expect([...seen]).not.toContain(onCycle);
+		}
 	});
 
-	it("a redirect the resolver records is visible through the leaf's reader", () => {
-		// The write side and the read side agreeing end to end, in one process.
+	it("file-utils.ts neither defines nor re-exports getGlobalPiLensLogDir", () => {
+		// If it drifts back, every log-family module's module-top-level call
+		// resolves through a module record that can be mid-initialization again.
+		const source = fs.readFileSync(path.join(CLIENTS, "file-utils.ts"), "utf8");
+		expect(source).not.toMatch(/^export .*getGlobalPiLensLogDir/m);
+		// ...and the machine-state sibling really is still there, so this case
+		// cannot pass by the file having been renamed out from under it.
+		expect(source).toMatch(/^export function getGlobalPiLensDir\(\)/m);
+	});
+});
+
+describe("the recorded resolution is visible through the leaf's reader (#2506)", () => {
+	// The write side and the read side agreeing end to end, in one process:
+	// `getGlobalPiLensLogDir()` stores the decision, and the reader
+	// `degradation-ledger.ts` folds at summary time returns the same fact. A
+	// drift between them would mean the ledger never sees a redirect that
+	// actually happened.
+	it("stores the redirect the resolver returned, event and all", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-probe-slot-"));
 		const savedHome = process.env.PI_LENS_HOME;
 		const savedProbe = process.env.PILENS_PROBE;
@@ -448,114 +542,3 @@ describe("the shared globalThis slot has exactly one key (#2506)", () => {
 		}
 	});
 });
-
-describe("computeProbeHomeDir's isTestMode() short-circuit (#2516 review S2)", () => {
-	// #2516's review flagged `if (isTestMode()) return undefined;` inside
-	// `computeProbeHomeDir` (clients/file-utils.ts) as apparently vacuous:
-	// deleting it left every existing test green. It is NOT vacuous — deleting
-	// it reproduces a real crash, just not one any existing assertion happened
-	// to probe for. `log-cleanup.ts` calls `getGlobalPiLensLogDir()` at its OWN
-	// module top level, which can run while `file-utils.ts`'s own module body
-	// is still mid-initialization (the pre-existing
-	// file-utils→safe-spawn→degradation-ledger→extension-log→file-utils
-	// cycle). Reaching `findAgentWorktreeRoot` in that window touches
-	// `normalizeFilePath`, a binding still in the TDZ, and throws
-	// `ReferenceError: Cannot access '...' before initialization` — caught
-	// live on the very first cold import of `clients/latency-logger.js` once
-	// the short-circuit is removed. `isTestMode()` is true for exactly this
-	// window under vitest (`VITEST` is set by the runner before any module
-	// loads, ahead of `PI_LENS_HOME` being pinned), so short-circuiting there
-	// is what keeps a cold import from ever reaching `findAgentWorktreeRoot`.
-	const savedHome = process.env.PI_LENS_HOME;
-	afterEach(() => {
-		if (savedHome === undefined) delete process.env.PI_LENS_HOME;
-		else process.env.PI_LENS_HOME = savedHome;
-		vi.resetModules();
-	});
-
-	it("a cold import of the log-cleanup cycle does not throw a TDZ ReferenceError", async () => {
-		// `PI_LENS_HOME` unset + a fresh module graph (`vi.resetModules()`)
-		// reproduces the exact window: `log-cleanup.ts`'s top-level call runs
-		// before this test's own import of `latency-logger.js` (which pulls in
-		// `log-cleanup.js`, which pulls in `file-utils.js`) has anywhere else
-		// pinned the home first.
-		delete process.env.PI_LENS_HOME;
-		vi.resetModules();
-		await expect(
-			import("../../clients/latency-logger.js"),
-		).resolves.toBeDefined();
-	});
-});
-
-describe.skipIf(process.platform !== "darwin")(
-	"macOS /var → /private/var realpath branch (#2506 round 3 F7, #2516 review item 5)",
-	() => {
-		// Unprovable on Windows (a different symlink shape — 8.3 short names,
-		// substituted drives) and not naturally reproducible on Linux, so this
-		// case only runs on the platform it actually guards: `isUnderRealDir`
-		// (clients/file-utils.ts) resolves BOTH `cwd` and `os.tmpdir()` through
-		// `fs.realpathSync.native` before the containment check, specifically
-		// because on macOS `process.cwd()` reports the CANONICAL
-		// `/private/var/...` form while `os.tmpdir()` reports the SYMLINKED
-		// `/var/...` form — a bare string-prefix check between the two would
-		// never match, making the tmpdir branch dead on every real Mac. This is
-		// the live proof, not a hand-faked path pair: it uses the actual
-		// `os.tmpdir()`/`process.cwd()` this Node process reports on THIS
-		// machine.
-		const savedHome = process.env.PI_LENS_HOME;
-		const savedProbe = process.env.PILENS_PROBE;
-		const savedCwd = process.cwd();
-
-		afterEach(() => {
-			process.chdir(savedCwd);
-			if (savedHome === undefined) delete process.env.PI_LENS_HOME;
-			else process.env.PI_LENS_HOME = savedHome;
-			if (savedProbe === undefined) delete process.env.PILENS_PROBE;
-			else process.env.PILENS_PROBE = savedProbe;
-			_resetProbeHomeRedirectStateForTests();
-		});
-
-		it("os.tmpdir() and its realpath actually differ on this machine (anti-vacuity)", () => {
-			// If this ever stops being true (a future macOS drops the /var
-			// symlink, or the fixture runs somewhere unexpected), the case below
-			// would pass for the wrong reason — a bare prefix check would also
-			// have worked. This assertion makes that impossible to miss.
-			const resolved = fs.realpathSync.native(os.tmpdir());
-			expect(resolved).not.toBe(os.tmpdir());
-			expect(resolved).toContain("/private/var");
-		});
-
-		it("still redirects a probe whose cwd is under the SYMLINKED os.tmpdir() form", () => {
-			const scratch = fs.mkdtempSync(
-				path.join(os.tmpdir(), "pi-lens-probe-darwin-"),
-			);
-			try {
-				delete process.env.PI_LENS_HOME;
-				process.env.PILENS_PROBE = "1";
-				_resetProbeHomeRedirectStateForTests();
-				process.chdir(scratch);
-
-				// PILENS_PROBE=1 always redirects regardless of the tmpdir branch —
-				// this only proves the memoized resolver runs cleanly from a cwd
-				// that exhibits the real symlink mismatch. The tmpdir-branch-
-				// specific proof is the negative case below.
-				const forced = getGlobalPiLensLogDir();
-				expect(forced).toBe(
-					path.join(fs.realpathSync(scratch), ".pi-lens-probe-home"),
-				);
-
-				_resetProbeHomeRedirectStateForTests();
-				delete process.env.PILENS_PROBE;
-				// No PILENS_PROBE and no worktree segment: only the tmpdir branch
-				// (isUnderRealDir(cwd, os.tmpdir())) can redirect this cwd, and it
-				// must still fire despite the /var vs /private/var mismatch.
-				const viaTmpdirBranch = getGlobalPiLensLogDir();
-				expect(viaTmpdirBranch).toBe(
-					path.join(fs.realpathSync(scratch), ".pi-lens-probe-home"),
-				);
-			} finally {
-				fs.rmSync(scratch, { recursive: true, force: true });
-			}
-		});
-	},
-);
