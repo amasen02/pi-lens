@@ -1,4 +1,3 @@
-import * as os from "node:os";
 import * as path from "node:path";
 import { findLocalToolConfig } from "./path-utils.js";
 
@@ -24,13 +23,12 @@ export const LOCAL_OPENGREP_CONFIG_NAMES = [
 	"semgrep.yaml",
 ] as const;
 
-export function findLocalOpengrepConfig(
-	startDir: string,
-	homeDir: string = os.homedir(),
-): string | undefined {
-	return findLocalToolConfig(startDir, LOCAL_OPENGREP_CONFIG_NAMES, {
-		homeDir,
-	});
+// Deliberately UNCEILINGED at $HOME (refs #2472 review round 3, F1):
+// opengrep/semgrep's own resolver reads a rule file wherever it sits, and a
+// user-level `~/.opengrep.yml` is a legitimate global config, not an
+// escaped-workspace accident.
+export function findLocalOpengrepConfig(startDir: string): string | undefined {
+	return findLocalToolConfig(startDir, LOCAL_OPENGREP_CONFIG_NAMES);
 }
 
 function isRegistryOrAutoConfig(config: string): boolean {

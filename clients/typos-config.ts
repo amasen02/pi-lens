@@ -1,4 +1,3 @@
-import * as os from "node:os";
 import { findLocalToolConfig } from "./path-utils.js";
 
 /**
@@ -22,9 +21,11 @@ export const LOCAL_TYPOS_CONFIG_NAMES = [
 	".typos.toml",
 ] as const;
 
-export function findLocalTyposConfig(
-	startDir: string,
-	homeDir: string = os.homedir(),
-): string | undefined {
-	return findLocalToolConfig(startDir, LOCAL_TYPOS_CONFIG_NAMES, { homeDir });
+// Deliberately UNCEILINGED at $HOME (refs #2472 review round 3, F1): typos
+// discovers `~/typos.toml` as the user's legitimate global config, and
+// `typos-lsp` merges an injected config with its own discovery (injected
+// wins) — a ceilinged search here silently hid the user's config from that
+// merge and let pi-lens's own shipped `_typos.toml` clobber it instead.
+export function findLocalTyposConfig(startDir: string): string | undefined {
+	return findLocalToolConfig(startDir, LOCAL_TYPOS_CONFIG_NAMES);
 }

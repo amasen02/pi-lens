@@ -17,9 +17,27 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+// Controllable `os.homedir()` override — `vi.spyOn(os, "homedir")` fails
+// under Vitest's ESM interop ("Cannot redefine property"), so the module is
+// replaced with a thin wrapper that defers to the REAL os.homedir() unless a
+// test has set an override (refs #2472 review round 3, F1). Never used to
+// touch the real HOME directory — only to redirect os.homedir() to a temp
+// dir for the duration of one test; every OTHER test in this file gets the
+// real os.homedir() unchanged.
+const homedirOverride = vi.hoisted(() => ({
+	value: undefined as string | undefined,
+}));
+vi.mock("node:os", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:os")>();
+	const homedir = () => homedirOverride.value ?? actual.homedir();
+	return { ...actual, default: { ...actual, homedir }, homedir };
+});
+
 import { phpCsFixerFormatter } from "../../clients/formatters.js";
 import { resolvePhpCsFixerConfig } from "../../clients/php-cs-fixer-config.js";
+import { hasPhpCsFixerConfig } from "../../clients/tool-policy.js";
 import { removeTempDirSync, setupTestEnvironment } from "./test-utils.js";
 
 const isWin = process.platform === "win32";
@@ -170,30 +188,41 @@ describe("phpCsFixerFormatter — ancestor config carriage (#2472)", () => {
 		expect(resolvePhpCsFixerConfig(crossFormFilePath)).toBe(configPath);
 	});
 
-	it("stops the ancestor climb at the injected HOME ceiling even when the real config sits one level above it", () => {
-		// Mutation-proof HOME-ceiling fixture (mirrors formatters-rustfmt-
-		// edition.test.ts's F5): the true config sits ABOVE an injected
-		// `homeDir`, with the formatted file BELOW it. If the
-		// `isAtOrAboveHomeDir` guard inside `findLocalToolConfig` (refs #2472
-		// review F2, folded from a private `findNearestMarkerRoot` call) were
-		// neutered, the climb would sail past the injected home, find the
-		// outer config, and this assertion would go red.
-		const tmpDir = newTmpDir("pi-lens-phpcsfixer-homeceiling-");
-		fs.writeFileSync(
-			path.join(tmpDir, ".php-cs-fixer.dist.php"),
-			CONFIG_CONTENT,
-		);
-		const homeDir = path.join(tmpDir, "home");
-		const filePath = path.join(homeDir, "project", "src", "index.php");
-		fs.mkdirSync(path.dirname(filePath), { recursive: true });
-		fs.writeFileSync(filePath, "<?php\n");
+	// #2472 review round 3, F1/F3 (maintainer-decision reversal): a round-2
+	// fold ceilinged `resolvePhpCsFixerConfig` (the carriage) at $HOME by
+	// default while its own detection gates — `hasPhpCsFixerConfig`
+	// (`clients/tool-policy.ts`, via the unceilinged `findNearestContaining`)
+	// and `phpCsFixerFormatter.detect` (via its own unceilinged `findUp`) —
+	// stayed unceilinged. That disagreement re-created #2472 for any project
+	// rooted at or above $HOME: the gate said "config exists", the carriage
+	// said "not found", and `--config` was silently dropped. The carriage is
+	// unceilinged again; this proves gate and carriage now AGREE for a config
+	// sitting exactly AT (a mocked, never-real) $HOME.
+	it("gate (hasPhpCsFixerConfig) and carriage (resolvePhpCsFixerConfig) agree for a config AT HOME (#2472 review round 3 F1)", () => {
+		const tmpDir = newTmpDir("pi-lens-phpcsfixer-homeagree-");
+		const mockedHome = path.join(tmpDir, "mocked-home");
+		fs.mkdirSync(mockedHome, { recursive: true });
+		homedirOverride.value = mockedHome;
+		try {
+			const configPath = path.join(mockedHome, ".php-cs-fixer.dist.php");
+			fs.writeFileSync(configPath, CONFIG_CONTENT);
+			const filePath = path.join(mockedHome, "project", "src", "index.php");
+			fs.mkdirSync(path.dirname(filePath), { recursive: true });
+			fs.writeFileSync(filePath, "<?php\n");
 
-		const resolved = resolvePhpCsFixerConfig(filePath, homeDir);
+			// The gate: does detection say a config exists starting from the
+			// project directory?
+			expect(hasPhpCsFixerConfig(path.dirname(filePath))).toBe(true);
 
-		expect(resolved).toBeUndefined();
+			// The carriage: does the resolver find the SAME file starting from
+			// the formatted file's own directory?
+			expect(resolvePhpCsFixerConfig(filePath)).toBe(configPath);
 
-		// Cross-form (forward-slash) filePath must be guarded identically.
-		const crossFormFilePath = filePath.split(path.sep).join("/");
-		expect(resolvePhpCsFixerConfig(crossFormFilePath, homeDir)).toBeUndefined();
+			// Cross-form (forward-slash) filePath resolves identically.
+			const crossFormFilePath = filePath.split(path.sep).join("/");
+			expect(resolvePhpCsFixerConfig(crossFormFilePath)).toBe(configPath);
+		} finally {
+			homedirOverride.value = undefined;
+		}
 	});
 });

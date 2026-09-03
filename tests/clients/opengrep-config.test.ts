@@ -1,7 +1,23 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// Controllable `os.homedir()` override — `vi.spyOn(os, "homedir")` fails
+// under Vitest's ESM interop ("Cannot redefine property"), so the module is
+// replaced with a thin wrapper that defers to the REAL os.homedir() unless a
+// test has set an override (refs #2472 review round 3, F1). Never used to
+// touch the real HOME directory — only to redirect os.homedir() to a temp
+// dir for the duration of one test.
+const homedirOverride = vi.hoisted(() => ({
+	value: undefined as string | undefined,
+}));
+vi.mock("node:os", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:os")>();
+	const homedir = () => homedirOverride.value ?? actual.homedir();
+	return { ...actual, default: { ...actual, homedir }, homedir };
+});
+
 import {
 	findLocalOpengrepConfig,
 	normalizeOpengrepConfigArg,
@@ -43,26 +59,29 @@ describe("opengrep config resolution", () => {
 		expect(resolveOpengrepConfig(tmp).enabled).toBe(true);
 	});
 
-	// #2472 review F2: findLocalOpengrepConfig delegates to the shared
-	// findLocalToolConfig walker in path-utils.ts, which climbed to the
-	// filesystem root with NO $HOME ceiling before this fold — the same
-	// #250/#253 defect class every other ancestor-project-root walker in the
-	// codebase already guards against via isAtOrAboveHomeDir. A config that
-	// sits AT an injected home directory, with the search starting BELOW it,
-	// must not be found.
-	it("stops the ancestor climb at the injected HOME ceiling (#2472 review F2)", () => {
-		const cfg = path.join(tmp, ".opengrep.yml");
-		fs.writeFileSync(cfg, "rules: []\n");
-		const homeDir = path.join(tmp, "home");
-		const startDir = path.join(homeDir, "project", "src");
-		fs.mkdirSync(startDir, { recursive: true });
+	// #2472 review round 3, F1 (maintainer-decision reversal): a round-2 fold
+	// made findLocalOpengrepConfig's ancestor climb stop at $HOME by default,
+	// but a user-level `~/.opengrep.yml` is opengrep's own legitimate global
+	// config — the ceiling hid it from pi-lens for no benefit. The climb is
+	// unceilinged again: a config sitting exactly AT `os.homedir()` resolves.
+	it("finds a config sitting AT (mocked) $HOME — no default ceiling (#2472 review round 3 F1)", () => {
+		const mockedHome = path.join(tmp, "mocked-home");
+		fs.mkdirSync(mockedHome, { recursive: true });
+		homedirOverride.value = mockedHome;
+		try {
+			const cfg = path.join(mockedHome, ".opengrep.yml");
+			fs.writeFileSync(cfg, "rules: []\n");
+			const startDir = path.join(mockedHome, "project", "src");
+			fs.mkdirSync(startDir, { recursive: true });
 
-		expect(findLocalOpengrepConfig(startDir, homeDir)).toBeUndefined();
+			expect(findLocalOpengrepConfig(startDir)).toBe(cfg);
 
-		// Cross-form (forward-slash) startDir must be guarded identically —
-		// a raw string comparison against homeDir would miss it.
-		const crossFormStartDir = startDir.split(path.sep).join("/");
-		expect(findLocalOpengrepConfig(crossFormStartDir, homeDir)).toBeUndefined();
+			// Cross-form (forward-slash) startDir resolves identically.
+			const crossFormStartDir = startDir.split(path.sep).join("/");
+			expect(findLocalOpengrepConfig(crossFormStartDir)).toBe(cfg);
+		} finally {
+			homedirOverride.value = undefined;
+		}
 	});
 
 	it("--lens-opengrep alone defaults to the 'auto' ruleset (seamless)", () => {

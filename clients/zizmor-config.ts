@@ -1,4 +1,3 @@
-import * as os from "node:os";
 import * as path from "node:path";
 import { type SpawnResult, safeSpawnAsync } from "./safe-spawn.js";
 import { findLocalToolConfig } from "./path-utils.js";
@@ -33,13 +32,11 @@ export const LOCAL_ZIZMOR_CONFIG_NAMES = [
 	"zizmor.yaml",
 ] as const;
 
-export function findLocalZizmorConfig(
-	startDir: string,
-	homeDir: string = os.homedir(),
-): string | undefined {
-	return findLocalToolConfig(startDir, LOCAL_ZIZMOR_CONFIG_NAMES, {
-		homeDir,
-	});
+// Deliberately UNCEILINGED at $HOME (refs #2472 review round 3, F1): a
+// user-level `~/zizmor.yml` (or `~/.github/zizmor.yml`) is a legitimate
+// global config, not an escaped-workspace accident.
+export function findLocalZizmorConfig(startDir: string): string | undefined {
+	return findLocalToolConfig(startDir, LOCAL_ZIZMOR_CONFIG_NAMES);
 }
 
 // zizmor's own input collection (see `zizmor --collect`) only ever audits three

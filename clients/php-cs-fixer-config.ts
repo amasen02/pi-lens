@@ -45,13 +45,22 @@
  * We always spawn `fix` with the FILE as a positional argument (not stdin,
  * never a bare directory), so `$path[0]` is always that file and `$configDir`
  * always resolves to `pathinfo($path[0], PATHINFO_DIRNAME)` — the file's OWN
- * directory — REGARDLESS of the spawned process's cwd. This means the
- * alternative fix of just spawning with `cwd = <ancestor config's directory>`
- * would NOT work: php-cs-fixer never consults its own process cwd to build
- * `$configDir` once a file argument is present, only the (unrelated) `$this
- * ->cwd`-equality check for whether to ALSO probe cwd as a second candidate.
- * Explicit `--config <path>` is the only carriage that reaches an ancestor
- * config; there is no spawn-option workaround.
+ * directory — REGARDLESS of the spawned process's cwd.
+ *
+ * #2472 review round 3, F3 correction: an EARLIER version of this comment
+ * concluded from the above that "spawning with `cwd = <ancestor config's
+ * directory>` would NOT work" and that `--config` is "the only carriage —
+ * there is no spawn-option workaround." That conclusion does not follow from
+ * the quoted code and is FALSE: the `$configDir !== $this->cwd` branch
+ * appends `$this->cwd`-rooted candidates whenever the file's own directory
+ * differs from the spawn's cwd — the common case, since we always spawn one
+ * file below the project root. Spawning with `cwd` set to the ancestor
+ * config's directory WOULD make `computeConfigFiles()` find it, via that
+ * second branch. `--config <path>` remains the better fix regardless: it
+ * names the exact winning file directly, with no reliance on this
+ * inequality quirk (and no need to compute a spawn `cwd` distinct from the
+ * file's own directory, which `formatFile` doesn't do) — it is the better
+ * carriage, not the only possible one.
  *
  * Unlike prettier/biome/eslint, an ancestor config found by `detect()`'s own
  * climb (`hasPhpCsFixerConfig` in `clients/tool-policy.ts`,
@@ -69,14 +78,19 @@
  * `phpCsFixerFormatter.detect` never look for them either) so they are not
  * candidates here.
  *
- * Reuses the shared `findLocalToolConfig` walker (`clients/path-utils.ts`,
- * home-ceiling guarded via `isAtOrAboveHomeDir`, `homeDir`-injectable for
- * tests) — the same single source of truth `opengrep-config.ts`,
- * `sgconfig.ts`, `typos-config.ts`, and `zizmor-config.ts` already delegate
- * to for their own "walk up for one of these config filenames" search
- * (refs #680, #2472 review F2), rather than a private walker of its own.
+ * Reuses the shared `findLocalToolConfig` walker (`clients/path-utils.ts`) —
+ * the same single source of truth `opengrep-config.ts`, `sgconfig.ts`,
+ * `typos-config.ts`, and `zizmor-config.ts` already delegate to for their own
+ * "walk up for one of these config filenames" search (refs #680, #2472
+ * review F2), rather than a private walker of its own. Called with NO
+ * `homeDir` — deliberately UNCEILINGED (#2472 review round 3, F1): this
+ * resolver's own gates (`hasPhpCsFixerConfig` in `clients/tool-policy.ts`,
+ * `phpCsFixerFormatter.detect` in `clients/formatters.ts`) are both
+ * unceilinged too (`findNearestContaining`/`findUp` walk to the filesystem
+ * root), so a ceilinged carriage here would disagree with its own gate — the
+ * gate says "config exists" while the carriage says "not found", silently
+ * dropping the `--config` argv this module exists to carry.
  */
-import * as os from "node:os";
 import * as path from "node:path";
 import { findLocalToolConfig } from "./path-utils.js";
 
@@ -93,12 +107,10 @@ export const PHP_CS_FIXER_CONFIG_NAMES = [
 /**
  * Resolve the nearest ancestor php-cs-fixer config FILE for `filePath`
  * (climbing from the file's own directory, never the file itself), or
- * `undefined` when none is found before the home-directory ceiling.
+ * `undefined` when none is found up to the filesystem root — unceilinged,
+ * agreeing with this tool's own (unceilinged) detection gates.
  */
-export function resolvePhpCsFixerConfig(
-	filePath: string,
-	homeDir: string = os.homedir(),
-): string | undefined {
+export function resolvePhpCsFixerConfig(filePath: string): string | undefined {
 	const startDir = path.dirname(path.resolve(filePath));
-	return findLocalToolConfig(startDir, PHP_CS_FIXER_CONFIG_NAMES, { homeDir });
+	return findLocalToolConfig(startDir, PHP_CS_FIXER_CONFIG_NAMES);
 }
