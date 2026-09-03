@@ -44,7 +44,7 @@
 
 import * as asyncHooks from "node:async_hooks";
 import * as path from "node:path";
-import { getGlobalPiLensLogDir } from "./file-utils.js";
+import { getGlobalPiLensLogDir } from "./probe-home-state.js";
 import { getMaxLogSizeMB } from "./log-cleanup.js";
 import { createNdjsonLogger, type NdjsonLogger } from "./ndjson-logger.js";
 

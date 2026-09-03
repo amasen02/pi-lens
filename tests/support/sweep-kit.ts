@@ -93,13 +93,13 @@
  *   directory walk, so excluding `vendor/x.ts` still descends into `vendor/`.
  *   That is cheap on these trees; a sweep over a `node_modules`-sized tree
  *   needs directory pruning this kit does not offer (#1755 review F5).
- * - Under `strings: "blank"`, a call written inside a TEMPLATE EXPRESSION
- *   (`` `${resetThing()}` ``) is blanked with the rest of the template, so a
- *   reachability walk cannot see it. This matches the behavior the
- *   session-state sweep shipped with before the kit, and it is a false
- *   NEGATIVE — the direction that matters for a guard. No such call exists in
- *   `clients/` today. A sweep that needs them visible wants `strings: "keep"`
- *   and a needle-based check (#1755 review F6).
+ * - RESOLVED by #2502: under `strings: "blank"`, a call written inside a
+ *   TEMPLATE EXPRESSION (`` `${resetThing()}` ``) used to be blanked with the
+ *   rest of the template — a false NEGATIVE, the direction that matters for a
+ *   guard, and the noted reason a reachability walk couldn't see it. Fixing
+ *   `${` nesting depth (below) required lexing the expression as real code
+ *   rather than opaque text, which makes it visible to a `"blank"`-policy scan
+ *   the same as any other code — the limitation is gone, not just narrowed.
  *
  * This module is deliberately STATELESS — no module-level caches, no latches.
  * A sweep helper that memoized its own scan would be exactly the
@@ -168,6 +168,18 @@ const KEYWORDS_BEFORE_REGEX = new Set([
  * TOKEN rather than the preceding CHARACTER (#1635 review R2): a character
  * check reads the `f` of `typeof /x()/` as an identifier, calls the regex a
  * division, and leaves a phantom call visible to the scan.
+ *
+ * A TEMPLATE LITERAL's `${...}` interpolation is lexed as ordinary code, not
+ * opaque text (#2502) — nested templates, strings, comments and regexes
+ * inside it are recognized by this same state machine, so a stray delimiter
+ * in there (a nested `` ` `` in particular) cannot be misread as the
+ * template's own close. Its code is therefore never blanked by this
+ * function's own hand, on EITHER string policy: doing so once (to imitate the
+ * pre-#2502 "whole template is opaque" behavior) blanked plain identifiers
+ * like `arg` in `arg.replace(/"/g, ...)` above, which made `regexMayStart`'s
+ * backward walk over the already-blanked `out` array tunnel straight through
+ * them to the template's own opening backtick and misclassify the `/` that
+ * follows as NOT a regex-start — silently corrupting the rest of the file.
  */
 export function stripSource(
 	source: string,
@@ -200,6 +212,22 @@ export function stripSource(
 	let blockComment = false;
 	let regex = false;
 	let regexClass = false;
+	// Stack of currently-OPEN template literals (outermost first). Each frame
+	// tracks the unmatched `{` depth of that template's CURRENT `${...}`
+	// interpolation — 0 means the template is presently in its literal-text
+	// portion (`quote` is `` ` `` and this frame is the one it belongs to);
+	// >=1 means we are lexing the interpolation's expression as ordinary code
+	// (`quote` is unset) and this frame's count is how many unmatched `{` we
+	// have seen since the `${` that opened it.
+	//
+	// #2502: a scalar `quote` alone cannot express "inside template N's
+	// expression, which itself opened template N+1". Without this stack, a
+	// backtick that opens a NESTED template inside an interpolation
+	// (`` `x ${cond ? `y(` : `z`} w` ``) is read as `ch === quote` — the
+	// (wrong) CLOSE of the outer template — leaving the outer template's own
+	// remaining text, including this nested template's own stray delimiters,
+	// to fall through as ordinary unmasked code.
+	const templateStack: { braceDepth: number }[] = [];
 	for (let i = 0; i < source.length; i++) {
 		const ch = source[i];
 		const next = source[i + 1];
@@ -235,7 +263,18 @@ export function stripSource(
 					blank(i + 1);
 				}
 				i++;
+			} else if (quote === "`" && ch === "$" && next === "{") {
+				// Enter this template's `${...}` interpolation: it now reads as
+				// ordinary code (so a nested template, string, comment or regex
+				// inside the expression is lexed by its own real machinery below,
+				// rather than as opaque template text) until the matching `}`.
+				// `${`/`}` are delimiters, kept exactly like the surrounding
+				// backticks — never blanked, on either policy.
+				templateStack[templateStack.length - 1].braceDepth = 1;
+				quote = undefined;
+				i++;
 			} else if (ch === quote) {
+				if (quote === "`") templateStack.pop();
 				quote = undefined;
 			} else if (ch === "\n" && quote !== "`") {
 				// A `'`/`"` string cannot span a raw newline in valid source, so
@@ -267,7 +306,43 @@ export function stripSource(
 			regexClass = false;
 			continue;
 		}
-		if (ch === '"' || ch === "'" || ch === "`") quote = ch;
+		if (ch === '"' || ch === "'" || ch === "`") {
+			quote = ch;
+			if (ch === "`") templateStack.push({ braceDepth: 0 });
+			continue;
+		}
+		if (templateStack.length > 0) {
+			// Inside a template's `${...}` interpolation (invariant: reaching
+			// here with a non-empty stack means the top frame's braceDepth is
+			// already >=1 — every path that resumes template TEXT mode sets
+			// `quote` back to `` ` `` in the same step it would otherwise leave
+			// the top frame at depth 0). Track nested `{`/`}` — an object
+			// literal or block inside the expression — so the `}` that actually
+			// closes the interpolation is the one where this frame's count
+			// returns to 0, not the first `}` encountered.
+			//
+			// Deliberately NOT blanked, on EITHER policy: this is ordinary CODE,
+			// not template text, and `regexMayStart` above depends on it staying
+			// that way. It walks `out` backward, skipping blanked positions to
+			// see past neutralized comments/strings straight to the real
+			// preceding token — an early version of this fix blanked plain
+			// expression characters (to match the pre-#2502 "whole template is
+			// opaque" behavior under `strings: "blank"`), which made that walk
+			// tunnel through the blanked identifiers of e.g. `${arg.replace(`
+			// straight back to the template's own OPENING backtick — a
+			// preserved delimiter, so the scan stopped there and misread a
+			// value-position `/` (regex-start) as following a string/template
+			// close instead of `(`, silently corrupting comment/regex/string
+			// recognition for the rest of the file. Leaving expression code
+			// unblanked keeps `out` identical to `source` here, exactly like
+			// top-level code, so `regexMayStart` needs no special case.
+			const top = templateStack[templateStack.length - 1];
+			if (ch === "{") top.braceDepth++;
+			else if (ch === "}") {
+				top.braceDepth--;
+				if (top.braceDepth === 0) quote = "`"; // resume this template's text
+			}
+		}
 	}
 	return out.join("");
 }
