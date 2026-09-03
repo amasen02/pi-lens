@@ -64,6 +64,10 @@ describe("published manifest carries no devDependencies", () => {
 		{ timeout: 180_000 },
 		() => {
 			const before = fs.readFileSync(path.join(root, "package.json"), "utf8");
+			const lockBefore = fs.readFileSync(
+				path.join(root, "package-lock.json"),
+				"utf8",
+			);
 			const npm = process.platform === "win32" ? "npm.cmd" : "npm";
 			const out = execFileSync(
 				npm,
@@ -96,6 +100,10 @@ describe("published manifest carries no devDependencies", () => {
 				before,
 			);
 			expect(fs.existsSync(path.join(root, ".pack-backup"))).toBe(false);
+			// npm re-syncs the lock from the stripped manifest during pack; postpack must put it back too.
+			expect(
+				fs.readFileSync(path.join(root, "package-lock.json"), "utf8"),
+			).toBe(lockBefore);
 		},
 	);
 });

@@ -22,7 +22,11 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const manifest = path.join(root, "package.json");
-const backup = path.join(root, ".pack-backup", "package.json");
+const backupDir = path.join(root, ".pack-backup");
+// npm re-syncs package-lock.json's root entry from the (stripped) manifest
+// during `npm pack` and rewrites the whole file in its own formatting, so the
+// lock is backed up and restored alongside the manifest (#2573 round 2).
+const FILES = ["package.json", "package-lock.json"];
 
 /** Pure: the manifest as it must be published. Exported for the packaging test. */
 export function stripForPack(pkg) {
@@ -39,22 +43,33 @@ function strip() {
 		);
 		return;
 	}
-	fs.mkdirSync(path.dirname(backup), { recursive: true });
-	fs.writeFileSync(backup, raw);
-	fs.writeFileSync(manifest, `${JSON.stringify(stripForPack(pkg), null, 2)}\n`);
+	fs.mkdirSync(backupDir, { recursive: true });
+	for (const f of FILES) {
+		const src = path.join(root, f);
+		if (fs.existsSync(src)) fs.copyFileSync(src, path.join(backupDir, f));
+	}
+	const indent = /^	/m.test(raw) ? "	" : 2;
+	fs.writeFileSync(
+		manifest,
+		`${JSON.stringify(stripForPack(pkg), null, indent)}
+`,
+	);
 	console.error(
-		`[strip-dev-deps] removed ${Object.keys(pkg.devDependencies).length} devDependencies from package.json for packing (backup: .pack-backup/package.json)`,
+		`[strip-dev-deps] removed ${Object.keys(pkg.devDependencies).length} devDependencies from package.json for packing (backup: .pack-backup/)`,
 	);
 }
 
 function restore() {
-	if (!fs.existsSync(backup)) {
+	if (!fs.existsSync(backupDir)) {
 		console.error("[strip-dev-deps] no backup to restore");
 		return;
 	}
-	fs.copyFileSync(backup, manifest);
-	fs.rmSync(path.dirname(backup), { recursive: true, force: true });
-	console.error("[strip-dev-deps] restored package.json");
+	for (const f of FILES) {
+		const b = path.join(backupDir, f);
+		if (fs.existsSync(b)) fs.copyFileSync(b, path.join(root, f));
+	}
+	fs.rmSync(backupDir, { recursive: true, force: true });
+	console.error("[strip-dev-deps] restored package.json and package-lock.json");
 }
 
 const mode = process.argv[2];
