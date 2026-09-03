@@ -84,16 +84,25 @@ describe("getClientForFile wait records — unrooted candidates (#2525)", () => 
 	});
 
 	it("lsp_client_wait_timeout names only the rooted candidate, not an unrooted deno-style fallback", async () => {
+		// vi.useFakeTimers() BEFORE the import/construction (matching the
+		// known-slow and L2-partition cases below) — installing it AFTER let a
+		// real-timers window into the freshly re-imported module's own
+		// (`vi.resetModules()`-fresh) setup, which was flaky under heavy
+		// machine contention (an extra lsp_client_wait_timeout record, or an
+		// outright hang, in a 53-file concurrent batch).
+		vi.useFakeTimers();
 		const { LSPService } = await import("../../../clients/lsp/index.js");
 		const service = new LSPService();
 
 		// Mirrors the real "typescript" primary: resolves a root and spawns,
-		// but cold-start takes longer than the caller's wait budget. A raw
-		// setTimeout delay only needs to outlast a 1ms budget, so it never
-		// exercises anything about ITS OWN duration — a never-resolving promise
-		// (same idiom as the "known-slow" and "L2 partition" cases below) proves
-		// "has not settled by the time the budget expires" without racing any
-		// clock, real or fake (flake-shape: raw-timer-wait).
+		// but cold-start takes longer than the caller's wait budget. A
+		// never-resolving promise (same idiom as the known-slow and
+		// L2-partition cases below) proves "has not settled by the time the
+		// budget expires" without a raw timer call of its own (flake-shape:
+		// raw-timer-wait); the OUTER wait-budget race is still the
+		// production code's own real `setTimeout`, driven deterministically
+		// via `vi.advanceTimersByTimeAsync` below instead of racing the real
+		// clock.
 		const typescriptSpawn = vi.fn(() => new Promise<never>(() => {}));
 		// Mirrors the real DenoServer: fallbackFor "typescript", root gated on
 		// deno.json(c) which does not exist in this project, so root() resolves
@@ -126,8 +135,12 @@ describe("getClientForFile wait records — unrooted candidates (#2525)", () => 
 
 		const file = "C:/repo/main.ts";
 		// maxWaitMs=1 forces the real timeoutSentinel branch well before the
-		// never-settling typescript spawn (or any deno attempt) could resolve.
-		const result = await service.getClientForFile(file, 1);
+		// never-settling typescript spawn (or any deno attempt) could resolve;
+		// advancing fake time fires that budget deterministically instead of
+		// racing the real clock.
+		const resultPromise = service.getClientForFile(file, 1);
+		await vi.advanceTimersByTimeAsync(1);
+		const result = await resultPromise;
 
 		expect(result).toBeUndefined();
 
@@ -148,6 +161,8 @@ describe("getClientForFile wait records — unrooted candidates (#2525)", () => 
 	});
 
 	it("names both candidates when deno.json makes deno a real rooted fallback", async () => {
+		// Same fake-timers-before-import ordering as the case above.
+		vi.useFakeTimers();
 		const { LSPService } = await import("../../../clients/lsp/index.js");
 		const service = new LSPService();
 
@@ -176,7 +191,9 @@ describe("getClientForFile wait records — unrooted candidates (#2525)", () => 
 		]);
 
 		const file = "C:/repo/main.ts";
-		const result = await service.getClientForFile(file, 1);
+		const resultPromise = service.getClientForFile(file, 1);
+		await vi.advanceTimersByTimeAsync(1);
+		const result = await resultPromise;
 
 		expect(result).toBeUndefined();
 
