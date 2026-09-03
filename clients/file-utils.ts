@@ -230,6 +230,23 @@ function computeProbeHomeDir(cwd: string): string | undefined {
 	if (process.env.PILENS_PROBE === "1") {
 		return path.join(cwd, ".pi-lens-probe-home");
 	}
+	// #2516 review flagged this as untested and possibly vacuous — deleting it
+	// left every test file that already imports this cycle green. It is
+	// neither: under vitest, `log-cleanup.ts`'s own top-level
+	// `getGlobalPiLensLogDir()` call (see the doc comment above this
+	// function) can reach THIS function while `file-utils.ts`'s module body
+	// is still mid-init and `PI_LENS_HOME` has not been pinned yet — the
+	// exact cycle window described above. `findAgentWorktreeRoot` below reads
+	// `normalizeFilePath`, one of the bindings still in the TDZ during that
+	// window, so calling it there throws `ReferenceError: Cannot access
+	// '...' before initialization` on the very first cold import of that
+	// cycle (reproduced live by deleting this line —
+	// `tests/config/global-dir-probe-redirect.test.ts`'s "cold import of the
+	// log-cleanup cycle" case). `isTestMode()` is true for exactly this
+	// window (`VITEST` is set by the runner before any module loads), so
+	// returning early here is what keeps that cold import from ever reaching
+	// `findAgentWorktreeRoot`. Do not delete without also resolving the TDZ
+	// hazard itself.
 	if (isTestMode()) return undefined;
 	const worktreeRoot = findAgentWorktreeRoot(cwd);
 	if (worktreeRoot) return path.join(worktreeRoot, ".pi-lens-probe-home");

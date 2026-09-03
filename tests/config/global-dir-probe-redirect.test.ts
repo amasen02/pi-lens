@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 // `tests/config/git-fixture-governance.test.ts` requires every direct Git
 // spawn under tests/ to route through this helper. It is also the RIGHT
 // wrapper here rather than a concession: it pins GIT_CONFIG_NOSYSTEM and
@@ -448,3 +448,114 @@ describe("the shared globalThis slot has exactly one key (#2506)", () => {
 		}
 	});
 });
+
+describe("computeProbeHomeDir's isTestMode() short-circuit (#2516 review S2)", () => {
+	// #2516's review flagged `if (isTestMode()) return undefined;` inside
+	// `computeProbeHomeDir` (clients/file-utils.ts) as apparently vacuous:
+	// deleting it left every existing test green. It is NOT vacuous — deleting
+	// it reproduces a real crash, just not one any existing assertion happened
+	// to probe for. `log-cleanup.ts` calls `getGlobalPiLensLogDir()` at its OWN
+	// module top level, which can run while `file-utils.ts`'s own module body
+	// is still mid-initialization (the pre-existing
+	// file-utils→safe-spawn→degradation-ledger→extension-log→file-utils
+	// cycle). Reaching `findAgentWorktreeRoot` in that window touches
+	// `normalizeFilePath`, a binding still in the TDZ, and throws
+	// `ReferenceError: Cannot access '...' before initialization` — caught
+	// live on the very first cold import of `clients/latency-logger.js` once
+	// the short-circuit is removed. `isTestMode()` is true for exactly this
+	// window under vitest (`VITEST` is set by the runner before any module
+	// loads, ahead of `PI_LENS_HOME` being pinned), so short-circuiting there
+	// is what keeps a cold import from ever reaching `findAgentWorktreeRoot`.
+	const savedHome = process.env.PI_LENS_HOME;
+	afterEach(() => {
+		if (savedHome === undefined) delete process.env.PI_LENS_HOME;
+		else process.env.PI_LENS_HOME = savedHome;
+		vi.resetModules();
+	});
+
+	it("a cold import of the log-cleanup cycle does not throw a TDZ ReferenceError", async () => {
+		// `PI_LENS_HOME` unset + a fresh module graph (`vi.resetModules()`)
+		// reproduces the exact window: `log-cleanup.ts`'s top-level call runs
+		// before this test's own import of `latency-logger.js` (which pulls in
+		// `log-cleanup.js`, which pulls in `file-utils.js`) has anywhere else
+		// pinned the home first.
+		delete process.env.PI_LENS_HOME;
+		vi.resetModules();
+		await expect(
+			import("../../clients/latency-logger.js"),
+		).resolves.toBeDefined();
+	});
+});
+
+describe.skipIf(process.platform !== "darwin")(
+	"macOS /var → /private/var realpath branch (#2506 round 3 F7, #2516 review item 5)",
+	() => {
+		// Unprovable on Windows (a different symlink shape — 8.3 short names,
+		// substituted drives) and not naturally reproducible on Linux, so this
+		// case only runs on the platform it actually guards: `isUnderRealDir`
+		// (clients/file-utils.ts) resolves BOTH `cwd` and `os.tmpdir()` through
+		// `fs.realpathSync.native` before the containment check, specifically
+		// because on macOS `process.cwd()` reports the CANONICAL
+		// `/private/var/...` form while `os.tmpdir()` reports the SYMLINKED
+		// `/var/...` form — a bare string-prefix check between the two would
+		// never match, making the tmpdir branch dead on every real Mac. This is
+		// the live proof, not a hand-faked path pair: it uses the actual
+		// `os.tmpdir()`/`process.cwd()` this Node process reports on THIS
+		// machine.
+		const savedHome = process.env.PI_LENS_HOME;
+		const savedProbe = process.env.PILENS_PROBE;
+		const savedCwd = process.cwd();
+
+		afterEach(() => {
+			process.chdir(savedCwd);
+			if (savedHome === undefined) delete process.env.PI_LENS_HOME;
+			else process.env.PI_LENS_HOME = savedHome;
+			if (savedProbe === undefined) delete process.env.PILENS_PROBE;
+			else process.env.PILENS_PROBE = savedProbe;
+			_resetProbeHomeRedirectStateForTests();
+		});
+
+		it("os.tmpdir() and its realpath actually differ on this machine (anti-vacuity)", () => {
+			// If this ever stops being true (a future macOS drops the /var
+			// symlink, or the fixture runs somewhere unexpected), the case below
+			// would pass for the wrong reason — a bare prefix check would also
+			// have worked. This assertion makes that impossible to miss.
+			const resolved = fs.realpathSync.native(os.tmpdir());
+			expect(resolved).not.toBe(os.tmpdir());
+			expect(resolved).toContain("/private/var");
+		});
+
+		it("still redirects a probe whose cwd is under the SYMLINKED os.tmpdir() form", () => {
+			const scratch = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-probe-darwin-"),
+			);
+			try {
+				delete process.env.PI_LENS_HOME;
+				process.env.PILENS_PROBE = "1";
+				_resetProbeHomeRedirectStateForTests();
+				process.chdir(scratch);
+
+				// PILENS_PROBE=1 always redirects regardless of the tmpdir branch —
+				// this only proves the memoized resolver runs cleanly from a cwd
+				// that exhibits the real symlink mismatch. The tmpdir-branch-
+				// specific proof is the negative case below.
+				const forced = getGlobalPiLensLogDir();
+				expect(forced).toBe(
+					path.join(fs.realpathSync(scratch), ".pi-lens-probe-home"),
+				);
+
+				_resetProbeHomeRedirectStateForTests();
+				delete process.env.PILENS_PROBE;
+				// No PILENS_PROBE and no worktree segment: only the tmpdir branch
+				// (isUnderRealDir(cwd, os.tmpdir())) can redirect this cwd, and it
+				// must still fire despite the /var vs /private/var mismatch.
+				const viaTmpdirBranch = getGlobalPiLensLogDir();
+				expect(viaTmpdirBranch).toBe(
+					path.join(fs.realpathSync(scratch), ".pi-lens-probe-home"),
+				);
+			} finally {
+				fs.rmSync(scratch, { recursive: true, force: true });
+			}
+		});
+	},
+);

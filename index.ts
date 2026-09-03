@@ -1428,7 +1428,9 @@ function activateExtension(hostPi: ExtensionAPI) {
 				// a fabricated subject/reason instead of the bare informational
 				// count the shared renderer gives it), so the two surfaces
 				// disagreed about the exact same ledger.
-				const degradationLines = renderDegradationLines(getDegradationSummary());
+				const degradationLines = renderDegradationLines(
+					getDegradationSummary(),
+				);
 				const degradationText = degradationLines.length
 					? `\n\n${degradationLines.join("\n")}`
 					: "";

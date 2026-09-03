@@ -1059,7 +1059,10 @@ describe("index.ts extension wiring", () => {
 
 				const out = ctx.notifications.map((n) => n.message).join("\n");
 				const expectedLines = renderDegradationLines(getDegradationSummary());
-				expect(expectedLines).toEqual(["Degradations:", "  log-sink-rotated: 1"]);
+				expect(expectedLines).toEqual([
+					"Degradations:",
+					"  log-sink-rotated: 1",
+				]);
 				for (const line of expectedLines) {
 					expect(out).toContain(line);
 				}

@@ -1,0 +1,5 @@
+---
+section: Fixed
+---
+
+- **Close out the #2508/#2511 ndjson-logger and log-dir leftovers (refs #2515, refs #2516)** — pinned the `actualSize === 0` rotation guard with a regression case (a stale-high cached size plus a sibling process that already rotated and emptied the active file, plus an incoming line alone ≥ the rotation bound), removed a dead `knownSize` adoption shim, and folded `/lens-perf`'s degradation rendering onto the same `renderDegradationLines()` seam `pilens_health` already uses so the two surfaces agree. Added a conformance test pinning that every `createNdjsonLogger` caller resolves its directory through `getGlobalPiLensLogDir()`, never the machine-state-only `getGlobalPiLensDir()`. Investigated deleting the `isTestMode()` short-circuit in `computeProbeHomeDir` and kept it instead: removing it reproduces a real module-load-time `ReferenceError` (a TDZ hazard in the pre-existing `file-utils.ts`/`log-cleanup.ts` import cycle), now pinned by a dedicated regression test plus documentation explaining why.
