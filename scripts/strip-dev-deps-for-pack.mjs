@@ -34,13 +34,17 @@ function strip() {
 	const raw = fs.readFileSync(manifest, "utf8");
 	const pkg = JSON.parse(raw);
 	if (!pkg.devDependencies) {
-		console.error("[strip-dev-deps] no devDependencies in package.json; nothing to do");
+		console.error(
+			"[strip-dev-deps] no devDependencies in package.json; nothing to do",
+		);
 		return;
 	}
 	fs.mkdirSync(path.dirname(backup), { recursive: true });
 	fs.writeFileSync(backup, raw);
 	fs.writeFileSync(manifest, `${JSON.stringify(stripForPack(pkg), null, 2)}\n`);
-	console.error(`[strip-dev-deps] removed ${Object.keys(pkg.devDependencies).length} devDependencies from package.json for packing (backup: .pack-backup/package.json)`);
+	console.error(
+		`[strip-dev-deps] removed ${Object.keys(pkg.devDependencies).length} devDependencies from package.json for packing (backup: .pack-backup/package.json)`,
+	);
 }
 
 function restore() {
@@ -56,7 +60,10 @@ function restore() {
 const mode = process.argv[2];
 if (mode === "--strip") strip();
 else if (mode === "--restore") restore();
-else if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith("strip-dev-deps-for-pack.mjs")) {
+else if (
+	import.meta.url === `file://${process.argv[1]}` ||
+	process.argv[1]?.endsWith("strip-dev-deps-for-pack.mjs")
+) {
 	console.error("usage: strip-dev-deps-for-pack.mjs --strip | --restore");
 	process.exitCode = 64;
 }

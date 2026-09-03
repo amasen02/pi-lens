@@ -95,7 +95,8 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 	// (prepack/postpack are npm lifecycle hooks); header on the file states why.
 	"real-process-spawn:packaging-pack-manifest.test.ts": {
 		detector: "real-process-spawn",
-		reason: "observes the real npm pack lifecycle (prepack/postpack); no in-process double is faithful",
+		reason:
+			"observes the real npm pack lifecycle (prepack/postpack); no in-process double is faithful",
 	},
 };
 
