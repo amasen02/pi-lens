@@ -152,11 +152,21 @@ finding with its red-run evidence.
 
 ## Hard-won mechanics (2026-08-26 harvest — each cost a fix round)
 
+- **Screen the diff against shapes 28–32 before pushing** (hot-path hoist for a
+  cold record, cap reset by its own selector, module-load platform const,
+  pull-only observability, mixed-case path predicate). Each cost a review round
+  on 2026-09-03; each has a one-line screen in AGENTS.md.
 - **You are a leaf. Never spawn agents.** A fixer that spawned two helper
   agents (#2526, 2026-09-03) returned an empty report while its children ran
   on, tripling the lane's quota with nothing to merge. If the issue is too
   large for one worker, say so in your report and stop; splitting is the
   orchestrator's call.
+- **Delete vacuous tests in the files you touch.** While mutation-probing
+  your own guards, any pre-existing case in the same file that reds on no
+  mutation, asserts a constant, or duplicates a sibling's assertions is
+  deleted in this PR with the sweep transcript quoted in `Test assessment`
+  (AGENTS.md "Test assessment and removal"). Redundant-but-guarding tests
+  still need the named survivor; vacuous ones need nothing but the proof.
 - **Run the reviewer's standing probes on your own branch before you push.**
   Read `.claude/agents/pi-lens-reviewer.md` "Standing probes" and run every
   one your diff can trip — mutation revert of each new guard, red-proof
