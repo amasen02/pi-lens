@@ -236,6 +236,31 @@ describe("public surface drift — helpers", () => {
 		expect(documentedIn("## tools", "tools")).toBe(true);
 	});
 
+	/**
+	 * The check the case above asserted it performed and did not (#2427
+	 * review round 2, F7).
+	 *
+	 * The old pattern matched the field name ANYWHERE inside a code span, so
+	 * `ui` was "documented" by a sentence mentioning `builtin`, and every one of
+	 * the short section names — `ui`, `lsp`, `delta`, `tools` — had a plausible
+	 * carrier word in the reference docs. A drift guard that passes on a
+	 * substring is a guard that cannot red, which is the defect it exists to
+	 * catch.
+	 */
+	it("documentedIn requires a whole token inside a code span, heading or row", () => {
+		expect(documentedIn("Set `builtin` to false.", "ui")).toBe(false);
+		expect(documentedIn("| `builtin` | the builtin set |", "ui")).toBe(false);
+		expect(documentedIn("## builtin servers", "ui")).toBe(false);
+		expect(documentedIn("Set `guardrails` on.", "guard")).toBe(false);
+		// A dotted or bracketed path is still the field being documented, so the
+		// boundary is a TOKEN boundary, not a whitespace one.
+		expect(documentedIn("Set `config.ui.compact` to false.", "ui")).toBe(
+			true,
+		);
+		expect(documentedIn("| `ui.compact` | compact mode |", "ui")).toBe(true);
+		expect(documentedIn("## ui", "ui")).toBe(true);
+	});
+
 	it("schemaEnumAt reads an enum out of a schema, and reports its absence", () => {
 		expect(
 			schemaEnumAt(

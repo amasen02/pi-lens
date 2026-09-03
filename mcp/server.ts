@@ -39,6 +39,9 @@ import {
 	createWarmIpcRequestQueue,
 	diagnosticStats,
 	effectiveConfig,
+	type EffectiveConfigView,
+	type EffectiveFileView,
+	type EffectiveServerDecision,
 	ensureLspConfig,
 	generatedSkipNotice,
 	ipcPathForCwd,
@@ -1069,6 +1072,64 @@ function formatAnalyze(
 	return toolText(summary, servedBy ? { ...result, servedBy } : result);
 }
 
+/** The per-tier and per-code counts `pilens_health` reports for a resolution. */
+interface HealthConfigProvenance {
+	readonly documents: number;
+	readonly tiers: Readonly<Record<string, number>>;
+	readonly codes: Readonly<Record<string, number>>;
+}
+
+/**
+ * The `Config:` line of `pilens_health` (#2427).
+ *
+ * A named formatter rather than a ternary nested inside a template inside a
+ * ternary in the `lines` array (review round 2, F3). Counts only — the
+ * whole point of embedding provenance in a health report is that it names WHICH
+ * files contributed without carrying WHAT they said.
+ */
+function healthConfigLine(
+	provenance: HealthConfigProvenance | null,
+): string {
+	if (!provenance) return "Config: unavailable (resolution failed)";
+	const tiers = Object.entries(provenance.tiers)
+		.filter(([, count]) => count > 0)
+		.map(([tier, count]) => `${tier} ${count}`)
+		.join(" · ");
+	const codes = Object.entries(provenance.codes)
+		.map(([code, count]) => `${code}×${count}`)
+		.join(", ");
+	const notices = codes.length > 0 ? ` · notices ${codes}` : "";
+	const documents = `${provenance.documents} file(s)`;
+	return `Config: ${documents} · ${tiers} leaf/leaves${notices}`;
+}
+
+/** One `pilens_effective_config` server row, with the tier that decided it. */
+function effectiveServerLine(server: EffectiveServerDecision): string {
+	const mark = server.selected ? "✓" : "✗";
+	const decided = server.decidedBy;
+	if (!decided) return `  ${mark} ${server.id} — ${server.reason}`;
+	const file = decided.file === undefined ? "" : ` ${decided.file}`;
+	const source = `${decided.tier}${file} → ${decided.key}`;
+	return `  ${mark} ${server.id} — ${server.reason} (${source})`;
+}
+
+/** The `File:` heading of `pilens_effective_config`. */
+function effectiveFileHeading(file: EffectiveFileView): string {
+	const language = file.language === undefined ? "" : ` — ${file.language}`;
+	const kind = file.kind === undefined ? "" : ` (kind ${file.kind})`;
+	return `File: ${file.path}${language}${kind}`;
+}
+
+/** One `pilens_effective_config` config-document row. */
+function effectiveDocumentLine(
+	document: EffectiveConfigView["documents"][number],
+): string {
+	const legacy = document.legacy
+		? " (legacy location — scheduled for removal)"
+		: "";
+	return `  ${document.tier}: ${document.file}${legacy}`;
+}
+
 async function callTool(
 	name: string,
 	args: Record<string, unknown>,
@@ -1599,20 +1660,7 @@ async function callTool(
 					`${turnEnd.lastRunAt ? ` (last ran ${turnEnd.lastRunAt})` : ""}` +
 					`${turnEnd.lastSkipReason ? ` — last skip: ${turnEnd.lastSkipReason}${turnEnd.lastSkipAt ? ` at ${turnEnd.lastSkipAt}` : ""}` : ""}`
 				: "Stop-hook turn-end: no activity recorded (hook not installed, or no Stop yet)",
-			configProvenance
-				? `Config: ${configProvenance.documents} file(s) · ` +
-					`${Object.entries(configProvenance.tiers)
-						.filter(([, count]) => count > 0)
-						.map(([tier, count]) => `${tier} ${count}`)
-						.join(" · ")} leaf/leaves` +
-					`${
-						Object.keys(configProvenance.codes).length > 0
-							? ` · notices ${Object.entries(configProvenance.codes)
-									.map(([code, count]) => `${code}×${count}`)
-									.join(", ")}`
-							: ""
-					}`
-				: "Config: unavailable (resolution failed)",
+			healthConfigLine(configProvenance),
 			footprint
 				? `Resource footprint: ${footprint.instanceCount} pi-lens instance(s) · ` +
 					`${(footprint.totalRssBytes / 1024 / 1024).toFixed(0)}MB RSS · ` +
@@ -1654,23 +1702,16 @@ async function callTool(
 		});
 		const lines = [
 			`Config: ${view.documents.length} file(s) contributing, ${view.provenance.length} resolved leaf/leaves`,
-			...view.documents.map(
-				(document) =>
-					`  ${document.tier}: ${document.file}${document.legacy ? " (legacy location — scheduled for removal)" : ""}`,
-			),
+			...view.documents.map(effectiveDocumentLine),
 			...(view.file
 				? [
-						`File: ${view.file.path}${view.file.language ? ` — ${view.file.language}` : ""}${view.file.kind ? ` (kind ${view.file.kind})` : ""}`,
+						effectiveFileHeading(view.file),
 						...view.file.servers
 							// Only the servers with something to say: every registry entry
 							// whose extension simply does not match this file would be ~40
 							// lines of "not applicable" ahead of the answer.
 							.filter((server) => server.reason !== "extension-mismatch")
-							.map(
-								(server) =>
-									`  ${server.selected ? "✓" : "✗"} ${server.id} — ${server.reason}` +
-									`${server.decidedBy ? ` (${server.decidedBy.tier}${server.decidedBy.file ? ` ${server.decidedBy.file}` : ""} → ${server.decidedBy.key})` : ""}`,
-							),
+							.map(effectiveServerLine),
 						...view.file.tools.map(
 							(tool) =>
 								`  ${tool.selected ? "✓" : "✗"} ${tool.id} — ${tool.reason}`,

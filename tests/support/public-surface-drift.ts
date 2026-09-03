@@ -81,16 +81,26 @@ export interface PublicSurface {
 /**
  * Is `name` genuinely written down, rather than merely a substring?
  *
- * A bare `text.includes(name)` passes for `tools` against the word "tools" in a
- * sentence — which would make the whole check read as coverage while proving
- * nothing. A documented field appears as code (`` `maxProjectFiles` ``), as a
- * JSON key in an example (`"ignore":`), in a heading, or in a table row, and
- * those four shapes are what this matches.
+ * A bare `text.includes(name)` passes for `tools` against the word
+ * "tools" in a sentence — which would make the whole check read as coverage
+ * while proving nothing. A documented field appears as code, as a JSON key in
+ * an example, in a heading, or in a table row, and those four shapes are what
+ * this matches.
+ *
+ * The name must be a WHOLE TOKEN in all four (#2427 review round 2, F7).
+ * Round 1 matched the name anywhere inside a code span, so `ui` was
+ * "documented" by a span reading `builtin` and `guard` by `guardrails` — and
+ * the helper test that claimed to reject an incidental substring only ever
+ * exercised the PROSE case, which is rejected on the span shape rather than on
+ * the name, so the claim was never tested. The boundary excludes identifier
+ * characters only, so a dotted or indexed path still documents its head: a
+ * span reading `config.ui.compact` documents `ui`, a longer word does not.
  */
 export function documentedIn(text: string, name: string): boolean {
 	const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	const token = `(?<![A-Za-z0-9_$])${escaped}(?![A-Za-z0-9_$])`;
 	return new RegExp(
-		`(\`[^\`\\n]*${escaped}[^\`\\n]*\`)|("${escaped}"\\s*:)|(^#{1,6}\\s.*${escaped})|(^\\|[^\\n]*${escaped})`,
+		`(\`[^\`\\n]*${token}[^\`\\n]*\`)|("${escaped}"\\s*:)|(^#{1,6}\\s.*${token})|(^\\|[^\\n]*${token})`,
 		"m",
 	).test(text);
 }

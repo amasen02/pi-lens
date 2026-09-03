@@ -87,18 +87,21 @@ is usually one that arrived with somebody else's checkout.
 project `.pi-lens.json` can add to it and can never subtract from it, so a
 repository cannot re-enable a server you turned off in
 `~/.pi-lens/config.json`. There is no vocabulary for un-denying an entry: if
-you change your mind, edit the file that denied. The provenance reports the
-tier that **first** denied — the one a nearer file cannot out-rank.
+you change your mind, edit the file that denied. The provenance reports, per
+denied server, the tier that contributed it.
 
 ```console
 $ # which servers run for this file, and why
 $ pilens_effective_config file=src/main.rs
-  ✗ typos — disabled-by-config (global ~/.pi-lens/config.json → /lsp/disabledServers)
+  ✗ typos — disabled-by-config (global ~/.pi-lens/config.json → /lsp/disabledServers/0)
 ```
 
-The same rule applies to the deprecated root spelling (`disabledServers` at the
-file root), so migrating does not change the answer and staying un-migrated is
-not a way around it.
+The union spans **both spellings**: a document's deprecated root keys
+(`servers`, `serverOverrides`, `disabledServers`, `warmFiles`) are read
+into the `lsp` namespace before any tier is merged, so one setting is resolved
+once no matter which spelling each file uses. Migrating does not change the
+answer, staying un-migrated is not a way around the denial, and a half-migrated
+pair of files merges rather than one clobbering the other.
 
 Two rules make the rest of the table unambiguous:
 

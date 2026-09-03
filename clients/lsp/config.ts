@@ -167,11 +167,27 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
  *    since #783.
  *
  * `homeDir` is a test seam only, matching `findNestedProjectMutationValue`'s.
+ *
+ * `report: false` performs the same resolution and returns the same config
+ * WITHOUT firing a user-facing notice (#2427 review round 2, F6). It
+ * exists for `effectiveConfig`, whose whole contract is that asking what your
+ * configuration is must not warn you about it or consume the warn-once latch
+ * that the session-start load needs. Suppressing means suppressing BOTH sinks —
+ * the record report and the per-document read-failure report — because a
+ * question that answers "your global config is unreadable" by emitting the
+ * loader's own degradation notice has reported all the same.
  */
+export interface LoadLSPConfigOptions {
+	/** Fire the user-facing config notices. Defaults to true. */
+	readonly report?: boolean;
+}
+
 export async function loadLSPConfig(
 	cwd: string,
 	homeDir: string = os.homedir(),
+	options: LoadLSPConfigOptions = {},
 ): Promise<LSPConfig> {
+	const reporting = options.report !== false;
 	const resolution = resolvePiLensConfig({
 		cwd,
 		globalDir: getGlobalPiLensDir(),
@@ -188,7 +204,7 @@ export async function loadLSPConfig(
 		// `.pi-lens.json` as well as the LSP-scoped files, and reporting all of
 		// them as `lsp-config` announced an "invalid LSP config" for a file whose
 		// contents are pi-lens settings. An LSP-scoped file still reports here.
-		onReadError: reportConfigReadFailure,
+		...(reporting ? { onReadError: reportConfigReadFailure } : {}),
 	});
 	// EVERY record this resolution produced (#2426 review round 3, F1) — not
 	// filtered to what this loader "owns". `reportPiLensConfigRecords` derives
@@ -196,7 +212,7 @@ export async function loadLSPConfig(
 	// loader's report with the pi-lens loaders' report of the SAME record into
 	// one notice. Filtering here (as round 2 did) silently dropped a pi-lens-
 	// owned record from a document only this multi-file resolution discovered.
-	reportPiLensConfigRecords(resolution.records);
+	if (reporting) reportPiLensConfigRecords(resolution.records);
 
 	const section = lspSectionOf(resolution.value);
 	const config: LSPConfig = {};
@@ -255,6 +271,15 @@ const EMPTY_CONFIG: RegisteredLSPConfig = {
 const workspaceConfigs = new BoundedLruCache<string, RegisteredLSPConfig>(32);
 /** In-flight config initialization promises to prevent duplicate concurrent loads */
 const configInFlight = new Map<string, Promise<void>>();
+/**
+ * The cwds whose in-flight init is running with reporting SUPPRESSED.
+ *
+ * A parallel set rather than a richer in-flight value, so the map stays exactly
+ * what the identity-guarded release and `_peekConfigInFlightForTests` already
+ * reason about (#1968) and the ordinary reporting path allocates nothing.
+ */
+const silentInFlight = new Set<string>();
+
 
 function normalizeWorkspacePath(cwd: string): string {
 	return path.resolve(cwd);
@@ -283,18 +308,33 @@ function getConfigForFile(filePath: string): RegisteredLSPConfig {
  * Initialize LSP configuration (call at session start)
  * Deduplicates concurrent calls for the same workspace.
  */
-export async function initLSPConfig(cwd: string): Promise<void> {
+export async function initLSPConfig(
+	cwd: string,
+	options: LoadLSPConfigOptions = {},
+): Promise<void> {
+	const reporting = options.report !== false;
 	const normalizedCwd = normalizeWorkspacePath(cwd);
 	// #2052: this cwd is now a served session root. Registered BEFORE the
 	// in-flight dedup return below, so a concurrent duplicate init still
 	// registers it rather than returning early with the root unrecorded.
 	registerSessionRoot(normalizedCwd);
 
+	// A REPORTING caller never joins a non-reporting run (#2427 review round
+	// 2, F6). The dedup exists to avoid a duplicate resolution, not to make
+	// one caller inherit another sinks: session start joining an
+	// `effectiveConfig` query silent load would drop that session config
+	// notices entirely, which is a worse failure than resolving twice. The other
+	// direction is safe and still dedupes — a silent caller joining a reporting
+	// run gets notices that were going to fire anyway.
 	const existing = configInFlight.get(normalizedCwd);
-	if (existing) return existing;
+	if (existing && (!reporting || !silentInFlight.has(normalizedCwd))) {
+		return existing;
+	}
+	if (reporting) silentInFlight.delete(normalizedCwd);
+	else silentInFlight.add(normalizedCwd);
 
 	const promise = (async () => {
-		const config = await loadLSPConfig(cwd);
+		const config = await loadLSPConfig(cwd, os.homedir(), options);
 		const customServers: LSPServerInfo[] = [];
 		const disabledServerIds = new Set(config.disabledServers ?? []);
 
@@ -346,6 +386,10 @@ export async function initLSPConfig(cwd: string): Promise<void> {
 		// mid-flight, after which the next caller starts a duplicate config load.
 		if (configInFlight.get(normalizedCwd) === promise) {
 			configInFlight.delete(normalizedCwd);
+			// Same identity guard covers the silent-mode flag: it describes the
+			// run this release is retiring, so it goes only when that run is still
+			// the registered one.
+			silentInFlight.delete(normalizedCwd);
 		}
 	}
 }
@@ -508,6 +552,7 @@ export function getServerInitOverride(
 
 export function resetLSPConfigStateForTests(): void {
 	workspaceConfigs.clear();
+	silentInFlight.clear();
 	resetLSPCaseSensitivityState();
 	// Reset both together: a cleared config store beside a live session-root
 	// registry would decline files for roots nothing can serve any more.

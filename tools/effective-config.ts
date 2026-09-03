@@ -27,9 +27,14 @@ function summarize(view: EffectiveConfigView): string {
 		(entry) => entry.reason === "disabled-by-config",
 	).length;
 	const tools = view.file.tools.filter((entry) => entry.selected).length;
+	// The denial clause is built first rather than nested inside the summary
+	// template: a conditional expression inside a template inside a template is
+	// the S3358/nested-template shape SonarCloud flags, and it hid the one
+	// number a reader is looking for (#2427 review round 2, F3).
+	const deniedClause = denied > 0 ? `, ${denied} denied by config` : "";
 	return (
 		`effective_config ${view.file.path} — ${documents} · ` +
-		`${selected} server(s) selected${denied > 0 ? `, ${denied} denied by config` : ""} · ` +
+		`${selected} server(s) selected${deniedClause} · ` +
 		`${tools} tool(s)`
 	);
 }

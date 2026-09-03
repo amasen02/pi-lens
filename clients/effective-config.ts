@@ -55,6 +55,7 @@ import {
 	type ServerSelectionReason,
 } from "./lsp/config.js";
 import { homeRelativePath } from "./path-utils.js";
+import { compareOrdinal } from "./string-utils.js";
 
 export interface EffectiveConfigOptions {
 	/** Workspace the resolution is performed for. Defaults to `process.cwd()`. */
@@ -176,7 +177,7 @@ function redactServerSpec(entry: unknown): RedactedServerSpec | undefined {
 	const args = Array.isArray(record.args) ? record.args : [];
 	const env =
 		typeof record.env === "object" && record.env !== null
-			? Object.keys(record.env as Record<string, unknown>).sort()
+			? Object.keys(record.env as Record<string, unknown>).sort(compareOrdinal)
 			: [];
 	return {
 		...(command === undefined ? {} : { command }),
@@ -278,7 +279,12 @@ export async function effectiveConfig(
 ): Promise<EffectiveConfigView> {
 	const cwd = options.cwd ?? process.cwd();
 	const homeDir = options.homeDir ?? os.homedir();
-	if (options.file !== undefined) await initLSPConfig(cwd);
+	// `report: false` — rule 2 (#2427 review round 2, F6). This init is a step
+	// in answering a QUESTION, and the query contract is that asking must not
+	// warn: an uninitialized cwd used to have its deprecation notices fired here
+	// and the loader warn-once latch consumed, so the session-start load that
+	// owns those notices then said nothing.
+	if (options.file !== undefined) await initLSPConfig(cwd, { report: false });
 
 	const resolution = resolvePiLensConfig({
 		cwd,
@@ -323,6 +329,22 @@ export async function effectiveConfig(
 				}),
 	};
 	return view;
+}
+
+/**
+ * Why a runner is or is not in the plan for a file.
+ *
+ * A named function rather than a nested ternary at the call site (#2427
+ * review round 2, F3): the two-level conditional was one of the nesting
+ * hits SonarCloud raises on this file, and the three answers read as a table
+ * here.
+ */
+function toolReason(
+	selected: boolean,
+	kind: ReturnType<typeof detectFileKind>,
+): ToolSelectionReason {
+	if (selected) return "selected";
+	return kind === undefined ? "no-dispatch-plan" : "not-registered-for-kind";
 }
 
 async function fileView(
@@ -408,15 +430,15 @@ async function fileView(
 	const planned = kind
 		? (getToolPlan(kind)?.groups.flatMap((group) => group.runnerIds) ?? [])
 		: [];
-	const ids = [...new Set([...planned, ...available])].sort();
+	// Ordinal, not the default locale sort: this list is the ORDER of a payload
+	// callers compare across machines, and a locale-sensitive comparator can
+	// order the same ids differently under a different ICU build (#2427 review
+	// round 2, F3; SonarCloud S2871).
+	const ids = [...new Set([...planned, ...available])].sort(compareOrdinal);
 	const tools: EffectiveToolDecision[] = ids.map((id) => ({
 		id,
 		selected: available.has(id),
-		reason: available.has(id)
-			? "selected"
-			: kind === undefined
-				? "no-dispatch-plan"
-				: "not-registered-for-kind",
+		reason: toolReason(available.has(id), kind),
 	}));
 
 	return {

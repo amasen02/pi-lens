@@ -31,11 +31,19 @@ import { removeTempDirSync } from "./test-utils.js";
 
 // The extension log is an ndjson sink, not the terminal; a fixture that
 // deliberately carries a legacy location would otherwise spray test output.
-// Same mock as tests/clients/config-golden-layouts.test.ts.
+// CAPTURED rather than discarded (#2427 review round 2, F6): the surface
+// contract is that asking a question fires no user-facing notice, and a mock
+// that throws the notices away cannot tell a suppressed one from an absent one.
+const logSink = vi.hoisted(() => ({ messages: [] as string[] }));
 vi.mock("../../clients/extension-log.js", async (importOriginal) => {
 	const actual =
 		await importOriginal<typeof import("../../clients/extension-log.js")>();
-	return { ...actual, logExtension: () => {} };
+	return {
+		...actual,
+		logExtension: (entry: { message: string }) => {
+			logSink.messages.push(entry.message);
+		},
+	};
 });
 
 const tempRoots: string[] = [];
@@ -106,6 +114,7 @@ async function viewFor(
 /** Fixture layout keys, assembled so no literal path appears in the source. */
 const GLOBAL_CONFIG = [".pi-lens", "config.json"].join("/");
 const PROJECT_CONFIG = ["proj", ".pi-lens.json"].join("/");
+const LEGACY_PROJECT_LSP = ["proj", "pi-lsp.json"].join("/");
 const TYPOS_POINTER = ["", "lsp", "disabledServers", "0"].join("/");
 const MARKSMAN_POINTER = ["", "lsp", "disabledServers", "1"].join("/");
 
@@ -297,6 +306,38 @@ describe("effectiveConfig — why is X running (#2415 AC)", () => {
 		expect(view.file?.language).toBe("markdown");
 	});
 
+	/**
+	 * The GATE ORDER, made non-vacuous (#2427 review round 2, F5).
+	 *
+	 * `selectionReason` documents that "you turned it off" outranks "this file
+	 * is not yours" — a server the operator disabled reports
+	 * `disabled-by-config` even when the extension would not have matched
+	 * anyway. Every case that existed for it disabled a server the file DID
+	 * match, so the documented order was never exercised and moving the disable
+	 * check below the extension check left the suite green.
+	 *
+	 * Here `rust` is disabled and the file is markdown, so the two gates
+	 * disagree and only the order can decide.
+	 */
+	it("reports a disabled server as disabled even when the extension would not match", async () => {
+		const files: Record<string, unknown> = {};
+		files[GLOBAL_CONFIG] = denyDoc("rust");
+		const layout: Layout = { files, startDir: "proj" };
+		const result = await viewFor(layout, { file: "notes.md" });
+		const rust = result.view.file?.servers.find(
+			(entry) => entry.id === "rust",
+		);
+		expect(rust).toBeDefined();
+		expect(rust?.selected).toBe(false);
+		expect(rust?.reason).toBe("disabled-by-config");
+		// And the ordinary mismatch answer is still reachable, so this is a
+		// discrimination test rather than a constant.
+		const python = result.view.file?.servers.find(
+			(entry) => entry.id === "python",
+		);
+		expect(python?.reason).toBe("extension-mismatch");
+	});
+
 	it("resolves the file's language and the runners that would dispatch for it", async () => {
 		const { view } = await viewFor(
 			{ files: {}, startDir: "proj" },
@@ -371,5 +412,49 @@ describe("effectiveConfig — redaction is unconditional", () => {
 		const legacy = view.documents.filter((document) => document.legacy);
 		expect(legacy.length).toBe(1);
 		expect(legacy[0].file.endsWith("pi-lsp.json")).toBe(true);
+	});
+});
+
+describe("effectiveConfig — asking must not report (#2427 rule 2)", () => {
+	/**
+	 * The per-file path drives `initLSPConfig`, and that used to fire the
+	 * loader deprecation notices and consume the process-lifetime warn-once
+	 * latch (review round 2, F6). A QUESTION that answers itself by
+	 * warning the user — and then leaves the session-start load with nothing
+	 * left to say — is the opposite of the surface contract.
+	 */
+	it("does not fire a legacy-location notice, and leaves the latch for the loader", async () => {
+		const files: Record<string, unknown> = {};
+		files[LEGACY_PROJECT_LSP] = { disabledServers: ["typos"] };
+		const layout: Layout = { files, startDir: "proj" };
+		logSink.messages.length = 0;
+		const result = await viewFor(layout, { file: "notes.md" });
+		// The view still SEES the legacy document and still counts its record.
+		expect(result.view.documents.some((d) => d.legacy)).toBe(true);
+		expect(result.view.recordCounts.PILENS_CFG_0003).toBeGreaterThanOrEqual(1);
+		expect(logSink.messages).toEqual([]);
+
+		// And the latch is untouched: the loader that OWNS the notice still says
+		// it. This is the half that a bare "no output" assertion would miss —
+		// suppressing by consuming the latch looks identical from inside the
+		// query and is exactly the defect.
+		const previousHome = process.env.PI_LENS_HOME;
+		const previousConfigPath = process.env.PI_LENS_CONFIG_PATH;
+		process.env.PI_LENS_HOME = path.join(result.home, ".pi-lens");
+		process.env.PI_LENS_CONFIG_PATH = path.join(
+			result.home,
+			".pi-lens",
+			"config.json",
+		);
+		try {
+			await loadLSPConfig(result.projectDir, result.home);
+		} finally {
+			if (previousHome === undefined) delete process.env.PI_LENS_HOME;
+			else process.env.PI_LENS_HOME = previousHome;
+			if (previousConfigPath === undefined)
+				delete process.env.PI_LENS_CONFIG_PATH;
+			else process.env.PI_LENS_CONFIG_PATH = previousConfigPath;
+		}
+		expect(logSink.messages.join("\n")).toContain("deprecated");
 	});
 });
