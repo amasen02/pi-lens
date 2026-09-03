@@ -114,6 +114,43 @@ written into the PR body BEFORE any edit, and the fixer is Opus. Never send a
 third patch-only round: #2528 went r2 → r3 → r4 on one cache record, each
 round fixing three findings and adding two, until the model was demanded.
 
+## Orchestrator invariants (any orchestrator, not only Claude)
+
+These are the habits the train depends on. They live here, not in any one
+operator's private notes, so a different orchestrator can run the same train.
+
+- **Contracts move in the same session.** When a review or a dogfood finding
+  reveals a defect CLASS (not an instance), add a numbered shape to AGENTS.md's
+  catalog with the issue ref and a one-line screen, extend the fixer's screen
+  list, and cite the number in the next brief — before the next dispatch. "To
+  err twice is not the mark of a wise man." (2026-09-03: shapes 28–36 came out
+  of one day's reviews this way.)
+- **Keep a lane ledger.** One file, one row per lane: issue/PR, worker id,
+  round, state, head SHA, merge-order note; a header line with the quota
+  reading and the merged list. Update it on every dispatch, report and merge.
+  It is what survives a context reset.
+- **A lane's worktree lives until its PR merges.** Pruning it after a report
+  makes the owning worker un-resumable, so every fix round then costs a fresh
+  worker. Prune on merge, or when the lane is abandoned.
+- **Brief shape for a fixer.** Issue/PR number and head; the checked-out
+  branch; the exact findings with file:line, the reviewer's probe to reproduce
+  FIRST, and the remedy shape the maintainer chose; what to fold (net-count)
+  and what stays out; the suites to run (named files + the mechanical
+  governance selector + every tests/config file); the observability record to
+  name; "no agents, foreground runs, one CI read, no monitors". Brief a
+  reviewer with the PR number, the claims as the fixer stated them, and the
+  attack angles that matter for THIS diff; ask for a verdict first.
+- **Round routing.** Fix rounds that only apply a reviewer-prescribed remedy
+  with quoted reds merge on green (CI read on the exact head, both required
+  checks, mergeable state). Rounds that add mechanism, touch session or
+  lifecycle semantics, or rewrite a guard get a fresh verify. A verify that
+  reports a NEW defect triggers the round-count rail above.
+- **Maintainer trailing commits** are for intent-free deltas only (a literal
+  NUL byte, a false comment, a missing PR-body heading); anything that changes
+  what code MEANS goes through a fix round.
+- **Refill order** when the quota gate is open: p1 first, then the queued
+  follow-ups in ledger order, then the program work (#2421 → #2416 → #2383/#195).
+
 ## Honesty rules
 
 - A finding is real when a probe proves it; a fix is real when the same probe
