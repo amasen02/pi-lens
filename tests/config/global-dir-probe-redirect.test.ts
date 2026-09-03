@@ -11,6 +11,7 @@ import { afterEach, describe, expect, it } from "vitest";
 // own `core.excludesFile` cannot be what makes the assertion below pass —
 // the repo's committed `.gitignore` has to do the work on its own.
 import { execFileSync } from "../support/git-fixture-env.js";
+import { getDegradationSummary } from "../../clients/degradation-ledger.js";
 import { getGlobalPiLensDir } from "../../clients/file-utils.js";
 import {
 	_resetProbeHomeRedirectStateForTests,
@@ -304,6 +305,49 @@ describe("getGlobalPiLensLogDir probe-home redirect (#2506)", () => {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	}, 40_000);
+
+	// round 3 (#2515/#2516): `isUnderRealDir` (probe-home-state.ts:247-248)
+	// realpath-resolves BOTH sides of the tmpdir containment check before
+	// comparing them. Off Windows that is the only thing that makes the
+	// tmpdir branch fire when `os.tmpdir()` itself is a symlink — macOS's
+	// `/var` -> `/private/var` is the textbook case, but any Linux box with
+	// TMPDIR pointed at a symlinked directory hits the identical shape. A
+	// plain `isUnderDir` (no realpath) would never see the symlinked tmpdir
+	// and the literal, real cwd as related, and this case would go red.
+	// Windows is excluded deliberately: this repo's path handling already
+	// resolves through `normalizeFilePath` elsewhere on that platform, and
+	// creating a real filesystem symlink from an unprivileged Windows
+	// process is unreliable — this case runs only in the ubuntu Unit tests
+	// CI lane.
+	it.runIf(process.platform !== "win32")(
+		"resolves a symlinked TMPDIR to its real target before the containment check",
+		async () => {
+			const { root, fakeHome } = makeFixture("probe-tmpdir-symlink");
+			const realTmpTarget = path.join(root, "real-tmp-target");
+			const tmpSymlink = path.join(root, "tmp-symlink");
+			fs.mkdirSync(realTmpTarget, { recursive: true });
+			fs.symlinkSync(realTmpTarget, tmpSymlink, "dir");
+
+			// The child's cwd sits INSIDE THE REAL directory, not through the
+			// symlink — TMPDIR points the child's `os.tmpdir()` at the symlink,
+			// so the two only relate once both are realpath-resolved.
+			const probeCwd = path.join(realTmpTarget, "scratch-probe");
+			fs.mkdirSync(probeCwd, { recursive: true });
+
+			try {
+				const facts = await runChild(probeCwd, fakeHome, tmpSymlink);
+				// The child really did see the SYMLINK path, unresolved — proving
+				// the redirect below can only have matched via realpath, not
+				// because the literal paths already agreed.
+				expect(facts.tmpdir).toBe(tmpSymlink);
+				expect(facts.logDir).toBe(path.join(probeCwd, ".pi-lens-probe-home"));
+				expect(facts.globalDir).toBe(path.join(fakeHome, ".pi-lens"));
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		},
+		40_000,
+	);
 });
 
 describe("probe-home resolution is memoized per process (#2506 F5)", () => {
@@ -456,16 +500,24 @@ describe("the log-dir resolver is reachable without a cycle (#2516 round 2)", ()
 	// derived from the source rather than hand-listed.
 	const CLIENTS = path.join(REPO_ROOT, "clients");
 
-	/** Every relative specifier a `clients/` module imports, as repo paths. */
+	/**
+	 * Every relative specifier a `clients/` module imports, as repo paths.
+	 * Matches both `import ... from "./x.js"` / `export ... from "./x.js"`
+	 * AND a bare side-effect `import "./x.js";` with no `from` clause — the
+	 * first pattern alone missed the second (round 3, #2515/#2516), which
+	 * would have let a bare import re-establish a walked-around cycle edge
+	 * without this walk ever noticing.
+	 */
 	function localImportsOf(relative: string): string[] {
 		const source = fs.readFileSync(path.join(CLIENTS, relative), "utf8");
 		const dir = path.dirname(relative);
 		const found: string[] = [];
 		for (const match of source.matchAll(
-			/^\s*(?:import|export)[\s\S]*?from\s+"(\.[^"]+)";/gm,
+			/^\s*(?:import|export)[\s\S]*?from\s+"(\.[^"]+)";|^\s*import\s+"(\.[^"]+)";/gm,
 		)) {
+			const specifier = match[1] ?? match[2];
 			const resolved = path
-				.normalize(path.join(dir, match[1].replace(/\.js$/, ".ts")))
+				.normalize(path.join(dir, specifier.replace(/\.js$/, ".ts")))
 				.replace(/\\/g, "/");
 			if (fs.existsSync(path.join(CLIENTS, resolved))) found.push(resolved);
 		}
@@ -533,6 +585,44 @@ describe("the recorded resolution is visible through the leaf's reader (#2506)",
 			expect(stored?.probeHome).toBe(resolved);
 			expect(stored?.event?.probeHome).toBe(resolved);
 			expect(stored?.event?.cwd).toBe(process.cwd());
+		} finally {
+			process.chdir(savedCwd);
+			if (savedHome === undefined) delete process.env.PI_LENS_HOME;
+			else process.env.PI_LENS_HOME = savedHome;
+			if (savedProbe === undefined) delete process.env.PILENS_PROBE;
+			else process.env.PILENS_PROBE = savedProbe;
+			_resetProbeHomeRedirectStateForTests();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	// round 3 (#2515/#2516): the reason string used to say "PI_LENS_HOME
+	// unset outside test mode", a leftover from the #2516 round 2 `isTestMode()`
+	// guard that this module's redirect no longer has — `computeProbeHomeDir`
+	// fires under vitest too (globalSetup, children spawned without the
+	// `PI_LENS_HOME` pin), and via `PILENS_PROBE=1` from an ordinary checkout
+	// that vitest never touches at all. The old text told a reader the redirect
+	// was test-mode-scoped when it is not.
+	it("describes the actual trigger, not a removed test-mode gate", () => {
+		const root = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-probe-reason-"),
+		);
+		const savedHome = process.env.PI_LENS_HOME;
+		const savedProbe = process.env.PILENS_PROBE;
+		const savedCwd = process.cwd();
+		try {
+			delete process.env.PI_LENS_HOME;
+			process.env.PILENS_PROBE = "1";
+			_resetProbeHomeRedirectStateForTests();
+			process.chdir(root);
+			getGlobalPiLensLogDir();
+
+			const group = getDegradationSummary().find(
+				(entry) => entry.kind === "global-dir-probe-redirect",
+			);
+			const reason = group?.latestReasons[0]?.reason ?? "";
+			expect(reason).not.toContain("outside test mode");
+			expect(reason).toContain("PILENS_PROBE=1");
 		} finally {
 			process.chdir(savedCwd);
 			if (savedHome === undefined) delete process.env.PI_LENS_HOME;

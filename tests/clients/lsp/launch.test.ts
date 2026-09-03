@@ -108,8 +108,22 @@ describe("lsp launch", () => {
 		} finally {
 			vi.doUnmock("../../../clients/env-utils.js");
 			vi.doUnmock("../../../clients/file-utils.js");
+			vi.doUnmock("../../../clients/probe-home-state.js");
 			removeTempDirSync(tempDir);
 		}
+	});
+
+	it("leaves probe-home-state.js un-truncated for later cases in this file", async () => {
+		// Regression for the previous test's `vi.doMock("../../../clients/
+		// probe-home-state.js", ...)` double, which stubbed only
+		// `getGlobalPiLensLogDir`. `vi.resetModules()` in `afterEach` clears the
+		// real-module cache but NOT the doMock registry, so a missing
+		// `vi.doUnmock` for that module leaves every later dynamic import of it
+		// (direct, or transitive through degradation-ledger.js) seeing the
+		// truncated fake instead of the real module.
+		const probeHomeState = await import("../../../clients/probe-home-state.js");
+		expect(typeof probeHomeState.getProbeHomeRedirectEvent).toBe("function");
+		expect(typeof probeHomeState.getProbeHomeResolution).toBe("function");
 	});
 
 	it.runIf(process.platform === "win32")(

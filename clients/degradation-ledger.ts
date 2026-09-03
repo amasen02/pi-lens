@@ -740,11 +740,14 @@ export type DegradationKind =
 	 */
 	| "config-notice-suppressed"
 	/**
-	 * `getGlobalPiLensLogDir()` (`clients/file-utils.ts`, #2506) redirected the
-	 * LOG/ledger root away from the real `~/.pi-lens` because `PI_LENS_HOME`
-	 * was unset outside test mode and the process's `cwd` looked like a
-	 * probe context (inside a specific `.claude/worktrees/<worktree>/` or under
-	 * `os.tmpdir()`), or `PILENS_PROBE=1` forced the redirect. Without this kind
+	 * `getGlobalPiLensLogDir()` (`clients/probe-home-state.ts`, #2506) redirected
+	 * the LOG/ledger root away from the real `~/.pi-lens` because `PI_LENS_HOME`
+	 * was unset and the process's `cwd` looked like a probe context (inside a
+	 * specific `.claude/worktrees/<worktree>/` or under `os.tmpdir()`), or
+	 * `PILENS_PROBE=1` forced the redirect — this fires in test mode too, not
+	 * only outside it: `tests/support/vitest-setup.ts` pins `PI_LENS_HOME` for
+	 * the workers it covers, but globalSetup and children spawned without that
+	 * pin still redirect. Without this kind
 	 * a probe run outside vitest that forgot to pin `PI_LENS_HOME` would
 	 * silently write into the maintainer's real telemetry with no durable trace
 	 * — the exact gap that let two review probes leave 42 fixture rows in real
@@ -1064,7 +1067,7 @@ export function getDegradationSummary(): DegradationGroup[] {
 		});
 	}
 	// #2506, same read-time fold: `getGlobalPiLensLogDir()`'s probe-home redirect
-	// fires at most once per process (see `file-utils.ts`), so this is a
+	// fires at most once per process (see `probe-home-state.ts`), so this is a
 	// presence check, not a tally.
 	const probeHomeRedirect = getProbeHomeRedirectEvent();
 	if (probeHomeRedirect) {
@@ -1076,7 +1079,7 @@ export function getDegradationSummary(): DegradationGroup[] {
 				{
 					subject: truncateForLedger(probeHomeRedirect.probeHome),
 					reason: truncateForLedger(
-						`PI_LENS_HOME unset outside test mode with cwd in a worktree/tmp probe context (${probeHomeRedirect.cwd}); LOGS redirected away from the real home directory (tools, bin and instances.json are unaffected)`,
+						`PI_LENS_HOME unset with cwd in an agent worktree/tmp probe context (${probeHomeRedirect.cwd}), or PILENS_PROBE=1 forced it; LOGS redirected away from the real home directory (tools, bin and instances.json are unaffected)`,
 					),
 				},
 			],
