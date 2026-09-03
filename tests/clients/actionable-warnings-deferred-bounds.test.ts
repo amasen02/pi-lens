@@ -1433,8 +1433,10 @@ describe("#2504 r6 F1 — a resumed process's reset fileSeq no longer resurrects
 	}
 
 	it("drops STALE-A instead of carrying it into process B's turn-1 report", async () => {
-		const { publishActionableWarningsReport, checkActionableWarningsReportFresh } =
-			await loadWarnings();
+		const {
+			publishActionableWarningsReport,
+			checkActionableWarningsReportFresh,
+		} = await loadWarnings();
 		const cacheManager = new CacheManager(false);
 		const [stale] = makeSources(1);
 		const sharedSessionId = "lens-stable-resume-id";
@@ -1488,17 +1490,17 @@ describe("#2504 r6 F1 — a resumed process's reset fileSeq no longer resurrects
 		);
 
 		expect(result.droppedFiles).toContain(path.basename(stale));
-		expect(
-			(result.report.files ?? []).some((f) => f.filePath === stale),
-		).toBe(false);
+		expect((result.report.files ?? []).some((f) => f.filePath === stale)).toBe(
+			false,
+		);
 
 		const persisted = cacheManager.readCache<ActionableWarningsReport>(
 			"actionable-warnings",
 			env.tmpDir,
 		)?.data;
-		expect(
-			(persisted?.files ?? []).some((f) => f.filePath === stale),
-		).toBe(false);
+		expect((persisted?.files ?? []).some((f) => f.filePath === stale)).toBe(
+			false,
+		);
 
 		// And with the entry gone at merge time, the freshness gate never trips
 		// on it -- `agent_end`'s autofix pass is not skipped over a report that
@@ -1566,8 +1568,10 @@ describe("#2504 r6 F2 — the marker spend actually stops accumulation on the th
 	}
 
 	it("f0 survives turn N+1 (carried once) and is gone by turn N+2 (marker spent)", async () => {
-		const { writeDeferredActionableWarningsReport, publishActionableWarningsReport } =
-			await loadWarnings();
+		const {
+			writeDeferredActionableWarningsReport,
+			publishActionableWarningsReport,
+		} = await loadWarnings();
 		const cacheManager = new CacheManager(false);
 		const [f0] = makeSources(1);
 		const liveFileSeq = () => 1;
