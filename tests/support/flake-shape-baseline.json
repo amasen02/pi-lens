@@ -36,6 +36,7 @@
 		"scripts/lint-js.test.ts": 4,
 		"scripts/pre-push-targeted-tests.test.ts": 3,
 		"scripts/prune-agent-worktrees.test.ts": 5,
+		"scripts/rekey-hook-await-exemptions.test.ts": 2,
 		"scripts/rule-catalogs.test.ts": 2,
 		"scripts/rule-language-case.test.ts": 4,
 		"scripts/warm-loader-cache.test.ts": 2,
@@ -43,6 +44,7 @@
 	},
 	"elapsed-time-assertion": {
 		"clients/actionable-warnings-bounds.test.ts": 1,
+		"clients/bounded-hook-await.test.ts": 3,
 		"clients/cascade-turn-merge.test.ts": 1,
 		"clients/dispatch/runners/helm-render.test.ts": 1,
 		"clients/installer/verify-binary-semantics.test.ts": 1,
@@ -74,6 +76,7 @@
 		"clients/actionable-warnings-deferred-bounds.test.ts": 2,
 		"clients/availability-latching-siblings.test.ts": 2,
 		"clients/biome-client-dedupe.test.ts": 1,
+		"clients/bounded-hook-await.test.ts": 2,
 		"clients/child-unref.test.ts": 1,
 		"clients/deadline-utils.test.ts": 4,
 		"clients/debug-handles.test.ts": 1,
