@@ -9,14 +9,28 @@ import {
 import { setupTestEnvironment } from "./test-utils.js";
 
 /**
- * #2460 substitution-style mutation proof: `bookkeepLspMutation`'s per-batch
- * autofix dedupe used to hand-roll its eviction over a bare `Set<string>`
+ * #2460 substitution-style proof: `bookkeepLspMutation`'s per-batch autofix
+ * dedupe used to hand-roll its eviction over a bare `Set<string>`
  * (`context.autofixRecordedPaths`), capped at `MAX_SAMPLES` (100). It now
  * goes through `BoundedSet` (`clients/bounded-cache.ts`). This drives the
  * cap through the real `recordLspMutation` seam — never a hand-fed
- * `BoundedSet` — so a regression in the migration (wrong cap, LRU instead of
- * FIFO, a reordering read) shows up here even though `bounded-cache.test.ts`
- * covers the primitive itself in isolation.
+ * `BoundedSet` — so it proves the WIRING: the seam actually reads
+ * `MAX_SAMPLES`, actually calls `BoundedSet`, and a path genuinely evicted by
+ * the cap is treated as a new observation (re-fires) rather than a
+ * still-deduped one.
+ *
+ * What it does NOT prove (#2460 review T2 — checked by mutation, not
+ * inspection): an off-by-one on `MAX_SAMPLES` (99 or 101 in place of 100)
+ * leaves this test green, because it only asserts eviction eventually
+ * happens by the time all 100 fillers have gone through, not the exact
+ * count at which it happens. An LRU-instead-of-FIFO swap (a `.has()` that
+ * promotes recency) also leaves this test green, because the one dedup-check
+ * on `first` happens before any filler is inserted, when `first` is the only
+ * member — promoting it then is a no-op on insertion order. Both axes ARE
+ * covered, just not here: `bounded-cache.test.ts`'s `BoundedSet` suite
+ * (`has() does not refresh recency`, `setMaxEntries() shrinks immediately`)
+ * catches the LRU swap directly, and is the right place for cap-boundary
+ * precision — this test's job is only the seam wiring above.
  */
 function record(context: LspMutationContext, filePath: string): void {
 	recordLspMutation(context, {

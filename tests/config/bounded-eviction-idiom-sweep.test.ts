@@ -2,22 +2,33 @@
  * #2442: forbid a NEW hand-rolled evict-oldest block outside
  * `clients/bounded-cache.ts`.
  *
- * `clients/bounded-cache.ts` ships two small bounded collections —
- * `BoundedLruCache` (get() re-inserts) and `BoundedFifoMap` (get() never
- * re-inserts, insertion-order eviction) — built specifically so a call site
- * never has to hand-roll `const oldest = map.keys().next().value; if
- * (oldest !== undefined) map.delete(oldest);` again. #2432's round-3 review
- * named two such hand-rolled sites (`clients/hashline-anchor.ts`,
- * `clients/mutating-tool.ts`); a repo-wide sweep found the idiom 27 times.
+ * `clients/bounded-cache.ts` ships three small bounded collections —
+ * `BoundedLruCache` (get() re-inserts), `BoundedFifoMap` (get() never
+ * re-inserts, insertion-order eviction), and `BoundedSet` (the Set-shaped,
+ * membership-only sibling, #2460) — built specifically so a call site never
+ * has to hand-roll `const oldest = map.keys().next().value; if (oldest !==
+ * undefined) map.delete(oldest);` again. #2432's round-3 review named two such
+ * hand-rolled sites (`clients/hashline-anchor.ts`, `clients/mutating-tool.ts`);
+ * a repo-wide sweep found the idiom 27 times.
  *
- * ## Two properties this sweep learned the hard way (#2442 review F5/F6)
+ * ## Properties this sweep learned the hard way (#2442 review F5/F6, #2460
+ * review S1)
  *
- * 1. **Three spellings, not one.** The first draft matched only
+ * 1. **Four spellings, not one.** The first draft matched only
  *    `.keys().next().value`, so `tree-sitter-client.ts`'s two live
  *    `.entries().next().value` evictions and `debug-handles.ts`'s
  *    `for (const k of map.keys()) { …; break }` walk were invisible to a guard
- *    whose whole job was finding them. All three spellings are matched now,
- *    across `keys`/`values`/`entries` — the Set-shaped sites use `.values()`.
+ *    whose whole job was finding them. A fourth spelling — a BARE
+ *    `for (const x of set) { set.delete(x); break; }`, with no
+ *    `.keys()/.values()/.entries()` call at all — was still invisible after
+ *    that fix: #2460's review planted it in `clients/lsp/session-roots.ts` and
+ *    it passed silently, because iterating a `Set` directly already yields
+ *    its values and neither prior regex requires the accessor call the bare
+ *    form has no reason to make. All four spellings are matched now, across
+ *    `keys`/`values`/`entries`/bare — the Set-shaped sites use `.values()` or
+ *    the bare form; the bare form is additionally gated on a `.size`
+ *    comparison in the surrounding loop, since a bare `for...of` is common for
+ *    reasons that have nothing to do with eviction.
  * 2. **Per-OCCURRENCE, not per-FILE.** Exemptions used to name a file, so a
  *    NEW hand-rolled eviction appended to an already-exempted file passed
  *    silently — the exemption laundered it. Every flagged item is now keyed
@@ -88,6 +99,33 @@ const FOR_OF_ITERATOR =
 	/\bfor\s*\(\s*(?:const|let|var)\s+[\w$]+\s+of\s+[\w$.[\]]+\.(?:keys|values|entries)\(\)\s*\)/;
 const FOR_OF_WINDOW = 12;
 
+/**
+ * Spelling 3 (#2460 review S1): a BARE `for (const x of container)` — no
+ * `.keys()/.values()/.entries()` call at all, because iterating a `Set`
+ * directly already yields its values (a `Map` yields `[k, v]` pairs, so this
+ * spelling is Set-shaped in practice). The reviewer's probe
+ * (`clients/lsp/session-roots.ts`) proved this invisible to both
+ * {@link ITERATOR_HEAD} and {@link FOR_OF_ITERATOR}, which both require an
+ * explicit accessor call the bare form has no reason to make.
+ *
+ * Capturing the loop variable and the iterated container lets the delete
+ * check below require the SAME pair (`container.delete(loopVar)`) rather than
+ * just "a delete appeared somewhere nearby" — an ordinary `for...of` walk
+ * that breaks and deletes an unrelated key from a different map must not be
+ * misread as an eviction. And because a bare identifier iteration is common
+ * for reasons that have nothing to do with eviction, this spelling ALSO
+ * requires a `.size` comparison within {@link SIZE_LOOP_WINDOW} lines above
+ * the `for` — the bounded-loop shape every real eviction site has
+ * (`while (set.size > cap)` / `for (...; set.size > cap; ...)`).
+ */
+const BARE_FOR_OF_ITERATOR =
+	/\bfor\s*\(\s*(?:const|let|var)\s+([\w$]+)\s+of\s+([\w$.[\]]+)\s*\)/;
+const SIZE_LOOP_WINDOW = 6;
+
+function escapeRegExp(literal: string): string {
+	return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 /** The one file allowed to spell the idiom: the canonical implementation. */
 const DEFINITION_FILE = "clients/bounded-cache.ts";
 
@@ -139,9 +177,32 @@ export function findEvictionLines(stripped: string): number[] {
 	for (let i = 0; i < lines.length; i++) {
 		const line = lines[i] ?? "";
 		if (ITERATOR_HEAD.test(line)) hits.add(i + 1);
-		if (!FOR_OF_ITERATOR.test(line)) continue;
-		const window = lines.slice(i + 1, i + 1 + FOR_OF_WINDOW).join("\n");
-		if (/\bbreak\b/.test(window) && /\.delete\(/.test(window)) hits.add(i + 1);
+
+		if (FOR_OF_ITERATOR.test(line)) {
+			const window = lines.slice(i + 1, i + 1 + FOR_OF_WINDOW).join("\n");
+			if (/\bbreak\b/.test(window) && /\.delete\(/.test(window))
+				hits.add(i + 1);
+			continue;
+		}
+
+		const bareMatch = BARE_FOR_OF_ITERATOR.exec(line);
+		if (bareMatch) {
+			const [, loopVar, container] = bareMatch;
+			const window = lines.slice(i + 1, i + 1 + FOR_OF_WINDOW).join("\n");
+			const deleteRe = new RegExp(
+				`${escapeRegExp(container ?? "")}\\.delete\\(\\s*${escapeRegExp(loopVar ?? "")}\\s*\\)`,
+			);
+			const precedingWindow = lines
+				.slice(Math.max(0, i - SIZE_LOOP_WINDOW), i)
+				.join("\n");
+			if (
+				/\bbreak\b/.test(window) &&
+				deleteRe.test(window) &&
+				/\.size\b/.test(precedingWindow)
+			) {
+				hits.add(i + 1);
+			}
+		}
 	}
 	return [...hits].sort((a, b) => a - b);
 }
@@ -189,7 +250,7 @@ describe("#2442 no new hand-rolled evict-oldest idiom outside bounded-cache.ts",
 		expect(flagged.length).toBeGreaterThanOrEqual(1);
 	});
 
-	it("detects all three spellings, not just `.keys().next().value`", () => {
+	it("detects all four spellings, not just `.keys().next().value`", () => {
 		// Mutation guard on the DETECTOR itself (#2442 review F5): the first
 		// draft matched one spelling and silently missed the other two. Each
 		// fixture below is a real shape found in this tree.
@@ -211,6 +272,46 @@ describe("#2442 no new hand-rolled evict-oldest idiom outside bounded-cache.ts",
 		expect(
 			findEvictionLines(
 				["for (const k of m.keys()) {", "  total += k;", "}"].join("\n"),
+			),
+		).toEqual([]);
+		// Spelling 4 (#2460 review S1): a BARE `for (const x of set)` — no
+		// `.keys()/.values()/.entries()` call at all, because iterating a `Set`
+		// directly already yields its values. The reviewer planted this exact
+		// shape in `clients/lsp/session-roots.ts` and it passed the sweep
+		// silently — ITERATOR_HEAD and FOR_OF_ITERATOR both require an explicit
+		// accessor call. This spelling also requires a `.size`-bounded loop
+		// around it, so an ordinary `for...of` walk that happens to `break` and
+		// `delete` an unrelated key elsewhere is not misread as an eviction.
+		expect(
+			findEvictionLines(
+				[
+					"while (set.size > cap) {",
+					"  for (const oldest of set) {",
+					"    set.delete(oldest);",
+					"    break;",
+					"  }",
+					"}",
+				].join("\n"),
+			),
+		).toEqual([2]);
+		// Bare for-of with no size-bounded loop around it, and no break/delete
+		// of the loop variable, is NOT an eviction.
+		expect(
+			findEvictionLines(
+				["for (const x of set) {", "  total += x;", "}"].join("\n"),
+			),
+		).toEqual([]);
+		// Bare for-of that breaks+deletes but is NOT inside a `.size` loop is not
+		// flagged by this spelling either — it needs a real bounded-eviction
+		// shape, not just any early-exit delete.
+		expect(
+			findEvictionLines(
+				[
+					"for (const oldest of set) {",
+					"  set.delete(oldest);",
+					"  break;",
+					"}",
+				].join("\n"),
 			),
 		).toEqual([]);
 	});
@@ -343,11 +444,13 @@ describe("#2442 no new hand-rolled evict-oldest idiom outside bounded-cache.ts",
 			minScanned: 200,
 			minFlagged: 1,
 			remediation:
-				"Migrate the site to BoundedLruCache (get() re-inserts — LRU) or " +
-				"BoundedFifoMap (get() never re-inserts — FIFO) from " +
-				"clients/bounded-cache.ts — both return the evicted [key, value] " +
-				"pairs from set(), so eviction-side bookkeeping needs no hand-rolled " +
-				"block either — or add an EXEMPT_SITES entry here (keyed by " +
+				"Migrate the site to BoundedLruCache (get() re-inserts — LRU), " +
+				"BoundedFifoMap (get() never re-inserts — FIFO), or BoundedSet " +
+				"(Set-shaped, membership-only — #2460) from " +
+				"clients/bounded-cache.ts — all three return the evicted " +
+				"key(s)/value(s) from set()/add(), so eviction-side bookkeeping " +
+				"needs no hand-rolled block either — or add an EXEMPT_SITES entry " +
+				"here (keyed by " +
 				"`stableOccurrenceKey` from tests/support/sweep-kit.ts — " +
 				"`path#symbol:hash` or `path#hash`, printed above) with a real " +
 				"reason (see #2442's PR body verdict table for the shape of a " +

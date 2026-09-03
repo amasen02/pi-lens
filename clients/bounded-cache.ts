@@ -101,12 +101,19 @@ export class BoundedFifoMap<K, V> {
 
 /**
  * Small insertion-ordered FIFO SET used for process-lifetime membership-only
- * caps — "is this key known", with no associated value. `BoundedFifoMap`
- * covers the K,V shape; forcing a membership-only site to store a dummy value
- * just to reuse it is a worse shape than the eviction block it would save
- * (#2460's review of `clients/observed-mutation.ts`'s `handled` set). Not
- * built ON `BoundedFifoMap` for the same reason — a `Map<T, true>` wrapper
- * would carry the same dummy-value cost one layer down.
+ * caps — "is this key known", with no associated value.
+ *
+ * A thin wrapper over `BoundedFifoMap<T, true>` (#2460 review T1): eviction,
+ * capacity and the whole Map-ish surface already live in `BoundedFifoMap`
+ * exactly once, and this class's earlier standalone `Set`-backed
+ * implementation was a byte-for-byte copy of that eviction block one layer
+ * down — the exact duplication `BoundedFifoMap`'s own header describes
+ * `BoundedLruCache` existing to delete (#2442). The `true` dummy value never
+ * escapes this wrapper: it is not a cost paid by call sites, only by this
+ * file, so the earlier objection to building membership on top of the K,V
+ * map (#2460's first review, about `clients/observed-mutation.ts`'s
+ * `handled` set) does not apply here — that objection was about a caller
+ * storing a dummy value itself, not about a wrapper hiding one.
  *
  * Same eviction contract as {@link BoundedFifoMap}: `add` never reorders an
  * already-present member (matches native `Set#add`), and both `add` and
@@ -116,11 +123,10 @@ export class BoundedFifoMap<K, V> {
  * `values().next().value` or a `for (... of set) { …; break }` walk (#2442).
  */
 export class BoundedSet<T> {
-	private readonly entries = new Set<T>();
-	private maxEntries: number;
+	private readonly entries: BoundedFifoMap<T, true>;
 
 	constructor(maxEntries: number) {
-		this.maxEntries = maxEntries;
+		this.entries = new BoundedFifoMap<T, true>(maxEntries);
 	}
 
 	has(value: T): boolean {
@@ -135,8 +141,7 @@ export class BoundedSet<T> {
 	 * call site consumes this instead of hand-rolling the drop.
 	 */
 	add(value: T): T[] {
-		this.entries.add(value);
-		return this.evictOverflow();
+		return this.entries.set(value, true).map(([evicted]) => evicted);
 	}
 
 	/**
@@ -145,25 +150,12 @@ export class BoundedSet<T> {
 	 * as {@link add}.
 	 */
 	setMaxEntries(maxEntries: number): T[] {
-		this.maxEntries = maxEntries;
-		return this.evictOverflow();
+		return this.entries.setMaxEntries(maxEntries).map(([evicted]) => evicted);
 	}
 
 	/** Current capacity ceiling. */
 	getMaxEntries(): number {
-		return this.maxEntries;
-	}
-
-	/** Drop oldest-first until within capacity. The one eviction block. */
-	private evictOverflow(): T[] {
-		const evicted: T[] = [];
-		while (this.entries.size > this.maxEntries) {
-			const oldest = this.entries.values().next().value as T | undefined;
-			if (oldest === undefined) break;
-			this.entries.delete(oldest);
-			evicted.push(oldest);
-		}
-		return evicted;
+		return this.entries.getMaxEntries();
 	}
 
 	delete(value: T): boolean {
@@ -176,10 +168,10 @@ export class BoundedSet<T> {
 		return this.entries.size;
 	}
 	values(): IterableIterator<T> {
-		return this.entries.values();
+		return this.entries.keys();
 	}
 	[Symbol.iterator](): IterableIterator<T> {
-		return this.entries[Symbol.iterator]();
+		return this.entries.keys();
 	}
 }
 
