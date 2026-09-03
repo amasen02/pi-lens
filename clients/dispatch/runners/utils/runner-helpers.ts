@@ -1964,7 +1964,10 @@ export async function isSgAvailableAsync(): Promise<boolean> {
  */
 function noteSgAvailable(
 	startedAt: number,
-	opts: { retained?: boolean; source?: SgLocalBinSource | "global" | "npx" } = {},
+	opts: {
+		retained?: boolean;
+		source?: SgLocalBinSource | "global" | "npx";
+	} = {},
 ): void {
 	const provisional = sgSweepSawTransient;
 	let retryAfterMs = 0;

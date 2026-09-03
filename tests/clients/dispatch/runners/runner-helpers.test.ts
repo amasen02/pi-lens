@@ -644,14 +644,12 @@ describe("runner-helpers availability checker", () => {
 
 			const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
 			vi.mocked(safeSpawnMod.safeSpawnAsync).mockReset();
-			vi.mocked(safeSpawnMod.safeSpawnAsync).mockImplementation(
-				async (cmd) => {
-					if (String(cmd) === homeShim) {
-						return { stdout: "ast-grep 0.1.0", stderr: "", status: 0 };
-					}
-					return { stdout: "", stderr: "missing", status: 1 };
-				},
-			);
+			vi.mocked(safeSpawnMod.safeSpawnAsync).mockImplementation(async (cmd) => {
+				if (String(cmd) === homeShim) {
+					return { stdout: "ast-grep 0.1.0", stderr: "", status: 0 };
+				}
+				return { stdout: "", stderr: "missing", status: 1 };
+			});
 
 			expect(await isSgAvailableAsync()).toBe(true);
 			expect(getSgCommand().cmd).toBe(homeShim);
@@ -689,11 +687,7 @@ describe("runner-helpers availability checker", () => {
 		const cwdEnv = setupTestEnvironment("pi-lens-sg-project-bin-");
 		const originalCwd = process.cwd();
 		try {
-			const projectBinDir = path.join(
-				cwdEnv.tmpDir,
-				"node_modules",
-				".bin",
-			);
+			const projectBinDir = path.join(cwdEnv.tmpDir, "node_modules", ".bin");
 			fs.mkdirSync(projectBinDir, { recursive: true });
 			const ext = process.platform === "win32" ? ".cmd" : "";
 			const projectBin = path.join(projectBinDir, `ast-grep${ext}`);
@@ -705,14 +699,12 @@ describe("runner-helpers availability checker", () => {
 
 			const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
 			vi.mocked(safeSpawnMod.safeSpawnAsync).mockReset();
-			vi.mocked(safeSpawnMod.safeSpawnAsync).mockImplementation(
-				async (cmd) => {
-					if (String(cmd) === projectBin) {
-						return { stdout: "ast-grep 0.1.0", stderr: "", status: 0 };
-					}
-					return { stdout: "", stderr: "missing", status: 1 };
-				},
-			);
+			vi.mocked(safeSpawnMod.safeSpawnAsync).mockImplementation(async (cmd) => {
+				if (String(cmd) === projectBin) {
+					return { stdout: "ast-grep 0.1.0", stderr: "", status: 0 };
+				}
+				return { stdout: "", stderr: "missing", status: 1 };
+			});
 
 			expect(await isSgAvailableAsync()).toBe(true);
 			expect(getSgCommand().cmd).toBe(projectBin);
