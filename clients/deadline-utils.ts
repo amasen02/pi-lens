@@ -329,7 +329,16 @@ export async function bounded<T>(
 			cause ??= reason;
 			resolve(BOUND_ABORTED);
 		};
-		if (signal.aborted) return fire("caller-abort");
+		// `signal?.` — same reason `ms` is `Number.isFinite`-guarded above: the
+		// type marks `signal` required (a deadline-only call is exactly the
+		// defect this helper exists to make unrepresentable), but a JS caller
+		// can still hand over `undefined`, and a helper whose whole job is
+		// keeping a hook from blowing up must not itself throw
+		// `Cannot read properties of undefined` when one does (#2530 round 3
+		// F5). A missing signal is treated as one that never aborts, which is
+		// the deadline-only behavior the type otherwise refuses — the caller
+		// opted out of the compiler, not out of the semantics.
+		if (signal?.aborted) return fire("caller-abort");
 		if (shutdownSignal?.aborted) return fire("shutdown");
 		// A zero budget ("this hook may not await at all") is a bound that has
 		// already elapsed, not a timer to arm.
@@ -338,7 +347,7 @@ export async function bounded<T>(
 		// Never hold the event loop open past the hook this bounds.
 		timer.unref?.();
 		onCallerAbort = () => fire("caller-abort");
-		signal.addEventListener("abort", onCallerAbort, { once: true });
+		signal?.addEventListener("abort", onCallerAbort, { once: true });
 		if (shutdownSignal) {
 			onShutdownAbort = () => fire("shutdown");
 			shutdownSignal.addEventListener("abort", onShutdownAbort, {
@@ -373,7 +382,7 @@ export async function bounded<T>(
 		return undefined;
 	} finally {
 		if (timer !== undefined) clearTimeout(timer);
-		if (onCallerAbort) signal.removeEventListener("abort", onCallerAbort);
+		if (onCallerAbort) signal?.removeEventListener("abort", onCallerAbort);
 		if (onShutdownAbort) {
 			shutdownSignal?.removeEventListener("abort", onShutdownAbort);
 		}

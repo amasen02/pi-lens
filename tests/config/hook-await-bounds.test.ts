@@ -81,7 +81,6 @@
  * suffix buys and what it costs.
  */
 
-import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -90,22 +89,21 @@ import {
 	HOOK_WALL_BUDGET_MS,
 	isHookBudgetKey,
 } from "../../clients/hook-budgets.js";
-import { lineContentHash } from "../../clients/read-guard.js";
 import {
-	auditRegistry,
-	listSourceFiles,
-	relativePosix,
-	stableOccurrenceKey,
-	stripSource,
-} from "../support/sweep-kit.js";
+	awaitOccurrenceKey,
+	DEFINITION_FILE,
+	findHandRolledRaceLines,
+	findUnboundedAwaitLines,
+	hookPathFiles,
+	scanFiles,
+	shippedSourceFiles,
+} from "../support/hook-await-scan.js";
+import { auditRegistry, stripSource } from "../support/sweep-kit.js";
 
 const REPO_ROOT = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
 	"../..",
 );
-
-/** The one module allowed to spell a timeout race: the canonical implementation. */
-const DEFINITION_FILE = "clients/deadline-utils.ts";
 
 /**
  * Whose budget an unbounded await spends.
@@ -166,20 +164,29 @@ export const SWEEP_HEURISTIC_LIMITS = [
 		"wraps `bounded()` one level down reads as unbounded here and needs an " +
 		"exemption naming the wrapper — mechanically visible, unlike a walk that " +
 		"would silently call it clean.",
-	"Exactly TWO call shapes count as bounded: `bounded(...)`, and a " +
-		"`withDeadline`/`withTimeout`/`withBudget`/`withinRemaining` call with " +
-		"the word `signal` inside its own parentheses. Those helpers take no " +
-		"signal today, so the second is forward cover for a signal-aware " +
-		"caller, not a claim about the helpers. A bare `Promise.race` is NOT " +
-		"accepted even when `signal` appears in it: a signal-only race is the " +
-		"mirror image of the deadline-only defect this guard exists for, and a " +
-		"new race is forbidden by the hand-rolled-race family anyway.",
+	"Exactly ONE call shape counts as bounded: `bounded(...)` (#2530 round 3 " +
+		"F1). Round 1 also accepted a `withDeadline`/`withTimeout`/`withBudget`/" +
+		"`withinRemaining` call whenever the word `signal` appeared anywhere in " +
+		"its own parentheses — but none of those helpers takes a `signal` " +
+		"parameter at all, so the match was pure text: `withBudget(sweep(cwd, " +
+		"{ signal }), 500)` read as bounded because `signal` named the WRAPPED " +
+		"work's argument, not anything reaching the race that decides how long " +
+		"this await waits. That is the exact deadline-only hole #2523 exists to " +
+		"close, reopened by substring. Zero sites in the scanned tree relied on " +
+		"it (measured: the flagged set is identical with or without the " +
+		"allowance). A bare `Promise.race`/`Promise.any` is NOT accepted even " +
+		"when `signal` appears in it: a signal-only race is the mirror image " +
+		"of the deadline-only defect this guard exists for, and a new race is " +
+		"forbidden by the hand-rolled-race family anyway.",
 	"Awaits in `clients/` modules OTHER than `runtime-*.ts` are out of scope of " +
 		"the hook-await family, so a hook whose work moves into a new helper " +
 		"module leaves that scan's view. #2523 slice 2 threads the hook signal " +
 		"into the deps types, which is the structural answer; this sweep covers " +
 		"the hook FILES.",
-	"The hand-rolled-race scan reads the race's own parentheses PLUS the 25 " +
+	"The hand-rolled-race scan matches `Promise.race(` AND `Promise.any(` " +
+		"(#2530 round 3 F3: `Promise.any([work, delay])` is the same " +
+		"first-settlement-wins shape as `race` with a timer arm, and round 1 " +
+		"matched only `race`) and reads the call's own parentheses PLUS the 25 " +
 		"lines above it, because the dominant spelling hoists the timer arm into " +
 		"a named local. A timer built further away, in a helper, or in another " +
 		"module is invisible to it; a `setTimeout` within 25 lines of an " +
@@ -198,6 +205,12 @@ export const SWEEP_HEURISTIC_LIMITS = [
  * inserted elsewhere — that churn is what content keying removes), the
  * failing test prints the key the scan now computes; paste it in with a
  * reason, or wrap the call in `bounded()` and delete the entry.
+ *
+ * A merge that shifts many keys at once (a line inserted near several
+ * flagged sites) does not have to be re-keyed by hand: run
+ * `node scripts/rekey-hook-await-exemptions.mjs` — it recomputes every
+ * entry's key from the live scan and refuses to rewrite unless the table and
+ * the scan agree exactly, one-to-one (#2530 round 3 F6).
  */
 const EXEMPT_SITES: Readonly<Record<string, SweepExemption>> = {
 	"clients/mcp/session.ts#getMcpSessionContext:3ab92062~01e3e700": {
@@ -2049,273 +2062,6 @@ const EXEMPT_SITES: Readonly<Record<string, SweepExemption>> = {
 	},
 };
 
-/** The four file groups a registered hook handler and its direct deps live in. */
-function hookPathFiles(): string[] {
-	const files: string[] = [];
-	// Mechanical, never a hand-kept list: a NEW clients/runtime-*.ts is in
-	// scope the moment it lands, which is the whole point of a governance
-	// registry (a hand-maintained mirror of a directory is the defect).
-	for (const absolute of listSourceFiles(path.join(REPO_ROOT, "clients"), {
-		skipTests: true,
-	})) {
-		const rel = relativePosix(REPO_ROOT, absolute);
-		if (/^clients\/runtime-[^/]+\.ts$/.test(rel)) files.push(absolute);
-	}
-	for (const rel of ["index.ts", "mcp/server.ts", "clients/mcp/session.ts"]) {
-		const absolute = path.join(REPO_ROOT, rel);
-		if (fs.existsSync(absolute)) files.push(absolute);
-	}
-	return files.sort();
-}
-
-/** Every shipped source file the hand-rolled-race scan covers. */
-function shippedSourceFiles(): string[] {
-	const files = ["clients", "mcp", "tools"].flatMap((dir) => {
-		const absolute = path.join(REPO_ROOT, dir);
-		return fs.existsSync(absolute)
-			? listSourceFiles(absolute, { skipTests: true })
-			: [];
-	});
-	const indexTs = path.join(REPO_ROOT, "index.ts");
-	if (fs.existsSync(indexTs)) files.push(indexTs);
-	return files.sort();
-}
-
-/** An `await` token that is a KEYWORD, not a property name or an identifier tail. */
-const AWAIT_TOKEN = /(?<![.\w$])await(?![\w$])/g;
-
-/** A `Promise.race(` call head. */
-const RACE_TOKEN = /\bPromise\s*\.\s*race\s*\(/g;
-
-/** A timer arm: the shape that makes a race a hand-rolled bound. */
-const TIMER_ARM = /\bsetTimeout\s*\(|\bAbortSignal\s*\.\s*timeout\s*\(/;
-
-/**
- * How far ABOVE a `Promise.race(` to look for the timer that feeds it.
- *
- * The inline arm (`new Promise((r) => setTimeout(r, ms))` written straight
- * into the race) is the minority spelling. The dominant one hoists the arm
- * into a named local a few lines up — `clients/format-service.ts`'s
- * `timeoutPromise`, `clients/runtime-session.ts`'s
- * `readSequenceWithBudget` — and an inline-only detector called both of them
- * clean, which for a guard is the failure direction that hides. The window is
- * a line count rather than a scope walk for the same reason the rest of this
- * file is: a partial scope walk produces false negatives, a window produces
- * false positives, and a false positive is a table entry a reviewer reads.
- */
-const RACE_TIMER_WINDOW = 25;
-
-/** Call shapes that carry a real bound. See {@link SWEEP_HEURISTIC_LIMITS}. */
-const BOUNDED_CALL = /^\s*bounded\s*\(/;
-const DEADLINE_CALL =
-	/^\s*(?:withDeadline|withTimeout|withBudget|withinRemaining)\s*\(/;
-
-/**
- * Text of the call's own parentheses, starting at the `(` at or after
- * `from`. Paren matching over STRIPPED source, so a paren inside a comment or
- * string cannot unbalance it. Bounded by `maxChars` so one pathological
- * expression cannot turn this into a whole-file scan.
- */
-function callArguments(
-	stripped: string,
-	from: number,
-	maxChars = 4000,
-): string {
-	const open = stripped.indexOf("(", from);
-	if (open < 0) return "";
-	let depth = 0;
-	const end = Math.min(stripped.length, open + maxChars);
-	for (let i = open; i < end; i++) {
-		const ch = stripped[i];
-		if (ch === "(") depth++;
-		else if (ch === ")") {
-			depth--;
-			if (depth === 0) return stripped.slice(open, i + 1);
-		}
-	}
-	return stripped.slice(open, end);
-}
-
-/**
- * Is the expression starting at `at` (just past an `await`) bounded?
- *
- * Exactly TWO accepted forms, and a bare `Promise.race` is not one of them
- * (#2530 review F3). Round 1 accepted a race whose arguments mentioned
- * `signal`, which let a signal-only race — no deadline at all — satisfy this
- * family: the precise mirror image of the deadline-only defect the whole
- * guard exists for, and a shape that already ships at
- * `clients/project-diagnostics/fresh-fetch.ts:670`. Nothing is lost by
- * dropping it: a NEW hand-rolled race is forbidden by the second family
- * anyway, and no site in the scanned files relies on the allowance (measured:
- * the flagged set is 175 either way).
- */
-function isBoundedAwait(stripped: string, at: number): boolean {
-	const head = stripped.slice(at, at + 80);
-	if (BOUNDED_CALL.test(head)) return true;
-	if (DEADLINE_CALL.test(head)) {
-		return /\bsignal\b/.test(callArguments(stripped, at));
-	}
-	return false;
-}
-
-/** 1-based line number of `offset` in `source`. */
-function lineOf(source: string, offset: number): number {
-	return source.slice(0, offset).split("\n").length;
-}
-
-/**
- * Every unbounded-await LINE in one already-stripped source, 1-based.
- *
- * Exported so the detector itself can be pinned against synthetic fixtures
- * (the mutation tests below) rather than only against whatever happens to be
- * in the tree today — a detector that quietly stops detecting is defect shape
- * 10 wearing a green check.
- */
-export function findUnboundedAwaitLines(stripped: string): number[] {
-	const hits = new Set<number>();
-	for (const match of stripped.matchAll(AWAIT_TOKEN)) {
-		const at = match.index + match[0].length;
-		if (isBoundedAwait(stripped, at)) continue;
-		hits.add(lineOf(stripped, match.index));
-	}
-	return [...hits].sort((a, b) => a - b);
-}
-
-/**
- * Every hand-rolled timeout race LINE in one already-stripped source,
- * 1-based: a `Promise.race(` whose own arguments spell a timer.
- */
-export function findHandRolledRaceLines(stripped: string): number[] {
-	const hits = new Set<number>();
-	const lines = stripped.split("\n");
-	for (const match of stripped.matchAll(RACE_TOKEN)) {
-		const line = lineOf(stripped, match.index);
-		const args = callArguments(stripped, match.index + match[0].length - 1);
-		const above = lines
-			.slice(Math.max(0, line - 1 - RACE_TIMER_WINDOW), line - 1)
-			.join("\n");
-		if (TIMER_ARM.test(args) || TIMER_ARM.test(above)) hits.add(line);
-	}
-	return [...hits].sort((a, b) => a - b);
-}
-
-/**
- * Nearest non-blank RAW line in `direction` from `index`, or `""` at the edge
- * of the file.
- */
-function neighbourLine(
-	rawLines: readonly string[],
-	index: number,
-	direction: -1 | 1,
-): string {
-	for (
-		let i = index + direction;
-		i >= 0 && i < rawLines.length;
-		i += direction
-	) {
-		const line = rawLines[i] ?? "";
-		if (line.trim().length > 0) return line;
-	}
-	return "";
-}
-
-/**
- * `stableOccurrenceKey` over the RAW lines, plus a neighbourhood suffix.
- *
- * Round 1 forked the kit's key derivation outright. It did not need to
- * (#2530 review F5): the kit's own function, handed the RAW lines instead of
- * the stripped ones, is already most of the answer, and the neighbourhood is
- * the only part this family actually has to add.
- *
- * Measured over today's tree — 175 flagged hook-path awaits:
- *
- * | key derivation                          | colliding keys |
- * |-----------------------------------------|----------------|
- * | `stableOccurrenceKey(rel, STRIPPED, i)` | 10             |
- * | `stableOccurrenceKey(rel, RAW, i)`      | 7              |
- * | the above `+ neighbourhood`             | 0              |
- *
- * RAW alone removes 3 of the 10 with no new code, because `lineContentHash`
- * deletes all whitespace: a STRIPPED `await import("./word-index.js")` and
- * `await import("./call-graph.js")` are both `awaitimport("");` — one key for
- * every dynamic import in the tree — while the raw line keeps the specifier.
- *
- * The remaining 7 need context, so that, and only that, stays local. `await
- * ensureReady(cwd);` appears four times in `mcp/server.ts` and `await
- * loadBootstrapClients();` twice in `index.ts`, byte-identical, inside one
- * enclosing declaration; `auditRegistry`'s `requireUniqueFlagged` correctly
- * refuses to let ONE exemption excuse four call sites. The neighbourhood is
- * symmetric because one side is not enough: the two `} = await
- * import("./word-index.js");` sites in `runtime-session.ts` share their
- * preceding lines (both the tail of a multi-line destructuring whose last
- * names match) and are separated only by what follows.
- *
- * The trade, stated: a one-line edit re-keys UP TO THREE entries — the
- * flagged line itself, and a flagged neighbour on either side — where
- * `stableOccurrenceKey` alone would re-key one. It is not hypothetical: 27 of
- * the 175 entries sit within one line of another flagged entry. #2475's
- * actual property still holds — a line inserted ANYWHERE ELSE in the file
- * re-keys nothing. Lift the suffix into `sweep-kit.ts` if a third sweep needs
- * the same widening; one caller is not yet a shared primitive.
- */
-function awaitOccurrenceKey(
-	rel: string,
-	rawLines: readonly string[],
-	index: number,
-): string {
-	// The kit's own derivation, handed the RAW lines. Only the neighbourhood
-	// suffix below is local to this family.
-	const base = stableOccurrenceKey(rel, rawLines, index);
-	// NUL separator: `lineContentHash` strips whitespace, so a newline would
-	// vanish and `a\nb` would hash the same as `ab`.
-	const context = lineContentHash(
-		[
-			neighbourLine(rawLines, index, -1),
-			neighbourLine(rawLines, index, 1),
-		].join("\u0000"),
-	);
-	return `${base}~${context}`;
-}
-
-interface FlaggedSite {
-	key: string;
-	detail: string;
-}
-
-/**
- * Run one line detector over one file group and key every hit.
- *
- * `prefix` namespaces the two families inside the single exemption table, so
- * an `await` and a race on the same line can never be confused for one
- * another (and `auditRegistry`'s stale check stays exact for both).
- */
-function scanFiles(
-	files: readonly string[],
-	detect: (stripped: string) => number[],
-	prefix: string,
-	skipRel?: (rel: string) => boolean,
-): { occurrences: FlaggedSite[]; scanned: number } {
-	const occurrences: FlaggedSite[] = [];
-	let scanned = 0;
-	for (const absolute of files) {
-		const rel = relativePosix(REPO_ROOT, absolute);
-		if (skipRel?.(rel)) continue;
-		scanned++;
-		const raw = fs.readFileSync(absolute, "utf8");
-		// Layout-preserving, so these line numbers and the hash inputs derived
-		// from them line up with the raw source.
-		const stripped = stripSource(raw);
-		const rawLines = raw.split("\n");
-		for (const line of detect(stripped)) {
-			occurrences.push({
-				key: `${prefix}${awaitOccurrenceKey(rel, rawLines, line - 1)}`,
-				detail: `${rel}:${line}  ${(rawLines[line - 1] ?? "").trim().slice(0, 100)}`,
-			});
-		}
-	}
-	return { occurrences, scanned };
-}
-
 /** `auditRegistry` takes flat strings; the structure is folded in here. */
 function exemptionReasons(): Record<string, string> {
 	const out: Record<string, string> = {};
@@ -2329,9 +2075,21 @@ function exemptionReasons(): Record<string, string> {
 	return out;
 }
 
-const awaits = scanFiles(hookPathFiles(), findUnboundedAwaitLines, "");
+// The detector, the key derivation and this file-listing/scan driver are all
+// imported from `tests/support/hook-await-scan.ts` — the ONE home shared
+// with `scripts/rekey-hook-await-exemptions.mjs` (see that file's header,
+// and the usage note above `EXEMPT_SITES`). A vitest test file cannot be
+// `import()`ed by a plain Node script, so a second, hand-copied detector in
+// the script would be the single-source-of-truth violation AGENTS.md flags.
+const awaits = scanFiles(
+	REPO_ROOT,
+	hookPathFiles(REPO_ROOT),
+	findUnboundedAwaitLines,
+	"",
+);
 const races = scanFiles(
-	shippedSourceFiles(),
+	REPO_ROOT,
+	shippedSourceFiles(REPO_ROOT),
 	findHandRolledRaceLines,
 	"race:",
 	(rel) => rel === DEFINITION_FILE,
@@ -2363,11 +2121,29 @@ describe("#2523 AC1 every hook-path await is bounded, and no new hand-rolled rac
 		expect(findUnboundedAwaitLines("await withBudget(sweep(), 500);")).toEqual([
 			1,
 		]);
+		// #2530 round 3 F2: round 1 accepted this because the word `signal`
+		// appeared ANYWHERE in the call's own parentheses — even here, where it
+		// names an argument of the WRAPPED work (`sweep`), not anything reaching
+		// `withDeadline`'s own race. None of `withDeadline`/`withTimeout`/
+		// `withBudget`/`withinRemaining` takes a `signal` parameter at all
+		// (`DeadlineOptions` has none), so the match was pure substring — the
+		// exact deadline-only hole #2523 exists to close, reopened by text
+		// instead of semantics. `bounded()` is the only accepted shape now.
 		expect(
 			findUnboundedAwaitLines(
 				"await withDeadline(sweep(), { ms: 500, signal });",
 			),
-		).toEqual([]);
+		).toEqual([1]);
+		expect(
+			findUnboundedAwaitLines(
+				"await withTimeout(sweep(cwd, { signal }), 500);",
+			),
+		).toEqual([1]);
+		expect(
+			findUnboundedAwaitLines(
+				"await withinRemaining(sweep(cwd, { signal }), deadlineAt);",
+			),
+		).toEqual([1]);
 		// Review round 2 (F3): a bare `Promise.race` is NEVER a bound here,
 		// even when the word `signal` appears in it. A signal-only race is the
 		// mirror image of the deadline-only defect — the shape
@@ -2375,12 +2151,17 @@ describe("#2523 AC1 every hook-path await is bounded, and no new hand-rolled rac
 		// one this file's own inventory names as "signal only, no deadline" —
 		// so accepting it let a half-bound pass BOTH families at once. Round 1
 		// pinned that hole as correct. A new race is forbidden by the
-		// `hand-rolled-race` family anyway, which leaves exactly two accepted
-		// forms: `bounded()`, and a `withDeadline`-family call with a signal.
+		// `hand-rolled-race` family anyway, which leaves `bounded()` as the only
+		// accepted form.
 		expect(
 			findUnboundedAwaitLines(
 				"await Promise.race([sweep(), aborted(signal)]);",
 			),
+		).toEqual([1]);
+		// #2530 round 3 F3: `Promise.any` is the same first-settlement-wins
+		// shape as `Promise.race` with a timer arm.
+		expect(
+			findUnboundedAwaitLines("await Promise.any([sweep(), aborted(signal)]);"),
 		).toEqual([1]);
 		// Including the timer-bearing spelling: the race family forbids it, and
 		// the await family must not quietly call it bounded on the way past.
@@ -2421,6 +2202,14 @@ describe("#2523 AC1 every hook-path await is bounded, and no new hand-rolled rac
 		expect(
 			findHandRolledRaceLines(
 				"await Promise.race([work(), abortPromise(AbortSignal.timeout(500))]);",
+			),
+		).toEqual([1]);
+		// #2530 round 3 F3: `Promise.any` is the same first-settlement-wins
+		// shape as `Promise.race` with a timer arm, and round 1 matched only
+		// `race`.
+		expect(
+			findHandRolledRaceLines(
+				"await Promise.any([work(), new Promise((r) => setTimeout(r, 500))]);",
 			),
 		).toEqual([1]);
 		// The dominant spelling: the timer arm hoisted into a named local a few
@@ -2514,61 +2303,6 @@ describe("#2523 AC1 every hook-path await is bounded, and no new hand-rolled rac
 		);
 		expect(hookOwned.length).toBeGreaterThanOrEqual(
 			Math.max(1, Math.floor(entries.length / 4)),
-		);
-	});
-
-	it("the canonical primitive arms ONE timer and builds no composite signal", () => {
-		// #2530 review F2/F4. Every other bound in the tree is being folded onto
-		// `bounded()`, so its own settle path is the one place a leak or a
-		// duplicate timer multiplies by 187. Round 1 armed `AbortSignal.timeout`
-		// AND passed the same `ms` to `withDeadline` — two timers for one budget
-		// — and combined the source signal through `AbortSignal.any`, which
-		// registers a permanent composite on the SOURCE (measured: 20 000 calls
-		// on one hook signal left 20 000 entries, and the `finally` cleaned the
-		// throwaway composite instead).
-		//
-		// This is a source-shape assertion, not a behavioural one, because the
-		// behavioural half already lives in
-		// `tests/clients/bounded-hook-await.test.ts` — Node's
-		// `AbortSignal.timeout` timer is unref'd and therefore invisible to
-		// `process.getActiveResourcesInfo()`, so "how many timers" has no
-		// runtime probe. It sits in this file because this file is already the
-		// one that reads sources and already exempts `deadline-utils.ts` from
-		// the race family.
-		const source = fs.readFileSync(
-			path.join(REPO_ROOT, DEFINITION_FILE),
-			"utf8",
-		);
-		const marker = "export async function bounded<T>(";
-		const at = source.indexOf(marker);
-		// Vacuity floor: an assertion over an empty slice proves nothing.
-		expect(
-			at,
-			`${DEFINITION_FILE} no longer declares bounded()`,
-		).toBeGreaterThan(0);
-		const body = stripSource(source.slice(at));
-		expect(body.length).toBeGreaterThan(500);
-		// Positive control: the slice really is the implementation.
-		expect(body).toContain("recordDegradationOnce");
-
-		const count = (pattern: RegExp) => (body.match(pattern) ?? []).length;
-		// The composite checks come FIRST: the leak is the finding, and an
-		// assertion order that reported "wrong number of timers" instead would
-		// name the symptom rather than the cause.
-		expect(
-			count(/AbortSignal\s*\.\s*(?:any|timeout)\s*\(/g),
-			"AbortSignal.any registers a permanent composite on the SOURCE signal",
-		).toBe(0);
-		expect(
-			count(/\bcombineAbortSignals\s*\(/g),
-			"combineAbortSignals is AbortSignal.any with a fallback: same leak",
-		).toBe(0);
-		expect(count(/\bsetTimeout\s*\(/g), "one timer per bounded() call").toBe(1);
-		expect(count(/\bclearTimeout\s*\(/g), "and it is always cleared").toBe(1);
-		// The listeners it does add are added to the SOURCE signals, and every
-		// one of them is removed again.
-		expect(count(/\baddEventListener\s*\(/g)).toBe(
-			count(/\bremoveEventListener\s*\(/g),
 		);
 	});
 
