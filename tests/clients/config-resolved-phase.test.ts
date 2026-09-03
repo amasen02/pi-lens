@@ -32,7 +32,9 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { withResidentBootstrap } from "../support/bootstrap-access.js";
 import { resetIgnoredConfigWarnCache } from "../../clients/config-warn.js";
+import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import {
 	clearLatencyLog,
 	flushLatencyLog,
@@ -170,9 +172,9 @@ describe("config_resolved: the session's one positive config record (#2526)", ()
 		const { home, projectDir } = canonicalOnlyLayout();
 		const offset = sessionStartOffset();
 
-		const { loadLSPConfig, resetConfigResolvedTelemetryForSession } =
+		const { loadLSPConfig, resetLSPConfigStateForTests } =
 			await import("../../clients/lsp/config.js");
-		resetConfigResolvedTelemetryForSession();
+		resetLSPConfigStateForTests();
 		await loadLSPConfig(projectDir, home);
 
 		const rows = await configResolvedRows();
@@ -218,9 +220,9 @@ describe("config_resolved: the session's one positive config record (#2526)", ()
 		const { home, projectDir } = legacyLayout();
 		const offset = sessionStartOffset();
 
-		const { loadLSPConfig, resetConfigResolvedTelemetryForSession } =
+		const { loadLSPConfig, resetLSPConfigStateForTests } =
 			await import("../../clients/lsp/config.js");
-		resetConfigResolvedTelemetryForSession();
+		resetLSPConfigStateForTests();
 		await loadLSPConfig(projectDir, home);
 
 		const rows = await configResolvedRows();
@@ -243,9 +245,9 @@ describe("config_resolved: the session's one positive config record (#2526)", ()
 	it("ONE row per session, not one per resolution", async () => {
 		const { home, projectDir } = canonicalOnlyLayout();
 
-		const { loadLSPConfig, resetConfigResolvedTelemetryForSession } =
+		const { loadLSPConfig, resetLSPConfigStateForTests } =
 			await import("../../clients/lsp/config.js");
-		resetConfigResolvedTelemetryForSession();
+		resetLSPConfigStateForTests();
 		// Three resolutions — the session-start deferred load, a served root's
 		// init, and the first edit's ensure — collapse to one record.
 		await loadLSPConfig(projectDir, home);
@@ -254,6 +256,8 @@ describe("config_resolved: the session's one positive config record (#2526)", ()
 		expect(await configResolvedRows()).toHaveLength(1);
 
 		// A new session re-arms it, so the next session gets its own row.
+		const { resetConfigResolvedTelemetryForSession } =
+			await import("../../clients/lsp/config.js");
 		resetConfigResolvedTelemetryForSession();
 		await loadLSPConfig(projectDir, home);
 		expect(await configResolvedRows()).toHaveLength(2);
@@ -278,6 +282,98 @@ describe("config_resolved: the session's one positive config record (#2526)", ()
 		expect(summary.documents).toEqual([
 			{ tier: "project", file: "~/proj/.pi-lens.json", legacy: false },
 		]);
+	});
+});
+
+/**
+ * The session-start half: `handleSessionStart` re-arms the latch, so the NEXT
+ * resolution of the new session writes its own record instead of inheriting
+ * the previous session's "already recorded" claim (catalog shape 17). Quick
+ * mode is used deliberately — it is the mode every process's first session
+ * takes, and it resolves NO config on its interactive path, so it is also the
+ * mode in which forgetting the re-arm would be invisible.
+ */
+describe("handleSessionStart re-arms the record for the new session (#2526)", () => {
+	function makeDeps(ctxCwd: string): unknown {
+		return withResidentBootstrap({
+			ctxCwd,
+			getFlag: () => false,
+			notify: () => {},
+			dbg: () => {},
+			log: () => {},
+			runtime: new RuntimeCoordinator(),
+			metricsClient: { reset: () => {} },
+			cacheManager: { writeCache: () => {}, readCache: () => null },
+			todoScanner: { scanDirectory: () => ({ items: [] }) },
+			astGrepClient: {
+				isAvailable: () => false,
+				ensureAvailable: async () => false,
+				scanExports: async () => new Map(),
+			},
+			biomeClient: {
+				isAvailable: () => false,
+				ensureAvailable: async () => false,
+			},
+			ruffClient: {
+				isAvailable: () => false,
+				ensureAvailable: async () => false,
+			},
+			knipClient: {
+				isAvailable: () => false,
+				ensureAvailable: async () => false,
+			},
+			jscpdClient: {
+				isAvailable: () => false,
+				ensureAvailable: async () => false,
+			},
+			depChecker: {
+				isAvailable: () => false,
+				ensureAvailable: async () => false,
+			},
+			testRunnerClient: {
+				detectRunner: () => null,
+				runTestFile: () => ({ failed: 0, error: false }),
+			},
+			goClient: { isGoAvailableAsync: async () => false },
+			rustClient: { isAvailableAsync: async () => false },
+			ensureTool: async () => null,
+			cleanStaleTsBuildInfo: () => [],
+			resetDispatchBaselines: () => {},
+			resetLSPService: () => {},
+		});
+	}
+
+	it("a second session gets its own row", async () => {
+		const { home, projectDir } = canonicalOnlyLayout();
+		const previousStartupMode = process.env.PI_LENS_STARTUP_MODE;
+		process.env.PI_LENS_STARTUP_MODE = "quick";
+		const globals = globalThis as { __piLensWarmupScheduled?: boolean };
+		const previousWarmup = globals.__piLensWarmupScheduled;
+		globals.__piLensWarmupScheduled = true;
+		try {
+			const { loadLSPConfig, resetLSPConfigStateForTests } =
+				await import("../../clients/lsp/config.js");
+			resetLSPConfigStateForTests();
+			await loadLSPConfig(projectDir, home);
+			expect(await configResolvedRows()).toHaveLength(1);
+
+			// A fresh session, through the REAL handler.
+			const { handleSessionStart } =
+				await import("../../clients/runtime-session.js");
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			await handleSessionStart(makeDeps(projectDir) as any);
+
+			await loadLSPConfig(projectDir, home);
+			expect(
+				await configResolvedRows(),
+				"handleSessionStart did not re-arm the config_resolved latch",
+			).toHaveLength(2);
+		} finally {
+			globals.__piLensWarmupScheduled = previousWarmup;
+			if (previousStartupMode === undefined)
+				delete process.env.PI_LENS_STARTUP_MODE;
+			else process.env.PI_LENS_STARTUP_MODE = previousStartupMode;
+		}
 	});
 });
 
