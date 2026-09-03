@@ -60,6 +60,12 @@ import {
 	type RegisteredLSPConfig,
 	type ServerSelectionReason,
 } from "./lsp/config.js";
+// The shared path-shape-aware containment comparator (#1150/#1152 defect
+// shape) — the SAME one the session-root registry
+// (`clients/lsp/session-roots.ts`) gates enrollment with. A second
+// hand-rolled `path.relative`/prefix check here is how the two would drift
+// apart on a Windows-shaped path (AGENTS.md defect shape 2).
+import { isSameOrWithin } from "./lsp/server.js";
 import { homeRelativePath } from "./path-utils.js";
 import { compareOrdinal } from "./string-utils.js";
 
@@ -141,6 +147,22 @@ export interface EffectiveFileView {
 	readonly tools: readonly EffectiveToolDecision[];
 }
 
+/**
+ * The per-file half's answer when `file` was named but does not resolve
+ * inside `cwd`. `effectiveConfig` rejects rather than answers for a foreign
+ * tree (#2520) — see the CONFINED note on {@link effectiveConfig}.
+ */
+export interface EffectiveFileViewError {
+	readonly error: string;
+}
+
+/** True when a `file` half is the rejection shape, not a resolved view. */
+export function isEffectiveFileViewError(
+	file: EffectiveFileView | EffectiveFileViewError,
+): file is EffectiveFileViewError {
+	return "error" in file;
+}
+
 export interface EffectiveConfigView {
 	/** Home-relative when the workspace is under `$HOME`. */
 	readonly cwd: string;
@@ -151,7 +173,12 @@ export interface EffectiveConfigView {
 	readonly provenanceCounts: Readonly<Record<SourceTier, number>>;
 	/** The stable `PILENS_CFG_*` codes this resolution produced, with counts. */
 	readonly recordCounts: Readonly<Record<string, number>>;
-	readonly file?: EffectiveFileView;
+	/**
+	 * Absent when no `file` was asked about. `{ error }` when one was named but
+	 * lies outside `cwd` — never a view resolved against a tree unrelated to the
+	 * workspace this answer is `cwd`-labelled as (#2520).
+	 */
+	readonly file?: EffectiveFileView | EffectiveFileViewError;
 }
 
 /** A zero for every tier, so a consumer never has to test for an absent key. */
@@ -269,20 +296,6 @@ function decidedByOrNothing(entry: ProvenanceViewEntry | undefined): {
 }
 
 /**
- * Everything the per-file half needs and the whole-config half must not pay
- * for: the file it answers about, and the LSP config that answer is read
- * against. One value, so the two are produced under a single condition.
- *
- * It deliberately does NOT carry a resolution. There is exactly one, shared
- * with the whole-config half (#2427 review round 5, F-R4-1); a second field
- * here is how the two roots diverged.
- */
-interface FileQuery {
-	readonly absolute: string;
-	readonly lspConfig: RegisteredLSPConfig;
-}
-
-/**
  * The resolved model of pi-lens's configuration, with the provenance of every
  * decision — and, for one file, which servers and tools that configuration
  * selects or denies and why.
@@ -319,12 +332,18 @@ interface FileQuery {
  * omitted the nested document. Deriving both halves from a single resolution
  * makes that class of disagreement unrepresentable rather than fixed.
  *
- * The file-directory root is a SUPERSET of the workspace's — the project walk
- * runs upward and is ceiling-bounded — so the whole-config half loses nothing
- * by sharing it: the workspace's own document still contributes, at the
- * `project` tier, with the nested one layered over it as `nested-project`.
- * When no `file` is asked about the root IS the workspace `cwd`, and that is
- * the view `pilens_health` takes on every call.
+ * The file-directory root is a SUPERSET of the workspace's ONLY when `file`
+ * resolves inside `cwd` — the project walk runs upward and is
+ * ceiling-bounded, so a nested `file` naturally passes back through the
+ * workspace's own document on its way up. A `file` outside `cwd` has no such
+ * relationship: its own ancestry can omit the workspace's document entirely
+ * while `cwd` above still names the workspace, mislabelling a foreign tree's
+ * config as this workspace's own (#2520). So the containment is CONFINED, not
+ * assumed: a `file` that does not resolve inside `cwd` is rejected —
+ * `file: { error: "file is outside cwd" }` — rather than answered from an
+ * unrelated root. When no `file` is asked about, or the confined one is
+ * used, the root IS (or nests under) the workspace `cwd`, and the fileless
+ * case is the view `pilens_health` takes on every call.
  *
  * The differentials are pinned in `tests/clients/effective-config.test.ts`.
  */
@@ -360,11 +379,23 @@ export async function effectiveConfig(
 	// and a bare `path.resolve` would silently answer for a same-named path
 	// under the host process's own directory — a wrong answer wearing a
 	// confident shape.
-	const absolute =
+	const requestedFile =
 		options.file === undefined ? undefined : path.resolve(cwd, options.file);
 
+	// CONFINED, not assumed (#2520). A `file` that resolves outside `cwd` has
+	// no containment relationship to the workspace this view is `cwd`-labelled
+	// as: its own ancestor walk can reach a `.pi-lens.json` the workspace never
+	// saw while omitting the workspace's own, and `resolveAt` below would
+	// silently answer for that unrelated tree. `isSameOrWithin` is the shared
+	// path-shape-aware comparator, not a hand-rolled prefix check, so a
+	// Windows-shaped `cwd`/`file` pair is judged the same way on every host OS.
+	const fileOutsideCwd =
+		requestedFile !== undefined && !isSameOrWithin(cwd, requestedFile);
+	const absolute = fileOutsideCwd ? undefined : requestedFile;
+
 	// ONE RESOLUTION ANSWERS THE WHOLE QUERY (#2427 review round 5, F-R4-1),
-	// and its root is the FILE's own directory whenever a file is asked about.
+	// and its root is the FILE's own directory whenever a CONFINED file is
+	// asked about.
 	//
 	// The runtime registers LSP config at that directory —
 	// `ensureLSPConfigInitialized(path.dirname(filePath))` in
@@ -380,25 +411,12 @@ export async function effectiveConfig(
 	// misattribution, reopened), and omitted the nested document entirely. One
 	// resolution makes the two halves unable to disagree by construction.
 	//
-	// The walk is UPWARD and ceiling-bounded, so this root is a SUPERSET of the
-	// workspace's: `live/.pi-lens.json` still contributes, at the `project`
-	// tier, with `live/sub/.pi-lens.json` layered over it as `nested-project`.
-	// The workspace root remains the resolution for the whole-config (fileless)
-	// view, which is the view `pilens_health` takes on every call.
+	// A rejected (outside-`cwd`) file falls back to `cwd` itself here, same as
+	// no file at all — the walk never touches the foreign tree.
 	const resolution = resolveAt(
 		absolute === undefined ? cwd : path.dirname(absolute),
 	);
 
-	// The gates read the LSP slice of that SAME resolution, through the same
-	// `registerLSPConfig` conversion `initLSPConfig` uses — no session-root
-	// registration, no `workspaceConfigs` LRU write (P11/P12).
-	const fileQuery: FileQuery | undefined =
-		absolute === undefined
-			? undefined
-			: {
-					absolute,
-					lspConfig: registerLSPConfig(lspConfigOf(resolution.value)),
-				};
 	const resolved = {
 		value: resolution.value,
 		provenance: resolution.provenance,
@@ -417,16 +435,25 @@ export async function effectiveConfig(
 		provenance: provenanceView(resolved, homeDir).entries,
 		provenanceCounts: counts,
 		recordCounts: countBy(resolution.records, (record) => record.code),
-		...(fileQuery === undefined
-			? {}
-			: {
-					file: await fileView(
-						fileQuery.absolute,
-						resolved,
-						homeDir,
-						fileQuery.lspConfig,
-					),
-				}),
+		...(fileOutsideCwd
+			? { file: { error: "file is outside cwd" } }
+			: absolute === undefined
+				? {}
+				: {
+						file: await fileView(
+							absolute,
+							resolved,
+							homeDir,
+							// The gates read the LSP slice of that SAME resolution, through
+							// the same `registerLSPConfig` conversion `initLSPConfig` uses —
+							// no session-root registration, no `workspaceConfigs` LRU write
+							// (P11/P12). Computed here rather than hoisted into a
+							// `{ absolute, lspConfig }` struct (#2520): `absolute` is already
+							// this branch's narrowed local, so the struct's own field was
+							// carrying the same fact twice.
+							registerLSPConfig(lspConfigOf(resolution.value)),
+						),
+					}),
 	};
 	return view;
 }

@@ -21,7 +21,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	effectiveConfig,
 	type EffectiveConfigView,
+	type EffectiveFileView,
 	type EffectiveServerDecision,
+	isEffectiveFileViewError,
 } from "../../clients/effective-config.js";
 import {
 	explainServersForFile,
@@ -124,6 +126,24 @@ async function viewFor(
 	}
 }
 
+/**
+ * Narrow `view.file` to the resolved shape. Every test in this file below
+ * the dedicated #2520 confinement `describe` queries a `file` inside `cwd`,
+ * so it never sees the `{ error }` rejection shape — this throws instead of
+ * silently coercing past it if one ever did, which would mean the FIXTURE,
+ * not the assertion, needs fixing.
+ */
+function resolvedFile(
+	view: EffectiveConfigView,
+): EffectiveFileView | undefined {
+	const file = view.file;
+	if (file === undefined) return undefined;
+	if (isEffectiveFileViewError(file)) {
+		throw new Error(`effectiveConfig rejected the file: ${file.error}`);
+	}
+	return file;
+}
+
 /** Fixture layout keys, assembled so no literal path appears in the source. */
 const GLOBAL_CONFIG = [".pi-lens", "config.json"].join("/");
 const PROJECT_CONFIG = ["proj", ".pi-lens.json"].join("/");
@@ -218,7 +238,7 @@ describe("effectiveConfig — why is X running (#2415 AC)", () => {
 			{ file: "notes.md" },
 		);
 
-		const typos = view.file?.servers.find((entry) => entry.id === "typos");
+		const typos = resolvedFile(view)?.servers.find((entry) => entry.id === "typos");
 		expect(typos).toBeDefined();
 		expect(typos?.selected).toBe(false);
 		expect(typos?.reason).toBe("disabled-by-config");
@@ -284,7 +304,7 @@ describe("effectiveConfig — why is X running (#2415 AC)", () => {
 			{ file: "notes.md" },
 		);
 		const denied = new Set(
-			view.file?.servers
+			resolvedFile(view)?.servers
 				.filter((entry) => entry.reason === "disabled-by-config")
 				.map((entry) => entry.id),
 		);
@@ -307,7 +327,7 @@ describe("effectiveConfig — why is X running (#2415 AC)", () => {
 		files[PROJECT_CONFIG] = denyDoc("marksman");
 		const layout: Layout = { files, startDir: "proj" };
 		const result = await viewFor(layout, { file: "notes.md" });
-		const servers = result.view.file?.servers ?? [];
+		const servers = resolvedFile(result.view)?.servers ?? [];
 		const byId = new Map(servers.map((entry) => [entry.id, entry] as const));
 		expect(byId.get("typos")?.reason).toBe("disabled-by-config");
 		expect(byId.get("marksman")?.reason).toBe("disabled-by-config");
@@ -329,13 +349,13 @@ describe("effectiveConfig — why is X running (#2415 AC)", () => {
 			{ file: "notes.md" },
 		);
 		const reasons = new Map(
-			view.file?.servers.map((entry) => [entry.id, entry.reason]),
+			resolvedFile(view)?.servers.map((entry) => [entry.id, entry.reason]),
 		);
 		expect(reasons.get("typos")).toBe("disabled-by-config");
 		// A Rust server has nothing to do with a markdown file, and that is a
 		// different answer from "you turned it off".
 		expect(reasons.get("rust")).toBe("extension-mismatch");
-		expect(view.file?.language).toBe("markdown");
+		expect(resolvedFile(view)?.language).toBe("markdown");
 	});
 
 	/**
@@ -356,13 +376,13 @@ describe("effectiveConfig — why is X running (#2415 AC)", () => {
 		files[GLOBAL_CONFIG] = denyDoc("rust");
 		const layout: Layout = { files, startDir: "proj" };
 		const result = await viewFor(layout, { file: "notes.md" });
-		const rust = result.view.file?.servers.find((entry) => entry.id === "rust");
+		const rust = resolvedFile(result.view)?.servers.find((entry) => entry.id === "rust");
 		expect(rust).toBeDefined();
 		expect(rust?.selected).toBe(false);
 		expect(rust?.reason).toBe("disabled-by-config");
 		// And the ordinary mismatch answer is still reachable, so this is a
 		// discrimination test rather than a constant.
-		const python = result.view.file?.servers.find(
+		const python = resolvedFile(result.view)?.servers.find(
 			(entry) => entry.id === "python",
 		);
 		expect(python?.reason).toBe("extension-mismatch");
@@ -373,10 +393,10 @@ describe("effectiveConfig — why is X running (#2415 AC)", () => {
 			{ files: {}, startDir: "proj" },
 			{ file: "main.py" },
 		);
-		expect(view.file?.language).toBe("python");
-		expect(view.file?.kind).toBe("python");
-		expect(view.file?.tools.length).toBeGreaterThan(0);
-		for (const tool of view.file?.tools ?? []) {
+		expect(resolvedFile(view)?.language).toBe("python");
+		expect(resolvedFile(view)?.kind).toBe("python");
+		expect(resolvedFile(view)?.tools.length).toBeGreaterThan(0);
+		for (const tool of resolvedFile(view)?.tools ?? []) {
 			expect([
 				"selected",
 				"not-registered-for-kind",
@@ -417,14 +437,14 @@ describe("effectiveConfig — redaction is unconditional", () => {
 		// rewritten home-relative.
 		expect(serialized).not.toContain(JSON.stringify(home).slice(1, -1));
 		expect(view.cwd.startsWith("~/")).toBe(true);
-		expect(view.file?.path.startsWith("~/")).toBe(true);
+		expect(resolvedFile(view)?.path.startsWith("~/")).toBe(true);
 		for (const document of view.documents) {
 			expect(document.file.startsWith("~/")).toBe(true);
 		}
 
 		// What DOES survive is the part that answers the question: the server
 		// exists, it came from the project file, and this is the binary.
-		const custom = view.file?.servers.find(
+		const custom = resolvedFile(view)?.servers.find(
 			(entry) => entry.id === "secret-server",
 		);
 		expect(custom?.spec?.command).toBe("my-lsp");
@@ -711,7 +731,7 @@ describe("effectiveConfig — asking changes no session state (#2427 round 3)", 
 			expect(session.some(isSelectedSubOnly)).toBe(true);
 
 			const view = await nestedView(scenario);
-			const queried = (view.file?.servers ?? []).map(viewDecision);
+			const queried = (resolvedFile(view)?.servers ?? []).map(viewDecision);
 			expect(queried.map(core)).toEqual(session);
 		} finally {
 			scenario.restore();
@@ -749,7 +769,7 @@ describe("effectiveConfig — asking changes no session state (#2427 round 3)", 
 			expect(atRoot.servers?.shared?.command).toBe(ROOT_COMMAND);
 
 			const view = await nestedView(scenario);
-			const shared = (view.file?.servers ?? [])
+			const shared = (resolvedFile(view)?.servers ?? [])
 				.map(viewDecision)
 				.find((entry) => entry.id === "shared");
 			expect(shared).toBeDefined();
@@ -781,7 +801,7 @@ describe("effectiveConfig — asking changes no session state (#2427 round 3)", 
 		try {
 			const view = await nestedView(scenario);
 			const byId = new Map(
-				(view.file?.servers ?? [])
+				(resolvedFile(view)?.servers ?? [])
 					.map(viewDecision)
 					.map((entry) => [entry.id, entry] as const),
 			);
@@ -913,4 +933,79 @@ describe("effectiveConfig — asking changes no session state (#2427 round 3)", 
 	function isSelectedSubOnly(entry: Decision): boolean {
 		return entry.id === "sub-only" && entry.selected;
 	}
+});
+
+/**
+ * CONFINE, not assume (#2520). Before this fix, `effectiveConfig` resolved
+ * the per-file half from the FILE's own directory unconditionally — correct
+ * when `file` is inside `cwd` (the whole point of the nested-config tests
+ * above), silently wrong when it is not: a sibling tree's `.pi-lens.json`
+ * answered for the query while `view.cwd` still named the unrelated
+ * workspace, `documents` omitted the workspace's own config, and the
+ * "SUPERSET of the workspace's" invariant the module doc claims did not hold.
+ */
+describe("effectiveConfig — a file outside cwd is rejected, not silently resolved (#2520)", () => {
+	it("returns { error: \"file is outside cwd\" } instead of a foreign tree's answer", async () => {
+		const home = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-effcfg-confine-"),
+		);
+		tempRoots.push(home);
+		const ws = path.join(home, "ws");
+		const foreign = path.join(home, "foreign");
+		fs.mkdirSync(ws, { recursive: true });
+		fs.mkdirSync(foreign, { recursive: true });
+		const wsConfig = path.join(ws, ".pi-lens.json");
+		const foreignConfig = path.join(foreign, ".pi-lens.json");
+		fs.writeFileSync(wsConfig, JSON.stringify({}));
+		fs.writeFileSync(
+			foreignConfig,
+			JSON.stringify({ lsp: { disabledServers: ["typos"] } }),
+		);
+
+		const previousHome = process.env.PI_LENS_HOME;
+		const previousConfigPath = process.env.PI_LENS_CONFIG_PATH;
+		process.env.PI_LENS_HOME = path.join(home, ".pi-lens");
+		process.env.PI_LENS_CONFIG_PATH = path.join(
+			home,
+			".pi-lens",
+			"config.json",
+		);
+		resetLSPConfigStateForTests();
+		resetLSPConfigWarnCache();
+		try {
+			const view = await effectiveConfig({
+				cwd: ws,
+				homeDir: home,
+				redact: true,
+				// An absolute path into a SIBLING tree — not under `ws` at all.
+				file: path.join(foreign, "notes.md"),
+			});
+
+			// `cwd` still names the workspace the caller actually asked about —
+			// the confinement must not silently re-root the answer at `foreign`.
+			expect(view.cwd).toBe(homeRelativePath(ws, home));
+			expect(view.file).toEqual({ error: "file is outside cwd" });
+			// The workspace's OWN document is what this view is resolved from —
+			// never the foreign tree's, and never omitted.
+			const files = view.documents.map((document) => document.file);
+			expect(files).toContain(homeRelativePath(wsConfig, home));
+			expect(files).not.toContain(homeRelativePath(foreignConfig, home));
+		} finally {
+			if (previousHome === undefined) delete process.env.PI_LENS_HOME;
+			else process.env.PI_LENS_HOME = previousHome;
+			if (previousConfigPath === undefined)
+				delete process.env.PI_LENS_CONFIG_PATH;
+			else process.env.PI_LENS_CONFIG_PATH = previousConfigPath;
+			resetLSPConfigStateForTests();
+		}
+	});
+
+	it("still answers normally for a file nested INSIDE cwd (confinement must not reject the common case)", async () => {
+		const { view } = await viewFor(
+			{ files: { "proj/.pi-lens.json": {} }, startDir: "proj" },
+			{ file: path.join("sub", "notes.md") },
+		);
+		expect(view.file).toBeDefined();
+		expect(view.file && "error" in view.file).toBe(false);
+	});
 });

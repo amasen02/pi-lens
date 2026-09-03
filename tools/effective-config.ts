@@ -15,6 +15,7 @@ import { Type } from "../clients/deps/typebox.js";
 import {
 	effectiveConfig,
 	type EffectiveConfigView,
+	isEffectiveFileViewError,
 } from "../clients/lens-engine.js";
 import { compactRenderResult } from "./render-compact.js";
 
@@ -22,6 +23,9 @@ import { compactRenderResult } from "./render-compact.js";
 function summarize(view: EffectiveConfigView): string {
 	const documents = `${view.documents.length} config file(s)`;
 	if (!view.file) return `effective_config — ${documents}`;
+	if (isEffectiveFileViewError(view.file)) {
+		return `effective_config — ${documents} · ${view.file.error}`;
+	}
 	const selected = view.file.servers.filter((entry) => entry.selected).length;
 	const denied = view.file.servers.filter(
 		(entry) => entry.reason === "disabled-by-config",
@@ -92,12 +96,14 @@ export function createEffectiveConfigTool(getProjectRoot: () => string) {
 					provenance: view.provenance.length,
 					...(view.file === undefined
 						? {}
-						: {
-								file: view.file.path,
-								selectedServers: view.file.servers.filter(
-									(entry) => entry.selected,
-								).length,
-							}),
+						: isEffectiveFileViewError(view.file)
+							? { fileError: view.file.error }
+							: {
+									file: view.file.path,
+									selectedServers: view.file.servers.filter(
+										(entry) => entry.selected,
+									).length,
+								}),
 				},
 			};
 		},

@@ -120,8 +120,10 @@ export {
 	type EffectiveConfigOptions,
 	type EffectiveConfigView,
 	type EffectiveFileView,
+	type EffectiveFileViewError,
 	type EffectiveServerDecision,
 	type EffectiveToolDecision,
+	isEffectiveFileViewError,
 	type RedactedServerSpec,
 	type ToolSelectionReason,
 } from "./effective-config.js";
