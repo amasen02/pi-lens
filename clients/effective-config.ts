@@ -42,7 +42,11 @@ import {
 	type SourceTier,
 } from "./config-core/provenance.js";
 import { LSP_NAMESPACE_KEY } from "./config-locations.js";
-import { lspSectionOf, resolvePiLensConfig } from "./config-resolve.js";
+import {
+	lspSectionOf,
+	type PiLensConfigResolution,
+	resolvePiLensConfig,
+} from "./config-resolve.js";
 import { getToolPlan } from "./dispatch/plan.js";
 import { getAvailableRunners } from "./dispatch/integration.js";
 import { detectFileKind } from "./file-kinds.js";
@@ -51,7 +55,7 @@ import { type LanguageEntry, resolveLanguage } from "./language-registry.js";
 import { getPiLensGlobalConfigPath } from "./lens-config.js";
 import {
 	explainServersForFile,
-	loadLSPConfig,
+	lspConfigOf,
 	registerLSPConfig,
 	type RegisteredLSPConfig,
 	type ServerSelectionReason,
@@ -74,7 +78,14 @@ export interface EffectiveConfigOptions {
 	readonly homeDir?: string;
 }
 
-/** One config document that contributed to the resolution. */
+/**
+ * One config document that contributed to the resolution.
+ *
+ * When a `file` is asked about, the resolution — and therefore this list — is
+ * taken at that file's own directory, so it names the nested documents that
+ * decided the file half too (#2427 review round 5, F-R4-1). The walk is
+ * upward, so the workspace's own documents are always included.
+ */
 export interface EffectiveConfigDocument {
 	readonly tier: SourceTier;
 	/** Home-relative when the file is under `$HOME`. */
@@ -261,6 +272,10 @@ function decidedByOrNothing(entry: ProvenanceViewEntry | undefined): {
  * Everything the per-file half needs and the whole-config half must not pay
  * for: the file it answers about, and the LSP config that answer is read
  * against. One value, so the two are produced under a single condition.
+ *
+ * It deliberately does NOT carry a resolution. There is exactly one, shared
+ * with the whole-config half (#2427 review round 5, F-R4-1); a second field
+ * here is how the two roots diverged.
  */
 interface FileQuery {
 	readonly absolute: string;
@@ -285,73 +300,105 @@ interface FileQuery {
  * cannot happen. `sessionRoots` is capped at 128, so `shouldInitializeSessionRoot`
  * never repaired it either.
  *
- * So the query DERIVES the config instead: `loadLSPConfig(..., report: false)`
- * (the same loader `initLSPConfig` itself uses, minus the notices — rule 2)
- * through the same `registerLSPConfig` conversion, handed to
- * `explainServersForFile` as an explicit argument. Same gate, same answer, no
- * write. The load root is the FILE's own directory (matching what the
- * runtime registers via `ensureLSPConfigInitialized(path.dirname(filePath))`),
- * not the workspace `cwd` — a nested `repo/sub/.pi-lens.json` layer (config.ts
- * header point 3) is otherwise invisible to the query (#2427 review round 4,
- * F1). The differential is pinned in `tests/clients/effective-config.test.ts`.
+ * So the query DERIVES the config instead: `lspConfigOf` (the projection
+ * `loadLSPConfig` returns, minus the notices — rule 2) through the same
+ * `registerLSPConfig` conversion, handed to `explainServersForFile` as an
+ * explicit argument. Same gate, same answer, no write.
  *
- * The load runs ONLY when a `file` is asked about. The whole-config view is
- * derived from `resolvePiLensConfig` alone, and `pilens_health` takes exactly
- * that view on every call.
+ * ONE RESOLUTION ANSWERS THE WHOLE QUERY (#2427 review round 5, F-R4-1), taken
+ * at the FILE's own directory whenever a file is asked about — matching what
+ * the runtime registers via `ensureLSPConfigInitialized(path.dirname(filePath))`,
+ * because a nested `repo/sub/.pi-lens.json` layer (config.ts header point 3)
+ * reaches the runtime's decision no other way (round 4, F1).
+ *
+ * Round 4 moved the GATES to that root and left the rest — the redacted spec,
+ * every `decidedBy`, the `documents` list — reading a SECOND resolution taken
+ * at the workspace root. Two roots, and they disagreed: the view named the
+ * root's definition of a server the runtime spawns from the nested one,
+ * attributed a nested denial to whichever tier denied first at the root, and
+ * omitted the nested document. Deriving both halves from a single resolution
+ * makes that class of disagreement unrepresentable rather than fixed.
+ *
+ * The file-directory root is a SUPERSET of the workspace's — the project walk
+ * runs upward and is ceiling-bounded — so the whole-config half loses nothing
+ * by sharing it: the workspace's own document still contributes, at the
+ * `project` tier, with the nested one layered over it as `nested-project`.
+ * When no `file` is asked about the root IS the workspace `cwd`, and that is
+ * the view `pilens_health` takes on every call.
+ *
+ * The differentials are pinned in `tests/clients/effective-config.test.ts`.
  */
 export async function effectiveConfig(
 	options: EffectiveConfigOptions = {},
 ): Promise<EffectiveConfigView> {
 	const cwd = options.cwd ?? process.cwd();
 	const homeDir = options.homeDir ?? os.homedir();
-	// `report: false` — rule 2 (#2427 review round 2, F6). This load is a step
-	// in answering a QUESTION, and the query contract is that asking must not
-	// warn: an uninitialized cwd used to have its deprecation notices fired here
-	// and the loader warn-once latch consumed, so the session-start load that
-	// owns those notices then said nothing.
+	// The resolution, at whichever directory this query is answered FROM.
 	//
 	// `homeDir` is threaded, unlike `initLSPConfig`'s hard-wired `os.homedir()`:
 	// this call answers for the workspace the CALLER named, so the project walk
 	// must stop at the `$HOME` the rest of the view is resolved against.
 	//
-	// The path resolves HERE too, beside the load, so "is there a file half"
-	// is one condition rather than two that a later edit could disagree on.
-	// It is relative to the WORKSPACE, not to `process.cwd()`: a caller that
-	// names a workspace and then a file inside it means that file, and a bare
-	// `path.resolve` would silently answer for a same-named path under the host
-	// process's own directory — a wrong answer wearing a confident shape.
+	// No `onReadError`: rule 2. An unreadable file still shows up as a
+	// `PILENS_CFG_0001` record count below, so the answer is not silent — it
+	// just is not a second user-facing warning fired by a question. Nothing
+	// here reports at all, which is why the query no longer routes through
+	// `loadLSPConfig`: that loader's whole difference from this call is the
+	// notices, and the query wants the resolution, not the notices.
+	const resolveAt = (dir: string): PiLensConfigResolution =>
+		resolvePiLensConfig({
+			cwd: dir,
+			globalDir: getGlobalPiLensDir(),
+			globalConfigPath: getPiLensGlobalConfigPath(homeDir),
+			homeDir,
+		});
+
+	// The queried path resolves HERE, beside the resolution root it selects, so
+	// "is there a file half" is one condition rather than two a later edit could
+	// disagree on. It is relative to the WORKSPACE, not to `process.cwd()`: a
+	// caller that names a workspace and then a file inside it means that file,
+	// and a bare `path.resolve` would silently answer for a same-named path
+	// under the host process's own directory — a wrong answer wearing a
+	// confident shape.
+	const absolute =
+		options.file === undefined ? undefined : path.resolve(cwd, options.file);
+
+	// ONE RESOLUTION ANSWERS THE WHOLE QUERY (#2427 review round 5, F-R4-1),
+	// and its root is the FILE's own directory whenever a file is asked about.
 	//
-	// The LSP load root is the FILE's own directory, not the workspace `cwd`
-	// (#2427 review round 4, F1). The runtime registers config there too —
+	// The runtime registers LSP config at that directory —
 	// `ensureLSPConfigInitialized(path.dirname(filePath))` in
 	// `runtime-tool-call.ts` — and `getConfigForFile` answers with the deepest
 	// registered ancestor, so a nested `repo/sub/.pi-lens.json` (config.ts
 	// header point 3) only reaches the runtime's decision through the file's
-	// own directory. Deriving from `cwd` made the query blind to a nested
-	// layer's denials AND additions — under-reporting a denial is the
-	// dangerous direction this surface exists to rule out.
-	let fileQuery: FileQuery | undefined;
-	if (options.file !== undefined) {
-		const absolute = path.resolve(cwd, options.file);
-		fileQuery = {
-			absolute,
-			lspConfig: registerLSPConfig(
-				await loadLSPConfig(path.dirname(absolute), homeDir, {
-					report: false,
-				}),
-			),
-		};
-	}
+	// own directory. Round 4 fixed the GATES that way but left every other fact
+	// — the redacted spec, every `decidedBy`, the `documents` list — read off a
+	// second resolution taken at the workspace root, so the query had two
+	// resolution roots and they disagreed: it reported the root's definition of
+	// a server the runtime spawns from the nested one, attributed a nested deny
+	// to whichever tier denied FIRST at the root (the round-2 F2
+	// misattribution, reopened), and omitted the nested document entirely. One
+	// resolution makes the two halves unable to disagree by construction.
+	//
+	// The walk is UPWARD and ceiling-bounded, so this root is a SUPERSET of the
+	// workspace's: `live/.pi-lens.json` still contributes, at the `project`
+	// tier, with `live/sub/.pi-lens.json` layered over it as `nested-project`.
+	// The workspace root remains the resolution for the whole-config (fileless)
+	// view, which is the view `pilens_health` takes on every call.
+	const resolution = resolveAt(
+		absolute === undefined ? cwd : path.dirname(absolute),
+	);
 
-	const resolution = resolvePiLensConfig({
-		cwd,
-		globalDir: getGlobalPiLensDir(),
-		globalConfigPath: getPiLensGlobalConfigPath(homeDir),
-		homeDir,
-		// No `onReadError`: see rule 2. An unreadable file still shows up as a
-		// `PILENS_CFG_0001` record count below, so the answer is not silent — it
-		// just is not a second user-facing warning fired by a question.
-	});
+	// The gates read the LSP slice of that SAME resolution, through the same
+	// `registerLSPConfig` conversion `initLSPConfig` uses — no session-root
+	// registration, no `workspaceConfigs` LRU write (P11/P12).
+	const fileQuery: FileQuery | undefined =
+		absolute === undefined
+			? undefined
+			: {
+					absolute,
+					lspConfig: registerLSPConfig(lspConfigOf(resolution.value)),
+				};
 	const resolved = {
 		value: resolution.value,
 		provenance: resolution.provenance,

@@ -227,7 +227,28 @@ export async function loadLSPConfig(
 	// owned record from a document only this multi-file resolution discovered.
 	if (reporting) reportPiLensConfigRecords(resolution.records);
 
-	const section = lspSectionOf(resolution.value);
+	return lspConfigOf(resolution.value);
+}
+
+/**
+ * THE resolved-value → {@link LSPConfig} projection: read the `lsp` namespace
+ * and keep the four keys the gates consume, each only when the resolution
+ * actually produced it in the right shape.
+ *
+ * Exported and named in #2427 review round 5 (F-R4-1). `effectiveConfig`
+ * needs the LSP config AND the provenance of the same resolution, and
+ * `loadLSPConfig` returns only the former — it discards the resolution it
+ * just performed. Round 4 therefore had the query call `loadLSPConfig` for
+ * the gates and run a SECOND `resolvePiLensConfig` for the provenance, at a
+ * different root, and the two disagreed: the gates answered from the file's
+ * own directory while the reported spec, provenance and document list came
+ * from the workspace root. With the projection spelled here the query performs
+ * ONE resolution and derives both halves from it, and the projection is still
+ * a single definition, so a derived config and a session-registered one cannot
+ * disagree about what a document means.
+ */
+export function lspConfigOf(value: Record<string, unknown>): LSPConfig {
+	const section = lspSectionOf(value);
 	const config: LSPConfig = {};
 	const servers = asRecord(section.servers);
 	if (servers) config.servers = servers as Record<string, CustomServerConfig>;

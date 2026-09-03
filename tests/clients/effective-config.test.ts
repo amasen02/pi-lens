@@ -36,6 +36,10 @@ import {
 	isOutsideAllSessionRoots,
 	isSessionRootRegistered,
 } from "../../clients/lsp/session-roots.js";
+// The production rewriter, so an expected provenance path is derived by the
+// same function the view uses rather than spelled as a literal that would
+// agree with a wrong implementation on one platform.
+import { homeRelativePath } from "../../clients/path-utils.js";
 import { removeTempDirSync } from "./test-utils.js";
 
 // The extension log is an ndjson sink, not the terminal; a fixture that
@@ -126,6 +130,25 @@ const PROJECT_CONFIG = ["proj", ".pi-lens.json"].join("/");
 const LEGACY_PROJECT_LSP = ["proj", "pi-lsp.json"].join("/");
 const TYPOS_POINTER = ["", "lsp", "disabledServers", "0"].join("/");
 const MARKSMAN_POINTER = ["", "lsp", "disabledServers", "1"].join("/");
+
+/**
+ * The command the WORKSPACE-ROOT layer gives `shared`, and the command the
+ * NESTED layer redefines it to. Distinct strings because the whole question
+ * F-R4-1 raised is which of the two the query reports (#2427 review round 5).
+ */
+const ROOT_COMMAND = "root-shared-lsp";
+const SUB_COMMAND = "sub-shared-lsp";
+
+/** One custom-server definition, identical but for the command. */
+function sharedServer(command: string): Record<string, unknown> {
+	return {
+		name: "Shared LSP",
+		extensions: [".md"],
+		command,
+		args: ["--stdio"],
+		rootMarkers: ["package.json"],
+	};
+}
 
 /** A canonical-namespace document denying one server. */
 function denyDoc(...ids: string[]): Record<string, unknown> {
@@ -503,6 +526,16 @@ describe("effectiveConfig — asking changes no session state (#2427 round 3)", 
 		 * `runtime-tool-call.ts:699-703` — never at `liveRoot`.
 		 */
 		readonly subDir: string;
+		/**
+		 * The WORKSPACE-ROOT `.pi-lens.json` — the only project document a
+		 * resolution taken at `liveRoot` can see.
+		 */
+		readonly liveConfig: string;
+		/**
+		 * The NESTED `.pi-lens.json` — the document the runtime actually
+		 * decides a file under `sub` from.
+		 */
+		readonly subConfig: string;
 		readonly restore: () => void;
 	}
 
@@ -533,9 +566,20 @@ describe("effectiveConfig — asking changes no session state (#2427 round 3)", 
 		const denyDocument: Record<string, unknown> = { lsp: denySection };
 		fs.writeFileSync(globalConfig, JSON.stringify(denyDocument));
 
+		// The WORKSPACE-ROOT layer. It defines `shared` with the ROOT command,
+		// which the nested layer below redefines: this is the document a
+		// resolution taken at `liveRoot` reads, and the one the runtime does
+		// NOT decide from for a file under `sub`.
+		const liveConfig = path.join(liveRoot, ".pi-lens.json");
+		const liveDocument: Record<string, unknown> = {
+			lsp: { servers: { shared: sharedServer(ROOT_COMMAND) } },
+		};
+		fs.writeFileSync(liveConfig, JSON.stringify(liveDocument));
+
 		// The nested layer P13 exists to prove reachable: a project-level deny
-		// (P-E) plus a custom server found NOWHERE else (P-F), both scoped to
-		// `sub` alone so a query derived from `liveRoot` cannot see either.
+		// (P-E), a custom server found NOWHERE else (P-F), and a REDEFINITION of
+		// the root's `shared` (P-G) — all scoped to `sub` alone, so a query
+		// derived from `liveRoot` sees none of the three.
 		const subConfig = path.join(subDir, ".pi-lens.json");
 		const subDocument: Record<string, unknown> = {
 			lsp: {
@@ -548,6 +592,7 @@ describe("effectiveConfig — asking changes no session state (#2427 round 3)", 
 						args: ["--stdio"],
 						rootMarkers: ["package.json"],
 					},
+					shared: sharedServer(SUB_COMMAND),
 				},
 			},
 		};
@@ -567,7 +612,15 @@ describe("effectiveConfig — asking changes no session state (#2427 round 3)", 
 			else process.env.PI_LENS_CONFIG_PATH = previousConfigPath;
 			resetLSPConfigStateForTests();
 		};
-		return { home, liveRoot, foreignDir, subDir, restore };
+		return {
+			home,
+			liveRoot,
+			foreignDir,
+			subDir,
+			liveConfig,
+			subConfig,
+			restore,
+		};
 	}
 
 	/** P11: the queried cwd never becomes a served root. */
@@ -657,18 +710,133 @@ describe("effectiveConfig — asking changes no session state (#2427 round 3)", 
 			expect(session.some(isDeniedMarksman)).toBe(true);
 			expect(session.some(isSelectedSubOnly)).toBe(true);
 
-			const view = await effectiveConfig({
-				cwd: scenario.liveRoot,
-				homeDir: scenario.home,
-				redact: true as const,
-				file: path.join("sub", "notes.md"),
-			});
+			const view = await nestedView(scenario);
 			const queried = (view.file?.servers ?? []).map(viewDecision);
-			expect(queried).toEqual(session);
+			expect(queried.map(core)).toEqual(session);
 		} finally {
 			scenario.restore();
 		}
 	});
+
+	/**
+	 * P14 — the SPEC the view reports is the definition the runtime would
+	 * spawn (#2427 review round 5, F-R4-1).
+	 *
+	 * Round 4 moved the LSP load to the file's own directory but left every
+	 * other fact — the spec, the provenance, the documents — read off a SECOND
+	 * resolution taken at the workspace root. With `shared` defined at
+	 * `liveRoot` and redefined at `liveRoot/sub`, that split is directly
+	 * observable: the gates answer from the nested definition while the
+	 * reported `spec.command` names the root's. A user reading this surface
+	 * to answer "what is actually being launched" got the wrong binary.
+	 */
+	it("reports the spec the runtime would spawn, not the workspace root's", async () => {
+		const scenario = rootScenario();
+		try {
+			// What the RUNTIME registers for a file under `sub`: the production
+			// loader at `path.dirname(filePath)`, the directory
+			// `ensureLSPConfigInitialized` uses in `runtime-tool-call.ts`.
+			const runtime = await loadLSPConfig(scenario.subDir, scenario.home, {
+				report: false,
+			});
+			const runtimeCommand = runtime.servers?.shared?.command;
+			// Non-vacuous on both sides: the nested layer really does win here,
+			// and the workspace root really does say something else.
+			expect(runtimeCommand).toBe(SUB_COMMAND);
+			const atRoot = await loadLSPConfig(scenario.liveRoot, scenario.home, {
+				report: false,
+			});
+			expect(atRoot.servers?.shared?.command).toBe(ROOT_COMMAND);
+
+			const view = await nestedView(scenario);
+			const shared = (view.file?.servers ?? [])
+				.map(viewDecision)
+				.find((entry) => entry.id === "shared");
+			expect(shared).toBeDefined();
+			expect(shared?.specCommand).toBe(runtimeCommand);
+			// ... and the provenance names the file that carries THAT command.
+			expect(shared?.decidedByFile).toBe(
+				homeRelativePath(scenario.subConfig, scenario.home),
+			);
+			expect(shared?.decidedByTier).toBe("nested-project");
+		} finally {
+			scenario.restore();
+		}
+	});
+
+	/**
+	 * P15 — a nested denial is attributed to the file that denied IT.
+	 *
+	 * Round 2's F2 misattribution, reopened by the second resolution root, and
+	 * failing in the most misleading direction available. The workspace-root
+	 * resolution's deny union is `["typos"]` (global), so `marksman` has no
+	 * member entry there; `provenanceFor` walks up to the ARRAY entry and
+	 * hands back the GLOBAL file. The operator is then told to edit a
+	 * machine-global config to re-enable a server their own
+	 * `sub/.pi-lens.json` turned off — which docs/configuration.md instructs
+	 * them to do verbatim.
+	 */
+	it("attributes a nested denial to the nested file, not to the global deny", async () => {
+		const scenario = rootScenario();
+		try {
+			const view = await nestedView(scenario);
+			const byId = new Map(
+				(view.file?.servers ?? [])
+					.map(viewDecision)
+					.map((entry) => [entry.id, entry] as const),
+			);
+			const marksman = byId.get("marksman");
+			expect(marksman?.reason).toBe("disabled-by-config");
+			expect(marksman?.decidedByTier).toBe("nested-project");
+			expect(marksman?.decidedByFile).toBe(
+				homeRelativePath(scenario.subConfig, scenario.home),
+			);
+			// The global denial is still the global file's — the fix must not
+			// simply move every attribution to the nearest document.
+			const typos = byId.get("typos");
+			expect(typos?.reason).toBe("disabled-by-config");
+			expect(typos?.decidedByTier).toBe("global");
+		} finally {
+			scenario.restore();
+		}
+	});
+
+	/**
+	 * P16 — `documents` names every file the answer was resolved from.
+	 *
+	 * The AC asks for the file behind every decision; a list that omits the
+	 * nested layer cannot support the decisions the same view reports from it.
+	 */
+	it("lists the nested document the file answer was resolved from", async () => {
+		const scenario = rootScenario();
+		try {
+			const view = await nestedView(scenario);
+			const files = view.documents.map((document) => document.file);
+			expect(files).toContain(
+				homeRelativePath(scenario.liveConfig, scenario.home),
+			);
+			expect(files).toContain(
+				homeRelativePath(scenario.subConfig, scenario.home),
+			);
+		} finally {
+			scenario.restore();
+		}
+	});
+
+	/**
+	 * The query the runtime's nested case corresponds to: the workspace root as
+	 * `cwd`, a file one directory down.
+	 */
+	async function nestedView(
+		scenario: RootScenario,
+	): Promise<EffectiveConfigView> {
+		return effectiveConfig({
+			cwd: scenario.liveRoot,
+			homeDir: scenario.home,
+			redact: true as const,
+			file: path.join("sub", "notes.md"),
+		});
+	}
 
 	function queryFor(cwd: string, homeDir: string) {
 		const file = "notes.md";
@@ -688,7 +856,44 @@ describe("effectiveConfig — asking changes no session state (#2427 round 3)", 
 		return { id, selected, reason };
 	}
 
-	function viewDecision(entry: EffectiveServerDecision): Decision {
+	/**
+	 * The view's answer for one server INCLUDING the three facts round 4 left
+	 * reading a different resolution from the one the gates were evaluated
+	 * against: which file decided, which tier that was, and which command the
+	 * reported spec names (#2427 review round 5, F-R4-1).
+	 */
+	interface ViewedDecision extends Decision {
+		readonly decidedByFile?: string;
+		readonly decidedByTier?: string;
+		readonly specCommand?: string;
+	}
+
+	function viewDecision(entry: EffectiveServerDecision): ViewedDecision {
+		const id = entry.id;
+		const selected = entry.selected;
+		const reason = entry.reason;
+		return {
+			id,
+			selected,
+			reason,
+			...(entry.decidedBy?.file === undefined
+				? {}
+				: { decidedByFile: entry.decidedBy.file }),
+			...(entry.decidedBy?.tier === undefined
+				? {}
+				: { decidedByTier: entry.decidedBy.tier }),
+			...(entry.spec?.command === undefined
+				? {}
+				: { specCommand: entry.spec.command }),
+		};
+	}
+
+	/**
+	 * The registry can only answer id/selected/reason — provenance is a
+	 * property of the RESOLUTION, not of the LSP gate — so the equality against
+	 * the session path narrows to what both sides know.
+	 */
+	function core(entry: ViewedDecision): Decision {
 		const id = entry.id;
 		const selected = entry.selected;
 		const reason = entry.reason;

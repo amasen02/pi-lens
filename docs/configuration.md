@@ -192,6 +192,12 @@ server with the reason it was selected or denied, and the runners that would
 dispatch. That is the answer to "why is this running" and to "why is this *not*
 running", without reading a log.
 
+Naming a `file` resolves the configuration **at that file's own directory**,
+which is where the runtime decides from — so a nested `repo/sub/.pi-lens.json`
+layer contributes to the answer, appears in the reported document list, and is
+named as the file behind any decision it made. The walk runs upward, so the
+workspace's own documents are always included too.
+
 It reports **sources, never values**. Environment values never appear, a custom
 server's command line is cut to the binary itself, and every path is rewritten
 `~`-relative. There is no un-redacted mode: the un-redacted data is the config
