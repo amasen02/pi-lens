@@ -38,7 +38,12 @@ const MANAGED_TOOLS_DIR = path.join(
 	"tools",
 );
 
-vi.mock("../../clients/package-manager.js", () => ({ findNodeToolBinary }));
+vi.mock("../../clients/package-manager.js", async (importOriginal) => ({
+	...(await importOriginal<
+		typeof import("../../clients/package-manager.js")
+	>()),
+	findNodeToolBinary,
+}));
 vi.mock("../../clients/installer/index.js", () => ({
 	ensureTool,
 	getManagedToolsDir: () => MANAGED_TOOLS_DIR,

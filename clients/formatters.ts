@@ -34,7 +34,12 @@ import {
 	logAvailabilityDecision,
 	startHostStallSampler,
 } from "./dispatch/runners/utils/availability-policy.js";
-import { findGlobalBinary, findLocalBinUpwards } from "./package-manager.js";
+import {
+	findGlobalBinary,
+	findLocalBinUpwards,
+	VENDOR_BIN_DIRS,
+	VENV_BIN_DIRS,
+} from "./package-manager.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
 import { assertInstallAllowed } from "./project-trust.js";
 import { tryLazyInstallForFormatter } from "./dispatch/runners/utils/lazy-installer.js";
@@ -599,82 +604,70 @@ async function resolveGoFmtBinary(): Promise<string | null> {
 /**
  * Walk up from cwd looking for a binary in .venv or venv.
  * Returns the absolute path if found, null otherwise.
+ *
+ * Tool-resolution walker, not a config lookup (#2514/#2517 policy): escaping
+ * the project upward past HOME means STOP, not keep reading — a `.venv`/`venv`
+ * bin found at or above HOME can never be THIS project's own virtualenv. The
+ * ceiling lives in `findLocalBinUpwards` and is default-on there; the tests
+ * that pin a fake HOME drive that walker directly rather than threading a
+ * `homeDir` no production caller ever passed (#2544 review F3).
+ *
+ * On Windows the candidate order is EXT-OUTER, DIR-INNER — `.venv/Scripts/x.exe`,
+ * `venv/Scripts/x.exe`, then the bare names — which is what the pre-fold copy
+ * did and what `findLocalBinUpwards` preserves.
  */
 async function findInVenv(binary: string, cwd: string): Promise<string | null> {
-	const isWin = process.platform === "win32";
-	const candidates = isWin
-		? [
-				`.venv/Scripts/${binary}.exe`,
-				`venv/Scripts/${binary}.exe`,
-				`.venv/Scripts/${binary}`,
-				`venv/Scripts/${binary}`,
-			]
-		: [`.venv/bin/${binary}`, `venv/bin/${binary}`];
-
-	let dir = cwd;
-	const root = path.parse(dir).root;
-	while (dir !== root) {
-		for (const candidate of candidates) {
-			const full = path.join(dir, candidate);
-			if (await fileExists(full)) return full;
-		}
-		const parent = path.dirname(dir);
-		if (parent === dir) break;
-		dir = parent;
-	}
-	return null;
+	return (
+		findLocalBinUpwards(binary, cwd, {
+			windowsExt: ".exe",
+			binDirs: VENV_BIN_DIRS,
+		}) ?? null
+	);
 }
 
 /**
  * Check vendor/bin for PHP Composer-managed tools.
  * Walks up from cwd to find vendor/bin/<binary>.
+ *
+ * Tool-resolution walker, not a config lookup (#2514/#2517 policy): escaping
+ * the project upward past HOME means STOP, not keep reading — a `vendor/bin`
+ * match found at or above HOME can never be THIS project's own Composer
+ * install. Same single walker as `findInVenv` above; only `binDirs` and the
+ * Windows extension differ.
  */
 async function findInVendorBin(
 	binary: string,
 	cwd: string,
 ): Promise<string | null> {
-	const isWin = process.platform === "win32";
-	const names = isWin ? [`${binary}.bat`, binary] : [binary];
-	let dir = cwd;
-	const root = path.parse(dir).root;
-	while (dir !== root) {
-		for (const name of names) {
-			const full = path.join(dir, "vendor", "bin", name);
-			if (await fileExists(full)) return full;
-		}
-		const parent = path.dirname(dir);
-		if (parent === dir) break;
-		dir = parent;
-	}
-	return null;
+	return (
+		findLocalBinUpwards(binary, cwd, {
+			windowsExt: ".bat",
+			binDirs: VENDOR_BIN_DIRS,
+		}) ?? null
+	);
 }
 
 /**
  * Check node_modules/.bin for locally installed Node tools.
  * Walks up from cwd to find node_modules/.bin/<binary>.
+ *
+ * #2514: this WAS a private, byte-for-byte duplicate of
+ * `findLocalBinUpwards` (`package-manager.ts`) — the same walk `stylua`
+ * below, `taplo.ts`, `knip-client.ts`, and (via `findNodeToolBinary`)
+ * `dependency-checker.ts`/`jscpd-client.ts` already reuse. A stray
+ * `~/node_modules/.bin/oxfmt.cmd` (the home-level pi-extensions manifest
+ * installs its own bins) was picked up as the project's formatter because
+ * this copy had no HOME ceiling; fixing only this copy would have left every
+ * other caller of `findLocalBinUpwards` with the same defect. Delegating
+ * here instead of hand-rolling a second ceiling keeps there being exactly one
+ * `node_modules/.bin` walker — see that function for the tool-resolution
+ * "escaping the project means STOP" policy (#2517).
  */
 async function findInNodeModules(
 	binary: string,
 	cwd: string,
 ): Promise<string | null> {
-	const isWin = process.platform === "win32";
-	let dir = cwd;
-	const root = path.parse(dir).root;
-	while (dir !== root) {
-		const candidates = isWin
-			? [
-					path.join(dir, "node_modules", ".bin", `${binary}.cmd`),
-					path.join(dir, "node_modules", ".bin", binary),
-				]
-			: [path.join(dir, "node_modules", ".bin", binary)];
-		for (const full of candidates) {
-			if (await fileExists(full)) return full;
-		}
-		const parent = path.dirname(dir);
-		if (parent === dir) break;
-		dir = parent;
-	}
-	return null;
+	return findLocalBinUpwards(binary, cwd) ?? null;
 }
 
 /**

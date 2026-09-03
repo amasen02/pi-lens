@@ -22,7 +22,10 @@ vi.mock("../../clients/installer/index.js", () => ({
 // these tests scoped to `ensureAvailable`'s own in-flight dedupe (#120) rather
 // than incidentally exercising package-manager's spawn count — the same
 // isolation `biome-install-evidence.test.ts` already uses.
-vi.mock("../../clients/package-manager.js", () => ({
+vi.mock("../../clients/package-manager.js", async (importOriginal) => ({
+	...(await importOriginal<
+		typeof import("../../clients/package-manager.js")
+	>()),
 	findGlobalBinary: vi.fn(async () => undefined),
 }));
 

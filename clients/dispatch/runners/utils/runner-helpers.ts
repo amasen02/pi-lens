@@ -35,7 +35,15 @@ import {
 	getServersForFileWithConfig,
 	isServerDisabled,
 } from "../../../lsp/config.js";
-import { findGlobalBinary } from "../../../package-manager.js";
+import {
+	findGlobalBinary,
+	findLocalBinAt,
+	findLocalBinsUpwards,
+	findLocalBinUpwards,
+	VENDOR_BIN_DIRS,
+	VENV_BIN_DIRS,
+} from "../../../package-manager.js";
+import { logLatency } from "../../../latency-logger.js";
 import { safeSpawnAsync } from "../../../safe-spawn.js";
 import { compareOrdinal } from "../../../string-utils.js";
 import {
@@ -101,29 +109,21 @@ export function lspPrimaryCoversFile(
 	return primary?.id === serverId;
 }
 
-/**
- * Walk up from startDir until we find a directory containing node_modules/.bin.
- * Returns all such roots found up to the filesystem root — not just the nearest —
- * so callers can search them all for a specific binary.
- */
-function findNodeBinRoots(startDir: string): string[] {
-	const roots: string[] = [];
-	let current = startDir;
-	const fsRoot = path.parse(current).root;
-	while (current !== fsRoot) {
-		if (fs.existsSync(path.join(current, "node_modules", ".bin"))) {
-			roots.push(current);
-		}
-		const parent = path.dirname(current);
-		if (parent === current) break;
-		current = parent;
-	}
-	return roots;
-}
+const _realThisDir = (() => {
+	if (typeof __dirname !== "undefined") return __dirname;
+	return path.dirname(fileURLToPath(import.meta.url));
+})();
+let _thisDir = _realThisDir;
 
-let _thisDir = path.dirname(fileURLToPath(import.meta.url));
-if (typeof __dirname !== "undefined") {
-	_thisDir = __dirname;
+/**
+ * Test-only override for pi-lens's OWN install-tree root (#2544 round 4 F1).
+ * `_thisDir` is fixed at module load from the running file's own location, so
+ * a test cannot otherwise place it under a synthetic HOME to prove the
+ * own-install walk's `ceiling: false` exemption without writing into this
+ * process's REAL, shared `node_modules` tree.
+ */
+export function _setThisDirForTests(dir: string | undefined): void {
+	_thisDir = dir ?? _realThisDir;
 }
 
 // Managed tools directory (~/.pi-lens/tools) — where ensureTool() installs binaries
@@ -345,6 +345,21 @@ export async function findManagedNodeToolBinary(
  * The resolved path is returned verbatim: every spawn consumer runs with
  * `shell: false` (safe-spawn, #817), so wrapping it in quotes would make it
  * a literal filename that ENOENTs on every platform (#1508).
+ *
+ * The venv directory list is `VENV_BIN_DIRS` (`package-manager.ts`), shared
+ * with `formatters.ts`'s `findInVenv` and `dead-code-client.ts`'s vulture
+ * candidates — three independent spellings of the same four directories before
+ * #2544 review F1.
+ *
+ * Resolution is a fixed lookup at `cwd` ONLY (`findLocalBinAt`, no ancestor
+ * walk). #2544 review round 3 folded this onto the shared ANCESTOR walker,
+ * on the reasoning that a monorepo package should find its repo-root venv —
+ * but that was an unrequested behaviour change with no #2514 defect behind
+ * it (#2514 is about the HOME ceiling, not about climbing at all), and the
+ * inversion is real: `~/code/app` with no venv of its own would resolve
+ * `~/code/.venv/bin/ruff` — an unrelated SIBLING project's interpreter —
+ * ahead of PATH. Reverted in round 4 F2. The HOME ceiling is moot here: a
+ * lookup at exactly `cwd` can never climb past it.
  */
 export function createVenvFinder(
 	command: string,
@@ -352,19 +367,11 @@ export function createVenvFinder(
 	verificationArgs: string[] = ["--version"],
 ): (cwd: string) => Promise<string> {
 	return async (cwd: string): Promise<string> => {
-		const venvPaths = [
-			`.venv/bin/${command}`,
-			`venv/bin/${command}`,
-			`.venv/Scripts/${command}${windowsExt}`,
-			`venv/Scripts/${command}${windowsExt}`,
-		];
-
-		for (const venvPath of venvPaths) {
-			const fullPath = path.join(cwd, venvPath);
-			if (fs.existsSync(fullPath)) {
-				return fullPath;
-			}
-		}
+		const venvBin = findLocalBinAt(command, cwd, {
+			windowsExt,
+			binDirs: VENV_BIN_DIRS,
+		});
+		if (venvBin) return venvBin;
 
 		// Managed-dir install (~/.pi-lens/tools/node_modules/.bin/<command>) — the
 		// same shim `ensureTool()` installs npm-strategy tools into. Checked BEFORE
@@ -1437,31 +1444,26 @@ export function resolveToolCommand(cwd: string, toolId: string): string | null {
 	return resolveNodeToolCommand(cwd, spec.command, spec.windowsExt ?? ".cmd");
 }
 
+/**
+ * Composer's `vendor/bin/<tool>` from the nearest ancestor that has one.
+ *
+ * Delegates to THE shared bin walker (#2544 review F1): this was a fifth
+ * private copy of that climb, unceilinged, so a `vendor/bin` at or above
+ * `$HOME` — which can never be this project's own Composer install — was
+ * resolved as the project's tool (#2514, same class as `findInVendorBin`,
+ * which had already been folded).
+ */
 export function resolveVendorToolCommand(
 	cwd: string,
 	toolName: string,
 	windowsExt = ".bat",
 ): string | null {
-	const isWin = process.platform === "win32";
-	const candidates = isWin
-		? [
-				path.join("vendor", "bin", `${toolName}${windowsExt}`),
-				path.join("vendor", "bin", toolName),
-			]
-		: [path.join("vendor", "bin", toolName)];
-	let dir = cwd;
-	const root = path.parse(dir).root;
-	while (true) {
-		for (const candidate of candidates) {
-			const full = path.join(dir, candidate);
-			if (fs.existsSync(full)) return full;
-		}
-		if (dir === root) break;
-		const parent = path.dirname(dir);
-		if (parent === dir) break;
-		dir = parent;
-	}
-	return null;
+	return (
+		findLocalBinUpwards(toolName, cwd, {
+			windowsExt,
+			binDirs: VENDOR_BIN_DIRS,
+		}) ?? null
+	);
 }
 
 export async function resolveToolCommandWithInstallFallback(
@@ -1757,8 +1759,16 @@ async function probeAstGrepCommandAsync(
 	return false;
 }
 
+/** Where a `buildSgLocalBins` candidate's path came from (#2544 round 4 F4). */
+type SgLocalBinSource = "own-install" | "project";
+
+interface SgLocalBinCandidate {
+	path: string;
+	source: SgLocalBinSource;
+}
+
 /** Pre-filter local node_modules/.bin candidates that actually exist on disk. */
-function buildSgLocalBins(): string[] {
+function buildSgLocalBins(): SgLocalBinCandidate[] {
 	const isWin = process.platform === "win32";
 	const hasBash = !!(
 		process.env.MSYSTEM ||
@@ -1773,16 +1783,53 @@ function buildSgLocalBins(): string[] {
 	const binaryCandidates = ["ast-grep", "sg"].flatMap((base) =>
 		extensions.map((ext) => `${base}${ext}`),
 	);
-	const binRoots = [
-		...findNodeBinRoots(_thisDir),
-		...findNodeBinRoots(process.cwd()),
-		_managedToolsDir,
+	// THE shared bin walk (#2544 review F1). This used to be a private
+	// `findNodeBinRoots` climb with no HOME ceiling, so on a box with a
+	// home-level `node_modules` (the pi-extensions manifest installs its own
+	// bins, #2514) `$HOME` itself came back as a bin root and an unrelated
+	// ast-grep was probed as if it were this project's. `windowsExt: ""`
+	// because the candidate names already carry their extensions — in a
+	// shell-dependent ORDER (`hasBash` above) that a single `windowsExt`
+	// cannot express.
+	//
+	// The PROJECT walk (from `process.cwd()`) keeps the default HOME ceiling —
+	// a `node_modules/.bin/ast-grep` at or above `$HOME` can never be THIS
+	// project's own dependency. pi-lens's OWN install-tree walk (from
+	// `_thisDir`) is exempt (`ceiling: false`, #2544 round 4 F1): `pi install
+	// npm:pi-lens` installs into the HOME-level manifest
+	// (`~/package.json` → `~/node_modules/pi-lens`), so pi-lens's bundled
+	// `@ast-grep/cli` shim can sit AT `~/node_modules/.bin/ast-grep` — exactly
+	// the directory the PROJECT ceiling exists to stop at. A previous version
+	// of this comment claimed the own install always lives "under"
+	// `~/.pi/extensions/…`, below the ceiling; that is false for the
+	// HOME-level manifest layout, and the round-2 ceiling silently made this
+	// walk return nothing for it (PATH, `findGlobalBinary` and npx do not
+	// cover this location either). `_managedToolsDir` (`~/.pi-lens/tools`) is
+	// a fixed location, not a walk, so it is checked directly as before —
+	// also own-install, since `ensureTool()` puts npm-strategy installs there.
+	const projectWalkOptions = { windowsExt: "" } as const;
+	const ownInstallWalkOptions = { windowsExt: "", ceiling: false } as const;
+	const bins: SgLocalBinCandidate[] = [
+		...findLocalBinsUpwards(
+			binaryCandidates,
+			_thisDir,
+			ownInstallWalkOptions,
+		).map((binPath) => ({ path: binPath, source: "own-install" as const })),
+		...findLocalBinsUpwards(
+			binaryCandidates,
+			process.cwd(),
+			projectWalkOptions,
+		).map((binPath) => ({ path: binPath, source: "project" as const })),
 	];
-	const bins: string[] = [];
-	for (const root of binRoots) {
-		for (const candidate of binaryCandidates) {
-			const localBin = path.join(root, "node_modules", ".bin", candidate);
-			if (fs.existsSync(localBin)) bins.push(localBin);
+	for (const candidate of binaryCandidates) {
+		const managedBin = path.join(
+			_managedToolsDir,
+			"node_modules",
+			".bin",
+			candidate,
+		);
+		if (fs.existsSync(managedBin)) {
+			bins.push({ path: managedBin, source: "own-install" });
 		}
 	}
 	return bins;
@@ -1815,12 +1862,12 @@ export async function isSgAvailableAsync(): Promise<boolean> {
 		sgSweepHostStallMs = 0;
 		sgSweepUnreachable = [];
 		sgSweepDurablyMissing = [];
-		// 1. Local node_modules/.bin
-		for (const localBin of buildSgLocalBins()) {
-			if (await probeAstGrepCommandAsync(localBin)) {
-				sgCmd = localBin;
+		// 1. Local node_modules/.bin (own-install tree, then project tree)
+		for (const candidate of buildSgLocalBins()) {
+			if (await probeAstGrepCommandAsync(candidate.path)) {
+				sgCmd = candidate.path;
 				sgCmdArgs = [];
-				noteSgAvailable(startedAt);
+				noteSgAvailable(startedAt, { source: candidate.source });
 				return true;
 			}
 		}
@@ -1830,7 +1877,7 @@ export async function isSgAvailableAsync(): Promise<boolean> {
 			if (await probeAstGrepCommandAsync(cmd)) {
 				sgCmd = cmd;
 				sgCmdArgs = [];
-				noteSgAvailable(startedAt);
+				noteSgAvailable(startedAt, { source: "global" });
 				return true;
 			}
 		}
@@ -1842,7 +1889,7 @@ export async function isSgAvailableAsync(): Promise<boolean> {
 			if (globalBin && (await probeAstGrepCommandAsync(globalBin))) {
 				sgCmd = globalBin;
 				sgCmdArgs = [];
-				noteSgAvailable(startedAt);
+				noteSgAvailable(startedAt, { source: "global" });
 				return true;
 			}
 		}
@@ -1851,7 +1898,7 @@ export async function isSgAvailableAsync(): Promise<boolean> {
 		if (await probeAstGrepCommandAsync("npx", ["--no", "--", "ast-grep"])) {
 			sgCmd = "npx";
 			sgCmdArgs = ["--no", "--", "ast-grep"];
-			noteSgAvailable(startedAt);
+			noteSgAvailable(startedAt, { source: "npx" });
 			return true;
 		}
 
@@ -1909,10 +1956,18 @@ export async function isSgAvailableAsync(): Promise<boolean> {
  * `retained` marks the other provisional case (#1568 review F1): no candidate
  * answered at all, so the winner being reported is the one the previous sweep
  * found, kept rather than discarded on a timeout.
+ *
+ * `source` (omitted for a `retained` win, which resolved nothing new this
+ * sweep) logs one `tool_bin_resolved` phase so F1's own-install-vs-project
+ * ceiling distinction is visible in `latency.log` instead of only inferable
+ * from a bin's absence (#2544 round 4 F4).
  */
 function noteSgAvailable(
 	startedAt: number,
-	opts: { retained?: boolean } = {},
+	opts: {
+		retained?: boolean;
+		source?: SgLocalBinSource | "global" | "npx";
+	} = {},
 ): void {
 	const provisional = sgSweepSawTransient;
 	let retryAfterMs = 0;
@@ -1920,6 +1975,19 @@ function noteSgAvailable(
 		retryAfterMs = sgLatch.noteProvisionallyAvailable(sgSweepTransientCause);
 	} else {
 		sgLatch.noteAvailable();
+	}
+	if (opts.source) {
+		logLatency({
+			type: "phase",
+			phase: "tool_bin_resolved",
+			filePath: "<pi-lens>",
+			durationMs: Math.round(Date.now() - startedAt),
+			metadata: {
+				tool: "ast-grep",
+				source: opts.source,
+				ceilingApplied: opts.source === "project",
+			},
+		});
 	}
 	logAvailabilityDecision({
 		tool: "ast-grep",

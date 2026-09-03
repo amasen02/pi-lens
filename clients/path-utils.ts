@@ -505,19 +505,45 @@ export function findNearestMarkerRoot(
  * `=== os.homedir()` check (which a marker found *above* `$HOME` slips past).
  * A normal project *under* home (e.g. `~/code/app`) is NOT at-or-above home,
  * so it still resolves fine. Refs #253.
+ *
+ * ONE expression, deliberately: `path.relative` alone answers "is home inside
+ * `dir`, or the same directory as `dir`", and it answers with the PLATFORM's
+ * path-equality semantics — case-folding on win32, case-sensitive on POSIX.
+ * The `resolvedDir === resolvedHome` shortcut that used to precede it was
+ * case-SENSITIVE on every platform, so `c:\Users\jane` (the lowercase-drive
+ * form VS Code URIs produce, and the form 46 records in a real `latency.log`
+ * carry) missed the equality test AND was then rejected by a `rel !== ""`
+ * clause — reporting "not at home" for the home directory itself and letting
+ * every ceilinged walker climb straight past HOME (#2544 review F1).
+ *
+ *   rel === ""                       ⇢ `dir` IS home
+ *   rel relative, no leading `..`    ⇢ home is INSIDE `dir` (an ancestor)
+ *   rel starts with `..`             ⇢ home is elsewhere — sibling, or the
+ *                                      prefix trap `C:\Users\jane2` → home
+ *                                      `C:\Users\jane` gives `..\jane`
+ *   rel absolute                     ⇢ different Windows drive
+ *
+ * Same shape as `isUnderDir` above; keep the two in step.
+ *
+ * `pathImpl` exists so the ubuntu Unit tests lane — the authoritative one —
+ * can exercise the WIN32 semantics this helper's whole bug was about. Every
+ * assertion that matters here (drive-letter folding, cross-drive `rel`) is
+ * win32-only, so with the ambient `path` hardcoded the ceiling was enforced
+ * only on a maintainer's dev box and CI's diff was structurally zero (#2544
+ * review F2). Production never passes it; `path.win32`/`path.posix` are pure,
+ * host-independent implementations, so `tests/clients/path-utils.test.ts` runs
+ * the same table under both on every lane. Lane-level fix tracked as #2536.
  */
 export function isAtOrAboveHomeDir(
 	dir: string,
 	homeDir: string = os.homedir(),
+	pathImpl: typeof path = path,
 ): boolean {
-	const resolvedDir = path.resolve(dir);
-	const resolvedHome = path.resolve(homeDir);
-	if (resolvedDir === resolvedHome) return true;
-	// `dir` is an ancestor of home ⇢ home lies inside dir ⇢ the relative path
-	// from dir to home has no leading `..` and is not absolute (cross-drive on
-	// Windows yields an absolute rel, correctly treated as "not above").
-	const rel = path.relative(resolvedDir, resolvedHome);
-	return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+	const rel = pathImpl.relative(
+		pathImpl.resolve(dir),
+		pathImpl.resolve(homeDir),
+	);
+	return !rel.startsWith("..") && !pathImpl.isAbsolute(rel);
 }
 
 /**

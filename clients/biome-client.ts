@@ -109,8 +109,15 @@ export class BiomeClient {
 		const cached = this.localBinaryByCwd.get(resolveCwd);
 		if (cached) return { cmd: cached, args: [] };
 
-		// Walk up from cwd looking for node_modules/.bin/biome BEFORE trusting
-		// `autoInstalledBinaryPath` (#1731). That field is set once, the first
+		// Check `<cwd>/node_modules/.bin/biome` BEFORE trusting
+		// `autoInstalledBinaryPath` (#1731). NOT a walk, despite what this
+		// comment claimed until #2544 review F1 — the candidates below are
+		// joined onto `resolveCwd` and nothing climbs. Callers pass the edited
+		// file's own project/sub-package root (see above), which is where an
+		// npm-workspace install puts the shim; converting this to the shared
+		// ancestor walk is a behaviour change with no reported defect behind
+		// it, so it is deliberately NOT part of #2514's ceiling fold. That
+		// field is set once, the first
 		// time `ensureAvailable()` auto-installs for ANY cwd this session, and
 		// every later call for every OTHER cwd short-circuited on it — so a
 		// project that ships its own biome never won once the session's first
