@@ -2530,8 +2530,9 @@ describe("#2523 AC1 every hook-path await is bounded, and no new hand-rolled rac
 		// two hops out, through `clients/dispatch/integration.ts`.
 		expect(helpers).not.toContain("clients/dispatch/dispatcher.ts");
 		expect(
-			localImportTargets(path.join(REPO_ROOT, "clients/dispatch/integration.ts"))
-				.map((absolute) => relativePosix(REPO_ROOT, absolute)),
+			localImportTargets(
+				path.join(REPO_ROOT, "clients/dispatch/integration.ts"),
+			).map((absolute) => relativePosix(REPO_ROOT, absolute)),
 		).toContain("clients/dispatch/dispatcher.ts");
 		// A hook handler is not its own helper.
 		for (const handler of hookPathFiles(REPO_ROOT)) {
@@ -2607,9 +2608,9 @@ describe("#2523 AC1 every hook-path await is bounded, and no new hand-rolled rac
 		// Shorthand `signal` keys on the same line the value comes from.
 		expect(
 			findBoundedCallLines(
-				['await bounded(w(), { ms, signal, hook: "turn_end", label: "l" });'].join(
-					"\n",
-				),
+				[
+					'await bounded(w(), { ms, signal, hook: "turn_end", label: "l" });',
+				].join("\n"),
 			),
 		).toEqual([1]);
 		// No `signal` property at all (a JS caller): keyed at the call head, so
@@ -2626,7 +2627,9 @@ describe("#2523 AC1 every hook-path await is bounded, and no new hand-rolled rac
 		expect(findBoundedCallLines("const c = new BoundedFifoMap(10);")).toEqual(
 			[],
 		);
-		expect(findBoundedCallLines(stripSource("// bounded(w(), o);"))).toEqual([]);
+		expect(findBoundedCallLines(stripSource("// bounded(w(), o);"))).toEqual(
+			[],
+		);
 	});
 
 	it("documents the heuristic's limits", () => {
