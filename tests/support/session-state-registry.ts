@@ -1481,7 +1481,11 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	"lsp/client.ts": 2,
 	// #2442 review F2: the container regex now recognises BoundedFifoMap /
 	// BoundedLruCache, so this file's module-level bounded cache is counted.
-	"lsp/config.ts": 2,
+	// #2427 review round 2, F6: 2 -> 3 for `silentInFlight`, the set naming the
+	// cwds whose in-flight init is running with config reporting suppressed. Same
+	// lifetime as the `configInFlight` map beside it (per load, not per session)
+	// and cleared by the same `resetLSPConfigStateForTests` seam.
+	"lsp/config.ts": 3,
 	"lsp/index.ts": 2,
 	// #2000 phase 2: the pending-baseline store (one slot per cwd:generation)
 	// plus the process-global Symbol.for slot; cleared via resetOpaqueMutationState.

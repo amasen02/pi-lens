@@ -280,7 +280,6 @@ const configInFlight = new Map<string, Promise<void>>();
  */
 const silentInFlight = new Set<string>();
 
-
 function normalizeWorkspacePath(cwd: string): string {
 	return path.resolve(cwd);
 }

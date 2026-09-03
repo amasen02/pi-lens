@@ -1087,9 +1087,7 @@ interface HealthConfigProvenance {
  * whole point of embedding provenance in a health report is that it names WHICH
  * files contributed without carrying WHAT they said.
  */
-function healthConfigLine(
-	provenance: HealthConfigProvenance | null,
-): string {
+function healthConfigLine(provenance: HealthConfigProvenance | null): string {
 	if (!provenance) return "Config: unavailable (resolution failed)";
 	const tiers = Object.entries(provenance.tiers)
 		.filter(([, count]) => count > 0)

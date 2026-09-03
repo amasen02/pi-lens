@@ -408,9 +408,8 @@ describe("loadLSPConfig — the deny union spans key spellings (#2427 round 2)",
 			".pi-lens",
 			"config.json",
 		);
-		const { loadLSPConfig, resetLSPConfigWarnCache } = await import(
-			"../../../clients/lsp/config.js"
-		);
+		const { loadLSPConfig, resetLSPConfigWarnCache } =
+			await import("../../../clients/lsp/config.js");
 		resetLSPConfigWarnCache();
 		try {
 			return (await loadLSPConfig(projectDir, home)) as never;

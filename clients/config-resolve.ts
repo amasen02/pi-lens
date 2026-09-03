@@ -551,9 +551,7 @@ export function configSources(
  */
 function canonicalKeyFor(document: ConfigDocument, key: string): string {
 	const namespaced = lspNamespaceKeyFor(document, key);
-	return namespaced === undefined
-		? key
-		: `${LSP_NAMESPACE_KEY}.${namespaced}`;
+	return namespaced === undefined ? key : `${LSP_NAMESPACE_KEY}.${namespaced}`;
 }
 
 function topLevelKeys(value: unknown): string[] {

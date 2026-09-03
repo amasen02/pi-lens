@@ -249,9 +249,9 @@ function viewOf(
  * spread inside a ternary, which is the nesting SonarCloud flags and a reader
  * has to unpick to learn one fact.
  */
-function decidedByOrNothing(
-	entry: ProvenanceViewEntry | undefined,
-): { decidedBy?: ProvenanceViewEntry } {
+function decidedByOrNothing(entry: ProvenanceViewEntry | undefined): {
+	decidedBy?: ProvenanceViewEntry;
+} {
 	return entry === undefined ? {} : { decidedBy: entry };
 }
 

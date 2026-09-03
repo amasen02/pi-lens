@@ -351,8 +351,8 @@ describe("deny resolvers in isolation (#2425)", () => {
 				{ tier: "global", value: "not-a-list" },
 				{ tier: "project", value: ["x"] },
 			]),
-		// `memberWinners` is positionally parallel to `value`: the one surviving
-		// member came from contribution 1, the non-array contribution nothing.
+			// `memberWinners` is positionally parallel to `value`: the one surviving
+			// member came from contribution 1, the non-array contribution nothing.
 		).toEqual({
 			value: ["x"],
 			winner: 1,
@@ -361,7 +361,7 @@ describe("deny resolvers in isolation (#2425)", () => {
 		});
 	});
 
-it("attributes each surviving union member to the tier that contributed it", () => {
+	it("attributes each surviving union member to the tier that contributed it", () => {
 		const resolution = resolveArrayDeny([
 			{ tier: "global", value: ["typos"] },
 			{ tier: "project", value: ["marksman"] },
@@ -373,7 +373,6 @@ it("attributes each surviving union member to the tier that contributed it", () 
 		expect(resolution.memberWinners).toEqual([0, 1]);
 		expect(resolution.winner).toBe(0);
 	});
-
 
 	it("keeps structurally equal object members rather than folding them", () => {
 		const resolution = resolveArrayDeny([

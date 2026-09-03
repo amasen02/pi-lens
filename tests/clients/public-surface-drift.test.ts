@@ -254,9 +254,7 @@ describe("public surface drift — helpers", () => {
 		expect(documentedIn("Set `guardrails` on.", "guard")).toBe(false);
 		// A dotted or bracketed path is still the field being documented, so the
 		// boundary is a TOKEN boundary, not a whitespace one.
-		expect(documentedIn("Set `config.ui.compact` to false.", "ui")).toBe(
-			true,
-		);
+		expect(documentedIn("Set `config.ui.compact` to false.", "ui")).toBe(true);
 		expect(documentedIn("| `ui.compact` | compact mode |", "ui")).toBe(true);
 		expect(documentedIn("## ui", "ui")).toBe(true);
 	});

@@ -324,9 +324,7 @@ describe("effectiveConfig — why is X running (#2415 AC)", () => {
 		files[GLOBAL_CONFIG] = denyDoc("rust");
 		const layout: Layout = { files, startDir: "proj" };
 		const result = await viewFor(layout, { file: "notes.md" });
-		const rust = result.view.file?.servers.find(
-			(entry) => entry.id === "rust",
-		);
+		const rust = result.view.file?.servers.find((entry) => entry.id === "rust");
 		expect(rust).toBeDefined();
 		expect(rust?.selected).toBe(false);
 		expect(rust?.reason).toBe("disabled-by-config");

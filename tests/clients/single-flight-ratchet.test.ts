@@ -51,6 +51,8 @@ const EXEMPTIONS: Record<string, string> = {
 	"dispatch/runners/utils/runner-helpers.ts:sgAvailableInFlight":
 		"backlog: ast-grep availability dedupe, #1753",
 	"lsp/config.ts:configInFlight": "backlog: per-workspace config load, #1753",
+	"lsp/config.ts:silentInFlight":
+		"Not a coordinator: a mode flag for the run configInFlight above already coordinates, naming the cwds whose in-flight init has config reporting suppressed (#2427). It holds no promise and shares no result, so createSingleFlight has nothing to replace; it is released under the same identity guard as the map it annotates.",
 	"lsp/jvm-runtime.ts:inFlightJavaProbe": "backlog: single JVM probe, #1753",
 	"mcp/session.ts:inFlightIpcTurnEnds":
 		"backlog: per-cwd Stop-hook pass (#1274), #1753",
