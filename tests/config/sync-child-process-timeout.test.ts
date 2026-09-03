@@ -98,6 +98,16 @@ const EXEMPT_SITES: Readonly<Record<string, string>> = {
  * perturb the depth count, while the slice still comes from `raw` so an
  * in-argument comment (like the plain-command safe-spawn fallback's) stays
  * visible to `exemptionKey`.
+ *
+ * That guarantee held for strings and comments from round 4 on, but not for
+ * a paren inside a NESTED TEMPLATE LITERAL until #2502: `stripSource` had no
+ * `${` nesting state, so a backtick opening a template nested inside an
+ * interpolation was read as the outer template's own close, leaving the
+ * nested template's own stray `(` to fall through into `masked` unblanked —
+ * the identical failure mode, one construct later. `stripSource` now tracks
+ * that nesting (a stack of open templates, each with its own `${...}` brace
+ * depth), so a paren inside a nested template cannot perturb this count
+ * either.
  */
 function callArguments(
 	masked: string,
@@ -331,6 +341,63 @@ describe("#2487 review round 4 F1: a paren inside a string/comment argument cann
 		// RED (pre-fix this passes with unaccounted: [] because the call
 		// misreads as bounded) — the unbounded shell-probe call must be
 		// caught, named by its own file:line.
+		expect(audit.unaccounted).toEqual(["clients/safe-spawn.ts:2 spawnSync"]);
+	});
+});
+
+describe("#2502 P1c: a nested template literal inside a call argument cannot unbalance the depth scan", () => {
+	// Named output from #2487 round-4 review (2026-09-02): `stripSource` had
+	// no `${` nesting state, so a backtick opening a NESTED template inside
+	// an interpolation was read as the CLOSING backtick of the outer
+	// template. The nested template's own stray `(` (from its unmasked text)
+	// then falls through into `masked` as an ordinary, unblanked character —
+	// `callArguments`'s depth scan over `masked` counts it as a real open
+	// paren with no matching close inside the call, runs past the call's
+	// true closing `)`, and does not return to depth 0 until it happens to
+	// consume the NEXT call's `{ timeout: 5000 }` too. That inflates the
+	// first call's own `args` to include `timeout:`, silently reclassifying
+	// a genuinely unbounded call as bounded.
+	const FIXTURE_FILE = "clients/safe-spawn.ts";
+	const FIXTURE_SOURCE = [
+		"function runTemplateProbe(cond) {",
+		"\tspawnSync(cmd, [`x ${cond ? `y(` : `z`} w`]);",
+		"}",
+		"",
+		"function runBoundedProbe() {",
+		"\tspawnSync(otherCmd, otherArgs, { timeout: 5000 });",
+		"}",
+		"",
+	].join("\n");
+
+	it("ATTACK_NESTED_TEMPLATE_LAUNDERING: the unbounded call stays unbounded, named by its own file:line", () => {
+		const sites = analyzeFile(FIXTURE_FILE, FIXTURE_SOURCE);
+		expect(sites.map((s) => s.id)).toEqual([
+			"clients/safe-spawn.ts:2 spawnSync", // the template-probe call — genuinely unbounded
+			"clients/safe-spawn.ts:6 spawnSync", // the bounded call — must stay bounded, not absorbed
+		]);
+		// Pre-fix, the nested template's leaked `(` inflates the depth count
+		// for THIS call, and the scan never returns to 0 before running past
+		// its own closing paren into `runBoundedProbe`'s `{ timeout: 5000 }` —
+		// so `bounded` reads true for a call with no `timeout:` in its own args.
+		const templateProbe = sites.find(
+			(s) => s.id === "clients/safe-spawn.ts:2 spawnSync",
+		);
+		expect(templateProbe?.bounded).toBe(false);
+		expect(templateProbe?.args).not.toContain("timeout");
+
+		const unbounded = sites.filter((s) => !s.bounded);
+		const flagged = unbounded.map((site) => ({
+			key: exemptionKey(site) ?? site.id,
+			detail: site.id,
+		}));
+		const audit = auditRegistry({
+			sweepName: "sync child-process timeout sweep",
+			flagged,
+			registered: [],
+			exemptions: EXEMPT_SITES,
+		});
+		// RED pre-fix: `audit.unaccounted` reads `[]` — the unbounded call
+		// silently reads as bounded, so nothing is ever flagged.
 		expect(audit.unaccounted).toEqual(["clients/safe-spawn.ts:2 spawnSync"]);
 	});
 });
