@@ -100,6 +100,90 @@ export class BoundedFifoMap<K, V> {
 }
 
 /**
+ * Small insertion-ordered FIFO SET used for process-lifetime membership-only
+ * caps — "is this key known", with no associated value. `BoundedFifoMap`
+ * covers the K,V shape; forcing a membership-only site to store a dummy value
+ * just to reuse it is a worse shape than the eviction block it would save
+ * (#2460's review of `clients/observed-mutation.ts`'s `handled` set). Not
+ * built ON `BoundedFifoMap` for the same reason — a `Map<T, true>` wrapper
+ * would carry the same dummy-value cost one layer down.
+ *
+ * Same eviction contract as {@link BoundedFifoMap}: `add` never reorders an
+ * already-present member (matches native `Set#add`), and both `add` and
+ * {@link setMaxEntries} return the evicted values, oldest first, so a call
+ * site with an eviction side effect (naming the dropped identity in a bounded
+ * telemetry record) consumes the return value instead of hand-rolling
+ * `values().next().value` or a `for (... of set) { …; break }` walk (#2442).
+ */
+export class BoundedSet<T> {
+	private readonly entries = new Set<T>();
+	private maxEntries: number;
+
+	constructor(maxEntries: number) {
+		this.maxEntries = maxEntries;
+	}
+
+	has(value: T): boolean {
+		return this.entries.has(value);
+	}
+
+	/**
+	 * Insert `value` without reordering an already-present member. Evicts the
+	 * oldest (insertion-order) members once the set exceeds capacity.
+	 *
+	 * Returns the evicted values, oldest first — see the class doc for why a
+	 * call site consumes this instead of hand-rolling the drop.
+	 */
+	add(value: T): T[] {
+		this.entries.add(value);
+		return this.evictOverflow();
+	}
+
+	/**
+	 * Change the capacity ceiling, evicting down to it immediately when it
+	 * shrinks. Returns the evicted values, oldest first, on the same contract
+	 * as {@link add}.
+	 */
+	setMaxEntries(maxEntries: number): T[] {
+		this.maxEntries = maxEntries;
+		return this.evictOverflow();
+	}
+
+	/** Current capacity ceiling. */
+	getMaxEntries(): number {
+		return this.maxEntries;
+	}
+
+	/** Drop oldest-first until within capacity. The one eviction block. */
+	private evictOverflow(): T[] {
+		const evicted: T[] = [];
+		while (this.entries.size > this.maxEntries) {
+			const oldest = this.entries.values().next().value as T | undefined;
+			if (oldest === undefined) break;
+			this.entries.delete(oldest);
+			evicted.push(oldest);
+		}
+		return evicted;
+	}
+
+	delete(value: T): boolean {
+		return this.entries.delete(value);
+	}
+	clear(): void {
+		this.entries.clear();
+	}
+	get size(): number {
+		return this.entries.size;
+	}
+	values(): IterableIterator<T> {
+		return this.entries.values();
+	}
+	[Symbol.iterator](): IterableIterator<T> {
+		return this.entries[Symbol.iterator]();
+	}
+}
+
+/**
  * Small insertion-ordered LRU used for process-lifetime memo tables. Same
  * bounded-`Map` surface as {@link BoundedFifoMap}; the only two differences
  * are overridden below.

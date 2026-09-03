@@ -110,34 +110,6 @@ const DEFINITION_FILE = "clients/bounded-cache.ts";
  * paste it in.
  */
 const EXEMPT_SITES: Readonly<Record<string, string>> = {
-	"clients/lsp/session-roots.ts#registerSessionRoot:0a69a3da":
-		"Set, not Map: `sessionRoots` stores membership only, and there is no " +
-		"BoundedSet in clients/bounded-cache.ts. Building one is a second " +
-		"primitive with its own tests, deliberately out of #2442's scope " +
-		"(the issue asks for a FIFO sibling of BoundedLruCache, a K,V map). " +
-		"Named here rather than left invisible; a BoundedSet is the natural " +
-		"follow-up that would clear all four Set-shaped entries at once.",
-	"index.ts#ensureLSPConfigInitialized:4115f214":
-		"Set, not Map: `_lspConfigInitializedCwds` is membership-only — same " +
-		"reason as clients/lsp/session-roots.ts, whose SESSION_ROOT_CAP this " +
-		"cap is deliberately paired with. No BoundedSet exists; see that " +
-		"entry for why building one is out of #2442's scope.",
-	"clients/observed-mutation.ts#noteMutationHandled:8c9e32ed":
-		"Set, not Map: `handled` records only THAT a path was already recorded " +
-		"through the pipeline this run — membership, no value. Migrating it to " +
-		"BoundedFifoMap purely to reuse the eviction block would mean storing a " +
-		"dummy value in every entry, which is a worse shape than the one line " +
-		"it deletes. Same reason as the three siblings above; #2460's BoundedSet " +
-		"is the follow-up that clears all four at once. The eviction is NOT " +
-		"silent: it emits `observed_handled_evicted` naming the dropped path " +
-		"(#2449 review round 4, S2), because dropping a mark makes pi-lens read " +
-		"its own formatter output as third-party drift.",
-	"clients/lsp-mutation.ts#bookkeepLspMutation:a1744d34":
-		"Set, not Map: `autofixRecordedPaths` is membership-only, and it is " +
-		"per-CONTEXT state (created on the mutation context, not module " +
-		"scope), so it is not even process-lifetime. No BoundedSet exists; " +
-		"see clients/lsp/session-roots.ts for why building one is out of " +
-		"#2442's scope.",
 	"clients/debug-handles.ts#recordTrackedInit:3737b5dc":
 		"Not evict-OLDEST: this walk deliberately SKIPS the first " +
 		"TRACKER_PROTECTED_COUNT insertion-order entries and evicts the " +
