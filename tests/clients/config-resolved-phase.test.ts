@@ -49,6 +49,7 @@ import {
 	flushSessionStartLog,
 	SESSIONSTART_LOG_FILE,
 } from "../../clients/sessionstart-logger.js";
+import { normalizeFilePath } from "../../clients/path-utils.js";
 import { removeTempDirSync } from "./test-utils.js";
 
 interface ConfigResolvedMetadata {
@@ -256,8 +257,16 @@ describe("config_resolved: the session's one positive config record (#2526)", ()
 	 * #2526 review round 3, S1. The pending mark is what lets the analyzer tell
 	 * "never expected" apart from "expected and never happened" — see
 	 * `publishConfigResolutionPending`'s doc comment (`clients/lsp/config.ts`).
+	 *
+	 * #2552 review round 4, MEDIUM: the mark ALSO carries `root=`, the same
+	 * `normalizeFilePath(cwd)` value the row's claim scope and `filePath` use.
+	 * A warm MCP process keeps one session id for its whole life but marks once
+	 * per served root — a session-id-only mark let one root's row silently
+	 * clear another root's deficit under the same id at the analyzer's join
+	 * (review round 2 F3's defect, reintroduced one layer up). Pinned here at
+	 * the seam directly, not only through the analyzer's fixtures.
 	 */
-	it("publishes a pending mark before the row, both carrying this session's id", async () => {
+	it("publishes a pending mark before the row, both carrying this session's id and root", async () => {
 		const { home, projectDir } = canonicalOnlyLayout();
 		const offset = sessionStartOffset();
 
@@ -268,6 +277,8 @@ describe("config_resolved: the session's one positive config record (#2526)", ()
 		resetLSPConfigStateForTests();
 		await loadLSPConfig(projectDir, home);
 
+		const expectedRoot = normalizeFilePath(projectDir);
+
 		const pendingLines = await sessionStartLinesSince(
 			offset,
 			"config_resolution_pending",
@@ -277,10 +288,24 @@ describe("config_resolved: the session's one positive config record (#2526)", ()
 		expect(pendingLines[0]).toContain(
 			`config_resolution_pending session=${sessionId}`,
 		);
+		expect(
+			pendingLines[0],
+			"the pending mark must carry the same root the row's claim scope uses",
+		).toContain(`root=${expectedRoot}`);
 
 		const resolvedLines = await sessionStartLinesSince(offset);
 		expect(resolvedLines).toHaveLength(1);
 		expect(resolvedLines[0]).toContain(`session=${sessionId}`);
+		expect(
+			resolvedLines[0],
+			"the row's sessionstart line must carry the SAME root as the pending mark",
+		).toContain(`root=${expectedRoot}`);
+
+		const rows = await configResolvedRows();
+		expect(
+			rows[0]?.filePath,
+			"the latency row's filePath must be the same normalized root",
+		).toBe(expectedRoot);
 
 		// Ordering: the pending mark is written BEFORE resolution starts, so it
 		// precedes the resolved line in the log.

@@ -386,10 +386,20 @@ async function analyzeLatency(files, state) {
 					// legacy/record cross-check reads the same row it counts.
 					state.config.resolved += 1;
 					const md = entry.metadata ?? {};
-					// #2526 R2 F2: the join key. A row from a build that predates the
-					// id carries none, and simply joins to no session.
-					if (typeof md.sessionId === "string" && md.sessionId.length > 0) {
-						state.config.resolvedSessions.add(md.sessionId);
+					// #2526 R2 F2 / #2552 R4: the join key is (session, root), not
+					// session alone — see `configJoinKey`'s doc comment. `entry.filePath`
+					// is this row's root (the same `normalizeFilePath(cwd)` value the
+					// pending mark's `root=` carries); a row from a build that predates
+					// the session id carries none, and simply joins to nothing.
+					if (
+						typeof md.sessionId === "string" &&
+						md.sessionId.length > 0 &&
+						typeof entry.filePath === "string" &&
+						entry.filePath.length > 0
+					) {
+						state.config.resolvedSessions.add(
+							configJoinKey(md.sessionId, entry.filePath),
+						);
 					}
 					const documents = Array.isArray(md.documents) ? md.documents : [];
 					const legacy = documents.filter((doc) => doc?.legacy === true);
@@ -699,16 +709,31 @@ async function analyzeSessionStart(files, state) {
 			// or minimal mode's second-and-later session in a process, for the
 			// same root) never writes this line, and is correctly absent from the
 			// join rather than counted against.
+			//
+			// #2552 R4: `root=` is REQUIRED in the match — a warm MCP process keeps
+			// one session id for its whole life but marks once per served root
+			// (`configJoinKey`'s doc comment), so a line missing it cannot be
+			// attributed to a specific root and is left out of the join rather than
+			// guessed into a wrong one.
 			const pending =
-				/session_start config_resolution_pending session=(\S+)/.exec(message);
+				/session_start config_resolution_pending session=(\S+) root=(.*)$/.exec(
+					message,
+				);
 			if (pending) {
-				state.config.pendingSessions.set(pending[1], { ts: iso(ts) });
+				const [, sessionId, root] = pending;
+				state.config.pendingSessions.set(configJoinKey(sessionId, root), {
+					ts: iso(ts),
+					sessionId,
+					root,
+				});
 			}
 			// The loader's own line is the second half of the join, so a rotated
 			// latency.log cannot manufacture a deficit on its own.
-			const resolvedSession = /config resolved .*\bsession=(\S+)/.exec(message);
+			const resolvedSession =
+				/config resolved .*\bsession=(\S+) root=(.*)$/.exec(message);
 			if (resolvedSession) {
-				state.config.resolvedSessions.add(resolvedSession[1]);
+				const [, sessionId, root] = resolvedSession;
+				state.config.resolvedSessions.add(configJoinKey(sessionId, root));
 			}
 
 			const total = /session_start total:\s*(\d+)ms/.exec(message);
@@ -972,6 +997,21 @@ function inWindow(date) {
 
 function iso(date) {
 	return date?.toISOString?.() ?? "unknown";
+}
+
+/**
+ * The config-resolution join key (#2552 review round 4). A warm MCP process
+ * keeps ONE session id for its entire life but calls `loadLSPConfig` once per
+ * SERVED ROOT (#2526 review round 2, F3's premise, reintroduced one layer up
+ * here) — joining on session id alone let one root's row silently clear every
+ * OTHER root's deficit under the same session id. `root` is whatever string
+ * the producer already wrote (the pending mark's `root=`, or the row's own
+ * `filePath` — both come from the SAME `normalizeFilePath(cwd)` call in
+ * `clients/lsp/config.ts`, so they compare equal without this script
+ * re-deriving any path normalization of its own).
+ */
+function configJoinKey(sessionId, root) {
+	return `${sessionId} ${root}`;
 }
 
 function counter() {
@@ -1307,16 +1347,21 @@ function buildReport(state) {
 	//     populations — which both masked total silence and charged
 	//     `--no-lsp`/subagent sessions with a permanent deficit they could never
 	//     clear).
+	//     Round 4, #2552 review: the join is on (session, root), not session
+	//     alone — a warm MCP process keeps one session id for its whole life but
+	//     marks once per SERVED ROOT (`configJoinKey`'s doc comment), so one
+	//     root's row must not clear another root's deficit under the same id.
 	// (b) a legacy document present with zero records — the deprecation
 	//     machinery went silent while the user is on a removal schedule.
 	const pendingConfigResolution = [...state.config.pendingSessions.entries()];
 	const unresolvedSessions = pendingConfigResolution.filter(
-		([id]) => !state.config.resolvedSessions.has(id),
+		([key]) => !state.config.resolvedSessions.has(key),
 	);
-	for (const [id, value] of unresolvedSessions.slice(0, limit * 3)) {
+	for (const [, value] of unresolvedSessions.slice(0, limit * 3)) {
 		state.config.examples.push({
 			ts: value.ts,
-			session: id,
+			session: value.sessionId,
+			root: value.root,
 			note: "session had a config_resolution_pending mark and produced no config_resolved row",
 		});
 	}

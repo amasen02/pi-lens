@@ -293,4 +293,39 @@ describe("index.ts session_start: ONE config_resolved row per session (#2526 R2 
 		).toHaveLength(1);
 		expect(lines[0]).toContain(`session=${rowSessionId}`);
 	}, 30000);
+
+	/**
+	 * #2552 review round 4, MEDIUM. The pending mark's `root=` must match the
+	 * row's own `filePath` — the value the analyzer's (session, root) join
+	 * compares. `freshRoot()` is already `realpathSync`-canonicalized, so it
+	 * equals `normalizeFilePath`'s output on both hosts without this test
+	 * re-deriving the normalization itself.
+	 */
+	it("the row's filePath matches the pending mark's root", async () => {
+		const root = freshRoot();
+		const pi = createPiMock();
+		extension(pi.asExtensionAPI());
+		clearLatencyLog();
+		await flushLatencyLog();
+		const offset = sessionStartOffset();
+
+		await pi.emit(
+			"session_start",
+			makeSessionStartEvent(),
+			makeCtx({ cwd: root, sessionId: "host-session-2" }),
+		);
+
+		const rows = await configResolvedRows();
+		expect(rows).toHaveLength(1);
+
+		const lines = await sessionStartLinesSince(
+			offset,
+			"config_resolution_pending",
+		);
+		expect(lines).toHaveLength(1);
+		expect(
+			lines[0],
+			"the pending mark's root must be the row's own filePath",
+		).toContain(`root=${rows[0].filePath}`);
+	}, 30000);
 });

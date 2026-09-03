@@ -280,10 +280,22 @@ const CONFIG_RESOLVED_PHASE = "config_resolved";
  * so a resolution that is entered but fails mid-flight leaves a mark with no
  * row, which the analyzer's join reads as "expected and never happened"
  * rather than silently matching "never expected at all".
+ *
+ * Carries `root=<normalizeFilePath(cwd)>` (#2552 review round 4, MEDIUM): the
+ * warm MCP server keeps ONE session id for the life of the process but calls
+ * this once per SERVED ROOT (`ensureReady` per root, `mcp/server.ts`) — a
+ * session-id-only mark let one root's `config_resolved` row silently clear
+ * every OTHER root's deficit under the same id, reintroducing review round
+ * 2's F3 defect one layer up, at the analyzer's join instead of the claim.
+ * The value is the SAME `normalizeFilePath(cwd)` string
+ * {@link recordConfigResolved} uses for its claim scope and its row's
+ * `filePath`, so the mark and the row compare equal without the analyzer
+ * re-deriving any path normalization of its own.
  */
-function publishConfigResolutionPending(): void {
+function publishConfigResolutionPending(cwd: string): void {
 	logSessionStart(
-		`session_start config_resolution_pending session=${currentSessionRecordId()}`,
+		`session_start config_resolution_pending session=${currentSessionRecordId()} ` +
+			`root=${normalizeFilePath(cwd)}`,
 	);
 }
 
@@ -294,9 +306,12 @@ function recordConfigResolved(
 	homeDir: string,
 	resolveMs: number,
 ): void {
-	if (
-		!claimPhaseOncePerSession(CONFIG_RESOLVED_PHASE, normalizeFilePath(cwd))
-	) {
+	// #2552 review round 4: computed ONCE and reused for the claim scope, the
+	// row's `filePath`, and the sessionstart line's `root=` — one normalization
+	// of `cwd`, so the pending mark, the row, and the claim can never disagree
+	// about which root they name.
+	const root = normalizeFilePath(cwd);
+	if (!claimPhaseOncePerSession(CONFIG_RESOLVED_PHASE, root)) {
 		return;
 	}
 	const summary = summarizeConfigResolution(resolution, homeDir);
@@ -315,7 +330,7 @@ function recordConfigResolved(
 	logLatency({
 		type: "phase",
 		phase: CONFIG_RESOLVED_PHASE,
-		filePath: cwd,
+		filePath: root,
 		durationMs: resolveMs,
 		metadata: {
 			sessionId,
@@ -329,7 +344,7 @@ function recordConfigResolved(
 	logSessionStart(
 		`config resolved documents=${summary.documents.length} legacy=${legacyDocuments} ` +
 			`records=${summary.recordCount} deniedServers=${deniedServers} resolveMs=${resolveMs} ` +
-			`session=${sessionId}`,
+			`session=${sessionId} root=${root}`,
 	);
 }
 
@@ -342,7 +357,7 @@ export async function loadLSPConfig(
 	// #2526 review round 3, S1: announce the attempt before anything that
 	// resolves it can throw — see `publishConfigResolutionPending`'s doc
 	// comment for why this lives here rather than at each caller.
-	publishConfigResolutionPending();
+	publishConfigResolutionPending(cwd);
 	const resolveStartedAt = Date.now();
 	const resolution = resolvePiLensConfig({
 		cwd,

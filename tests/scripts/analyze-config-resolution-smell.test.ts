@@ -86,16 +86,20 @@ interface Report {
 	};
 }
 
+/** The root every single-root fixture below implicitly shares. */
+const DEFAULT_ROOT = "/home/u/Desktop/proj";
+
 function configResolvedRow(options: {
 	sessionId: string;
 	documents: Array<{ tier: string; file: string; legacy: boolean }>;
 	recordCount: number;
+	root?: string;
 }): Record<string, unknown> {
 	return {
 		type: "phase",
 		ts: NOW,
 		phase: "config_resolved",
-		filePath: "/home/u/Desktop/proj",
+		filePath: options.root ?? DEFAULT_ROOT,
 		durationMs: 3,
 		metadata: {
 			sessionId: options.sessionId,
@@ -118,11 +122,20 @@ interface SessionFixture {
 	id: string;
 	/** Whether this session's `loadLSPConfig` call ever happened at all. */
 	pending: boolean;
+	/**
+	 * Round 4 (#2552 review): the served root the mark was published for. A
+	 * warm MCP process keeps ONE session id for its life but serves many
+	 * roots — defaults to `DEFAULT_ROOT` so every pre-existing single-root
+	 * fixture keeps matching on both sides without naming a root explicitly.
+	 */
+	root?: string;
 }
 
 function sessionLines(session: SessionFixture): string[] {
 	return session.pending
-		? [`[${NOW}] session_start config_resolution_pending session=${session.id}`]
+		? [
+				`[${NOW}] session_start config_resolution_pending session=${session.id} root=${session.root ?? DEFAULT_ROOT}`,
+			]
 		: [];
 }
 
@@ -345,11 +358,92 @@ describe("config-resolution smell (#2526)", () => {
 		fs.writeFileSync(path.join(dir, "latency.log"), "");
 		fs.writeFileSync(
 			path.join(dir, "sessionstart.log"),
-			`[${NOW}] session_start config_resolution_pending session=s1\n` +
-				`[${NOW}] config resolved documents=1 legacy=0 records=0 deniedServers=0 resolveMs=2 session=s1\n`,
+			`[${NOW}] session_start config_resolution_pending session=s1 root=${DEFAULT_ROOT}\n` +
+				`[${NOW}] config resolved documents=1 legacy=0 records=0 deniedServers=0 resolveMs=2 session=s1 root=${DEFAULT_ROOT}\n`,
 		);
 		const report = runReport(dir);
 		expect(smell(report)).toBeUndefined();
 		expect(report.config.sessionsWithoutResolution).toBe(0);
+	});
+
+	/**
+	 * #2552 review round 4 (reviewer's exact fixture). The warm MCP server
+	 * keeps ONE session id for the life of the process but calls `ensureReady`
+	 * — and therefore `loadLSPConfig` — once per SERVED ROOT (#2526 review
+	 * round 2, F3's premise). Two roots under one session id must not collapse
+	 * into one join entry: root A resolves, root B's resolution fails
+	 * mid-flight (a pending mark with no row), and the smell must still catch
+	 * root B even though the session id alone already has a row.
+	 *
+	 * Before this round, `pendingSessions` was `Map<sessionId, …>` and
+	 * `resolvedSessions` was a flat `Set<sessionId>` — the second `.set()` for
+	 * the same session id silently overwrote the first, and `resolvedSessions.
+	 * has(id)` matched on session id alone, so root A's row falsely cleared
+	 * root B's deficit. This is round 2 F3's defect reintroduced one layer up,
+	 * at the analyzer join instead of the claim.
+	 */
+	it("two roots under one session id (warm MCP): root B's failed resolution is not hidden by root A's row", () => {
+		const rootA = "/home/u/projA";
+		const rootB = "/home/u/projB";
+		const report = runReport(
+			buildRoot({
+				sessions: [
+					{ id: "mcpproc1", pending: true, root: rootA },
+					{ id: "mcpproc1", pending: true, root: rootB },
+				],
+				latency: [
+					configResolvedRow({
+						sessionId: "mcpproc1",
+						documents: [CANONICAL_DOCUMENT],
+						recordCount: 0,
+						root: rootA,
+					}),
+				],
+			}),
+		);
+		const found = smell(report);
+		expect(
+			found,
+			"root B's pending mark has no matching row and must flag, even though root A (same session id) resolved",
+		).toBeDefined();
+		expect(found?.count).toBe(1);
+		expect(report.config).toMatchObject({
+			resolved: 1,
+			sessionsPendingResolution: 2,
+			sessionsWithoutResolution: 1,
+		});
+	});
+
+	it("two roots under one session id, both resolved: stays silent", () => {
+		const rootA = "/home/u/projA";
+		const rootB = "/home/u/projB";
+		const report = runReport(
+			buildRoot({
+				sessions: [
+					{ id: "mcpproc1", pending: true, root: rootA },
+					{ id: "mcpproc1", pending: true, root: rootB },
+				],
+				latency: [
+					configResolvedRow({
+						sessionId: "mcpproc1",
+						documents: [CANONICAL_DOCUMENT],
+						recordCount: 0,
+						root: rootA,
+					}),
+					configResolvedRow({
+						sessionId: "mcpproc1",
+						documents: [CANONICAL_DOCUMENT],
+						recordCount: 0,
+						root: rootB,
+					}),
+				],
+			}),
+		);
+		expect(smell(report)).toBeUndefined();
+		expect(report.config).toMatchObject({
+			resolved: 2,
+			sessionsPendingResolution: 2,
+			sessionsWithoutResolution: 0,
+		});
 	});
 });
