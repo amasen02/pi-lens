@@ -92,6 +92,7 @@ describe("#2523 slice 2 — clients/bootstrap.ts#awaitWithinBounds folded onto b
 			await expect(
 				bootstrap.requestBootstrapClients({
 					reason: "fold-probe",
+					hook: "session_start",
 					timeoutMs: 40,
 				}),
 			).resolves.toBeNull();
@@ -99,8 +100,13 @@ describe("#2523 slice 2 — clients/bootstrap.ts#awaitWithinBounds folded onto b
 			// BootstrapUnavailableError and wrote nothing under this kind; the
 			// seam's own `analyzer-bootstrap-unavailable` row (asserted below)
 			// is a different fact and survived the fold unchanged.
+			// #2557 review F7: the HOOK on the hook axis, the demand on the label.
+			// This used to read `fold-probe:loadBootstrapClients` — the caller's
+			// own reason where a hook family belongs, which made the row
+			// unjoinable with every other hook-keyed record and with
+			// HOOK_WALL_BUDGET_MS.
 			expect(lastExceededSubject(ledger)).toBe(
-				"fold-probe:loadBootstrapClients",
+				"session_start:loadBootstrapClients:fold-probe",
 			);
 			// The pre-existing seam record is NOT replaced by the new one.
 			expect(
@@ -122,6 +128,7 @@ describe("#2523 slice 2 — clients/bootstrap.ts#awaitWithinBounds folded onto b
 			const startedAt = Date.now();
 			const pending = bootstrap.requestBootstrapClients({
 				reason: "fold-probe-abort",
+				hook: "session_start",
 				// Long enough that settling on the DEADLINE instead of the signal
 				// is unmistakable in the elapsed assertion below.
 				timeoutMs: 30_000,

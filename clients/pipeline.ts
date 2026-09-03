@@ -72,7 +72,7 @@ import type { RuffClient } from "./ruff-client.js";
 import { RUNTIME_CONFIG } from "./runtime-config.js";
 import type { WordIndex } from "./word-index.js";
 import { getAmbientAbortSignal, safeSpawnAsync } from "./safe-spawn.js";
-import { bounded, NEVER_ABORTED } from "./deadline-utils.js";
+import { bounded } from "./deadline-utils.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
 import { dropFindingsForMissingPaths } from "./advisory-provenance.js";
 import {
@@ -1101,7 +1101,11 @@ export async function resyncLspFile(
 			// `undefined`, so `undefined` here means exactly "a bound fired".
 			const outcome = await bounded(touch, {
 				ms: budgetMs,
-				signal: abort ?? NEVER_ABORTED,
+				// The ambient turn signal: set for the whole tool_result path and
+				// absent only in a bare unit harness, where the wall budget is
+				// still live (`bounded()` reads a missing signal as one that
+				// never aborts).
+				signal: abort,
 				hook: "tool_result_edit",
 				label: "resyncLspFile",
 			});

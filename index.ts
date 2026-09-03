@@ -1,4 +1,5 @@
 import "./clients/console-guard-install.js";
+import { BoundedSet } from "./clients/bounded-cache.js";
 import {
 	closeModuleLoadConsoleWindow,
 	installConsoleGuard,
@@ -11,6 +12,7 @@ import {
 	getDegradationSummary,
 	incrementDegradationCount,
 	recordDegradation,
+	renderDegradationLines,
 } from "./clients/degradation-ledger.js";
 import {
 	adoptProjectTrustFromPorts,
@@ -309,7 +311,11 @@ let loadedDispatchIntegration: DispatchIntegration | undefined;
  */
 const sessionBootstrapAccess: SessionBootstrapAccess = {
 	peek: () => peekBootstrapClients(),
-	request: (reason) => requestBootstrapClients({ reason }),
+	// `session_start` is not a guess: this adapter IS the session-start seam —
+	// `SessionBootstrapAccess` is constructed here and reached only from
+	// `handleSessionStart`'s three demands (#2557 review F7).
+	request: (reason) =>
+		requestBootstrapClients({ reason, hook: "session_start" }),
 };
 
 function warmDispatchAtSessionStart(): void {
@@ -562,19 +568,14 @@ let _turnSummaryEmitCtx:
 	| undefined;
 let _testRunnerDeliveryRegistered = false;
 let _nextTestRunnerDeliveryOwnerId = 0;
-const _lspConfigInitializedCwds = new Set<string>();
 const LSP_CONFIG_CWD_CAP = 128;
+const _lspConfigInitializedCwds = new BoundedSet<string>(LSP_CONFIG_CWD_CAP);
 
 async function ensureLSPConfigInitialized(cwd: string): Promise<void> {
 	const normalizedCwd = path.resolve(cwd);
 	if (_lspConfigInitializedCwds.has(normalizedCwd)) return;
 	await initLSPConfig(normalizedCwd);
 	_lspConfigInitializedCwds.add(normalizedCwd);
-	while (_lspConfigInitializedCwds.size > LSP_CONFIG_CWD_CAP) {
-		const oldest = _lspConfigInitializedCwds.values().next().value;
-		if (oldest === undefined) break;
-		_lspConfigInitializedCwds.delete(oldest);
-	}
 }
 
 /**
@@ -1421,9 +1422,17 @@ function activateExtension(hostPi: ExtensionAPI) {
 				const report = await collectLatencyPerformance({
 					sessionStartedAt: runtime.sessionStartedAt,
 				});
-				const degradations = getDegradationSummary();
-				const degradationText = degradations.length
-					? `\n\nDegradations:\n${degradations.map((group) => `  ${group.kind}: ${group.count} (${group.latestReasons.at(-1)?.subject}: ${group.latestReasons.at(-1)?.reason})`).join("\n")}`
+				// Shared with the MCP `pilens_health` path (#2515 review, S3): a
+				// hand-rolled renderer here used to diverge from
+				// `renderDegradationLines()` (e.g. printing `log-sink-rotated` with
+				// a fabricated subject/reason instead of the bare informational
+				// count the shared renderer gives it), so the two surfaces
+				// disagreed about the exact same ledger.
+				const degradationLines = renderDegradationLines(
+					getDegradationSummary(),
+				);
+				const degradationText = degradationLines.length
+					? `\n\n${degradationLines.join("\n")}`
 					: "";
 				notifyUi(
 					ctx,

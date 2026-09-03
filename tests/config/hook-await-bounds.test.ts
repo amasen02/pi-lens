@@ -48,23 +48,49 @@
  * says that none applies and why. That is a fact a reviewer can check against
  * the source; a reachability heuristic's silence is not.
  *
- * ## The walked file set — and the widening slice 2 added
+ * ## The walked file set, and the widening slice 2 added
  *
  * Round 1's header claimed "over-inclusion is the safe direction for a guard"
  * without saying that the FILE SET was a partial walk of its own (#2530 review
  * F6): hook work reached through a helper MODULE left the scan's view
- * entirely, and those modules carried 100 unbounded awaits the sweep neither
- * flagged nor recorded. The counts were prose in this header — a measurement,
- * not a ratchet, so a 47th could be added with the guard green.
+ * entirely. Slice 2's first attempt at closing that listed SIX module names by
+ * hand — which is defect shape 34, a guard that enumerates spellings. The
+ * reviewer planted 18 unbounded awaits in `clients/observed-mutation.ts` and
+ * 148 in `clients/lsp/index.ts` — modules that same PR labelled hook-reached —
+ * and the sweep stayed green (#2557 review F4).
  *
- * Slice 2 walks them. {@link HOOK_HELPER_MODULES} pins each module's count
- * exactly, so an added unbounded await fails this file and a bounded one
- * forces the number down. The granularity is per-MODULE rather than
- * per-occurrence on purpose, and its own doc comment states the trade: ~100
- * `EXEMPT_SITES` entries all reading "a later slice owns bounding this" would
- * be 500 lines carrying one fact. The counts go to zero as #2523 threads the
- * hook signal into the deps types, which is the structural answer a file list
- * only approximates.
+ * The set is now DERIVED from the import graph: {@link hookHelperModules}
+ * resolves every relative specifier in the four hook-handler groups and
+ * returns what they reach in ONE hop. That is **202** modules today, holding
+ * **1255** unbounded awaits, against the six hand-picked modules' 100 — and
+ * the hand-picked list included `clients/dispatch/dispatcher.ts`, which is not
+ * even a one-hop import (it is reached through `clients/dispatch/
+ * integration.ts`), so it was both under- and mis-inclusive.
+ *
+ * {@link HELPER_UNBOUNDED} pins every one of those modules that holds at least
+ * one, exactly, through the kit's own `auditSymbolCounts`. Zero-count modules
+ * are not listed and do not need to be: one gaining an await appears in the
+ * measured map and fails as an unaccounted entry. The granularity is
+ * per-MODULE rather than per-occurrence deliberately — 1255 `EXEMPT_SITES`
+ * entries whose `reason` would all read "slice 3 owns bounding this" is the
+ * hand-maintained mirror AGENTS.md's single-source rule exists to prevent —
+ * and the trade is stated in {@link SWEEP_HEURISTIC_LIMITS}: a count cannot
+ * tell "bounded one, added one" from "changed nothing". The table shrinks to
+ * nothing as #2523 threads the hook signal into the deps types, which is the
+ * structural answer a file list only approximates.
+ *
+ * ## A third family: every `bounded()` call, and where its signal comes from
+ *
+ * `bounded()`'s `signal` is a REQUIRED property typed `AbortSignal |
+ * undefined` — the key must be written, so a deadline-only call cannot
+ * compile, but a seam holding an optional signal may pass it straight through
+ * and then run on ONE live bound whenever the caller genuinely had none.
+ * {@link BOUNDED_CALL_SITES} registers every shipped call with the provenance
+ * of its signal, so that set cannot grow without someone writing down why. It
+ * replaces round 1's `NEVER_ABORTED` sentinel, which enumerated the same fact
+ * by making callers name a constant — a SECOND concept for behaviour
+ * `bounded()` already had, on an issue whose premise is that one primitive
+ * replaces the private copies (#2557 review F2).
  *
  * ## The table is a BASELINE, deliberately
  *
@@ -91,12 +117,22 @@ import {
 	HOOK_WALL_BUDGET_MS,
 	isHookBudgetKey,
 } from "../../clients/hook-budgets.js";
-import { lineContentHash } from "../../clients/read-guard.js";
+import {
+	awaitOccurrenceKey,
+	DEFINITION_FILE,
+	findBoundedCallLines,
+	findHandRolledRaceLines,
+	findUnboundedAwaitLines,
+	hookHelperModules,
+	hookPathFiles,
+	localImportTargets,
+	scanFiles,
+	shippedSourceFiles,
+} from "../support/hook-await-scan.js";
 import {
 	auditRegistry,
-	listSourceFiles,
+	auditSymbolCounts,
 	relativePosix,
-	stableOccurrenceKey,
 	stripSource,
 } from "../support/sweep-kit.js";
 
@@ -104,9 +140,6 @@ const REPO_ROOT = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
 	"../..",
 );
-
-/** The one module allowed to spell a timeout race: the canonical implementation. */
-const DEFINITION_FILE = "clients/deadline-utils.ts";
 
 /**
  * Whose budget an unbounded await spends.
@@ -154,32 +187,61 @@ export const SWEEP_HEURISTIC_LIMITS = [
 		"candidate; whether a site is actually on a hook path is recorded in the " +
 		"exemption table's `site` field, which a reviewer checks against the " +
 		"source. Over-inclusion WITHIN those files is the safe direction.",
-	"The file set covers the four HOOK-HANDLER groups per-occurrence and the " +
-		"six HELPER modules hook work reaches through per-MODULE COUNT " +
-		"(`HOOK_HELPER_MODULES`). Slice 1 walked only the first group and said " +
-		"so in prose, so a 47th unbounded await in clients/pipeline.ts left the " +
-		"guard green (#2530 review F6). Both are now ratchets; only the first " +
-		"names individual lines. A count cannot tell 'bounded one, added one' " +
-		"from 'changed nothing' — the deps-type threading #2523 still owes is " +
-		"what removes the need for the coarser half.",
+	"The helper walk is ONE import hop from the four hook-handler groups, not " +
+		"the transitive closure. index.ts alone reaches most of clients/ " +
+		"transitively, so the closure is 'the codebase' — a whole-repo " +
+		"unbounded-await ratchet, a much larger promise than #2523's and one " +
+		"whose numbers no reviewer could check. One hop is the set a hook " +
+		"handler calls DIRECTLY, which is where the work a hook awaits lives. A " +
+		"module reached only at two hops (clients/dispatch/dispatcher.ts, via " +
+		"clients/dispatch/integration.ts) is therefore NOT counted here.",
+	"The helper family is keyed per-MODULE COUNT, not per occurrence. A count " +
+		"cannot tell 'bounded one, added one' from 'changed nothing' — only the " +
+		"four hook-handler groups get per-line keys. The trade buys a table of " +
+		"~75 numbers instead of ~1255 exemption entries whose reason would all " +
+		"read 'slice 3 owns bounding this', which is the hand-maintained mirror " +
+		"the single-source rule exists to prevent. #2523's deps-type threading " +
+		"removes the need for the coarser half.",
+	"Type-only imports are NOT excluded from the helper walk: `stripSource` " +
+		"leaves `import type` lines intact, so a module reached only for its " +
+		"types still appears. That over-includes rather than under-includes, " +
+		"which for a guard is the direction that fails loudly — a spurious " +
+		"module is a table entry a reviewer reads, not a hole.",
+	"The `bounded()` call registry does NOT decide whether a call's `signal` " +
+		"argument can be `undefined`. That is a type question, and a regex for " +
+		"`??`/`||`/`undefined` would call `signal: options.signal` — the " +
+		"bootstrap seam, whose parameter is optional and which is the single " +
+		"most important site — clean, the false-negative direction a guard must " +
+		"never take. EVERY call is registered instead, and its entry states " +
+		"where its signal comes from.",
 	"`bounded()` is recognised SYNTACTICALLY, by call shape. A helper that " +
 		"wraps `bounded()` one level down reads as unbounded here and needs an " +
 		"exemption naming the wrapper — mechanically visible, unlike a walk that " +
 		"would silently call it clean.",
-	"Exactly TWO call shapes count as bounded: `bounded(...)`, and a " +
-		"`withDeadline`/`withTimeout`/`withBudget`/`withinRemaining` call with " +
-		"the word `signal` inside its own parentheses. Those helpers take no " +
-		"signal today, so the second is forward cover for a signal-aware " +
-		"caller, not a claim about the helpers. A bare `Promise.race` is NOT " +
-		"accepted even when `signal` appears in it: a signal-only race is the " +
-		"mirror image of the deadline-only defect this guard exists for, and a " +
-		"new race is forbidden by the hand-rolled-race family anyway.",
-	"A helper module NOT listed in `HOOK_HELPER_MODULES` is still outside both " +
-		"scans, so a hook whose work moves into a brand-new module leaves the " +
-		"guard's view until someone adds it. #2523's deps-type threading is the " +
-		"structural answer — it follows the work across module boundaries in a " +
-		"way a file list cannot — and until it lands the list is the screen.",
-	"The hand-rolled-race scan reads the race's own parentheses PLUS the 25 " +
+	"Exactly ONE call shape counts as bounded: `bounded(...)` (#2530 round 3 " +
+		"F1). Round 1 also accepted a `withDeadline`/`withTimeout`/`withBudget`/" +
+		"`withinRemaining` call whenever the word `signal` appeared anywhere in " +
+		"its own parentheses — but none of those helpers takes a `signal` " +
+		"parameter at all, so the match was pure text: `withBudget(sweep(cwd, " +
+		"{ signal }), 500)` read as bounded because `signal` named the WRAPPED " +
+		"work's argument, not anything reaching the race that decides how long " +
+		"this await waits. That is the exact deadline-only hole #2523 exists to " +
+		"close, reopened by substring. Zero sites in the scanned tree relied on " +
+		"it (measured: the flagged set is identical with or without the " +
+		"allowance). A bare `Promise.race`/`Promise.any` is NOT accepted even " +
+		"when `signal` appears in it: a signal-only race is the mirror image " +
+		"of the deadline-only defect this guard exists for, and a new race is " +
+		"forbidden by the hand-rolled-race family anyway.",
+	"A module reached only through ANOTHER helper is still outside both scans, " +
+		"so a hook whose work moves two hops out leaves the guard's view until " +
+		"someone widens the walk. #2523's deps-type threading is the structural " +
+		"answer — it follows the work across module boundaries in a way an " +
+		"import-graph radius cannot — and until it lands the one-hop set is the " +
+		"screen.",
+	"The hand-rolled-race scan matches `Promise.race(` AND `Promise.any(` " +
+		"(#2530 round 3 F3: `Promise.any([work, delay])` is the same " +
+		"first-settlement-wins shape as `race` with a timer arm, and round 1 " +
+		"matched only `race`) and reads the call's own parentheses PLUS the 25 " +
 		"lines above it, because the dominant spelling hoists the timer arm into " +
 		"a named local. A timer built further away, in a helper, or in another " +
 		"module is invisible to it; a `setTimeout` within 25 lines of an " +
@@ -198,6 +260,16 @@ export const SWEEP_HEURISTIC_LIMITS = [
  * inserted elsewhere — that churn is what content keying removes), the
  * failing test prints the key the scan now computes; paste it in with a
  * reason, or wrap the call in `bounded()` and delete the entry.
+ *
+ * A merge that shifts many keys at once (a line inserted near several
+ * flagged sites) does not have to be re-keyed by hand: run
+ * `node scripts/rekey-hook-await-exemptions.mjs` — it recomputes every
+ * entry's key from the live scan and rewrites only keys whose
+ * `rel[#symbol]:hash` head (everything before `~context`) still matches
+ * exactly one current occurrence; anything else — a genuinely changed line,
+ * a removed one, or an ambiguous duplicate — is refused and left for a
+ * human (#2530 round 3 F6, tightened round 4 F1: a head match, not a
+ * count-matched zip, is what makes a rewrite safe).
  */
 const EXEMPT_SITES: Readonly<Record<string, SweepExemption>> = {
 	"clients/mcp/session.ts#getMcpSessionContext:3ab92062~01e3e700": {
@@ -2023,350 +2095,156 @@ const EXEMPT_SITES: Readonly<Record<string, SweepExemption>> = {
 };
 
 /**
- * The HELPER modules hook work reaches through, and how many unbounded awaits
- * each still holds (#2523 slice 2).
+ * The one reason every {@link HELPER_UNBOUNDED} entry carries, written once.
  *
- * ## Why this exists, and why it is coarser than {@link EXEMPT_SITES}
- *
- * Slice 1's sweep walked four file groups and was SILENT outside them
- * (#2530 review F6): hook work that moves into a helper module left its view,
- * so `clients/pipeline.ts` could grow a 47th unbounded await with the guard
- * green. The counts were written into the header as prose, which is a
- * measurement, not a ratchet.
- *
- * These modules are now WALKED. What is not per-occurrence is the exemption:
- * the alternative was ~100 `EXEMPT_SITES` entries whose reason field would all
- * read "slice 3 owns bounding this", which is the hand-maintained mirror
- * AGENTS.md's single-source rule exists to prevent — 500 lines carrying one
- * fact. A per-MODULE count carries that same one fact, and carries it as a
- * ratchet: the number may only go DOWN, so a new unbounded await in any of
- * these modules fails this file even though no per-line key names it.
- *
- * The trade, stated plainly: a count cannot tell "bounded one, added one"
- * from "changed nothing". Per-occurrence keying (which `EXEMPT_SITES` still
- * has for the four hook-handler groups) can. The counts here shrink to zero as
- * #2523's remaining slices thread the hook signal into `TurnEndDeps` /
- * `AgentEndDeps` / `SessionStartDeps`, at which point this table goes away
- * rather than hardening into a permanent second dialect.
- *
- * `unbounded` is EXACT, not a ceiling: bounding one await here fails this test
- * with the new number, so the burn-down is recorded rather than absorbed.
+ * It is genuinely ONE fact for all 75 modules — none of them can be bounded
+ * from here, because bounding a helper's await needs the hook's signal to have
+ * been threaded into the deps type that reaches it, which is #2523 AC4 and has
+ * not landed. Repeating that sentence 75 times with a module name substituted
+ * in would be the hand-maintained mirror the single-source rule exists to
+ * prevent, not 75 reasons.
  */
-const HOOK_HELPER_MODULES: Readonly<
-	Record<string, { unbounded: number; reason: string }>
-> = {
-	"clients/actionable-warnings.ts": {
-		unbounded: 12,
-		reason:
-			"`buildActionableWarningsReport` is awaited ON turn_end. Its LSP " +
-			"round trips ARE bounded (`boundedLspCall`, folded onto bounded() " +
-			"in this PR); the remainder is cache and filesystem work.",
-	},
-	"clients/bootstrap.ts": {
-		unbounded: 23,
-		reason:
-			"The analyzer-bootstrap seam every hook reaches for clients " +
-			"through. The DEMAND is bounded (`requestBootstrapClients`, folded " +
-			"onto bounded() in this PR); the awaits below it are the load " +
-			"itself, which the demand's bound abandons rather than cancels.",
-	},
-	"clients/dispatch/dispatcher.ts": {
-		unbounded: 7,
-		reason:
-			"Reached from the edit tool_result path. `runRunner`'s own " +
-			"RUNNER_TIMEOUT_MS race is a leaf bound with no signal arm — " +
-			"#2523's fold worklist, and 10x turn_end's whole budget.",
-	},
-	"clients/format-service.ts": {
-		unbounded: 5,
-		reason:
-			"#2523 AC6's target: `runFormattersWithConcurrency` is a sequential " +
-			"loop with a per-item 30s timer, no aggregate cap and no signal in " +
-			"the race. The 3-wedged-formatter probe measured `still-blocked " +
-			"after 45011ms`.",
-	},
-	"clients/pipeline.ts": {
-		unbounded: 45,
-		reason:
-			"The edit tool_result pipeline. `resyncLspFile`'s bound is folded " +
-			"onto bounded() in this PR; `_pendingCascadeRuns` (AC6) and the " +
-			"rest of the pipeline's awaits are the remaining worklist.",
-	},
-	"clients/quiet-window.ts": {
-		unbounded: 6,
-		reason:
-			"Heartbeat resource sampling, reached from the turn boundary. " +
-			"`buildHeartbeatResourcePatchBounded` has a timer arm and no signal " +
-			"arm — the same half-bound shape, on a smaller budget.",
-	},
+const HELPER_EXEMPTION_REASON =
+	"Unbounded awaits in a module a registered hook handler imports directly. " +
+	"None can be bounded without the hook's own signal reaching them, which is " +
+	"#2523 AC4's deps-type threading (TurnEndDeps / AgentEndDeps / " +
+	"SessionStartDeps gain a required `signal`, both hosts pass ctx.signal) and " +
+	"is not in this PR. This pin is the measured slice-3 worklist: the number " +
+	"may only change with a stated reason, so an await added here fails loudly " +
+	"and one bounded here is recorded rather than absorbed.";
+
+/**
+ * Every one-hop helper module holding at least one unbounded await, and how
+ * many (#2557 review F4).
+ *
+ * The SET is derived by {@link hookHelperModules} from the import graph, never
+ * spelled — see this file's header for what the hand-written six-name list
+ * missed. Modules measuring ZERO are deliberately absent: one that gains an
+ * await appears in the measured map and fails as an unaccounted entry, so
+ * listing 127 zeroes would add churn without adding a guard.
+ *
+ * Pinned through `auditSymbolCounts`, the kit's own file-count mechanism
+ * (#1817), rather than a bespoke comparison — same machinery the session-state
+ * sweep pins ~72 files with.
+ */
+const HELPER_UNBOUNDED: Readonly<Record<string, number>> = {
+	"clients/actionable-warnings.ts": 12,
+	"clients/ast-grep-client.ts": 15,
+	"clients/biome-client.ts": 9,
+	"clients/blocker-freshness.ts": 13,
+	"clients/bootstrap.ts": 23,
+	"clients/complexity-client.ts": 1,
+	"clients/cooperative-budget.ts": 3,
+	"clients/dead-code-client.ts": 4,
+	"clients/dependency-checker.ts": 21,
+	"clients/dispatch/integration.ts": 20,
+	"clients/dispatch/pending-runner-findings.ts": 2,
+	"clients/dispatch/runners/psscriptanalyzer.ts": 7,
+	"clients/dispatch/runners/utils/lazy-installer.ts": 2,
+	"clients/dispatch/runners/utils/runner-helpers.ts": 32,
+	"clients/file-time.ts": 1,
+	"clients/file-utils.ts": 1,
+	"clients/format-service.ts": 5,
+	"clients/formatters.ts": 118,
+	"clients/gitleaks-client.ts": 4,
+	"clients/govulncheck-client.ts": 6,
+	"clients/installer/index.ts": 192,
+	"clients/installer/managed-tool-refresh.ts": 29,
+	"clients/instance-reaper.ts": 26,
+	"clients/instance-registry.ts": 23,
+	"clients/jscpd-client.ts": 4,
+	"clients/knip-client.ts": 6,
+	"clients/language-profile.ts": 3,
+	"clients/lens-engine.ts": 1,
+	"clients/lens-map.ts": 2,
+	"clients/lsp-budget.ts": 1,
+	"clients/lsp-document-symbols.ts": 2,
+	"clients/lsp/cascade-tier.ts": 2,
+	"clients/lsp/client.ts": 75,
+	"clients/lsp/config.ts": 3,
+	"clients/lsp/index.ts": 151,
+	"clients/lsp/server.ts": 111,
+	"clients/map-with-concurrency.ts": 2,
+	"clients/observed-mutation.ts": 18,
+	"clients/opaque-mutation-scan.ts": 10,
+	"clients/opengrep-client.ts": 2,
+	"clients/package-manager.ts": 8,
+	"clients/partial-edit-apply.ts": 2,
+	"clients/performance-report.ts": 8,
+	"clients/pipeline.ts": 45,
+	"clients/project-changes.ts": 2,
+	"clients/project-snapshot.ts": 2,
+	"clients/quiet-window.ts": 6,
+	"clients/read-expansion.ts": 2,
+	"clients/recent-touches.ts": 8,
+	"clients/review-graph/builder.ts": 41,
+	"clients/ruff-client.ts": 6,
+	"clients/safe-spawn.ts": 9,
+	"clients/session-state-store.ts": 4,
+	"clients/shared-checkout-guard.ts": 7,
+	"clients/source-filter.ts": 2,
+	"clients/startup-scan.ts": 3,
+	"clients/test-runner-client.ts": 4,
+	"clients/tree-sitter-shared.ts": 1,
+	"clients/trivy-client.ts": 2,
+	"clients/warm-attach.ts": 9,
+	"clients/widget-state.ts": 3,
+	"clients/word-index.ts": 24,
+	"clients/zizmor-config.ts": 2,
+	"tools/ast-dump.ts": 2,
+	"tools/ast-grep-outline.ts": 2,
+	"tools/ast-grep-replace.ts": 3,
+	"tools/ast-grep-search.ts": 5,
+	"tools/effective-config.ts": 1,
+	"tools/lens-diagnostic-mark.ts": 2,
+	"tools/lens-diagnostics.ts": 10,
+	"tools/lsp-diagnostics.ts": 30,
+	"tools/lsp-navigation.ts": 33,
+	"tools/module-report.ts": 3,
+	"tools/project-report.ts": 1,
+	"tools/symbol-search.ts": 1,
 };
 
-/** The four file groups a registered hook handler and its direct deps live in. */
-function hookPathFiles(): string[] {
-	const files: string[] = [];
-	// Mechanical, never a hand-kept list: a NEW clients/runtime-*.ts is in
-	// scope the moment it lands, which is the whole point of a governance
-	// registry (a hand-maintained mirror of a directory is the defect).
-	for (const absolute of listSourceFiles(path.join(REPO_ROOT, "clients"), {
-		skipTests: true,
-	})) {
-		const rel = relativePosix(REPO_ROOT, absolute);
-		if (/^clients\/runtime-[^/]+\.ts$/.test(rel)) files.push(absolute);
-	}
-	for (const rel of ["index.ts", "mcp/server.ts", "clients/mcp/session.ts"]) {
-		const absolute = path.join(REPO_ROOT, rel);
-		if (fs.existsSync(absolute)) files.push(absolute);
-	}
-	return files.sort();
-}
-
-/** Every shipped source file the hand-rolled-race scan covers. */
-function shippedSourceFiles(): string[] {
-	const files = ["clients", "mcp", "tools"].flatMap((dir) => {
-		const absolute = path.join(REPO_ROOT, dir);
-		return fs.existsSync(absolute)
-			? listSourceFiles(absolute, { skipTests: true })
-			: [];
-	});
-	const indexTs = path.join(REPO_ROOT, "index.ts");
-	if (fs.existsSync(indexTs)) files.push(indexTs);
-	return files.sort();
-}
-
-/** An `await` token that is a KEYWORD, not a property name or an identifier tail. */
-const AWAIT_TOKEN = /(?<![.\w$])await(?![\w$])/g;
-
-/** A `Promise.race(` call head. */
-const RACE_TOKEN = /\bPromise\s*\.\s*race\s*\(/g;
-
-/** A timer arm: the shape that makes a race a hand-rolled bound. */
-const TIMER_ARM = /\bsetTimeout\s*\(|\bAbortSignal\s*\.\s*timeout\s*\(/;
-
 /**
- * How far ABOVE a `Promise.race(` to look for the timer that feeds it.
+ * Every shipped `bounded()` CALL, and where its `signal` comes from (#2557
+ * review F2).
  *
- * The inline arm (`new Promise((r) => setTimeout(r, ms))` written straight
- * into the race) is the minority spelling. The dominant one hoists the arm
- * into a named local a few lines up — `clients/format-service.ts`'s
- * `timeoutPromise`, `clients/runtime-session.ts`'s
- * `readSequenceWithBudget` — and an inline-only detector called both of them
- * clean, which for a guard is the failure direction that hides. The window is
- * a line count rather than a scope walk for the same reason the rest of this
- * file is: a partial scope walk produces false negatives, a window produces
- * false positives, and a false positive is a table entry a reviewer reads.
+ * `bounded()` takes a REQUIRED `signal` whose type admits `undefined`: the key
+ * must be written, so a deadline-only call cannot compile, but a seam holding
+ * an optional signal passes it straight through and then runs on ONE live
+ * bound whenever the caller genuinely had none. That is weaker than #2523's
+ * contract, so it is not forbidden — it is written down, here, per call site.
+ *
+ * Keyed on the call's `signal` line (`findBoundedCallLines`), so changing WHICH
+ * signal a call passes re-keys it and forces the claim below to be re-stated
+ * rather than silently inherited.
  */
-const RACE_TIMER_WINDOW = 25;
-
-/** Call shapes that carry a real bound. See {@link SWEEP_HEURISTIC_LIMITS}. */
-const BOUNDED_CALL = /^\s*bounded\s*\(/;
-const DEADLINE_CALL =
-	/^\s*(?:withDeadline|withTimeout|withBudget|withinRemaining)\s*\(/;
-
-/**
- * Text of the call's own parentheses, starting at the `(` at or after
- * `from`. Paren matching over STRIPPED source, so a paren inside a comment or
- * string cannot unbalance it. Bounded by `maxChars` so one pathological
- * expression cannot turn this into a whole-file scan.
- */
-function callArguments(
-	stripped: string,
-	from: number,
-	maxChars = 4000,
-): string {
-	const open = stripped.indexOf("(", from);
-	if (open < 0) return "";
-	let depth = 0;
-	const end = Math.min(stripped.length, open + maxChars);
-	for (let i = open; i < end; i++) {
-		const ch = stripped[i];
-		if (ch === "(") depth++;
-		else if (ch === ")") {
-			depth--;
-			if (depth === 0) return stripped.slice(open, i + 1);
-		}
-	}
-	return stripped.slice(open, end);
-}
-
-/**
- * Is the expression starting at `at` (just past an `await`) bounded?
- *
- * Exactly TWO accepted forms, and a bare `Promise.race` is not one of them
- * (#2530 review F3). Round 1 accepted a race whose arguments mentioned
- * `signal`, which let a signal-only race — no deadline at all — satisfy this
- * family: the precise mirror image of the deadline-only defect the whole
- * guard exists for, and a shape that already ships at
- * `clients/project-diagnostics/fresh-fetch.ts:670`. Nothing is lost by
- * dropping it: a NEW hand-rolled race is forbidden by the second family
- * anyway, and no site in the scanned files relies on the allowance (measured:
- * the flagged set is 175 either way).
- */
-function isBoundedAwait(stripped: string, at: number): boolean {
-	const head = stripped.slice(at, at + 80);
-	if (BOUNDED_CALL.test(head)) return true;
-	if (DEADLINE_CALL.test(head)) {
-		return /\bsignal\b/.test(callArguments(stripped, at));
-	}
-	return false;
-}
-
-/** 1-based line number of `offset` in `source`. */
-function lineOf(source: string, offset: number): number {
-	return source.slice(0, offset).split("\n").length;
-}
-
-/**
- * Every unbounded-await LINE in one already-stripped source, 1-based.
- *
- * Exported so the detector itself can be pinned against synthetic fixtures
- * (the mutation tests below) rather than only against whatever happens to be
- * in the tree today — a detector that quietly stops detecting is defect shape
- * 10 wearing a green check.
- */
-export function findUnboundedAwaitLines(stripped: string): number[] {
-	const hits = new Set<number>();
-	for (const match of stripped.matchAll(AWAIT_TOKEN)) {
-		const at = match.index + match[0].length;
-		if (isBoundedAwait(stripped, at)) continue;
-		hits.add(lineOf(stripped, match.index));
-	}
-	return [...hits].sort((a, b) => a - b);
-}
-
-/**
- * Every hand-rolled timeout race LINE in one already-stripped source,
- * 1-based: a `Promise.race(` whose own arguments spell a timer.
- */
-export function findHandRolledRaceLines(stripped: string): number[] {
-	const hits = new Set<number>();
-	const lines = stripped.split("\n");
-	for (const match of stripped.matchAll(RACE_TOKEN)) {
-		const line = lineOf(stripped, match.index);
-		const args = callArguments(stripped, match.index + match[0].length - 1);
-		const above = lines
-			.slice(Math.max(0, line - 1 - RACE_TIMER_WINDOW), line - 1)
-			.join("\n");
-		if (TIMER_ARM.test(args) || TIMER_ARM.test(above)) hits.add(line);
-	}
-	return [...hits].sort((a, b) => a - b);
-}
-
-/**
- * Nearest non-blank RAW line in `direction` from `index`, or `""` at the edge
- * of the file.
- */
-function neighbourLine(
-	rawLines: readonly string[],
-	index: number,
-	direction: -1 | 1,
-): string {
-	for (
-		let i = index + direction;
-		i >= 0 && i < rawLines.length;
-		i += direction
-	) {
-		const line = rawLines[i] ?? "";
-		if (line.trim().length > 0) return line;
-	}
-	return "";
-}
-
-/**
- * `stableOccurrenceKey` over the RAW lines, plus a neighbourhood suffix.
- *
- * Round 1 forked the kit's key derivation outright. It did not need to
- * (#2530 review F5): the kit's own function, handed the RAW lines instead of
- * the stripped ones, is already most of the answer, and the neighbourhood is
- * the only part this family actually has to add.
- *
- * Measured over today's tree — 175 flagged hook-path awaits:
- *
- * | key derivation                          | colliding keys |
- * |-----------------------------------------|----------------|
- * | `stableOccurrenceKey(rel, STRIPPED, i)` | 10             |
- * | `stableOccurrenceKey(rel, RAW, i)`      | 7              |
- * | the above `+ neighbourhood`             | 0              |
- *
- * RAW alone removes 3 of the 10 with no new code, because `lineContentHash`
- * deletes all whitespace: a STRIPPED `await import("./word-index.js")` and
- * `await import("./call-graph.js")` are both `awaitimport("");` — one key for
- * every dynamic import in the tree — while the raw line keeps the specifier.
- *
- * The remaining 7 need context, so that, and only that, stays local. `await
- * ensureReady(cwd);` appears four times in `mcp/server.ts` and `await
- * loadBootstrapClients();` twice in `index.ts`, byte-identical, inside one
- * enclosing declaration; `auditRegistry`'s `requireUniqueFlagged` correctly
- * refuses to let ONE exemption excuse four call sites. The neighbourhood is
- * symmetric because one side is not enough: the two `} = await
- * import("./word-index.js");` sites in `runtime-session.ts` share their
- * preceding lines (both the tail of a multi-line destructuring whose last
- * names match) and are separated only by what follows.
- *
- * The trade, stated: a one-line edit re-keys UP TO THREE entries — the
- * flagged line itself, and a flagged neighbour on either side — where
- * `stableOccurrenceKey` alone would re-key one. It is not hypothetical: 27 of
- * the 175 entries sit within one line of another flagged entry. #2475's
- * actual property still holds — a line inserted ANYWHERE ELSE in the file
- * re-keys nothing. Lift the suffix into `sweep-kit.ts` if a third sweep needs
- * the same widening; one caller is not yet a shared primitive.
- */
-function awaitOccurrenceKey(
-	rel: string,
-	rawLines: readonly string[],
-	index: number,
-): string {
-	// The kit's own derivation, handed the RAW lines. Only the neighbourhood
-	// suffix below is local to this family.
-	const base = stableOccurrenceKey(rel, rawLines, index);
-	// NUL separator: `lineContentHash` strips whitespace, so a newline would
-	// vanish and `a\nb` would hash the same as `ab`.
-	const context = lineContentHash(
-		[
-			neighbourLine(rawLines, index, -1),
-			neighbourLine(rawLines, index, 1),
-		].join("\u0000"),
-	);
-	return `${base}~${context}`;
-}
-
-interface FlaggedSite {
-	key: string;
-	detail: string;
-}
-
-/**
- * Run one line detector over one file group and key every hit.
- *
- * `prefix` namespaces the two families inside the single exemption table, so
- * an `await` and a race on the same line can never be confused for one
- * another (and `auditRegistry`'s stale check stays exact for both).
- */
-function scanFiles(
-	files: readonly string[],
-	detect: (stripped: string) => number[],
-	prefix: string,
-	skipRel?: (rel: string) => boolean,
-): { occurrences: FlaggedSite[]; scanned: number } {
-	const occurrences: FlaggedSite[] = [];
-	let scanned = 0;
-	for (const absolute of files) {
-		const rel = relativePosix(REPO_ROOT, absolute);
-		if (skipRel?.(rel)) continue;
-		scanned++;
-		const raw = fs.readFileSync(absolute, "utf8");
-		// Layout-preserving, so these line numbers and the hash inputs derived
-		// from them line up with the raw source.
-		const stripped = stripSource(raw);
-		const rawLines = raw.split("\n");
-		for (const line of detect(stripped)) {
-			occurrences.push({
-				key: `${prefix}${awaitOccurrenceKey(rel, rawLines, line - 1)}`,
-				detail: `${rel}:${line}  ${(rawLines[line - 1] ?? "").trim().slice(0, 100)}`,
-			});
-		}
-	}
-	return { occurrences, scanned };
-}
+const BOUNDED_CALL_SITES: Readonly<Record<string, string>> = {
+	"call:clients/actionable-warnings.ts#boundedLspCall:2b57f8b9~9137fb1a":
+		"`LspEnrichmentDeps.signal`. ALWAYS live on the deferred loop (built " +
+		"from the turn signal combined with the deferral controller's). Optional " +
+		"for the in-band loop, which passes `args.signal` — present on every " +
+		"turn_end path and absent only in a unit harness. Deadline half is live " +
+		"either way, and is itself the per-trip minimum of the loop's remaining " +
+		"budget and the per-pull timeout.",
+	"call:clients/bootstrap.ts#requestBootstrapClients:076f54d7~878c680d":
+		"`options.signal`, GENUINELY absent for the three session-start demands: " +
+		"`SessionBootstrapAccess.request` takes no signal on purpose (#1394 — a " +
+		"session_start can land mid-turn, and binding the outgoing turn's signal " +
+		"cancelled every startup scan with no retry). Two live bounds even then, " +
+		"because this call supplies the seam's own `bootstrapShutdownController` " +
+		"as `shutdownSignal`. The tool_call demand passes the ambient signal.",
+	"call:clients/observed-mutation.ts#withBounds:6ec6083f~67028b50":
+		"`withBounds(work, ms, signal, site)`'s third parameter, threaded from " +
+		"`ArmObservationArgs.signal` / `SettledSweepArgs.signal`. Optional in the " +
+		"type; filled by every production hook path (tool_call arm, " +
+		"tool_result_edit settle, agent_settled sweeps). The fallback is " +
+		"fail-safe, not the normal case, and the wall budget is live regardless.",
+	"call:clients/pipeline.ts#resyncLspFile:194d22cb~34c8c753":
+		"The AMBIENT turn abort signal, set for the whole tool_result path and " +
+		"absent only in a bare unit harness. PI_LENS_LSP_SYNC_BUDGET_MS is the " +
+		"bound that is always live.",
+};
 
 /** `auditRegistry` takes flat strings; the structure is folded in here. */
 function exemptionReasons(): Record<string, string> {
@@ -2381,13 +2259,45 @@ function exemptionReasons(): Record<string, string> {
 	return out;
 }
 
-const awaits = scanFiles(hookPathFiles(), findUnboundedAwaitLines, "");
+// The detector, the key derivation and this file-listing/scan driver are all
+// imported from `tests/support/hook-await-scan.ts` — the ONE home shared
+// with `scripts/rekey-hook-await-exemptions.mjs` (see that file's header,
+// and the usage note above `EXEMPT_SITES`). A vitest test file cannot be
+// `import()`ed by a plain Node script, so a second, hand-copied detector in
+// the script would be the single-source-of-truth violation AGENTS.md flags.
+const awaits = scanFiles(
+	REPO_ROOT,
+	hookPathFiles(REPO_ROOT),
+	findUnboundedAwaitLines,
+	"",
+);
 const races = scanFiles(
-	shippedSourceFiles(),
+	REPO_ROOT,
+	shippedSourceFiles(REPO_ROOT),
 	findHandRolledRaceLines,
 	"race:",
 	(rel) => rel === DEFINITION_FILE,
 );
+const boundedCalls = scanFiles(
+	REPO_ROOT,
+	shippedSourceFiles(REPO_ROOT),
+	findBoundedCallLines,
+	"call:",
+	(rel) => rel === DEFINITION_FILE,
+);
+
+/** rel -> unbounded-await count for every one-hop helper that has any. */
+function measureHelperModules(): Record<string, number> {
+	const out: Record<string, number> = {};
+	for (const absolute of hookHelperModules(REPO_ROOT)) {
+		const rel = relativePosix(REPO_ROOT, absolute);
+		const count = findUnboundedAwaitLines(
+			stripSource(fs.readFileSync(absolute, "utf8")),
+		).length;
+		if (count > 0) out[rel] = count;
+	}
+	return out;
+}
 
 describe("#2523 AC1 every hook-path await is bounded, and no new hand-rolled race", () => {
 	it("scans both file groups and finds both families (a dead scan is not a clean one)", () => {
@@ -2415,11 +2325,29 @@ describe("#2523 AC1 every hook-path await is bounded, and no new hand-rolled rac
 		expect(findUnboundedAwaitLines("await withBudget(sweep(), 500);")).toEqual([
 			1,
 		]);
+		// #2530 round 3 F2: round 1 accepted this because the word `signal`
+		// appeared ANYWHERE in the call's own parentheses — even here, where it
+		// names an argument of the WRAPPED work (`sweep`), not anything reaching
+		// `withDeadline`'s own race. None of `withDeadline`/`withTimeout`/
+		// `withBudget`/`withinRemaining` takes a `signal` parameter at all
+		// (`DeadlineOptions` has none), so the match was pure substring — the
+		// exact deadline-only hole #2523 exists to close, reopened by text
+		// instead of semantics. `bounded()` is the only accepted shape now.
 		expect(
 			findUnboundedAwaitLines(
 				"await withDeadline(sweep(), { ms: 500, signal });",
 			),
-		).toEqual([]);
+		).toEqual([1]);
+		expect(
+			findUnboundedAwaitLines(
+				"await withTimeout(sweep(cwd, { signal }), 500);",
+			),
+		).toEqual([1]);
+		expect(
+			findUnboundedAwaitLines(
+				"await withinRemaining(sweep(cwd, { signal }), deadlineAt);",
+			),
+		).toEqual([1]);
 		// Review round 2 (F3): a bare `Promise.race` is NEVER a bound here,
 		// even when the word `signal` appears in it. A signal-only race is the
 		// mirror image of the deadline-only defect — the shape
@@ -2427,12 +2355,17 @@ describe("#2523 AC1 every hook-path await is bounded, and no new hand-rolled rac
 		// one this file's own inventory names as "signal only, no deadline" —
 		// so accepting it let a half-bound pass BOTH families at once. Round 1
 		// pinned that hole as correct. A new race is forbidden by the
-		// `hand-rolled-race` family anyway, which leaves exactly two accepted
-		// forms: `bounded()`, and a `withDeadline`-family call with a signal.
+		// `hand-rolled-race` family anyway, which leaves `bounded()` as the only
+		// accepted form.
 		expect(
 			findUnboundedAwaitLines(
 				"await Promise.race([sweep(), aborted(signal)]);",
 			),
+		).toEqual([1]);
+		// #2530 round 3 F3: `Promise.any` is the same first-settlement-wins
+		// shape as `Promise.race` with a timer arm.
+		expect(
+			findUnboundedAwaitLines("await Promise.any([sweep(), aborted(signal)]);"),
 		).toEqual([1]);
 		// Including the timer-bearing spelling: the race family forbids it, and
 		// the await family must not quietly call it bounded on the way past.
@@ -2473,6 +2406,14 @@ describe("#2523 AC1 every hook-path await is bounded, and no new hand-rolled rac
 		expect(
 			findHandRolledRaceLines(
 				"await Promise.race([work(), abortPromise(AbortSignal.timeout(500))]);",
+			),
+		).toEqual([1]);
+		// #2530 round 3 F3: `Promise.any` is the same first-settlement-wins
+		// shape as `Promise.race` with a timer arm, and round 1 matched only
+		// `race`.
+		expect(
+			findHandRolledRaceLines(
+				"await Promise.any([work(), new Promise((r) => setTimeout(r, 500))]);",
 			),
 		).toEqual([1]);
 		// The dominant spelling: the timer arm hoisted into a named local a few
@@ -2569,147 +2510,123 @@ describe("#2523 AC1 every hook-path await is bounded, and no new hand-rolled rac
 		);
 	});
 
-	it("the canonical primitive arms ONE timer and builds no composite signal", () => {
-		// #2530 review F2/F4. Every other bound in the tree is being folded onto
-		// `bounded()`, so its own settle path is the one place a leak or a
-		// duplicate timer multiplies by 187. Round 1 armed `AbortSignal.timeout`
-		// AND passed the same `ms` to `withDeadline` — two timers for one budget
-		// — and combined the source signal through `AbortSignal.any`, which
-		// registers a permanent composite on the SOURCE (measured: 20 000 calls
-		// on one hook signal left 20 000 entries, and the `finally` cleaned the
-		// throwaway composite instead).
-		//
-		// This is a source-shape assertion, not a behavioural one, because the
-		// behavioural half already lives in
-		// `tests/clients/bounded-hook-await.test.ts` — Node's
-		// `AbortSignal.timeout` timer is unref'd and therefore invisible to
-		// `process.getActiveResourcesInfo()`, so "how many timers" has no
-		// runtime probe. It sits in this file because this file is already the
-		// one that reads sources and already exempts `deadline-utils.ts` from
-		// the race family.
-		const source = fs.readFileSync(
-			path.join(REPO_ROOT, DEFINITION_FILE),
-			"utf8",
+	it("derives the helper set from the import graph, not from a list of names", () => {
+		// #2557 review F4. The round-1 shape was six hand-written module names,
+		// which is defect shape 34: it could not see `clients/observed-mutation.ts`
+		// or `clients/lsp/index.ts` — modules this PR itself labels hook-reached.
+		const helpers = hookHelperModules(REPO_ROOT).map((absolute) =>
+			relativePosix(REPO_ROOT, absolute),
 		);
-		const marker = "export async function bounded<T>(";
-		const at = source.indexOf(marker);
-		// Vacuity floor: an assertion over an empty slice proves nothing.
+		// A dead walk is not a clean one: the resolver returning [] (a stray
+		// `strings: "blank"` erases every specifier, which it did on the first
+		// cut) would make every count below vacuously correct.
+		expect(helpers.length).toBeGreaterThanOrEqual(100);
+		// The three modules the hand-written list missed, each reached in one hop
+		// and each carrying real unbounded awaits.
+		expect(helpers).toContain("clients/observed-mutation.ts");
+		expect(helpers).toContain("clients/lsp/index.ts");
+		expect(helpers).toContain("clients/formatters.ts");
+		// ...and one it WRONGLY included: `clients/dispatch/dispatcher.ts` is
+		// two hops out, through `clients/dispatch/integration.ts`.
+		expect(helpers).not.toContain("clients/dispatch/dispatcher.ts");
 		expect(
-			at,
-			`${DEFINITION_FILE} no longer declares bounded()`,
-		).toBeGreaterThan(0);
-		const body = stripSource(source.slice(at));
-		expect(body.length).toBeGreaterThan(500);
-		// Positive control: the slice really is the implementation.
-		expect(body).toContain("recordDegradationOnce");
-
-		const count = (pattern: RegExp) => (body.match(pattern) ?? []).length;
-		// The composite checks come FIRST: the leak is the finding, and an
-		// assertion order that reported "wrong number of timers" instead would
-		// name the symptom rather than the cause.
-		expect(
-			count(/AbortSignal\s*\.\s*(?:any|timeout)\s*\(/g),
-			"AbortSignal.any registers a permanent composite on the SOURCE signal",
-		).toBe(0);
-		expect(
-			count(/\bcombineAbortSignals\s*\(/g),
-			"combineAbortSignals is AbortSignal.any with a fallback: same leak",
-		).toBe(0);
-		expect(count(/\bsetTimeout\s*\(/g), "one timer per bounded() call").toBe(1);
-		expect(count(/\bclearTimeout\s*\(/g), "and it is always cleared").toBe(1);
-		// The listeners it does add are added to the SOURCE signals, and every
-		// one of them is removed again.
-		expect(count(/\baddEventListener\s*\(/g)).toBe(
-			count(/\bremoveEventListener\s*\(/g),
-		);
+			localImportTargets(path.join(REPO_ROOT, "clients/dispatch/integration.ts"))
+				.map((absolute) => relativePosix(REPO_ROOT, absolute)),
+		).toContain("clients/dispatch/dispatcher.ts");
+		// A hook handler is not its own helper.
+		for (const handler of hookPathFiles(REPO_ROOT)) {
+			expect(helpers).not.toContain(relativePosix(REPO_ROOT, handler));
+		}
 	});
 
-	it("walks the helper modules hook work reaches through, and ratchets each count", () => {
-		// #2530 review F6, closed. Slice 1's file set was a partial walk that
-		// said so only in prose: a 47th unbounded await in `clients/pipeline.ts`
-		// left the guard green. Each module below is walked with THIS file's own
-		// detector and pinned to an exact count, so adding one fails here.
-		const measured: Record<string, number> = {};
-		for (const rel of Object.keys(HOOK_HELPER_MODULES)) {
-			const absolute = path.join(REPO_ROOT, rel);
-			expect(
-				fs.existsSync(absolute),
-				`${rel} is listed here but does not exist — a dead entry is not a clean one`,
-			).toBe(true);
-			measured[rel] = findUnboundedAwaitLines(
-				stripSource(fs.readFileSync(absolute, "utf8")),
-			).length;
-		}
-		const declared = Object.fromEntries(
-			Object.entries(HOOK_HELPER_MODULES).map(([rel, entry]) => [
-				rel,
-				entry.unbounded,
-			]),
-		);
-		expect(
-			measured,
-			"An unbounded await was ADDED to a module hook work reaches through, " +
-				"or one was bounded and the count here was not lowered. Wrap it in " +
-				"bounded() (clients/deadline-utils.ts) and lower the number, or " +
-				"raise the number with the reason why it had to grow.",
-		).toEqual(declared);
-		// Vacuity floor: an all-zero table would assert nothing at all, and the
-		// point of this ratchet is the burn-down it measures.
+	it("pins every one-hop helper module's unbounded-await count", () => {
+		const measured = measureHelperModules();
+		// Vacuity floor: an empty measurement would make the audit below pass on
+		// nothing at all.
+		expect(Object.keys(measured).length).toBeGreaterThanOrEqual(50);
 		expect(
 			Object.values(measured).reduce((total, n) => total + n, 0),
 		).toBeGreaterThan(0);
-		for (const [rel, entry] of Object.entries(HOOK_HELPER_MODULES)) {
-			expect(entry.reason.length, `${rel}: reason too thin`).toBeGreaterThan(
-				60,
-			);
+		const audit = auditSymbolCounts({
+			sweepName: "hook helper unbounded-await pin (#2523 slice 3 worklist)",
+			counts: measured,
+			pinned: HELPER_UNBOUNDED,
+			remediation:
+				"A module a registered hook handler imports DIRECTLY gained or lost " +
+				"an unbounded await. Wrap it in bounded() (clients/deadline-utils.ts) " +
+				"and lower the pinned number, or raise the number here and say why it " +
+				"had to grow. A module that appears with no pin at all is new to the " +
+				"one-hop set — add it. " +
+				HELPER_EXEMPTION_REASON,
+		});
+		expect(audit.problems, audit.problems.join("\n\n")).toEqual([]);
+		expect(HELPER_EXEMPTION_REASON.length).toBeGreaterThan(120);
+	});
+
+	it("registers every shipped bounded() call with the provenance of its signal", () => {
+		// #2557 review F2. `bounded()` reads a missing signal as one that never
+		// aborts, so a seam with an optional signal runs on ONE live bound
+		// whenever its caller had none. Round 1 made that greppable with a
+		// `NEVER_ABORTED` sentinel — a second concept for behaviour bounded()
+		// already had. Registering the CALLS instead covers the same seams
+		// without one, and covers sites that would never have named a sentinel.
+		const audit = auditRegistry({
+			sweepName: "bounded() call-site registry (#2523)",
+			flagged: boundedCalls.occurrences,
+			registered: [],
+			exemptions: BOUNDED_CALL_SITES,
+			scannedCount: boundedCalls.scanned,
+			minScanned: 200,
+			minFlagged: 1,
+			remediation:
+				"A new bounded() call site. Add an entry here keyed by the printed " +
+				"occurrence key, saying WHERE its `signal` comes from and whether " +
+				"that source can be undefined — if it can, this call runs on the " +
+				"wall clock alone whenever it is, which is weaker than #2523's " +
+				"contract and has to be a written decision rather than a default.",
+		});
+		expect(audit.problems, audit.problems.join("\n\n")).toEqual([]);
+		for (const [key, reason] of Object.entries(BOUNDED_CALL_SITES)) {
+			expect(reason.length, `${key}: provenance too thin`).toBeGreaterThan(80);
 		}
 	});
 
-	it("enumerates every shipped use of NEVER_ABORTED, with a reason", () => {
-		// #2523 slice 2. `bounded()` refuses a deadline-only call by TYPE, and
-		// `NEVER_ABORTED` is the one shape that can get past that: a seam whose
-		// caller signal is `AbortSignal | undefined` substitutes it and is then
-		// running on ONE live bound whenever the caller genuinely had none.
-		// That is weaker than #2523's contract, so it is not forbidden — it is
-		// ENUMERATED. A new file reaching for it fails here and has to say why,
-		// which is the same ratchet the exemption table above is.
-		//
-		// Keyed by FILE, not by occurrence: the question this answers is "which
-		// seams run on a possibly-single bound", and that is a property of the
-		// seam, not of a line.
-		const declared: Readonly<Record<string, string>> = {
-			[DEFINITION_FILE]: "declares it",
-			"clients/bootstrap.ts":
-				"`SessionBootstrapAccess.request` takes NO signal on purpose " +
-				"(#1394: a session_start can land mid-turn, and binding the " +
-				"ambient turn signal cancelled every startup scan with no " +
-				"retry). Two live bounds regardless — it supplies the seam's " +
-				"own `bootstrapShutdownController` as `shutdownSignal`.",
-			"clients/observed-mutation.ts":
-				"`ArmObservationArgs.signal` / `SettledSweepArgs.signal` are " +
-				"optional parameters that every production hook path fills; the " +
-				"fallback is fail-safe, not the normal case.",
-			"clients/pipeline.ts":
-				"`resyncLspFile` reads the AMBIENT turn signal, which is set for " +
-				"the whole tool_result path and only absent in a bare unit " +
-				"harness; the wall budget is live either way.",
-			"clients/actionable-warnings.ts":
-				"`LspEnrichmentDeps.signal` is optional for the in-band caller; " +
-				"the deferred loop always builds one from the turn signal and " +
-				"the deferral controller.",
-		};
-		const users: string[] = [];
-		for (const absolute of shippedSourceFiles()) {
-			const rel = relativePosix(REPO_ROOT, absolute);
-			const stripped = stripSource(fs.readFileSync(absolute, "utf8"));
-			if (/\bNEVER_ABORTED\b/.test(stripped)) users.push(rel);
-		}
-		// Vacuity floor: a scan that finds nothing is dead, not clean (#1755 F4).
-		expect(users.length).toBeGreaterThanOrEqual(2);
-		expect(users.sort()).toEqual(Object.keys(declared).sort());
-		for (const [file, reason] of Object.entries(declared)) {
-			expect(reason.length, `${file}: reason too thin`).toBeGreaterThan(10);
-		}
+	it("MUTATION: the bounded() call detector sees calls and nothing that merely looks like one", () => {
+		expect(
+			findBoundedCallLines(
+				[
+					"const settled = await bounded(work(), {",
+					"\tms: 5,",
+					"\tsignal: deps.signal,",
+					'\thook: "turn_end",',
+					'\tlabel: "l",',
+					"});",
+				].join("\n"),
+			),
+		).toEqual([3]);
+		// Shorthand `signal` keys on the same line the value comes from.
+		expect(
+			findBoundedCallLines(
+				['await bounded(w(), { ms, signal, hook: "turn_end", label: "l" });'].join(
+					"\n",
+				),
+			),
+		).toEqual([1]);
+		// No `signal` property at all (a JS caller): keyed at the call head, so
+		// it is still registered rather than invisible.
+		expect(findBoundedCallLines("await bounded(w(), { ms: 5 });")).toEqual([1]);
+		// The neighbours that must NOT match.
+		expect(findBoundedCallLines("await boundedLspCall(call, deps);")).toEqual(
+			[],
+		);
+		expect(findBoundedCallLines("const n = boundedNumber(v, 5);")).toEqual([]);
+		expect(findBoundedCallLines("await deps.bounded(work(), opts);")).toEqual(
+			[],
+		);
+		expect(findBoundedCallLines("const c = new BoundedFifoMap(10);")).toEqual(
+			[],
+		);
+		expect(findBoundedCallLines(stripSource("// bounded(w(), o);"))).toEqual([]);
 	});
 
 	it("documents the heuristic's limits", () => {

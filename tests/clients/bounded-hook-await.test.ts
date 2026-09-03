@@ -13,7 +13,7 @@
  */
 
 import { getEventListeners } from "node:events";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { bounded } from "../../clients/deadline-utils.js";
 import {
 	getDegradationSummary,
@@ -128,6 +128,33 @@ describe("#2523 AC2 bounded() requires BOTH bounds", () => {
 		expect(summaryFor("hook-await-exceeded")?.count).toBe(1);
 	});
 
+	it("treats a missing `signal` as never-aborting instead of throwing", async () => {
+		// #2530 round 3 F5. `ms` is guarded with `Number.isFinite` before use
+		// (the case above), but `signal.aborted` is read unguarded a few lines
+		// later. The type marks `signal` required, same as `ms`, but a JS caller
+		// — or a caller that only checked the compiler on `ms` — can still hand
+		// over `undefined`, and `bounded(p, { ms, hook, label })` throws
+		// `Cannot read properties of undefined (reading 'aborted')` before the
+		// budget or the work ever gets a chance to settle it.
+		await expect(
+			bounded(Promise.resolve("answer"), {
+				ms: 1000,
+				signal: undefined as unknown as AbortSignal,
+				hook: "turn_end",
+				label: "no-signal",
+			}),
+		).resolves.toBe("answer");
+		// And the deadline half of the same call still works with no signal.
+		await expect(
+			bounded(wedged<string>(), {
+				ms: 20,
+				signal: undefined as unknown as AbortSignal,
+				hook: "turn_end",
+				label: "no-signal-deadline",
+			}),
+		).resolves.toBeUndefined();
+	});
+
 	it("returns the value when the work settles inside both bounds", async () => {
 		const controller = new AbortController();
 		await expect(
@@ -231,6 +258,32 @@ describe("#2523 AC2 bounded() requires BOTH bounds", () => {
 				label: "precedence",
 			}),
 		).resolves.toBeUndefined();
+		expect(getDegradationSummary()).toEqual([]);
+	});
+
+	it("names the CALLER's abort ahead of shutdown when both fire AFTER the call, in the same tick", async () => {
+		// #2530 round 3 F4. The case above pre-aborts BOTH signals before
+		// `bounded()` is even called, which only exercises the two
+		// `if (...aborted)` PRE-checks at the top of the abandon race — never
+		// the listener path below them, and never the `cause ??= reason`
+		// first-fire-wins guard that path depends on (with only one signal
+		// ever pre-aborted, `fire()` is never called twice, so first-wins vs
+		// last-wins cannot be told apart). Here both signals are still LIVE
+		// when `bounded()` starts, and both fire after it, in the same tick —
+		// caller first, then shutdown — so the caller's abort must still win
+		// and nothing must reach the ledger.
+		const caller = new AbortController();
+		const shutdown = new AbortController();
+		const pending = bounded(wedged<void>(), {
+			ms: 60_000,
+			signal: caller.signal,
+			shutdownSignal: shutdown.signal,
+			hook: "turn_end",
+			label: "post-call-precedence",
+		});
+		caller.abort();
+		shutdown.abort();
+		await expect(pending).resolves.toBeUndefined();
 		expect(getDegradationSummary()).toEqual([]);
 	});
 
@@ -379,6 +432,34 @@ describe("#2523 AC2 bounded() requires BOTH bounds", () => {
 		// one hook signal took it to 20 000.
 		expect(dependantCount(signal)).toBe(dependantsBefore);
 		expect(getEventListeners(signal, "abort").length).toBe(listenersBefore);
+	});
+
+	it("arms exactly ONE setTimeout per call, through the real global timer", async () => {
+		// #2530 round 3 F1. `tests/config/hook-await-bounds.test.ts` used to pin
+		// "one timer" with a SOURCE-SHAPE assertion — counting `setTimeout(`
+		// occurrences in the text of `bounded()`'s own body, sliced from its
+		// `export async function bounded<T>(` marker to end-of-file. That slice
+		// is blind to a helper hoisted ABOVE the marker: a second timer armed by
+		// a function `bounded()` calls, defined earlier in the same file, never
+		// appears in the counted text at all — measured, that mutation left the
+		// structural assertion at 24/24 green. `clients/deadline-utils.js` calls
+		// the bare global `setTimeout` (not a wrapped one), so a real runtime
+		// probe exists after all: `vi.spyOn(globalThis, "setTimeout")` sees
+		// every timer `bounded()` actually arms, regardless of which function in
+		// the file armed it. The structural case is deleted; this replaces it.
+		const spy = vi.spyOn(globalThis, "setTimeout");
+		try {
+			const controller = new AbortController();
+			await bounded(Promise.resolve("value"), {
+				ms: 1000,
+				signal: controller.signal,
+				hook: "turn_end",
+				label: "single-timer",
+			});
+			expect(spy).toHaveBeenCalledTimes(1);
+		} finally {
+			spy.mockRestore();
+		}
 	});
 
 	it("removes its abort listener when the WORK wins the race", async () => {

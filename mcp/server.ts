@@ -45,6 +45,7 @@ import {
 	ensureLspConfig,
 	generatedSkipNotice,
 	ipcPathForCwd,
+	isEffectiveFileViewError,
 	lspStatus,
 	type McpAnalyzeResult,
 	moduleReport,
@@ -959,7 +960,11 @@ const ALL_TOOLS = [
 				file: {
 					type: "string",
 					description:
-						"Path to explain: adds the resolved language plus the per-server and per-runner selection decisions for it.",
+						"Path to explain: adds the resolved language plus the per-server and " +
+						"per-runner selection decisions for it. Must resolve inside `cwd` " +
+						"(a sibling package in the same monorepo does not count) — a file " +
+						"outside it is rejected with the `cwd` it was measured against; " +
+						"re-query with `cwd` set to that file's own workspace instead.",
 				},
 			},
 		},
@@ -1698,24 +1703,28 @@ async function callTool(
 			...(typeof args.file === "string" ? { file: args.file } : {}),
 			redact: true,
 		});
+		const fileLines =
+			view.file === undefined
+				? []
+				: isEffectiveFileViewError(view.file)
+					? [`File: ${view.file.error}`]
+					: [
+							effectiveFileHeading(view.file),
+							...view.file.servers
+								// Only the servers with something to say: every registry entry
+								// whose extension simply does not match this file would be ~40
+								// lines of "not applicable" ahead of the answer.
+								.filter((server) => server.reason !== "extension-mismatch")
+								.map(effectiveServerLine),
+							...view.file.tools.map(
+								(tool) =>
+									`  ${tool.selected ? "✓" : "✗"} ${tool.id} — ${tool.reason}`,
+							),
+						];
 		const lines = [
 			`Config: ${view.documents.length} file(s) contributing, ${view.provenance.length} resolved leaf/leaves`,
 			...view.documents.map(effectiveDocumentLine),
-			...(view.file
-				? [
-						effectiveFileHeading(view.file),
-						...view.file.servers
-							// Only the servers with something to say: every registry entry
-							// whose extension simply does not match this file would be ~40
-							// lines of "not applicable" ahead of the answer.
-							.filter((server) => server.reason !== "extension-mismatch")
-							.map(effectiveServerLine),
-						...view.file.tools.map(
-							(tool) =>
-								`  ${tool.selected ? "✓" : "✗"} ${tool.id} — ${tool.reason}`,
-						),
-					]
-				: []),
+			...fileLines,
 		];
 		return toolText(lines.join("\n"), view);
 	}

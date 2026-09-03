@@ -36,7 +36,8 @@
  * abandon-the-wait, keep-the-work shape as `lsp-pull-late-answer`.
  */
 import { logExtension } from "./extension-log.js";
-import { bounded, NEVER_ABORTED } from "./deadline-utils.js";
+import { bounded } from "./deadline-utils.js";
+import type { LedgerHookKey } from "./hook-budgets.js";
 import { logLatency } from "./latency-logger.js";
 import { emitBounded } from "./bounded-telemetry.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
@@ -596,6 +597,17 @@ function noteBootstrapBuildFailure(err: unknown): void {
 export async function requestBootstrapClients(options: {
 	/** Who is asking. Becomes the ledger subject, so keep it stable and coarse. */
 	reason: string;
+	/**
+	 * Which HOOK the demand runs under (#2557 review F7).
+	 *
+	 * Separate from {@link reason} because they answer different questions and
+	 * a ledger row needs both: the hook says whose wall budget the wait is
+	 * spending, the reason says which demand spent it. Passing the reason as
+	 * the hook — what this seam did before — put `"session-start-scans"` on the
+	 * ledger's hook axis, where nothing could join it against
+	 * `HOOK_WALL_BUDGET_MS` or against any other hook-keyed record.
+	 */
+	hook: LedgerHookKey;
 	/** The caller's abort signal (turn abort / Escape). */
 	signal?: AbortSignal;
 	/** Override the default wall-clock ceiling. */
@@ -619,17 +631,17 @@ export async function requestBootstrapClients(options: {
 		// resolves `BootstrapClients` or rejects, never `undefined`.
 		const clients = await bounded(loadBootstrapClients(), {
 			ms: timeoutMs,
-			// Genuinely absent for the two session-start schedulers — see
+			// Genuinely absent for the three session-start schedulers — see
 			// `SessionBootstrapAccess.request` for why binding a turn signal
 			// there is the wrong bound. `shutdownSignal` is the second live
 			// bound in that case, so both still hold.
-			signal: options.signal ?? NEVER_ABORTED,
+			signal: options.signal,
 			shutdownSignal,
-			// The demand's own reason, not a hook family: this seam is reached
-			// from several hooks and the reason is what identifies WHICH demand
-			// blew the budget in `hook-await-exceeded`.
-			hook: options.reason,
-			label: "loadBootstrapClients",
+			// The hook on the hook axis, the demand on the label (#2557 F7).
+			// `<hook>:loadBootstrapClients:<reason>` joins against
+			// `HOOK_WALL_BUDGET_MS` and still says WHICH demand blew the budget.
+			hook: options.hook,
+			label: `loadBootstrapClients:${options.reason}`,
 		});
 		if (clients) return clients;
 		throw abandonedError(options.signal, shutdownSignal, timeoutMs);

@@ -1758,6 +1758,34 @@ describe("monorepo root hoisting (#1671)", () => {
 		expect(roots[0]).toBe(tmp);
 	});
 
+	it("RustServer.root hoists to the workspace root even when Cargo.toml opens with a UTF-8 BOM (#2498/#2520 round 2, F4)", async () => {
+		const { RustServer } = await import("../../../clients/lsp/server.js");
+		const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-cargo-bom-"));
+		dirs.push(tmp);
+
+		// A BOM before `[workspace]` is valid Cargo.toml (rust-lang/cargo#2031).
+		// `﻿` is inside ECMAScript's `\s` class, so the OLD hand-rolled
+		// `/^\s*\[workspace\]/m` regex this walk-up used to carry (pre-#2498)
+		// matched it; `extractTomlTableSection`'s own anchor is `[ \t]*`, which
+		// does not, so routing detection through the shared reader without
+		// stripping the BOM first silently regressed a manifest shape the old
+		// code happened to accept.
+		fs.writeFileSync(
+			path.join(tmp, "Cargo.toml"),
+			'﻿[workspace]\nmembers = ["crate-a"]\n',
+		);
+		const crateDir = path.join(tmp, "crate-a");
+		fs.mkdirSync(path.join(crateDir, "src"), { recursive: true });
+		fs.writeFileSync(
+			path.join(crateDir, "Cargo.toml"),
+			'[package]\nname = "crate-a"\n',
+		);
+		const file = path.join(crateDir, "src", "lib.rs");
+		fs.writeFileSync(file, "pub fn x() {}\n");
+
+		await expect(RustServer.root(file)).resolves.toBe(tmp);
+	});
+
 	it("RustServer.root leaves a crate outside the workspace's members table crate-rooted", async () => {
 		const { RustServer } = await import("../../../clients/lsp/server.js");
 		const tmp = fs.mkdtempSync(

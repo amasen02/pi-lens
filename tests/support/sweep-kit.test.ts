@@ -143,6 +143,57 @@ const CONTROL_REAL_CALL_SITE = [
 	'advisoryParts.push("finding");',
 ].join("\n");
 
+/**
+ * #2502 P1c: a nested template literal inside an interpolation must not read
+ * as the outer template's closing backtick. Pre-fix, `stripSource` has no
+ * `${` nesting state: the backtick that opens `` `y(` `` (nested inside the
+ * ternary) hits the plain `ch === quote` check and is read as the OUTER
+ * template's own close. The outer template's real closing backtick, two
+ * tokens later, is then lexed as ordinary code instead — and the nested
+ * template's own stray `(` (from `` `y(` ``'s text) falls through unmasked.
+ */
+const ATTACK_NESTED_TEMPLATE_LAUNDERING = [
+	"function run(cond) {",
+	"\tconst label = `x ${cond ? `y(` : `z`} w`;",
+	"\tresetDegradationLedger();",
+	"}",
+].join("\n");
+
+/**
+ * #2502 review round F1: a call written INSIDE a template's `${...}`
+ * expression must stay visible to a `strings: "blank"` scan — that
+ * visibility is the entire point of #2502 lexing the interpolation as real
+ * code instead of opaque template text (see the kit's module doc, "RESOLVED
+ * by #2502"). Nothing pinned this: the `templateStack.length > 0` branch
+ * that leaves expression characters unblanked has no guard of its own, so
+ * re-adding `if (blankStrings) blank(i);` there (restoring the pre-#2502
+ * false negative) leaves every existing test green.
+ */
+const ATTACK_TEMPLATE_EXPRESSION_CALL = "const a = `${resetThing()}`;";
+
+/**
+ * #2502 review round F2: the real bug that a `strings: "keep"` nested-
+ * template test needs to catch — reproduced from a genuine in-repo
+ * divergence, verified by running the pre-#2502 `stripSource` over
+ * `scripts/lib/merge-train-lane.mjs`. That file's real nested template at
+ * line 299 (`` `\`${c.name}\` (${c.conclusion})` ``) has an ESCAPED backtick
+ * (`` \` ``) in its own text; the pre-#2502 scalar `quote` (no nesting
+ * state) loses track at that escape and is left stuck "inside a string"
+ * past the template's real end. On the old lexer this left the THREE `//`
+ * comment lines immediately below it (302-304) completely unblanked under
+ * `strings: "keep"` — a comment leak, not the character-leak the `"blank"`
+ * fixture above pins. This is the minimal reproduction of that exact
+ * mechanism: a nested template whose text contains an escaped backtick,
+ * followed by a `//` comment that must still be blanked.
+ */
+const ATTACK_ESCAPED_BACKTICK_COMMENT_LEAK = [
+	"function run(cond) {",
+	"\tconst label = `x ${cond ? `\\`y(\\`` : `z`} w`;",
+	"\t// trailing comment must stay blanked",
+	"\tresetDegradationLedger();",
+	"}",
+].join("\n");
+
 const SEAM_PATTERN = /\b(blockerParts|advisoryParts|staleSecretParts)\.push\(/;
 const TAG = tagPattern("delivery-surface");
 
@@ -216,6 +267,46 @@ describe("sweep-kit: stripSource", () => {
 	it("an unterminated string recovers at the line break instead of eating the rest", () => {
 		const stripped = stripSource('const a = "oops\nconst b = 2;\n');
 		expect(stripped).toContain("const b = 2;");
+	});
+
+	it("ATTACK_NESTED_TEMPLATE_LAUNDERING: a nested template's backtick does not close the outer template early", () => {
+		const stripped = stripSource(ATTACK_NESTED_TEMPLATE_LAUNDERING);
+		expect(stripped).toHaveLength(ATTACK_NESTED_TEMPLATE_LAUNDERING.length);
+		// Pre-fix, the nested template's own `(` (from `` `y(` ``'s text)
+		// survives unmasked once the inner backtick prematurely closes the
+		// outer template's quote — every other paren in this fixture is
+		// naturally balanced, so a leaked, unmatched `(` is the tell.
+		const opens = stripped.split("(").length - 1;
+		const closes = stripped.split(")").length - 1;
+		expect(opens).toBe(closes);
+		expect(stripped).not.toContain("y(");
+		// The real call after the template must stay visible and untouched by
+		// the mis-lex — pre-fix, a lucky backtick parity can still leave
+		// `quote` cleared by here, but the leaked `(` above is what corrupts a
+		// downstream depth scan (see sync-child-process-timeout.test.ts P1c).
+		expect(stripped).toContain("resetDegradationLedger();");
+	});
+
+	// #2502 review F2 — this test used to run ATTACK_NESTED_TEMPLATE_LAUNDERING
+	// under `strings: "keep"`, but that fixture has no `/` and no comment, so
+	// `"keep"` (which only ever blanks comments) leaves it byte-identical to
+	// source under BOTH the pre-#2502 lexer and the fixed one — the assertion
+	// could not fail. Replaced with ATTACK_ESCAPED_BACKTICK_COMMENT_LEAK, whose
+	// trailing comment actually distinguishes the two lexers (see its doc for
+	// the real-world divergence this reproduces).
+	it('ATTACK_ESCAPED_BACKTICK_COMMENT_LEAK: strings: "keep" still blanks a comment after a nested template with an escaped backtick', () => {
+		const kept = stripSource(ATTACK_ESCAPED_BACKTICK_COMMENT_LEAK, {
+			strings: "keep",
+		});
+		expect(kept).toHaveLength(ATTACK_ESCAPED_BACKTICK_COMMENT_LEAK.length);
+		expect(kept).not.toContain("trailing comment must stay blanked");
+		expect(kept).toContain("resetDegradationLedger();");
+	});
+
+	// #2502 review F1.
+	it('ATTACK_TEMPLATE_EXPRESSION_CALL: a call inside a template\'s ${...} expression stays visible under strings: "blank"', () => {
+		const stripped = stripSource(ATTACK_TEMPLATE_EXPRESSION_CALL);
+		expect(stripped).toContain("resetThing()");
 	});
 });
 
