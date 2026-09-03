@@ -195,13 +195,16 @@ function buildConfigSchema(): ConfigSchemaNode {
 	// removal — a `stable` tier on a key with a `removeNotBefore` would be two
 	// registries contradicting each other.
 	//
-	// The deny annotation rides along (#2427). `lspSectionOf` lets the canonical
-	// spelling win a collision PER KEY, so a legacy-only spelling on both sides
-	// of a resolution is still a real path into the LSP disable set — and a
-	// denial that a user can lift by writing the deprecated key would not be
-	// monotonic, it would be a migration reward for staying un-migrated.
+	// NO deny annotation, unlike round 1 of #2427 (review round 2, F1). Round 1
+	// annotated BOTH spellings and got two independent deny unions for one
+	// setting, neither seeing the other tiers. Both resolution entry points now
+	// normalize a document legacy root LSP keys into the `lsp` namespace before
+	// merging, so this node never receives a contribution at all and a policy on
+	// it could not fire. The denial is resolved once, at the canonical node,
+	// over every tier and every spelling — which is what the second annotation
+	// was trying to achieve and structurally could not.
 	for (const key of LEGACY_ROOT_LSP_KEYS) {
-		properties[key] = { ...opaque("experimental"), ...denyAnnotation(key) };
+		properties[key] = opaque("experimental");
 	}
 
 	properties[LSP_NAMESPACE_KEY] = lspNamespace();

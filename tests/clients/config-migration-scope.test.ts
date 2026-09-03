@@ -22,7 +22,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MAX_MIGRATION_RECORDS } from "../../clients/config-core/records.js";
-import { PI_LENS_CONFIG_SCHEMA } from "../../clients/config-schema.js";
+import {
+	LSP_KEY_TYPES,
+	PI_LENS_CONFIG_SCHEMA,
+} from "../../clients/config-schema.js";
 import { resetIgnoredConfigWarnCache } from "../../clients/config-warn.js";
 import { removeTempDirSync } from "./test-utils.js";
 
@@ -490,20 +493,32 @@ const recognizedTopLevelKeys = (): string[] =>
  *
  * The values VALIDATE on purpose. A rejected value would add a validation
  * record to the same finalized list and change the count the two loaders are
- * compared on in the parity probe; only `$schema` (declared `string`) and
- * `lsp` (declared `object`) constrain anything.
+ * compared on in the parity probe. Four MORE keys constrain their value than
+ * used to (#2427 review round 2, F1): `resolvePiLensConfig` normalizes the
+ * legacy root LSP keys into the `lsp` namespace at source injection, so
+ * `warmFiles: true` is now checked against the namespace node that declares it
+ * an array instead of against an opaque root node that declared nothing. The
+ * filler is taken from `LSP_KEY_TYPES` rather than hand-listed, so a new typed
+ * key cannot quietly re-introduce the confound.
  */
 function everyRecognizedKey(): Record<string, unknown> {
 	const value: Record<string, unknown> = {};
 	for (const key of recognizedTopLevelKeys()) {
-		value[key] =
-			key === "$schema"
-				? "https://pi-lens.dev/schema/v1.json"
-				: key === "lsp"
-					? {}
-					: true;
+		value[key] = validFillerFor(key);
 	}
 	return value;
+}
+
+/** A value the canonical schema accepts for one top-level key. */
+function validFillerFor(key: string): unknown {
+	const emptyObject: Record<string, unknown> = {};
+	const emptyArray: unknown[] = [];
+	if (key === "$schema") return "https://pi-lens.dev/schema/v1.json";
+	const declared = LSP_KEY_TYPES[key];
+	if (key === "lsp") return emptyObject;
+	if (declared === "object") return emptyObject;
+	if (declared === "array") return emptyArray;
+	return true;
 }
 
 const suppressionNoticesFor = (file: string): string[] =>
