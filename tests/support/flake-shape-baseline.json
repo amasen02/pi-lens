@@ -160,7 +160,7 @@
 		"clients/runtime-session-warmup-oneshot.test.ts": 1,
 		"clients/runtime-session-warmup-prewarm.test.ts": 1,
 		"clients/runtime-tool-result-debounce.test.ts": 1,
-		"clients/runtime-turn-test-runner-bounds.test.ts": 1,
+		"clients/runtime-turn-test-runner-bounds.test.ts": 4,
 		"clients/safe-spawn-close-before-error-race.test.ts": 1,
 		"clients/safe-spawn-sync-throw.test.ts": 1,
 		"clients/single-flight.test.ts": 1,
