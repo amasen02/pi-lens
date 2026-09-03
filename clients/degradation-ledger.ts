@@ -139,6 +139,20 @@ export type DegradationKind =
 	 */
 	| "review-graph-non-absolute-entity-path"
 	/**
+	 * #2489 round 2: `dispatchForFile`'s (`clients/dispatch/dispatcher.ts`)
+	 * delta-baseline key is `session.baseline.<ctx.filePath>`. Every production
+	 * caller reaches `ctx.filePath` through `createDispatchContext`, which
+	 * guarantees it is always absolute (the #2016 invariant) — the same
+	 * guarantee `review-graph-non-absolute-entity-path` enforces for the
+	 * sibling entity-snapshot seam. A relative `ctx.filePath` here can only
+	 * happen through a caller regression (a hand-built `DispatchContext`
+	 * bypassing the constructor), so this fires at most once per subject (the
+	 * offending path) and the baseline read/write is skipped for that
+	 * dispatch rather than keyed under a value the constructor would never
+	 * produce. Subject is the raw `ctx.filePath` received.
+	 */
+	| "dispatch-non-absolute-baseline-path"
+	/**
 	 * The project-snapshot persist seam detected durable meta/body evidence
 	 * failing the #2008 integrity gate — the meta's recorded gz size no longer
 	 * matches the on-disk body (torn/truncated gzip under an intact meta), or a
