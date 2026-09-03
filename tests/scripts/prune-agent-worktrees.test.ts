@@ -902,14 +902,19 @@ describe("keptReasonFor (#2486 / PR #2493 review round 2, S2)", () => {
  * because the script derives REPO_ROOT from its own location: run from the
  * real checkout it would plan over the real worktrees.
  */
-describe("SubagentStop hook, end to end (#2486)", () => {
-	const AGENT_ID = "a0000000000000001";
-	let root = "";
-	let repo = "";
-	let ledgerDir = "";
-	let worktree = "";
-	let cli = "";
 
+/**
+ * PR #2493 round 4 review comment (folded into #2501): this describe block
+ * used to build repo/origin/worktree and a copy of three scripts by hand in
+ * `beforeEach`, and individual cases hand-patched that copy afterward (the
+ * process-scan wrapper, the `node_modules` junction, the renamed module) —
+ * a platform assumption hiding in one of those hand-patches (no
+ * `.gitignore` for `node_modules`, so Linux git sees the junction as
+ * untracked) shipped CI red once already (review round 4). This builder
+ * makes every one of those assumptions explicit in ONE place instead of
+ * re-deriving them per case.
+ */
+function createSubagentStopFixture(agentId: string) {
 	const git = (args: string[], cwd: string) =>
 		gitExecFileSync("git", args, {
 			cwd,
@@ -917,69 +922,262 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 			stdio: "pipe",
 		}) as string;
 
-	beforeEach(() => {
-		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-2486-"));
-		repo = path.join(root, "main");
-		ledgerDir = path.join(root, "ledger");
-		fs.mkdirSync(repo, { recursive: true });
-		fs.mkdirSync(ledgerDir, { recursive: true });
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-2486-"));
+	const repo = path.join(root, "main");
+	const ledgerDir = path.join(root, "ledger");
+	fs.mkdirSync(repo, { recursive: true });
+	fs.mkdirSync(ledgerDir, { recursive: true });
 
-		// A real `origin/*` ref, because the "pushed" rail is a containment
-		// query against one — a fixture without an origin would make every
-		// tree unpushed and every removal assertion vacuous.
-		const origin = path.join(root, "origin.git");
-		git(["init", "-q", "--bare", "-b", "master", origin], root);
-		git(["init", "-q", "-b", "master"], repo);
-		// Identities from tests/support/git-config-guard.ts KNOWN_FIXTURE_*.
-		git(["config", "user.email", "test@example.com"], repo);
-		git(["config", "user.name", "pi-lens test"], repo);
-		fs.writeFileSync(path.join(repo, "a.txt"), "hello\n");
-		git(["add", "a.txt"], repo);
-		git(["commit", "-qm", "init"], repo);
-		git(["remote", "add", "origin", origin], repo);
-		// PR #2493 round 5, R1: committed BEFORE `git worktree add` below, so
-		// every worktree this describe block creates -- not just the F1 test's
-		// `node_modules` junction fixture -- inherits it the same way a real
-		// agent worktree's checkout does (`node_modules` is gitignored in this
-		// repo too). Without it the F1 fixture's untracked junction makes `git
-		// status --porcelain` report `?? node_modules` on Linux the moment it
-		// is created (git-for-Windows silently treats the empty-target
-		// junction as absent and never reports it, which is why round 4 read
-		// the F1 case as win32-only -- it was never gated on the platform,
-		// only on this gap in the fixture).
-		fs.writeFileSync(path.join(repo, ".gitignore"), "node_modules\n");
-		git(["add", ".gitignore"], repo);
-		git(["commit", "-qm", "gitignore node_modules"], repo);
-		git(["push", "-q", "-u", "origin", "master"], repo);
+	// A real `origin/*` ref, because the "pushed" rail is a containment
+	// query against one — a fixture without an origin would make every
+	// tree unpushed and every removal assertion vacuous.
+	const origin = path.join(root, "origin.git");
+	git(["init", "-q", "--bare", "-b", "master", origin], root);
+	git(["init", "-q", "-b", "master"], repo);
+	// Identities from tests/support/git-config-guard.ts KNOWN_FIXTURE_*.
+	git(["config", "user.email", "test@example.com"], repo);
+	git(["config", "user.name", "pi-lens test"], repo);
+	fs.writeFileSync(path.join(repo, "a.txt"), "hello\n");
+	git(["add", "a.txt"], repo);
+	git(["commit", "-qm", "init"], repo);
+	git(["remote", "add", "origin", origin], repo);
+	// PR #2493 round 5, R1: committed BEFORE `git worktree add` below, so
+	// every worktree this fixture creates -- not just addNodeModulesJunction's
+	// caller -- inherits it the same way a real agent worktree's checkout
+	// does (`node_modules` is gitignored in this repo too). Without it an
+	// untracked junction makes `git status --porcelain` report `??
+	// node_modules` on Linux the moment it is created (git-for-Windows
+	// silently treats the empty-target junction as absent and never reports
+	// it, which is why round 4 read that as win32-only -- it was never
+	// gated on the platform, only on this gap in the fixture).
+	fs.writeFileSync(path.join(repo, ".gitignore"), "node_modules\n");
+	git(["add", ".gitignore"], repo);
+	git(["commit", "-qm", "gitignore node_modules"], repo);
+	git(["push", "-q", "-u", "origin", "master"], repo);
 
-		const scriptsDir = path.resolve(__dirname, "../../scripts");
-		fs.mkdirSync(path.join(repo, "scripts", "lib"), { recursive: true });
-		cli = path.join(repo, "scripts", "prune-agent-worktrees.mjs");
-		fs.copyFileSync(path.join(scriptsDir, "prune-agent-worktrees.mjs"), cli);
-		for (const file of ["worktree-hygiene.mjs", "process-scan.mjs"]) {
-			fs.copyFileSync(
-				path.join(scriptsDir, "lib", file),
-				path.join(repo, "scripts", "lib", file),
-			);
-		}
+	const scriptsDir = path.resolve(__dirname, "../../scripts");
+	fs.mkdirSync(path.join(repo, "scripts", "lib"), { recursive: true });
+	const cli = path.join(repo, "scripts", "prune-agent-worktrees.mjs");
+	fs.copyFileSync(path.join(scriptsDir, "prune-agent-worktrees.mjs"), cli);
+	for (const file of ["worktree-hygiene.mjs", "process-scan.mjs"]) {
+		fs.copyFileSync(
+			path.join(scriptsDir, "lib", file),
+			path.join(repo, "scripts", "lib", file),
+		);
+	}
 
-		worktree = path.join(repo, ".claude", "worktrees", `agent-${AGENT_ID}`);
-		git(["worktree", "add", "-q", "-b", "pr-9001", worktree], repo);
-	});
+	const worktree = path.join(repo, ".claude", "worktrees", `agent-${agentId}`);
+	git(["worktree", "add", "-q", "-b", "pr-9001", worktree], repo);
 
-	afterEach(() => {
-		// `maxRetries`/`retryDelay` (not just `force`): on Windows a directory
-		// that was very recently a live process's cwd (the F1 case's held
-		// helper, any spawned CLI still tearing down) can stay briefly locked
-		// after the process exits -- an EPERM/EBUSY race independent of
-		// whether this test itself killed anything, so it is handled here
-		// once for every case in this describe block rather than per-test.
+	const processScanPath = path.join(repo, "scripts", "lib", "process-scan.mjs");
+	const realProcessScanPath = path.join(
+		repo,
+		"scripts",
+		"lib",
+		"process-scan-real.mjs",
+	);
+
+	/**
+	 * Review round 3, F1's technique: wrap the fixture's OWN copy of
+	 * `process-scan.mjs` so `snapshotProcesses` — the one async step between
+	 * enrichment's `isDirty()` call and the removal loop's own pre-remove
+	 * recheck — resolves only after `delayMs`. Widens the enrichment-to-
+	 * removal gap to a controlled, machine-speed-independent window instead
+	 * of trusting absolute wall-clock timing.
+	 */
+	function patchProcessScan(delayMs: number) {
+		fs.renameSync(processScanPath, realProcessScanPath);
+		fs.writeFileSync(
+			processScanPath,
+			[
+				'import * as real from "./process-scan-real.mjs";',
+				'export * from "./process-scan-real.mjs";',
+				"export async function snapshotProcesses(...args) {",
+				`\tawait new Promise((resolve) => setTimeout(resolve, ${delayMs}));`,
+				"\treturn real.snapshotProcesses(...args);",
+				"}",
+				"",
+			].join("\n"),
+		);
+	}
+
+	/**
+	 * #2519: the same module-substitution hook as `patchProcessScan`, but
+	 * DETERMINISTIC rather than wall-clock-timed. `snapshotProcesses` is
+	 * only ever called from `readProcessTable`, itself only reached AFTER
+	 * the enrichment pass's own synchronous `isDirty()` call has already
+	 * returned for every candidate — both run in the same synchronous
+	 * stretch of the event loop, an ordering the JS run-to-completion
+	 * guarantee enforces regardless of machine speed, not a race a delay has
+	 * to out-run. Corrupting the gitlink synchronously at
+	 * `snapshotProcesses`'s own entry — before its `await`, so the
+	 * corruption is on disk before `readProcessTable` (and therefore the
+	 * recheck) can possibly resolve — therefore always lands strictly after
+	 * enrichment and strictly before the pre-remove recheck, with no race
+	 * window to lose under load. The earlier version of this hook raced a
+	 * wall-clock 150ms `setTimeout` against enrichment's own completion:
+	 * under load on Windows the 150ms could elapse before enrichment (a
+	 * handful of synchronous `git` spawns) had actually returned, corrupting
+	 * the gitlink DURING enrichment instead of the recheck — the candidate
+	 * then took the review round 3, F2 `dirtyUnreadable` rail straight to
+	 * `plan.keep` and never reached the removal loop at all, so
+	 * `hygiene.worktree-removed` was never written.
+	 *
+	 * Same unlink-then-write trick review round 3, F2 uses: Windows denies
+	 * the O_TRUNC open `writeFileSync` performs on a `.git` gitlink file
+	 * `git worktree add` just created (EPERM, reproducible outside vitest
+	 * too) even though a fresh create at the same path succeeds immediately
+	 * after.
+	 */
+	function patchRecheck(gitLinkPath: string) {
+		fs.renameSync(processScanPath, realProcessScanPath);
+		fs.writeFileSync(
+			processScanPath,
+			[
+				'import fs from "node:fs";',
+				'import * as real from "./process-scan-real.mjs";',
+				'export * from "./process-scan-real.mjs";',
+				"export async function snapshotProcesses(...args) {",
+				`\tconst gitLinkPath = ${JSON.stringify(gitLinkPath)};`,
+				"\tfs.unlinkSync(gitLinkPath);",
+				'\tfs.writeFileSync(gitLinkPath, "gitdir: /nonexistent\\n");',
+				"\treturn real.snapshotProcesses(...args);",
+				"}",
+				"",
+			].join("\n"),
+		);
+	}
+
+	/**
+	 * PR #2493 round 4, N1: a top-level reparse point (a junction into a
+	 * directory outside the worktree) stands in for the real shared-
+	 * `node_modules` link `unlinkTopLevelLinks` unlinks before `git worktree
+	 * remove`. Untracked and gitignore-shaped — exactly what a real agent
+	 * worktree carries — so it never makes `git status` dirty on its own.
+	 */
+	function addNodeModulesJunction(): string {
+		const junctionTarget = path.join(root, "shared-node_modules");
+		fs.mkdirSync(junctionTarget, { recursive: true });
+		const junctionPath = path.join(worktree, "node_modules");
+		fs.symlinkSync(
+			junctionTarget,
+			junctionPath,
+			process.platform === "win32" ? "junction" : "dir",
+		);
+		return junctionPath;
+	}
+
+	/**
+	 * #2519 round 2, S4: a second agent's worktree, coexisting with the
+	 * fixture's own. Used by every test that has to prove a SubagentStop run
+	 * never reaches beyond the stopped agent's own tree -- the #2501
+	 * sibling-scoping case and its cross-platform F1 sibling below -- so it
+	 * inherits the fixture's own assumptions (the pushed `origin`, the
+	 * tracked `.gitignore`) the same way `worktree` above does, instead of a
+	 * per-case `git worktree add` re-deriving them (the exact per-case
+	 * patching this builder exists to remove).
+	 */
+	function addSiblingWorktree(agentId: string, branch?: string): string {
+		const siblingPath = path.join(
+			repo,
+			".claude",
+			"worktrees",
+			`agent-${agentId}`,
+		);
+		git(
+			["worktree", "add", "-q", "-b", branch ?? `pr-${agentId}`, siblingPath],
+			repo,
+		);
+		return siblingPath;
+	}
+
+	/**
+	 * #2519 round 2, F1: a THIRD module-substitution hook alongside
+	 * `patchProcessScan`/`patchRecheck` -- this one appends synthetic rows to
+	 * whatever the real listing returns, rather than delaying or corrupting
+	 * it. It lets a test prove `restrictToPath` scoping (main()'s own
+	 * `agentTree` wiring, not just `planOrphanSweep`'s pure intersection)
+	 * without depending on either platform's real orphan-reparenting
+	 * behavior -- the win32-only sibling test above spawns real detached
+	 * processes and reads the kernel's own ppid bookkeeping, which POSIX
+	 * answers differently (see its comment), so it cannot run on ubuntu CI.
+	 * The appended rows are still genuine orphan-fixture rows as far as
+	 * `isFixtureHelperCommand`/`selectOrphanFixtureProcesses` can tell: a
+	 * `node .../tests/fixtures/...` command line whose `ppid` names a REAL
+	 * pid a launcher already waited to exit (see the caller), so it is
+	 * legitimately absent from the real snapshot this wrapper appends them
+	 * onto -- no synthetic liveness bookkeeping, and no `/proc` cwd, needed.
+	 */
+	function patchProcessScanAppendRows(
+		extraRows: { pid: number; ppid: number; command: string }[],
+	) {
+		fs.renameSync(processScanPath, realProcessScanPath);
+		fs.writeFileSync(
+			processScanPath,
+			[
+				'import * as real from "./process-scan-real.mjs";',
+				'export * from "./process-scan-real.mjs";',
+				`const EXTRA_ROWS = ${JSON.stringify(extraRows)};`,
+				"export async function snapshotProcesses(...args) {",
+				"\tconst result = await real.snapshotProcesses(...args);",
+				"\tif (!result.ok) return result;",
+				"\treturn { rows: [...result.rows, ...EXTRA_ROWS], ok: true };",
+				"}",
+				"",
+			].join("\n"),
+		);
+	}
+
+	function cleanup() {
+		// `maxRetries`/`retryDelay` (not just `force`): on Windows a
+		// directory that was very recently a live process's cwd (the F1
+		// case's held helper, any spawned CLI still tearing down) can stay
+		// briefly locked after the process exits -- an EPERM/EBUSY race
+		// independent of whether this test itself killed anything.
 		fs.rmSync(root, {
 			recursive: true,
 			force: true,
 			maxRetries: 5,
 			retryDelay: 200,
 		});
+	}
+
+	return {
+		root,
+		repo,
+		ledgerDir,
+		worktree,
+		cli,
+		git,
+		patchProcessScan,
+		patchRecheck,
+		patchProcessScanAppendRows,
+		addNodeModulesJunction,
+		addSiblingWorktree,
+		cleanup,
+	};
+}
+
+describe("SubagentStop hook, end to end (#2486)", () => {
+	const AGENT_ID = "a0000000000000001";
+	let fixture: ReturnType<typeof createSubagentStopFixture>;
+	let root = "";
+	let repo = "";
+	let ledgerDir = "";
+	let worktree = "";
+	let cli = "";
+	// #2519 round 2, S4: exposed by the builder rather than redeclared here
+	// -- the exact describe-private duplicate of the builder's own `git`
+	// this finding flagged.
+	let git: (args: string[], cwd: string) => string;
+
+	beforeEach(() => {
+		fixture = createSubagentStopFixture(AGENT_ID);
+		({ root, repo, ledgerDir, worktree, cli, git } = fixture);
+	});
+
+	afterEach(() => {
+		fixture.cleanup();
 	});
 
 	/**
@@ -1271,43 +1469,12 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 			// `git worktree remove`. Untracked and gitignore-shaped -- exactly
 			// what a real agent worktree carries -- so it never makes `git
 			// status` dirty on its own; only the late write below does that.
-			const junctionTarget = path.join(root, "shared-node_modules");
-			fs.mkdirSync(junctionTarget, { recursive: true });
-			const junctionPath = path.join(worktree, "node_modules");
-			fs.symlinkSync(
-				junctionTarget,
-				junctionPath,
-				process.platform === "win32" ? "junction" : "dir",
-			);
+			const junctionPath = fixture.addNodeModulesJunction();
 
-			const processScanPath = path.join(
-				repo,
-				"scripts",
-				"lib",
-				"process-scan.mjs",
-			);
-			const realProcessScanPath = path.join(
-				repo,
-				"scripts",
-				"lib",
-				"process-scan-real.mjs",
-			);
-			fs.renameSync(processScanPath, realProcessScanPath);
-			fs.writeFileSync(
-				processScanPath,
-				[
-					'import * as real from "./process-scan-real.mjs";',
-					'export * from "./process-scan-real.mjs";',
-					"// Deliberately delayed for review round 3, F1: widens the gap",
-					"// between enrichment's isDirty() and the final removal call to a",
-					"// fixed, machine-speed-independent window.",
-					"export async function snapshotProcesses(...args) {",
-					"\tawait new Promise((resolve) => setTimeout(resolve, 800));",
-					"\treturn real.snapshotProcesses(...args);",
-					"}",
-					"",
-				].join("\n"),
-			);
+			// Deliberately delayed for review round 3, F1: widens the gap
+			// between enrichment's isDirty() and the final removal call to a
+			// fixed, machine-speed-independent window.
+			fixture.patchProcessScan(800);
 
 			const helperScript = path.join(worktree, "keepalive.mjs");
 			const helper = spawn(process.execPath, [helperScript], {
@@ -1443,7 +1610,7 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 	it(
 		"tells an unreadable recheck apart from a genuinely dirty one (PR #2493 round 5, R2)",
 		{ timeout: 90_000 },
-		async () => {
+		() => {
 			// The gap R2 names: `isDirty(removal.path, recheckBound) !== "clean"`
 			// collapsed the recheck's tri-state, so a recheck that could not
 			// read `git status` at all (a wedged git, a bound too tight) was
@@ -1456,13 +1623,25 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 			// the removal loop's recheck at all -- it goes straight to
 			// `plan.keep` with `dirtyUnreadable` via planWorktreePrune's own
 			// dirty rail, which is the enrichment-time path F2 already covers,
-			// not this one. So the `.git` gitlink is corrupted only AFTER
-			// enrichment has had time to run (a handful of git spawns against
-			// ONE candidate, observed under 100ms even on a loaded box), timed
-			// into the recheck gap the same way review round 3, F1 does: this
-			// fixture's copy of `process-scan.mjs` wraps `snapshotProcesses`
-			// with a fixed, generous delay so the window between enrichment and
-			// the recheck is controlled regardless of machine speed. Corrupting
+			// not this one. #2519: the ORIGINAL version of this test raced a
+			// wall-clock 150ms `setTimeout` against enrichment's own completion
+			// to land the gitlink corruption after it -- under load on Windows
+			// the 150ms could elapse before enrichment (a handful of
+			// synchronous `git` spawns) had actually returned, corrupting the
+			// gitlink DURING enrichment instead of the recheck: the candidate
+			// then took F2's `dirtyUnreadable` rail straight to `plan.keep` and
+			// never reached the removal loop at all, so
+			// `hygiene.worktree-removed` was never written and the second
+			// assertion below failed against `undefined`.
+			//
+			// `fixture.patchRecheck` closes that gap deterministically instead
+			// of with a bigger delay: it corrupts the gitlink synchronously at
+			// `snapshotProcesses`'s own entry, which is only ever called from
+			// `readProcessTable`, itself only reached AFTER the enrichment
+			// pass's synchronous `isDirty()` call has already returned. The
+			// corruption is therefore on disk before `readProcessTable` (and
+			// so the recheck) can possibly resolve, every time, regardless of
+			// machine speed -- see the fixture builder's own comment. Corrupting
 			// the gitlink (not a tiny forced recheck bound) makes the recheck's
 			// `git status --porcelain` fail OUTRIGHT rather than merely risk
 			// timing out against `RECHECK_TIMEOUT_MS`'s floor
@@ -1470,69 +1649,30 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 			// real `git status` on this tiny fixture to answer, which would
 			// make a bound-forcing version of this test flaky rather than red
 			// for the right reason.
-			const processScanPath = path.join(
-				repo,
-				"scripts",
-				"lib",
-				"process-scan.mjs",
-			);
-			const realProcessScanPath = path.join(
-				repo,
-				"scripts",
-				"lib",
-				"process-scan-real.mjs",
-			);
-			fs.renameSync(processScanPath, realProcessScanPath);
-			fs.writeFileSync(
-				processScanPath,
-				[
-					'import * as real from "./process-scan-real.mjs";',
-					'export * from "./process-scan-real.mjs";',
-					"// Deliberately delayed (PR #2493 round 5, R2, following review",
-					"// round 3, F1's technique): widens the gap between enrichment's",
-					"// isDirty() and the pre-remove recheck's so the gitlink",
-					"// corruption below is guaranteed to land inside it.",
-					"export async function snapshotProcesses(...args) {",
-					"\tawait new Promise((resolve) => setTimeout(resolve, 400));",
-					"\treturn real.snapshotProcesses(...args);",
-					"}",
-					"",
-				].join("\n"),
-			);
+			fixture.patchRecheck(path.join(worktree, ".git"));
 
-			const cliRun = new Promise<void>((resolve, reject) => {
-				const child = spawn(process.execPath, [cli, ...registeredArgv()], {
-					cwd: repo,
-					env: {
-						...gitFixtureEnv(root),
-						PILENS_DATA_DIR: ledgerDir,
-					},
-					stdio: ["pipe", "pipe", "pipe"],
-				});
-				child.on("error", reject);
-				child.on("close", () => resolve());
-				child.stdin.write(subagentStopPayload(AGENT_ID));
-				child.stdin.end();
-			});
-			// Well after enrichment, comfortably inside the artificial 400ms
-			// process-table delay above.
-			await new Promise((resolve) => setTimeout(resolve, 150));
-			// Same unlink-then-write trick review round 3, F2 uses: Windows
-			// denies the O_TRUNC open `writeFileSync` performs on a `.git`
-			// gitlink file `git worktree add` just created.
-			const gitLinkPath = path.join(worktree, ".git");
-			fs.unlinkSync(gitLinkPath);
-			fs.writeFileSync(gitLinkPath, "gitdir: /nonexistent\n");
-			await cliRun;
+			runCli(registeredArgv(), subagentStopPayload(AGENT_ID));
 
+			const records = ledgerRecords();
+			// #2519 round 2, S2: this test's whole premise is that
+			// `readProcessTable` actually reaches `snapshotProcesses`, which is
+			// the only place `patchRecheck`'s corruption is applied. If the scan
+			// were instead skipped for budget (`hygiene.scan-degraded reason:
+			// "skipped"`), `snapshotProcesses` would never run, the gitlink
+			// would stay unpatched, `git status` would answer cleanly, and the
+			// tree would be REMOVED instead of kept -- silently turning this
+			// test's own failure into "worktree got removed?!" rather than a
+			// visible assertion about why.
+			expect(
+				records.find((record) => record.event === "hygiene.scan-degraded"),
+				"the scan must not be skipped, or patchRecheck's corruption never applies",
+			).toBeUndefined();
 			expect(fs.existsSync(worktree)).toBe(true);
 			expect(
-				ledgerRecords().find((record) => record.event === "hygiene.run"),
+				records.find((record) => record.event === "hygiene.run"),
 			).toMatchObject({ removed: 0, keptReason: "status-unreadable" });
 			expect(
-				ledgerRecords().find(
-					(record) => record.event === "hygiene.worktree-removed",
-				),
+				records.find((record) => record.event === "hygiene.worktree-removed"),
 			).toMatchObject({
 				removed: false,
 				error: "recheck could not read git status before removal",
@@ -1664,13 +1804,7 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 			// `--budget-ms 1` puts the deadline in the past before the first
 			// tree is even reached, so only that clause keeps the second tree
 			// out of `not-evaluated`.
-			const second = path.join(
-				repo,
-				".claude",
-				"worktrees",
-				"agent-a0000000000000002",
-			);
-			git(["worktree", "add", "-q", "-b", "pr-9002", second], repo);
+			const second = fixture.addSiblingWorktree("a0000000000000002", "pr-9002");
 			const out = runCli(
 				[
 					"--only",
@@ -1738,6 +1872,189 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 					),
 				},
 			]);
+		},
+	);
+
+	it.skipIf(process.platform !== "win32")(
+		"scopes the orphan sweep to the stopped agent's own tree, never a sibling's (#2501)",
+		{ timeout: 90_000 },
+		() => {
+			// #2435's contract: a SubagentStop run reaps ONLY orphaned helpers
+			// under the tree of the agent that stopped, never a sibling agent's
+			// -- `restrictToPath: agentTree` in main() (prune-agent-worktrees.mjs)
+			// is what enforces it. #2501 found this end-to-end path untested:
+			// deleting that one argument leaves this file's whole suite green
+			// (49 passed, verified on PR #2493 head 3ac2bcdb). `planOrphanSweep`'s
+			// OWN `restrictToPath` intersection IS unit-tested in
+			// worktree-hygiene.test.ts -- what was untested is `main()` actually
+			// PASSING it, so this drives the real CLI end to end, not the pure
+			// function.
+			//
+			// Windows-only, not a flake gate: `selectOrphanFixtureProcesses`
+			// infers "the parent exited" from the parent's pid being ABSENT
+			// from a process-table snapshot (worktree-hygiene.mjs's own note:
+			// "Windows keeps the recorded parent pid after the parent dies").
+			// On POSIX the kernel reparents an orphan to pid 1 (or the nearest
+			// subreaper) the instant its parent exits, so by the time any
+			// snapshot runs the orphan's ppid is already a LIVE pid -- neither
+			// tree's helper would ever be classified as an orphan there, so
+			// the "must appear in orphans" half of this assertion would fail
+			// for a reason that has nothing to do with `restrictToPath`, on
+			// every Linux/macOS box, deterministically (not flaky -- the
+			// mutation this test targets would ALSO stay invisible, the exact
+			// vacuous-test shape #2501 itself warns against). Verified live on
+			// this box: a detached grandchild's ppid stays the dead launcher's
+			// pid, absent from the table, after the launcher has fully exited.
+			// Windows is also #2435's own evidence platform.
+			const sibling = fixture.addSiblingWorktree(
+				"a0000000000000002",
+				"pr-9002",
+			);
+
+			const sleeperSource = "setInterval(() => {}, 1000);\n";
+			const agentSleeper = path.join(
+				worktree,
+				"tests",
+				"fixtures",
+				"sleeper.mjs",
+			);
+			const siblingSleeper = path.join(
+				sibling,
+				"tests",
+				"fixtures",
+				"sleeper.mjs",
+			);
+			fs.mkdirSync(path.dirname(agentSleeper), { recursive: true });
+			fs.mkdirSync(path.dirname(siblingSleeper), { recursive: true });
+			fs.writeFileSync(agentSleeper, sleeperSource);
+			fs.writeFileSync(siblingSleeper, sleeperSource);
+
+			// A short-lived `-e` launcher spawns the sleeper `detached` and
+			// exits; `execFileSync` blocks until the LAUNCHER itself has fully
+			// exited, so by the time this returns the sleeper's own parent pid
+			// is genuinely gone -- deterministic, no race, no wait-then-hope.
+			const spawnOrphan = (scriptPath: string): number => {
+				const launcherCode = [
+					'const { spawn } = require("node:child_process");',
+					`const child = spawn(process.execPath, [${JSON.stringify(
+						scriptPath,
+					)}], { detached: true, stdio: "ignore" });`,
+					"child.unref();",
+					"process.stdout.write(String(child.pid));",
+				].join("\n");
+				const out = execFileSync(process.execPath, ["-e", launcherCode], {
+					encoding: "utf8",
+				});
+				return Number(out.trim());
+			};
+
+			const agentPid = spawnOrphan(agentSleeper);
+			const siblingPid = spawnOrphan(siblingSleeper);
+			try {
+				// `--dry-run --json`, per #2501's proposed shape: nothing is
+				// ever killed, and the plan's `orphans` array is inspectable.
+				const out = runCli(
+					[...registeredArgv(), "--dry-run", "--json"],
+					subagentStopPayload(AGENT_ID),
+				);
+				const plan = JSON.parse(out) as {
+					orphans: { pid: number; command: string }[];
+				};
+				const orphanPids = plan.orphans.map((entry) => entry.pid);
+				expect(
+					orphanPids,
+					"the agent-tree helper never appeared in the orphan snapshot",
+				).toContain(agentPid);
+				expect(orphanPids).not.toContain(siblingPid);
+			} finally {
+				for (const pid of [agentPid, siblingPid]) {
+					try {
+						process.kill(pid);
+					} catch {
+						/* already gone, or never came up */
+					}
+				}
+			}
+		},
+	);
+
+	it(
+		"scopes the orphan sweep to the stopped agent's own tree, never a sibling's, on every platform (#2519 round 2, F1)",
+		{ timeout: 90_000 },
+		() => {
+			// The premise the reviewer named for round 1's `skipIf(!win32)`
+			// case above: no CI lane runs vitest on Windows, so it never
+			// exercises `restrictToPath` on the gate that actually decides
+			// this PR. Nulling `restrictToPath` in `main()` stayed green on
+			// ubuntu Unit tests the whole time.
+			//
+			// This variant proves the SAME wiring -- `main()` actually passing
+			// `restrictToPath: agentTree` into `planOrphanSweep`, not just
+			// `planOrphanSweep`'s own pure intersection (already covered in
+			// worktree-hygiene.test.ts) -- without depending on either
+			// platform's real orphan-reparenting behavior. Instead of
+			// spawning and killing real detached processes and reading the
+			// kernel's own ppid bookkeeping (POSIX and Windows disagree on
+			// when an orphan's ppid updates, which is exactly why the case
+			// above is win32-only), it uses the builder's module-substitution
+			// seam to append two SYNTHETIC fixture-helper rows directly onto
+			// the REAL snapshot `readProcessTable` produces: one for this
+			// agent's own tree, one for a sibling's. Each row's `ppid` names
+			// a real pid a short-lived launcher already waited to exit, so it
+			// is genuinely, deterministically absent from the snapshot by the
+			// time this test's own CLI invocation takes one -- no synthetic
+			// liveness bookkeeping, and no `/proc` cwd, required.
+			// `verifySnapshotIntegrity` still passes because the REAL rows
+			// (this process's own ancestor chain) are untouched; only two
+			// rows are appended on top.
+			const sibling = fixture.addSiblingWorktree(
+				"a0000000000000003",
+				"pr-9003",
+			);
+
+			// `execFileSync` blocks until the launcher itself has exited, so
+			// by the time this returns the reported pid is already gone from
+			// any process snapshot taken afterward -- deterministic, no
+			// signal-0 polling, no race window.
+			const deadPid = (): number => {
+				const out = execFileSync(
+					process.execPath,
+					["-e", "process.stdout.write(String(process.pid))"],
+					{ encoding: "utf8" },
+				);
+				return Number(out.trim());
+			};
+
+			const agentSyntheticPid = 900_000_001;
+			const siblingSyntheticPid = 900_000_002;
+			fixture.patchProcessScanAppendRows([
+				{
+					pid: agentSyntheticPid,
+					ppid: deadPid(),
+					command: `node ${worktree}/tests/fixtures/sleeper.mjs`,
+				},
+				{
+					pid: siblingSyntheticPid,
+					ppid: deadPid(),
+					command: `node ${sibling}/tests/fixtures/sleeper.mjs`,
+				},
+			]);
+
+			// `--dry-run --json`, same shape as the win32 case: nothing is
+			// ever killed, and the plan's `orphans` array is inspectable.
+			const out = runCli(
+				[...registeredArgv(), "--dry-run", "--json"],
+				subagentStopPayload(AGENT_ID),
+			);
+			const plan = JSON.parse(out) as {
+				orphans: { pid: number; command: string }[];
+			};
+			const orphanPids = plan.orphans.map((entry) => entry.pid);
+			expect(
+				orphanPids,
+				"the agent-tree synthetic helper never appeared in the orphan snapshot",
+			).toContain(agentSyntheticPid);
+			expect(orphanPids).not.toContain(siblingSyntheticPid);
 		},
 	);
 });
