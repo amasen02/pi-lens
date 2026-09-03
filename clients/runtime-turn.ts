@@ -2667,7 +2667,13 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				sessionId: runtime.telemetrySessionId,
 				metadata: {
 					turnIndex: runtime.turnIndex,
-					unsuppressed: report.summary.unsuppressed,
+					// #2504 review round 7 (F2): the MERGED report, matching the
+					// advisory text above it (round 6, a) -- a rescued deferred
+					// entry lives only on `publishResult.report`, and the pre-merge
+					// `report` this turn assembled undercounts it. This is the value
+					// scripts/analyze-pi-lens-logs.mjs sums, so an undercount here is
+					// a silent miscount there too.
+					unsuppressed: publishResult.report.summary.unsuppressed,
 				},
 			});
 			logLatency({

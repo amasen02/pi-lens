@@ -1412,17 +1412,32 @@ export function mergeActionableWarningsReports(args: {
 	const deferredPublish = origin === "deferred";
 
 	// The newer half wins identity and fileSeq; the older half is folded in.
-	// #2504 review round 6 (F1): a same-sessionId check used to gate this --
-	// removed. pi's telemetry sessionId is STABLE across a quit->resume
-	// (setSessionLifecycle pins it, runtime-coordinator.ts:677-682), but
-	// resetForSession clears the live _fileSeq map for the new process, so a
-	// resumed process's getFileSeq answers 0 for a file a PRE-restart
-	// deferral had recorded at a nonzero seq. The sessionId gate could not
-	// see that: same id, stale data. The equality check below (baselineSeq
-	// !== entry.fileSeq) is what actually distinguishes "this session,
-	// unmoved" (live seq matches the recorded seq exactly) from "stale
-	// carry" (any mismatch, including a reset-to-0 baseline) -- the
-	// sessionId gate added nothing past it.
+	// #2504 review round 6 (F1) removed a same-sessionId gate here, reasoning
+	// that the fileSeq equality check below subsumed it: pi's telemetry
+	// sessionId is STABLE across a quit->resume (setSessionLifecycle pins it,
+	// runtime-coordinator.ts:677-682), but resetForSession clears the live
+	// _fileSeq map for the new process, so a resumed process's getFileSeq
+	// answers 0 for a file a PRE-restart deferral had recorded at a nonzero
+	// seq -- the sessionId gate could not see that (same id, stale data), the
+	// equality check could.
+	// #2504 review round 7 (F4): that reasoning breaks at fileSeq 0. A file
+	// THIS process has never touched also answers getFileSeq 0 (a fresh
+	// RuntimeCoordinator's map starts empty), and an entry a DIFFERENT
+	// process stamped at fileSeq 0 can reach the persisted report entirely
+	// unrelated to a resume: `mcp/analyze.ts` and `mcp/session.ts` register
+	// modified ranges through their OWN CacheManager, which never bumps the
+	// extension runtime's `_fileSeq` map, so an MCP-touched file can persist
+	// at seq 0 under a foreign sessionId. `0 !== 0` then reads FALSE and the
+	// entry is carried as if it were this session's own unmoved file. The
+	// sessionId gate is restored ALONGSIDE the equality check, not instead of
+	// it: equality alone catches the resume-reset case (same session, seq
+	// forcibly reset to 0), the sessionId gate alone catches the
+	// foreign-session case (different session, seq coincidentally equal,
+	// often both 0) -- neither subsumes the other.
+	const sessionMismatch =
+		!deferredPublish &&
+		persisted?.sessionId !== undefined &&
+		persisted.sessionId !== incoming.sessionId;
 	const newerHalf = deferredPublish ? (persisted?.files ?? []) : incoming.files;
 	const olderHalf = deferredPublish ? incoming.files : (persisted?.files ?? []);
 	const newerReport = deferredPublish ? persisted : incoming;
@@ -1466,7 +1481,8 @@ export function mergeActionableWarningsReports(args: {
 		// it upserts into.
 		const stale =
 			!deferredPublish && liveBaseline
-				? typeof entry.fileSeq === "number" && baselineSeq !== entry.fileSeq
+				? sessionMismatch ||
+					(typeof entry.fileSeq === "number" && baselineSeq !== entry.fileSeq)
 				: typeof baselineSeq === "number" &&
 					typeof entry.fileSeq === "number" &&
 					baselineSeq > entry.fileSeq;
@@ -1593,6 +1609,25 @@ export function publishActionableWarningsReport(
 	if (merged.mergedFiles > 0) {
 		opts.dbg?.(
 			`actionable_warnings: ${origin} publish merged ${merged.mergedFiles} persisted file entry/entries`,
+		);
+	}
+	// #2504 review round 7 (F5): the deferred origin's own loss is already
+	// recorded by {@link writeDeferredActionableWarningsReport}, which calls
+	// through here first. The IN-BAND origin has the same shape of loss --
+	// this turn's own publish carries a carried-forward deferred entry
+	// forward only while its file has not moved, and a file that moved
+	// between the deferral and this publish is dropped -- but nothing counted
+	// or traced it: only the benign, expected scope-guard spend (an entry
+	// whose carry-forward window already closed) got a dbg line. Same
+	// accounting, mirrored for the origin that was silent.
+	if (origin === "in-band" && merged.droppedFiles.length > 0) {
+		incrementDegradationCount({
+			kind: "actionable-warnings-inband-superseded",
+			subject: `${path.resolve(cwd)}:inband-carry-superseded`,
+			reason: `${merged.droppedFiles.length} carried-forward deferred file entry/entries changed before this turn's in-band publish could keep them (${merged.droppedFiles.slice(0, 3).join(", ")}${merged.droppedFiles.length > 3 ? ", ..." : ""}); their earlier findings are LOST on this channel rather than published against content that has since moved`,
+		});
+		opts.dbg?.(
+			`actionable_warnings: in-band publish dropped ${merged.droppedFiles.length} superseded carried-forward file entry/entries (${merged.droppedFiles.slice(0, 3).join(", ")}${merged.droppedFiles.length > 3 ? ", ..." : ""})`,
 		);
 	}
 	return merged;
@@ -1990,6 +2025,16 @@ export function formatActionableWarningsAdvisory(
 		report.summary.autoFixEligible > 0
 			? ` ${report.summary.autoFixEligible} appear to have conservative preferred quickfixes.`
 			: "";
+	// #2504 review round 7 (F2, secondary): a file still carrying `origin:
+	// "deferred"` was found by a PRIOR turn's off-hook pull, not this one --
+	// "introduced this turn" overstates it. Cheap to say so.
+	const deferredCount = files.filter(
+		(file) => file.origin === "deferred",
+	).length;
+	const deferredNote =
+		deferredCount > 0
+			? ` (${deferredCount} delivered from a deferred pull)`
+			: "";
 	// #1777: hint and info are style opinions, so say how much of the count is
 	// opinion. The line appears only when a quiet tier is actually present —
 	// an all-warning turn already says everything in the count above.
@@ -2000,7 +2045,7 @@ export function formatActionableWarningsAdvisory(
 			? `${quiet} of those are hint/info tier — style opinions, worth fixing only while you are already in that code.`
 			: undefined;
 	return [
-		`🟡 Fixable warnings introduced this turn: ${report.summary.unsuppressed}.${safe}`,
+		`🟡 Fixable warnings introduced this turn: ${report.summary.unsuppressed}.${safe}${deferredNote}`,
 		tierLine,
 		`Details written to .pi-lens/cache/actionable-warnings.json`,
 		fileList ? `Files:\n${fileList}${more}` : undefined,

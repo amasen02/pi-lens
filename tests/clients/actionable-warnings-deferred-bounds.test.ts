@@ -96,6 +96,28 @@ vi.mock("../../clients/lsp/index.js", async (importOriginal) => {
 	return { ...actual, getLSPService: () => fakeService };
 });
 
+/**
+ * #2504 review round 7 (F3): `logActionableWarningsEvent` is a real no-op
+ * under `isTestMode()`, which is exactly why a pre-merge-vs-merged-report
+ * regression in its caller has no visible symptom without intercepting the
+ * call itself. Mocked here (not spied) so the arguments reach a plain array
+ * before the real implementation's test-mode short-circuit would swallow
+ * them.
+ */
+const loggedActionableWarningsEvents = vi.hoisted(
+	() => [] as Array<{ event: string; metadata?: Record<string, unknown> }>,
+);
+vi.mock("../../clients/actionable-warnings-logger.js", () => ({
+	logActionableWarningsEvent: (entry: {
+		event: string;
+		metadata?: Record<string, unknown>;
+	}) => {
+		loggedActionableWarningsEvents.push(entry);
+	},
+	getActionableWarningsLogPath: () => "",
+	flushActionableWarningsLog: async () => {},
+}));
+
 const EMPTY_KNIP_RESULT = {
 	success: true,
 	issues: [],
@@ -121,6 +143,7 @@ beforeEach(() => {
 	getDiagnostics.mockClear();
 	codeAction.mockClear();
 	getLastKnownDiagnostics.mockClear();
+	loggedActionableWarningsEvents.length = 0;
 	resetDegradationLedger();
 });
 
@@ -1624,5 +1647,375 @@ describe("#2504 r6 F2 — the marker spend actually stops accumulation on the th
 			env.tmpDir,
 		)?.data;
 		expect((afterN2?.files ?? []).map((f) => f.filePath)).toEqual([]);
+	});
+});
+
+/**
+ * #2504 review round 7 (F4) — round 6's removal of the same-`sessionId` gate
+ * reasoned that exact `fileSeq` equality subsumed it: an unmoved file's live
+ * seq always equals its recorded entry's seq, whether that is "this session,
+ * untouched" or "a resumed process whose `_fileSeq` map reset to 0". That
+ * reasoning breaks at `fileSeq` 0 for a genuinely DIFFERENT session (not a
+ * resume of the same one): `mcp/analyze.ts` and `mcp/session.ts` register
+ * turn-state ranges through their own `CacheManager`, never bumping the
+ * extension runtime's `_fileSeq`, so an MCP-touched file can persist a
+ * report entry at seq 0 under a foreign `sessionId`. The current session's
+ * OWN live `getFileSeq` for a file it has never touched also answers 0, so
+ * `0 !== 0` reads FALSE and the foreign entry was carried as if it were this
+ * session's own unmoved file.
+ */
+describe("#2504 r7 F4 — a foreign session's zero-seq entry no longer passes the equality gate", () => {
+	function warning(
+		filePath: string,
+		id: string,
+	): ActionableWarningsReport["files"][number]["warnings"][number] {
+		return {
+			id,
+			filePath,
+			displayPath: path.basename(filePath),
+			line: 1,
+			severity: "warning",
+			tool: "typescript",
+			message: `finding ${id}`,
+			actions: [],
+			suppressed: false,
+			origin: "lsp",
+		};
+	}
+
+	function baseReport(
+		over: Partial<ActionableWarningsReport>,
+	): ActionableWarningsReport {
+		return {
+			generatedAt: new Date(2_000_000).toISOString(),
+			scope: "turn_delta",
+			sessionId: "lens-test",
+			turnIndex: 1,
+			projectSeqStart: 0,
+			projectSeqEnd: 1,
+			deltaOnly: true,
+			includeLspCodeActions: true,
+			files: [],
+			summary: {
+				warnings: 0,
+				unsuppressed: 0,
+				byTier: { warning: 0, info: 0, hint: 0 },
+				suppressed: 0,
+				files: 0,
+				actions: 0,
+				autoFixEligible: 0,
+			},
+			...over,
+		} as ActionableWarningsReport;
+	}
+
+	it("drops a fileSeq-0 entry stamped by a different sessionId instead of carrying it", async () => {
+		const { publishActionableWarningsReport } = await loadWarnings();
+		const cacheManager = new CacheManager(false);
+		const [foreign] = makeSources(1);
+
+		// A foreign process (an MCP session, distinct sessionId) persisted this
+		// entry at fileSeq 0 -- its own turn-state ranges never touched the
+		// extension runtime's _fileSeq map.
+		cacheManager.writeCache(
+			"actionable-warnings",
+			baseReport({
+				sessionId: "mcp-foreign-session",
+				turnIndex: 5,
+				projectSeqEnd: 5,
+				files: [
+					{
+						filePath: foreign,
+						displayPath: path.basename(foreign),
+						fileSeq: 0,
+						generatedAt: new Date(2_000_000).toISOString(),
+						warnings: [warning(foreign, "FOREIGN-0")],
+						origin: "deferred" as const,
+					},
+				],
+			}),
+			env.tmpDir,
+		);
+
+		// This session has never touched `foreign` either -- its own live
+		// getFileSeq also answers 0, which pre-fix made the entry read as
+		// "this session, unmoved".
+		const result = publishActionableWarningsReport(
+			cacheManager,
+			env.tmpDir,
+			baseReport({
+				sessionId: "lens-current-session",
+				turnIndex: 1,
+				projectSeqEnd: 1,
+				files: [],
+			}),
+			{
+				origin: "in-band",
+				getFileSeq: () => 0,
+			},
+		);
+
+		expect(result.droppedFiles).toContain(path.basename(foreign));
+		expect(
+			(result.report.files ?? []).some((f) => f.filePath === foreign),
+		).toBe(false);
+
+		const persisted = cacheManager.readCache<ActionableWarningsReport>(
+			"actionable-warnings",
+			env.tmpDir,
+		)?.data;
+		expect((persisted?.files ?? []).some((f) => f.filePath === foreign)).toBe(
+			false,
+		);
+	});
+
+	it("still carries a fileSeq-0 entry from the SAME sessionId (a genuinely untouched file)", async () => {
+		const { publishActionableWarningsReport } = await loadWarnings();
+		const cacheManager = new CacheManager(false);
+		const [same] = makeSources(1);
+
+		cacheManager.writeCache(
+			"actionable-warnings",
+			baseReport({
+				sessionId: "lens-shared-session",
+				turnIndex: 5,
+				projectSeqEnd: 5,
+				files: [
+					{
+						filePath: same,
+						displayPath: path.basename(same),
+						fileSeq: 0,
+						generatedAt: new Date(2_000_000).toISOString(),
+						warnings: [warning(same, "SAME-0")],
+						origin: "deferred" as const,
+					},
+				],
+			}),
+			env.tmpDir,
+		);
+
+		const result = publishActionableWarningsReport(
+			cacheManager,
+			env.tmpDir,
+			baseReport({
+				sessionId: "lens-shared-session",
+				turnIndex: 6,
+				projectSeqEnd: 6,
+				files: [],
+			}),
+			{
+				origin: "in-band",
+				getFileSeq: () => 0,
+			},
+		);
+
+		expect(result.droppedFiles).not.toContain(path.basename(same));
+		expect((result.report.files ?? []).some((f) => f.filePath === same)).toBe(
+			true,
+		);
+	});
+});
+
+/**
+ * #2504 review round 7 (F5) — the scope-guard drop (an entry whose
+ * carry-forward window already closed) has always traced to `dbg`, because
+ * that loss is expected, not a fault. The STALE drop right below it -- a
+ * carried-forward deferred entry whose file genuinely moved between the
+ * deferral and this in-band publish -- is the loss that is NOT expected
+ * (content changed out from under the delivery), and it had neither a dbg
+ * line nor a degradation-ledger entry. The deferred origin's own version of
+ * this same loss (`writeDeferredActionableWarningsReport`) has always
+ * counted it; this pins the in-band side to the same accounting.
+ */
+describe("#2504 r7 F5 — the in-band stale drop is no longer silent", () => {
+	function warning(
+		filePath: string,
+		id: string,
+	): ActionableWarningsReport["files"][number]["warnings"][number] {
+		return {
+			id,
+			filePath,
+			displayPath: path.basename(filePath),
+			line: 1,
+			severity: "warning",
+			tool: "typescript",
+			message: `finding ${id}`,
+			actions: [],
+			suppressed: false,
+			origin: "lsp",
+		};
+	}
+
+	function baseReport(
+		over: Partial<ActionableWarningsReport>,
+	): ActionableWarningsReport {
+		return {
+			generatedAt: new Date(2_000_000).toISOString(),
+			scope: "turn_delta",
+			sessionId: "lens-test",
+			turnIndex: 1,
+			projectSeqStart: 0,
+			projectSeqEnd: 1,
+			deltaOnly: true,
+			includeLspCodeActions: true,
+			files: [],
+			summary: {
+				warnings: 0,
+				unsuppressed: 0,
+				byTier: { warning: 0, info: 0, hint: 0 },
+				suppressed: 0,
+				files: 0,
+				actions: 0,
+				autoFixEligible: 0,
+			},
+			...over,
+		} as ActionableWarningsReport;
+	}
+
+	it("traces the drop via dbg and counts it on the degradation ledger", async () => {
+		const { publishActionableWarningsReport } = await loadWarnings();
+		const cacheManager = new CacheManager(false);
+		const [moved] = makeSources(1);
+		const dbgLines: string[] = [];
+
+		cacheManager.writeCache(
+			"actionable-warnings",
+			baseReport({
+				sessionId: "lens-test",
+				turnIndex: 5,
+				projectSeqEnd: 5,
+				files: [
+					{
+						filePath: moved,
+						displayPath: path.basename(moved),
+						fileSeq: 5,
+						generatedAt: new Date(2_000_000).toISOString(),
+						warnings: [warning(moved, "MOVED-5")],
+						origin: "deferred" as const,
+					},
+				],
+			}),
+			env.tmpDir,
+		);
+
+		// `moved` was edited again since the deferred pull recorded fileSeq 5.
+		const result = publishActionableWarningsReport(
+			cacheManager,
+			env.tmpDir,
+			baseReport({
+				sessionId: "lens-test",
+				turnIndex: 6,
+				projectSeqEnd: 6,
+				files: [],
+			}),
+			{
+				origin: "in-band",
+				getFileSeq: () => 9,
+				dbg: (msg) => dbgLines.push(msg),
+			},
+		);
+
+		expect(result.droppedFiles).toContain(path.basename(moved));
+		expect(
+			dbgLines.some(
+				(line) =>
+					line.includes("in-band") &&
+					line.includes("dropped") &&
+					line.includes(path.basename(moved)),
+			),
+		).toBe(true);
+
+		const summary = getDegradationSummary();
+		const group = summary.find(
+			(g) => g.kind === "actionable-warnings-inband-superseded",
+		);
+		expect(group?.count).toBeGreaterThanOrEqual(1);
+	});
+});
+
+/**
+ * #2504 review round 7 (F2/F3) — round 6 fixed the ADVISORY text to read
+ * `publishResult.report` (the MERGED report) instead of the pre-merge
+ * `report` this turn assembled, but nothing pinned it: reverting that one
+ * line back to `report` left the existing suite green. The TELEMETRY event
+ * right below it (`logActionableWarningsEvent`'s `metadata.unsuppressed`)
+ * still read the pre-merge `report` even after round 6 -- a rescued
+ * deferred finding was correctly advised but logged as worth 0, and
+ * `scripts/analyze-pi-lens-logs.mjs` sums that field. This test drives the
+ * real `handleTurnEnd` path (not a hand-fed report) for both halves: a
+ * deferred delivery in turn N, then a turn N+1 with no new findings of its
+ * own, and checks both surfaces the merge is supposed to feed.
+ */
+describe("#2504 r7 F2/F3 — the advisory AND the telemetry both read the merged report", () => {
+	it("turn N+1's advisory mentions turn N's deferred finding, and its telemetry counts it", async () => {
+		const { _awaitDeferredLspPullForTest } = await loadWarnings();
+		const { handleTurnEnd } = await import("../../clients/runtime-turn.js");
+		const runtime = new RuntimeCoordinator();
+		const cacheManager = new CacheManager(false);
+		const [deferredFile, nextFile] = makeSources(2);
+
+		// Turn N: one modified file, nothing primed, so its pull defers.
+		runtime.beginTurn();
+		cacheManager.addModifiedRange(
+			deferredFile,
+			{ start: 1, end: 1 },
+			false,
+			env.tmpDir,
+			runtime.telemetrySessionId,
+		);
+		armOneActionableWarning(path.basename(deferredFile));
+		// biome-ignore lint/suspicious/noExplicitAny: minimal turn_end deps
+		await handleTurnEnd(turnEndDeps(runtime, cacheManager) as any);
+		// Land turn N's deferred report before turn N+1 starts.
+		await settlesWithin(_awaitDeferredLspPullForTest(), 8_000);
+		const afterDefer = cacheManager.readCache<ActionableWarningsReport>(
+			"actionable-warnings",
+			env.tmpDir,
+		)?.data;
+		// Premise check: the deferred finding really landed.
+		expect(afterDefer?.summary.files).toBe(1);
+
+		loggedActionableWarningsEvents.length = 0;
+
+		// Turn N+1: touches a DIFFERENT file, nothing primed for it either (so
+		// it too defers and contributes nothing in-band), and records no
+		// dispatch finding of its own. This turn's own pre-merge report is
+		// therefore empty; only the merge with what turn N deferred gives it
+		// anything to advise or log.
+		runtime.beginTurn();
+		cacheManager.addModifiedRange(
+			nextFile,
+			{ start: 1, end: 1 },
+			false,
+			env.tmpDir,
+			runtime.telemetrySessionId,
+		);
+		// biome-ignore lint/suspicious/noExplicitAny: minimal turn_end deps
+		await handleTurnEnd(turnEndDeps(runtime, cacheManager) as any);
+
+		const persisted = cacheManager.readCache<ActionableWarningsReport>(
+			"actionable-warnings",
+			env.tmpDir,
+		)?.data;
+		expect((persisted?.files ?? []).map((f) => f.filePath)).toContain(
+			deferredFile,
+		);
+
+		const findings = cacheManager.readCache<{ content: string }>(
+			"turn-end-findings",
+			env.tmpDir,
+		)?.data;
+		expect(findings?.content).toContain(path.basename(deferredFile));
+
+		const advisoryEvents = loggedActionableWarningsEvents.filter(
+			(e) => e.event === "advisory_injected" || e.event === "advisory_skipped",
+		);
+		expect(advisoryEvents.length).toBeGreaterThan(0);
+		const last = advisoryEvents[advisoryEvents.length - 1];
+		expect(last.event).toBe("advisory_injected");
+		expect(last.metadata?.unsuppressed).toBe(1);
+
+		// Drain turn N+1's own deferred loop so nothing outlives the test.
+		await settlesWithin(_awaitDeferredLspPullForTest(), 8_000);
 	});
 });
