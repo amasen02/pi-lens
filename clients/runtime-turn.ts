@@ -2600,17 +2600,28 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 						// overwrote a newer report, which `agent_end` then rejected
 						// as `project_seq_mismatch` (silently skipping the autofix
 						// pass) and `lens_diagnostics` re-served as a stale delta.
-						// #2504 review round 3 (F-A(a)): the guard asks only
-						// whether something NEWER is already PERSISTED. How far
-						// the live projectSeq moved is a freshness question, and
-						// both consumers (`formatDeltaMode`,
-						// `checkActionableWarningsReportFresh`) already answer it
-						// for themselves — refusing to publish on it only lost
-						// the turn's warnings outright.
+						// #2504 review round 4 (F1): guarded PER FILE, not per
+						// report. The round-3 shape (publish, or discard whole
+						// when something newer is persisted) composed with
+						// incumbent-wins into "publish nothing" — every turn_end
+						// with modified files persists an in-band report with a
+						// strictly increasing turnIndex, and the decline fires
+						// exactly when such a turn runs while a loop is in
+						// flight, so a decline always implied a supersede. The
+						// merge upserts the entries whose file has not moved and
+						// drops only those that have.
 						writeDeferredActionableWarningsReport({
 							cacheManager,
 							cwd,
 							report: deferred,
+							// The LIVE per-file sequence at WRITE time is the
+							// baseline the merge judges each entry against. The
+							// runtime is the only thing that knows it: a file
+							// edited into cleanliness by a later turn is absent
+							// from the persisted report entirely.
+							getFileSeq: getFileSeq
+								? (filePath: string) => getFileSeq.call(runtime, filePath)
+								: undefined,
 							dbg,
 						});
 					} catch (deferErr) {

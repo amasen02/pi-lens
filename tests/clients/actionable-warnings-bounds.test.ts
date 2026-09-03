@@ -11,11 +11,12 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { LSPCodeAction } from "../../clients/lsp/client.js";
+import type { LSPCodeAction, LSPDiagnostic } from "../../clients/lsp/client.js";
 import {
 	getDegradationSummary,
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
+import { normalizeMapKey } from "../../clients/path-utils.js";
 import { removeTempDirSync } from "./test-utils.js";
 
 const openFile = vi.fn(
@@ -28,12 +29,41 @@ const getDiagnostics = vi.fn(async (_filePath: string) => {
 	}
 	return [];
 });
-const codeAction = vi.fn(async (): Promise<LSPCodeAction[]> => []);
+/**
+ * #2504 review round 4. Both new bounds are about the cost of ONE file, so the
+ * double has to be able to cost something per round trip and the primed cache
+ * has to be able to hold real warnings.
+ */
+let codeActionDelayMs = 0;
+const codeAction = vi.fn(async (): Promise<LSPCodeAction[]> => {
+	if (codeActionDelayMs > 0) {
+		await new Promise((resolve) => setTimeout(resolve, codeActionDelayMs));
+	}
+	return [];
+});
 /** Files whose diagnostics the dispatch pipeline primed this turn. */
 let primedFiles = new Set<string>();
+/** What a PRIMED file's cache entry holds. Default: clean. */
+let primedDiagnostics: LSPDiagnostic[] = [];
 const getLastKnownDiagnostics = vi.fn((filePath: string) =>
-	primedFiles.has(filePath.replace(/\\/g, "/").toLowerCase()) ? [] : undefined,
+	primedFiles.has(filePath.replace(/\\/g, "/").toLowerCase())
+		? primedDiagnostics
+		: undefined,
 );
+
+/** `count` warning-severity diagnostics, one per line, all on modified lines. */
+function warningDiagnostics(count: number): LSPDiagnostic[] {
+	return Array.from({ length: count }, (_unused, i) => ({
+		severity: 2 as const,
+		message: `unused symbol #${i}`,
+		range: {
+			start: { line: i, character: 0 },
+			end: { line: i, character: 4 },
+		},
+		source: "ts",
+		code: 6133,
+	}));
+}
 
 vi.mock("../../clients/lsp/index.js", () => ({
 	getLSPService: () => ({
@@ -69,6 +99,8 @@ beforeEach(() => {
 	codeAction.mockClear();
 	getLastKnownDiagnostics.mockClear();
 	getDiagnosticsDelayMs = 0;
+	codeActionDelayMs = 0;
+	primedDiagnostics = [];
 	primedFiles = new Set();
 	resetDegradationLedger();
 	tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-2504-aw-"));
@@ -194,5 +226,105 @@ describe("#2504 AC3 — cold cache moves the fresh-pull loop off the awaited hoo
 		// ...but the work still happened, off-hook, and was delivered.
 		expect(getDiagnostics.mock.calls.length).toBeGreaterThan(0);
 		expect(deferred.length).toBe(1);
+	});
+});
+
+/**
+ * #2504 review round 4 (F2) — the wall budget must bound work INSIDE a file.
+ *
+ * Round 3 re-checked the budget BETWEEN files only, on the stated ground that
+ * a file already opened should be finished rather than half-enriched. But one
+ * file costs an openFile, a getDiagnostics and up to
+ * ACTIONABLE_WARNINGS_MAX_CODE_ACTIONS_PER_FILE codeAction round trips, each
+ * bounded only by the 10 s per-round-trip timeout: 270 s on the AWAITED
+ * turn_end hook, from a batch budget of 2500 ms. Measured on the pre-fix
+ * build: a 1 ms budget still cost 1012 ms.
+ */
+describe("#2504 r4 F2 — the wall budget bounds one file's round trips", () => {
+	it("stops between a file's codeAction pulls once the budget is spent", async () => {
+		const { buildActionableWarningsReport } = await load();
+		const files = makeFiles(path.join(tmpDir, "src"), 1);
+		// PRIMED, so this is the in-band path with no open/pull to pay for: the
+		// only cost left is the per-diagnostic codeAction fan-out, which is
+		// precisely what no bound reached.
+		prime(files[0]);
+		primedDiagnostics = warningDiagnostics(40);
+		codeActionDelayMs = 20;
+
+		const startedAt = Date.now();
+		await buildActionableWarningsReport({
+			cwd: tmpDir,
+			sessionId: "lens-test",
+			turnIndex: 1,
+			files,
+			modifiedRangesByFile: new Map([
+				// Keyed exactly as production keys it, per the read-guard
+				// path-key rule: normalizeMapKey, never a hand-rolled lowercase.
+				[normalizeMapKey(files[0]), [{ start: 1, end: 200 }]],
+			]),
+			dispatchWarnings: [],
+			includeLspCodeActions: true,
+			lspBudgetMs: 60,
+		});
+		const elapsedMs = Date.now() - startedAt;
+
+		// Pre-fix: the per-file cap (25) was the only thing that stopped it, so
+		// 25 x 20 ms of codeAction ran with the batch budget long gone.
+		expect(codeAction.mock.calls.length).toBeLessThan(10);
+		expect(elapsedMs).toBeLessThan(400);
+		const inFileBudget = getDegradationSummary()
+			.flatMap((group) => group.latestReasons)
+			.filter((entry) => entry.subject.includes("in-file-budget"));
+		expect(inFileBudget.length).toBe(1);
+		expect(inFileBudget[0].reason).toContain(
+			"were NOT checked for fix actions",
+		);
+	});
+});
+
+/**
+ * #2504 review round 4 (S-1) — the per-file code-action cap had NO test.
+ *
+ * Round 3 added ACTIONABLE_WARNINGS_MAX_CODE_ACTIONS_PER_FILE and its
+ * code-action-fanout degradation; deleting both left the whole suite green.
+ */
+describe("#2504 r4 S-1 — the per-file code-action fan-out cap", () => {
+	it("stops at the cap and records the warnings it did NOT report", async () => {
+		const {
+			buildActionableWarningsReport,
+			ACTIONABLE_WARNINGS_MAX_CODE_ACTIONS_PER_FILE,
+		} = await load();
+		const files = makeFiles(path.join(tmpDir, "src"), 1);
+		prime(files[0]);
+		primedDiagnostics = warningDiagnostics(40);
+
+		await buildActionableWarningsReport({
+			cwd: tmpDir,
+			sessionId: "lens-test",
+			turnIndex: 1,
+			files,
+			modifiedRangesByFile: new Map([
+				// Keyed exactly as production keys it, per the read-guard
+				// path-key rule: normalizeMapKey, never a hand-rolled lowercase.
+				[normalizeMapKey(files[0]), [{ start: 1, end: 200 }]],
+			]),
+			dispatchWarnings: [],
+			includeLspCodeActions: true,
+			// Room to spare: the CAP, not the clock, has to be what stops this.
+			lspBudgetMs: 60_000,
+		});
+
+		expect(ACTIONABLE_WARNINGS_MAX_CODE_ACTIONS_PER_FILE).toBe(25);
+		expect(codeAction.mock.calls.length).toBe(
+			ACTIONABLE_WARNINGS_MAX_CODE_ACTIONS_PER_FILE,
+		);
+		const fanout = getDegradationSummary()
+			.flatMap((group) => group.latestReasons)
+			.filter((entry) => entry.subject.includes("code-action-fanout"));
+		expect(fanout.length).toBe(1);
+		// #2504 r4 (S-2): a capped warning is skipped BEFORE its record exists,
+		// and an action-less record is dropped, so it is not reported at all.
+		expect(fanout[0].reason).toContain("were NOT reported");
+		expect(fanout[0].reason).not.toContain("reported without fix actions");
 	});
 });

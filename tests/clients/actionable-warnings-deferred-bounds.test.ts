@@ -28,7 +28,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CacheManager } from "../../clients/cache-manager.js";
 import type { ActionableWarningsReport } from "../../clients/actionable-warnings.js";
 import type { LSPCodeAction, LSPDiagnostic } from "../../clients/lsp/client.js";
-import { resetDegradationLedger } from "../../clients/degradation-ledger.js";
+import {
+	getDegradationSummary,
+	resetDegradationLedger,
+} from "../../clients/degradation-ledger.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { setupTestEnvironment } from "./test-utils.js";
 
@@ -520,7 +523,44 @@ describe("#2504 r3 F-A — the deferred report is actually DELIVERED", () => {
 		expect(persisted?.files[0]?.warnings[0]?.actions.length).toBeGreaterThan(0);
 	});
 
-	it("publishes even though the NEXT turn already edited a file", async () => {
+	it("publishes even though the NEXT turn edited a DIFFERENT file", async () => {
+		const { _awaitDeferredLspPullForTest } = await loadWarnings();
+		const { handleTurnEnd } = await import("../../clients/runtime-turn.js");
+		const runtime = new RuntimeCoordinator();
+		const cacheManager = new CacheManager(false);
+
+		const [source, other] = makeSources(2);
+		cacheManager.addModifiedRange(
+			source,
+			{ start: 1, end: 1 },
+			false,
+			env.tmpDir,
+			runtime.telemetrySessionId,
+		);
+		armOneActionableWarning(path.basename(source));
+
+		// biome-ignore lint/suspicious/noExplicitAny: minimal turn_end deps
+		await handleTurnEnd(turnEndDeps(runtime, cacheManager) as any);
+
+		// The next turn edits a file before the deferral finishes. That is the
+		// ordinary case, not an edge: the deferral exists precisely because the
+		// session is editing. The file under the deferred pull has NOT moved, so
+		// its entry still describes current content and must be published.
+		runtime.recordProjectMutation({ filePath: other, source: "agent-edit" });
+		expect(runtime.projectSeq).toBeGreaterThan(0);
+
+		expect(await settlesWithin(_awaitDeferredLspPullForTest(), 8_000)).toBe(
+			"settled",
+		);
+
+		const persisted = cacheManager.readCache<ActionableWarningsReport>(
+			"actionable-warnings",
+			env.tmpDir,
+		)?.data;
+		expect(persisted?.summary.files).toBe(1);
+	});
+
+	it("drops the entry for the file the NEXT turn edited, and says so", async () => {
 		const { _awaitDeferredLspPullForTest } = await loadWarnings();
 		const { handleTurnEnd } = await import("../../clients/runtime-turn.js");
 		const runtime = new RuntimeCoordinator();
@@ -539,18 +579,10 @@ describe("#2504 r3 F-A — the deferred report is actually DELIVERED", () => {
 		// biome-ignore lint/suspicious/noExplicitAny: minimal turn_end deps
 		await handleTurnEnd(turnEndDeps(runtime, cacheManager) as any);
 
-		// The next turn edits ONE file before the deferral finishes. That is the
-		// ordinary case, not an edge: the deferral exists precisely because the
-		// session is editing. Nothing NEWER has been persisted — no report has
-		// been written since this turn's own empty in-band one — so there is
-		// nothing to clobber and every reason to publish.
-		//
-		// Pre-fix, the `currentProjectSeq > report.projectSeqEnd` branch
-		// discarded it here (currentProjectSeq=1, projectSeqEnd=0), and the
-		// ledger then claimed the warnings were "re-derived by the next turn's
-		// report" — which a delta over a DISJOINT file set does not do.
+		// THIS file moves while the deferred pull is reading it. Its findings
+		// cite lines in content that no longer exists, and publishing them would
+		// also poison checkActionableWarningsReportFresh for the whole report.
 		runtime.recordProjectMutation({ filePath: source, source: "agent-edit" });
-		expect(runtime.projectSeq).toBeGreaterThan(0);
 
 		expect(await settlesWithin(_awaitDeferredLspPullForTest(), 8_000)).toBe(
 			"settled",
@@ -560,16 +592,53 @@ describe("#2504 r3 F-A — the deferred report is actually DELIVERED", () => {
 			"actionable-warnings",
 			env.tmpDir,
 		)?.data;
-		expect(persisted?.summary.files).toBe(1);
+		expect(persisted?.summary.files).toBe(0);
+		const superseded = getDegradationSummary().filter(
+			(group) => group.kind === "actionable-warnings-deferred-superseded",
+		);
+		expect(superseded.length).toBe(1);
+		expect(superseded[0].latestReasons[0].reason).toContain("LOST");
 	});
 });
 
-describe("#2504 r3 F-A — the write guard still refuses a NEWER PERSISTED report", () => {
-	/**
-	 * Each surviving branch is pinned INDEPENDENTLY: every case below is built
-	 * so that exactly ONE branch can produce the refusal, so deleting either
-	 * branch alone turns exactly one of these red.
-	 */
+/**
+ * #2504 review round 4 (F1) — the deferred report MERGES, per file.
+ *
+ * Rounds 2 and 3 ordered whole reports: publish, or discard on a newer
+ * persisted turnIndex/projectSeqEnd. Composed with incumbent-wins that could
+ * only ever discard. Every turn_end with modified files persists an in-band
+ * report whose turnIndex strictly increases, and the decline fires exactly
+ * when such a turn runs while a loop is in flight — so a decline implied a
+ * supersede, always, and the declining turn's EMPTY placeholder out-ranked the
+ * incumbent's real findings on ordering alone.
+ */
+describe("#2504 r4 F1 — the deferred report merges into the persisted one", () => {
+	function warning(
+		filePath: string,
+		id: string,
+	): ActionableWarningsReport["files"][number]["warnings"][number] {
+		return {
+			id,
+			filePath,
+			displayPath: path.basename(filePath),
+			line: 1,
+			severity: "warning",
+			tool: "typescript",
+			message: `finding ${id}`,
+			actions: [
+				{
+					title: "Fix it",
+					kind: "quickfix",
+					hasEdit: true,
+					hasCommand: false,
+					autoFixEligible: true,
+				},
+			],
+			suppressed: false,
+			origin: "lsp",
+		};
+	}
+
 	function baseReport(
 		over: Partial<ActionableWarningsReport>,
 	): ActionableWarningsReport {
@@ -596,76 +665,144 @@ describe("#2504 r3 F-A — the write guard still refuses a NEWER PERSISTED repor
 		} as ActionableWarningsReport;
 	}
 
-	it("refuses on a newer persisted projectSeqEnd alone", async () => {
-		const { writeDeferredActionableWarningsReport } = await loadWarnings();
-		const cacheManager = new CacheManager(false);
-		// Equal turnIndex and an EARLIER generatedAt, so neither of the other
-		// two branches can fire. Only projectSeqEnd can.
-		cacheManager.writeCache(
-			"actionable-warnings",
-			baseReport({
-				projectSeqEnd: 41,
-				generatedAt: new Date(1_000_000).toISOString(),
-			}),
-			env.tmpDir,
-		);
-		const result = writeDeferredActionableWarningsReport({
-			cacheManager,
-			cwd: env.tmpDir,
-			report: baseReport({}),
-		});
-		expect(result.written).toBe(false);
-		expect(result.reason).toContain("projectSeqEnd");
-	});
+	function fileEntry(
+		filePath: string,
+		id: string,
+		fileSeq: number,
+		generatedAt: string,
+	): ActionableWarningsReport["files"][number] {
+		return {
+			filePath,
+			displayPath: path.basename(filePath),
+			fileSeq,
+			generatedAt,
+			warnings: [warning(filePath, id)],
+		};
+	}
 
-	it("refuses on a newer persisted turnIndex alone", async () => {
+	it("upserts its entries into a NEWER persisted report instead of being discarded", async () => {
 		const { writeDeferredActionableWarningsReport } = await loadWarnings();
 		const cacheManager = new CacheManager(false);
-		// Equal projectSeqEnd and an EARLIER generatedAt, so only turnIndex can
-		// fire.
+		const [a, b] = makeSources(2);
+
+		// The NEXT turn's in-band report: newer on BOTH whole-report orderings
+		// that round 3 refused on.
 		cacheManager.writeCache(
 			"actionable-warnings",
 			baseReport({
 				turnIndex: 8,
-				generatedAt: new Date(1_000_000).toISOString(),
+				projectSeqEnd: 41,
+				generatedAt: new Date(3_000_000).toISOString(),
+				files: [fileEntry(b, "b1", 2, new Date(3_000_000).toISOString())],
 			}),
 			env.tmpDir,
 		);
-		const result = writeDeferredActionableWarningsReport({
-			cacheManager,
-			cwd: env.tmpDir,
-			report: baseReport({}),
-		});
-		expect(result.written).toBe(false);
-		expect(result.reason).toContain("turn 8");
-	});
 
-	it("publishes over an OLDER persisted report", async () => {
-		const { writeDeferredActionableWarningsReport } = await loadWarnings();
-		const cacheManager = new CacheManager(false);
-		cacheManager.writeCache(
-			"actionable-warnings",
-			baseReport({
-				turnIndex: 6,
-				projectSeqEnd: 39,
-				generatedAt: new Date(1_000_000).toISOString(),
-			}),
-			env.tmpDir,
-		);
 		const result = writeDeferredActionableWarningsReport({
 			cacheManager,
 			cwd: env.tmpDir,
-			report: baseReport({}),
+			report: baseReport({
+				files: [fileEntry(a, "a1", 5, new Date(2_000_000).toISOString())],
+			}),
+			// Neither file has moved since its entry was built.
+			getFileSeq: (filePath) => (filePath === a ? 5 : 2),
 		});
+
 		expect(result.written).toBe(true);
+		expect(result.mergedFiles).toBe(1);
+		expect(result.droppedFiles).toBe(0);
+
 		const persisted = cacheManager.readCache<ActionableWarningsReport>(
 			"actionable-warnings",
 			env.tmpDir,
 		)?.data;
-		expect(persisted?.turnIndex).toBe(7);
+		const ids = (persisted?.files ?? []).flatMap((f) =>
+			f.warnings.map((w) => w.id),
+		);
+		expect(ids.sort()).toEqual(["a1", "b1"]);
+		// The merged report never claims to be older than its newest part.
+		expect(persisted?.turnIndex).toBe(8);
+		expect(persisted?.projectSeqEnd).toBe(41);
+	});
+
+	it("drops only the file whose fileSeq advanced, and records that loss", async () => {
+		const { writeDeferredActionableWarningsReport } = await loadWarnings();
+		const cacheManager = new CacheManager(false);
+		const [a, b] = makeSources(2);
+
+		const result = writeDeferredActionableWarningsReport({
+			cacheManager,
+			cwd: env.tmpDir,
+			report: baseReport({
+				files: [
+					fileEntry(a, "a1", 5, new Date(2_000_000).toISOString()),
+					fileEntry(b, "b1", 2, new Date(2_000_000).toISOString()),
+				],
+			}),
+			// `a` was edited while the deferred pull was reading it; `b` was not.
+			getFileSeq: (filePath) => (filePath === a ? 6 : 2),
+		});
+
+		expect(result.written).toBe(true);
+		expect(result.mergedFiles).toBe(1);
+		expect(result.droppedFiles).toBe(1);
+
+		const persisted = cacheManager.readCache<ActionableWarningsReport>(
+			"actionable-warnings",
+			env.tmpDir,
+		)?.data;
+		expect(
+			(persisted?.files ?? []).flatMap((f) => f.warnings.map((w) => w.id)),
+		).toEqual(["b1"]);
+
+		// Never silent: the per-file loss is on the ledger, bounded and named.
+		const superseded = getDegradationSummary().filter(
+			(group) => group.kind === "actionable-warnings-deferred-superseded",
+		);
+		expect(superseded.length).toBe(1);
+		expect(superseded[0].latestReasons[0].reason).toContain(path.basename(a));
+	});
+
+	it("unions the warnings when both halves hold the same file", async () => {
+		const { writeDeferredActionableWarningsReport } = await loadWarnings();
+		const cacheManager = new CacheManager(false);
+		const [a] = makeSources(1);
+
+		cacheManager.writeCache(
+			"actionable-warnings",
+			baseReport({
+				turnIndex: 8,
+				files: [fileEntry(a, "fresh", 5, new Date(3_000_000).toISOString())],
+			}),
+			env.tmpDir,
+		);
+		writeDeferredActionableWarningsReport({
+			cacheManager,
+			cwd: env.tmpDir,
+			report: baseReport({
+				files: [fileEntry(a, "deferred", 5, new Date(2_000_000).toISOString())],
+			}),
+			getFileSeq: () => 5,
+		});
+
+		const persisted = cacheManager.readCache<ActionableWarningsReport>(
+			"actionable-warnings",
+			env.tmpDir,
+		)?.data;
+		expect(persisted?.files.length).toBe(1);
+		expect(persisted?.files[0].warnings.map((w) => w.id).sort()).toEqual([
+			"deferred",
+			"fresh",
+		]);
+		// The entry now carries both observations, so it must be aged by the
+		// EARLIER of them — an out-of-band edit after that moment makes every
+		// line in it suspect, not only the older half's.
+		expect(persisted?.files[0].generatedAt).toBe(
+			new Date(2_000_000).toISOString(),
+		);
+		expect(persisted?.summary.warnings).toBe(2);
 	});
 });
-
 describe("#2504 r3 F-B — an unacknowledged open is never read as clean", () => {
 	it("skips the file rather than pulling for a document the server never received", async () => {
 		const { buildActionableWarningsReport, _awaitDeferredLspPullForTest } =
@@ -718,5 +855,105 @@ describe("#2504 r3 F-B — an unacknowledged open is never read as clean", () =>
 			"settled",
 		);
 		expect(getDiagnostics.mock.calls.length).toBe(1);
+	});
+});
+
+/**
+ * #2504 review round 4 (F1) — the reviewer's P1 choreography, end to end.
+ *
+ * Two back-to-back cold turns through the REAL handleTurnEnd. Turn 0 arms a
+ * deferral; turn 1 runs while that loop is still in flight, so its own cold
+ * files are declined, and it persists its in-band report with a strictly
+ * higher turnIndex. Then turn 0's loop lands.
+ *
+ * Pre-fix that composition published NOTHING: the incumbent's real findings
+ * lost to the declining turn's report on whole-report ordering alone, and the
+ * declining turn had nothing of its own to contribute for the files it
+ * skipped. Both turns' warnings were gone.
+ */
+describe("#2504 r4 F1 — two back-to-back cold turns both deliver", () => {
+	it("keeps turn 1's in-band entries AND turn 0's deferred finding", async () => {
+		const { _awaitDeferredLspPullForTest } = await loadWarnings();
+		const { handleTurnEnd } = await import("../../clients/runtime-turn.js");
+		const runtime = new RuntimeCoordinator();
+		const cacheManager = new CacheManager(false);
+		const [deferredFile, dispatchFile] = makeSources(2);
+
+		// ── turn 0: one modified file, nothing primed, so the loop defers.
+		runtime.beginTurn();
+		cacheManager.addModifiedRange(
+			deferredFile,
+			{ start: 1, end: 1 },
+			false,
+			env.tmpDir,
+			runtime.telemetrySessionId,
+		);
+		armOneActionableWarning(path.basename(deferredFile));
+		// Wedged, so turn 0's loop is still in flight when turn 1 runs.
+		wedgedFiles.add(path.basename(deferredFile));
+		// biome-ignore lint/suspicious/noExplicitAny: minimal turn_end deps
+		await handleTurnEnd(turnEndDeps(runtime, cacheManager) as any);
+		const turnZeroIndex = runtime.turnIndex;
+
+		// ── turn 1: a dispatch warning of its own, plus a cold file whose
+		// deferral is DECLINED because turn 0 still holds the slot.
+		runtime.beginTurn();
+		expect(runtime.turnIndex).toBeGreaterThan(turnZeroIndex);
+		cacheManager.addModifiedRange(
+			dispatchFile,
+			{ start: 1, end: 1 },
+			false,
+			env.tmpDir,
+			runtime.telemetrySessionId,
+		);
+		runtime.recordActionableWarnings([
+			{
+				id: "turn1-dispatch",
+				filePath: dispatchFile,
+				displayPath: path.basename(dispatchFile),
+				line: 1,
+				severity: "warning",
+				tool: "ast-grep",
+				message: "turn 1 found this itself",
+				actions: [],
+				suppressed: false,
+				origin: "dispatch",
+			},
+		]);
+		// biome-ignore lint/suspicious/noExplicitAny: minimal turn_end deps
+		await handleTurnEnd(turnEndDeps(runtime, cacheManager) as any);
+
+		const afterTurnOne = cacheManager.readCache<ActionableWarningsReport>(
+			"actionable-warnings",
+			env.tmpDir,
+		)?.data;
+		expect(
+			(afterTurnOne?.files ?? []).flatMap((f) => f.warnings.map((w) => w.id)),
+		).toEqual(["turn1-dispatch"]);
+
+		// ── turn 0's incumbent loop finally lands.
+		wedgedFiles.clear();
+		expect(await settlesWithin(_awaitDeferredLspPullForTest(), 8_000)).toBe(
+			"settled",
+		);
+
+		const finalReport = cacheManager.readCache<ActionableWarningsReport>(
+			"actionable-warnings",
+			env.tmpDir,
+		)?.data;
+		const paths = (finalReport?.files ?? []).map((f) => f.filePath).sort();
+		expect(paths).toEqual([deferredFile, dispatchFile].sort());
+		// Turn 1 kept what it found in band...
+		expect(
+			(finalReport?.files ?? []).flatMap((f) => f.warnings.map((w) => w.id)),
+		).toContain("turn1-dispatch");
+		// ...and turn 0's deferred LSP finding arrived beside it, with its fix
+		// action, which is the only way the agent ever sees it.
+		const deferredEntry = (finalReport?.files ?? []).find(
+			(f) => f.filePath === deferredFile,
+		);
+		expect(deferredEntry?.warnings.length).toBe(1);
+		expect(deferredEntry?.warnings[0].actions.length).toBeGreaterThan(0);
+		expect(finalReport?.summary.files).toBe(2);
 	});
 });
