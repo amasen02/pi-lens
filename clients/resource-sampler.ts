@@ -143,7 +143,11 @@ async function findDescendantPidsWindows(
 		{ fields: ["pid", "ppid"] },
 		{
 			timeoutMs: RESOURCE_SAMPLE_QUERY_TIMEOUT_MS,
-			onTimeout: (child) => terminateScannerChild(child, {}),
+			onTimeout: (child) =>
+				terminateScannerChild(child, {
+					kind: "resource-sampler-scanner-escalated",
+					timeoutMs: RESOURCE_SAMPLE_QUERY_TIMEOUT_MS,
+				}),
 		},
 	);
 	if (result.status !== "ok") {
@@ -244,7 +248,11 @@ async function sampleProcessesWindows(
 		},
 		{
 			timeoutMs: RESOURCE_SAMPLE_QUERY_TIMEOUT_MS,
-			onTimeout: (child) => terminateScannerChild(child, {}),
+			onTimeout: (child) =>
+				terminateScannerChild(child, {
+					kind: "resource-sampler-scanner-escalated",
+					timeoutMs: RESOURCE_SAMPLE_QUERY_TIMEOUT_MS,
+				}),
 		},
 	);
 	if (query.status !== "ok") {
