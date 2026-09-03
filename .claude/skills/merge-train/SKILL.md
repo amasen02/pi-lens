@@ -79,10 +79,14 @@ changes must extend exact-key pins (`BASELINE_KEYS`-style), never loosen them.
 
 Before ANY new dispatch (not a fix round on an open PR): know the account's
 5h and weekly usage. Above 75% of the 5h window or 85% of the weekly window,
-no new work — finish in-flight lanes and merge on green. The numbers come
-from the maintainer's `/usage`; write them to `~/.claude/quota.json` so the
-`quota-gate.mjs` PreToolUse hook enforces the rule mechanically, and ask for a
-fresh reading when the file is older than the 5h window. Standing rule from
+no new work — finish in-flight lanes and merge on green. The numbers are
+readable live: `GET https://api.anthropic.com/api/oauth/usage` with the OAuth
+token from `~/.claude/.credentials.json` (`anthropic-beta: oauth-2025-04-20`)
+returns `five_hour.utilization` / `seven_day.utilization` and reset times; the
+`~/.claude/hooks/quota-gate.mjs` PreToolUse hook on `Agent` reads them and
+blocks dispatch above the thresholds (`~/.claude/quota.json` is the fallback
+and the `override: true` switch). Read the meters at session start and before
+every refill; state them in the lane ledger. Standing rule from
 2026-09-03, lifted only when the maintainer says so.
 
 ## Brief contract (orchestrator)
