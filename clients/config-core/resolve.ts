@@ -13,6 +13,7 @@
  * `index.ts` re-exports everything here, so the PUBLIC surface is unchanged and
  * `resolveConfig` is still the one supported way in.
  */
+import { errorClassName } from "../error-class.js";
 import { type ConfigSource, merge } from "./merge.js";
 import { validate } from "./normalize.js";
 import type { Resolved } from "./provenance.js";
@@ -106,6 +107,9 @@ export function resolveConfig<T = unknown>(
 		};
 	} catch (error) {
 		// The error CLASS only, never its message, which could quote the file.
+		// `errorClassName` (#2451) — never `config-warn.ts`'s own
+		// `normalizeParseErrorReason`, which this module must not import: that
+		// would reopen the sink-import cycle #2426 removed from `config-core/`.
 		//
 		// ANCHORED to the resolution's highest-precedence source (#2426 review
 		// round 4, S1). This record used to carry `file: ""` and no tier, which
@@ -140,9 +144,7 @@ export function resolveConfig<T = unknown>(
 			file,
 			key: "",
 			subject: migrationSubject(file, ""),
-			reason: `config resolution failed internally (${
-				error instanceof Error ? error.name : "unknown error"
-			}); configuration ignored`,
+			reason: `config resolution failed internally (${errorClassName(error)}); configuration ignored`,
 			...(anchor ? { tier: anchor.tier } : {}),
 		});
 		return {

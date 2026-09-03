@@ -26,6 +26,43 @@ import {
  * Older caches written before `results` existed won't have it — treated as
  * "nothing to adapt", not an error.
  */
+/**
+ * #2522 review round 2, F1: one target the turn-end batch could not finish —
+ * killed when the batch hit its wall budget, or never dispatched at all.
+ * Persisted by IDENTITY (not merely counted) so the next turn can run it
+ * FIRST. Plain JSON only: a `RunnerConfig` carries functions and cannot
+ * round-trip through the cache, so the runner is stored by key and its config
+ * re-resolved from `RUNNERS` at selection time.
+ */
+export interface DeferredTestTarget {
+	/** Absolute path to the test file that did not get to run. */
+	testFile: string;
+	/** `RUNNERS` key, re-resolved to a `RunnerConfig` on the next turn. */
+	runner: string;
+	/**
+	 * How many turn-end batches this target has now been cut out of. A target
+	 * whose own runtime EXCEEDS the whole batch budget would otherwise be
+	 * deferred, put first, cut, and deferred again — forever, burning the full
+	 * budget in spawned runners every turn. `TEST_RUNNER_MAX_DEFERRALS`
+	 * (`runtime-turn.ts`) retires it instead, with a counted degradation.
+	 * Absent on a record written before the cap existed, read as 0.
+	 */
+	attempts?: number;
+	/**
+	 * #2522 review round 3, F5: which session cut (or retired) this target.
+	 *
+	 * A deferral is a statement about ONE session's turn-end batches. The cache
+	 * record outlives the session, so without an identity stamp a fresh session
+	 * adopts the previous one's cut list — re-firing suites for edits it never
+	 * made — and, worse, inherits its `attempts` counters, so a target can be
+	 * retired on its first cut in a session that never cut it. Entries whose
+	 * stamp is not the current session are dropped at selection time, which is
+	 * also what re-arms a retirement at `session_start` (#2504's shape).
+	 * Absent on a record written before the stamp existed; read as foreign.
+	 */
+	sessionId?: string;
+}
+
 export interface TestRunnerFindingsCache {
 	content: string;
 	stale?: boolean;
@@ -35,6 +72,41 @@ export interface TestRunnerFindingsCache {
 	publishedAgainst?: AdvisoryProvenance;
 	provenance?: AdvisoryProvenance;
 	superseded?: boolean;
+	/**
+	 * #2522: true when NOTHING in `content` is a genuine failing test — every
+	 * entry is either a RUNNER error (timeout, missing provider/binary, a
+	 * rejected promise — `TestResult.error` with `failed === 0`) or, since
+	 * review round 2, a target the batch was cut before it could finish. Read
+	 * by `peekTestFindings`/`consumeTestFindings` (`runtime-context.ts`) to
+	 * deliver these as advisory rather than "fix before continuing" — the
+	 * agent introduced nothing here to fix. Absent on older cache writes,
+	 * which fall back to the pre-#2522 blocking framing.
+	 */
+	runnerErrorOnly?: boolean;
+	/**
+	 * #2522 review round 2, F1: the targets this turn's batch could not finish.
+	 * The turn-end selection loop (`runtime-turn.ts`) dispatches these FIRST on
+	 * the next turn, ahead of failed-first/related/self and under the same
+	 * `TEST_RUNNER_MAX_TARGETS` cap, then clears the list. A non-empty list is
+	 * also what stops an unfinished batch from being recorded as a clean run.
+	 */
+	deferredTargets?: DeferredTestTarget[];
+	/**
+	 * #2522 review round 3, F1: the targets that exhausted
+	 * `TEST_RUNNER_MAX_DEFERRALS` and are retired from turn-end selection for
+	 * the rest of the session.
+	 *
+	 * Round 2 announced the retirement and then `continue`d, leaving no record
+	 * of it anywhere: the same turn's candidate loop re-resolved the file
+	 * through `related`/`self` and re-added it with no attempt count, so the
+	 * cap reset every turn and the "too slow" suite was spawned and cut on
+	 * every single turn — exactly the livelock the cap was added to end. The
+	 * retirement has to outlive the turn to be a retirement at all. It is
+	 * session-scoped by the `sessionId` stamp on each entry, so a new session
+	 * re-arms every target rather than inheriting a verdict measured under
+	 * another session's load.
+	 */
+	retiredTargets?: DeferredTestTarget[];
 }
 
 function failureMessage(failure: TestFailure): string {

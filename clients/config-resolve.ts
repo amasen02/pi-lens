@@ -105,7 +105,18 @@ import { homeRelativePath } from "./path-utils.js";
 /** What reading one candidate path produced. */
 export type ConfigReadOutcome =
 	| { readonly status: "missing" }
-	| { readonly status: "error"; readonly error: unknown }
+	| {
+			readonly status: "error";
+			readonly error: unknown;
+			/**
+			 * The text that was actually read, when a `JSON.parse` failure is what
+			 * produced this outcome (#2451) — never set for an `fs.readFileSync`
+			 * failure, since nothing was ever read then. Lets `normalizeParseErrorReason`
+			 * locate a position-free `SyntaxError` in the source it came from,
+			 * instead of losing all locality the way #2431's own fix did.
+			 */
+			readonly sourceText?: string;
+	  }
 	| { readonly status: "ok"; readonly value: unknown };
 
 /**
@@ -129,7 +140,7 @@ export function readConfigDocument(file: string): ConfigReadOutcome {
 	try {
 		return { status: "ok", value: JSON.parse(text) as unknown };
 	} catch (error) {
-		return { status: "error", error };
+		return { status: "error", error, sourceText: text };
 	}
 }
 
@@ -156,6 +167,8 @@ export interface ConfigReadFailure {
 	readonly location: ConfigLocation;
 	readonly tier: SourceTier;
 	readonly error: unknown;
+	/** See `ConfigReadOutcome`'s `sourceText` (#2451): unset for an `fs` failure. */
+	readonly sourceText?: string;
 }
 
 export interface ResolvePiLensConfigOptions {
@@ -221,7 +234,13 @@ function collectDocuments(
 		const outcome = readConfigDocument(file);
 		if (outcome.status === "missing") continue;
 		if (outcome.status === "error") {
-			onReadError?.({ file, location, tier, error: outcome.error });
+			onReadError?.({
+				file,
+				location,
+				tier,
+				error: outcome.error,
+				sourceText: outcome.sourceText,
+			});
 			continue;
 		}
 		documents.push({ tier, file, location, value: outcome.value });
@@ -256,7 +275,13 @@ export function collectPiLensConfigDocuments(
 			const outcome = readConfigDocument(file);
 			if (outcome.status === "missing") continue;
 			if (outcome.status === "error") {
-				onReadError?.({ file, location, tier: "global", error: outcome.error });
+				onReadError?.({
+					file,
+					location,
+					tier: "global",
+					error: outcome.error,
+					sourceText: outcome.sourceText,
+				});
 				continue;
 			}
 			documents.push({ tier: "global", file, location, value: outcome.value });
@@ -913,7 +938,7 @@ export function reportConfigReadFailure(failure: ConfigReadFailure): void {
 	warnIgnoredConfigOnce({
 		subsystem: configFileSubsystem(failure.location, failure.tier),
 		file: failure.file,
-		reason: { parseError: failure.error },
+		reason: { parseError: failure.error, sourceText: failure.sourceText },
 	});
 }
 
@@ -961,7 +986,9 @@ export function reportPiLensConfigRecords(
  * a snippet of the source file on Node >=20, #2431) survives into the sinks.
  */
 export type NoteIgnored = (
-	reason: string | { readonly parseError: unknown },
+	reason:
+		| string
+		| { readonly parseError: unknown; readonly sourceText?: string },
 ) => void;
 
 /**
@@ -1010,7 +1037,9 @@ export function ignoredRecordCollector(
 			reason:
 				typeof reason === "string"
 					? reason
-					: normalizeParseErrorReason(reason.parseError),
+					: normalizeParseErrorReason(reason.parseError, {
+							sourceText: reason.sourceText,
+						}),
 			tier,
 		});
 	};

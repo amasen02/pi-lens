@@ -47,8 +47,9 @@ reviewed, zero unreviewed merges). Apply it to each PR in the queue.
    `--keep-agent-tree` / `PILENS_HYGIENE_KEEP_AGENT_TREES=1` merely to dodge
    this — that decision stays off by default (see step 2).
 4. **Merge gate.** Merge only when: verdict is merge-ready; Unit tests and
-   Lint genuinely EXECUTED and passed on the exact head SHA (read check-runs —
-   a DIRTY PR silently skips them, absent is not green); every failing check
+   Lint genuinely EXECUTED and passed on the exact head SHA
+   (`node scripts/ci-verdict.mjs <pr-number|sha>` — a DIRTY PR silently skips
+   them, absent is not green); every failing check
    was read and judged (infra failures — codeload 429/503, SARIF-upload
    errors, Initialize-CodeQL outages — may be waved through only with the
    log read and the judgment recorded).
@@ -74,6 +75,20 @@ merges first (the consumer then rebases and wires the new surface). Two PRs
 editing the same file get an explicit order decided up front. Log-schema
 changes must extend exact-key pins (`BASELINE_KEYS`-style), never loosen them.
 
+## Quota gate (orchestrator)
+
+Before ANY new dispatch (not a fix round on an open PR): know the account's
+5h and weekly usage. Above 75% of the 5h window or 85% of the weekly window,
+no new work — finish in-flight lanes and merge on green. The numbers are
+readable live: `GET https://api.anthropic.com/api/oauth/usage` with the OAuth
+token from `~/.claude/.credentials.json` (`anthropic-beta: oauth-2025-04-20`)
+returns `five_hour.utilization` / `seven_day.utilization` and reset times; the
+`~/.claude/hooks/quota-gate.mjs` PreToolUse hook on `Agent` reads them and
+blocks dispatch above the thresholds (no hand-written fallback;
+`QUOTA_GATE_OVERRIDE=1` lifts it when the maintainer says so). Read the meters at session start and before
+every refill; state them in the lane ledger. Standing rule from
+2026-09-03, lifted only when the maintainer says so.
+
 ## Brief contract (orchestrator)
 
 Before dispatching any issue that adds a shared helper or seam: grep for
@@ -98,6 +113,43 @@ AGENTS.md's state-space step — invariants, writers × axes, the cell list —
 written into the PR body BEFORE any edit, and the fixer is Opus. Never send a
 third patch-only round: #2528 went r2 → r3 → r4 on one cache record, each
 round fixing three findings and adding two, until the model was demanded.
+
+## Orchestrator invariants (any orchestrator, not only Claude)
+
+These are the habits the train depends on. They live here, not in any one
+operator's private notes, so a different orchestrator can run the same train.
+
+- **Contracts move in the same session.** When a review or a dogfood finding
+  reveals a defect CLASS (not an instance), add a numbered shape to AGENTS.md's
+  catalog with the issue ref and a one-line screen, extend the fixer's screen
+  list, and cite the number in the next brief — before the next dispatch. "To
+  err twice is not the mark of a wise man." (2026-09-03: shapes 28–36 came out
+  of one day's reviews this way.)
+- **Keep a lane ledger.** One file, one row per lane: issue/PR, worker id,
+  round, state, head SHA, merge-order note; a header line with the quota
+  reading and the merged list. Update it on every dispatch, report and merge.
+  It is what survives a context reset.
+- **A lane's worktree lives until its PR merges.** Pruning it after a report
+  makes the owning worker un-resumable, so every fix round then costs a fresh
+  worker. Prune on merge, or when the lane is abandoned.
+- **Brief shape for a fixer.** Issue/PR number and head; the checked-out
+  branch; the exact findings with file:line, the reviewer's probe to reproduce
+  FIRST, and the remedy shape the maintainer chose; what to fold (net-count)
+  and what stays out; the suites to run (named files + the mechanical
+  governance selector + every tests/config file); the observability record to
+  name; "no agents, foreground runs, one CI read, no monitors". Brief a
+  reviewer with the PR number, the claims as the fixer stated them, and the
+  attack angles that matter for THIS diff; ask for a verdict first.
+- **Round routing.** Fix rounds that only apply a reviewer-prescribed remedy
+  with quoted reds merge on green (CI read on the exact head, both required
+  checks, mergeable state). Rounds that add mechanism, touch session or
+  lifecycle semantics, or rewrite a guard get a fresh verify. A verify that
+  reports a NEW defect triggers the round-count rail above.
+- **Maintainer trailing commits** are for intent-free deltas only (a literal
+  NUL byte, a false comment, a missing PR-body heading); anything that changes
+  what code MEANS goes through a fix round.
+- **Refill order** when the quota gate is open: p1 first, then the queued
+  follow-ups in ledger order, then the program work (#2421 → #2416 → #2383/#195).
 
 ## Honesty rules
 

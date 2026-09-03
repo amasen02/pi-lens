@@ -45,9 +45,19 @@ On every write/edit, and at session/turn boundaries, pi-lens runs — without yo
 | **Structural rules** | ast-grep (NAPI engine) + tree-sitter rules flag correctness/security smells. |
 | **Opengrep security scan** | Always-on: per-edit via an auxiliary LSP, plus a cached project-wide CLI scan for `mode=full`. |
 | **Other scanners** | Config-/presence-gated: gitleaks (secrets), trivy (CVEs/IaC/license), govulncheck (Go), knip/jscpd/madge (JS/TS dead-code/dupes/cycles), vulture (Python), zizmor (GH Actions), typos. |
-| **Test-runner-on-write** | Related/affected tests are run asynchronously for the next turn's findings (edit-scoped, not a full-suite run). |
+| **Test-runner-on-write** | Related/affected tests are run asynchronously for the next turn's findings (edit-scoped, not a full-suite run). Integration/e2e tests are never auto-fired — see below. |
 | **Read-guard** | Tracks that you read a file before editing it; blocks/warns zero-read or stale-range edits. |
 | **Context injection** | Injects session-start guidance and turn-end findings into your context (see §2). |
+
+**Test-runner-on-write scope.** A built-in exclusion list keeps integration/e2e
+suites out of the auto-fired batch — `**/integration/**`, `**/e2e/**`,
+`**/*.integration.*`, `**/*.e2e.*` — since those commonly spawn external
+processes (another CLI, a browser, a live provider) that don't belong on an
+unattended per-edit turn. This is a fixed, built-in list; there is no
+per-project config knob for it. If a runner itself fails to complete (a
+timeout, or a missing provider/binary — not a failing assertion), pi-lens
+delivers it as an advisory ("could not complete last turn"), not as a
+"fix before continuing" blocker — you didn't introduce anything to fix.
 
 You don't invoke these. They happen. Your job is to **read the results** and **respond**.
 

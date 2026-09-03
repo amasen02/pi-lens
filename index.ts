@@ -914,9 +914,20 @@ function activateExtension(hostPi: ExtensionAPI) {
 					runtime.projectRoot || process.cwd(),
 				),
 			countFileLines,
+			// #2465: unlike the read bridge above (whose whole purpose IS the
+			// read-guard stamp, so `no-read-guard` correctly disables it
+			// entirely), this bridge also drives turn-state and the change-log
+			// receipt. `no-read-guard` gates ONLY the read-guard stamp — the same
+			// canonical split `clients/runtime-tool-result.ts` applies at
+			// `recordWritten` (:1859) — so it must not appear in the recordability
+			// gate `recordMutationThroughSeam` early-returns on. That gate stays
+			// path-scope only (ignored/vendor); the flag is threaded separately
+			// below via `shouldStampReadGuard`.
 			isRecordable(filePath: string): boolean {
-				if (_mutationBridgeGetFlag?.("no-read-guard")) return false;
 				return isRecordableProjectPath(filePath, runtime.projectRoot);
+			},
+			shouldStampReadGuard(): boolean {
+				return !_mutationBridgeGetFlag?.("no-read-guard");
 			},
 			dbg,
 		});
@@ -2550,11 +2561,25 @@ function activateExtension(hostPi: ExtensionAPI) {
 	 * #2430 item 3. Kept separate from `runDeferredMutationDrain` so a throw
 	 * here can never take the drain with it: the sweep is a last-resort net for
 	 * changes nothing else saw, and the drain is the pipeline's contract.
+	 *
+	 * #2465 round 2: this used to blanket-return under `no-read-guard`, on the
+	 * theory that the sweep's baseline only exists because the read-guard is
+	 * active. That is false — `clients/runtime-tool-call.ts`'s `recordRead`
+	 * (the call that seeds `getTrackedPaths`/`storedLineHashesFor`) has no flag
+	 * gate; only the pre-edit BLOCKING checks are gated, matching the flag's
+	 * documented meaning ("disable read-before-edit behavior monitor" —
+	 * `clients/lens-flag-registry.ts`). Under `no-read-guard` the sweep still
+	 * has real drift to catch, and skipping it here dropped turn-state, the
+	 * change-log receipt, and the `noteMutationHandled` mark right along with
+	 * the stamp — the same bridge-recordability conflation this issue already
+	 * fixed one layer down, just repeated here. The flag is threaded ONLY into
+	 * the replay's read-guard stamp step via the mutation bridge's
+	 * `shouldStampReadGuard` seam (see its registration above) — reused, not
+	 * duplicated.
 	 */
 	async function runObservedSettledSweepSafely(
 		ctx: DeferredDrainCtx,
 	): Promise<void> {
-		if (getLensFlag("no-read-guard")) return;
 		const cwd = ctx.cwd ?? runtime.projectRoot;
 		try {
 			const result = await runObservedSettledSweep({
@@ -2597,11 +2622,15 @@ function activateExtension(hostPi: ExtensionAPI) {
 	 * refresh's traversal is the `handled` set — the files THIS run's pipeline
 	 * or drain actually wrote — not the tracked set, so it needs no path
 	 * collection of its own.
+	 *
+	 * #2465 round 2: same fix as `runObservedSettledSweepSafely` above — no
+	 * blanket `no-read-guard` early return. This pass only re-baselines files
+	 * the drain just wrote (the `handled` set); it neither reads nor writes
+	 * the read-guard staleness stamp, so the flag has nothing to gate here.
 	 */
 	async function refreshObservedLedgerSafely(
 		ctx: DeferredDrainCtx,
 	): Promise<void> {
-		if (getLensFlag("no-read-guard")) return;
 		try {
 			await refreshObservedMutationLedger({
 				turnIndex: runtime.turnIndex,

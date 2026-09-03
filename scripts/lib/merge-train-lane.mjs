@@ -22,12 +22,11 @@
  * state to drift.
  */
 
+import { REQUIRED_CHECKS, resolveLatestByName } from "./ci-checks.mjs";
 import { commentMarkerExists, paginate } from "./github-paging.mjs";
 import {
 	classifyActionFailure,
 	fetchOpenPullRequests,
-	REQUIRED_CHECKS,
-	resolveCheckRuns,
 } from "./merge-train-warden.mjs";
 import { fetchHeadRunHealth, RUN_HEALTH } from "./warden-run-health.mjs";
 
@@ -252,7 +251,7 @@ export function evaluateMergeGate(pr, health, { approvedBy } = {}) {
 			"GitHub reported no check rollup for the head commit",
 		);
 
-	const byName = resolveCheckRuns(pr.checkRuns);
+	const byName = resolveLatestByName(pr.checkRuns);
 	for (const name of REQUIRED_CHECKS) {
 		const run = byName.get(name);
 		// Absent is the DIRTY-skip and dropped-dispatch case. It is the single

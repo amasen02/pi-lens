@@ -7,9 +7,7 @@
  * Requires: oxlint (npm install -g oxlint)
  */
 
-import * as fs from "node:fs";
-import * as path from "node:path";
-import { walkUpDirs } from "../../path-utils.js";
+import { findLocalBinUpwards } from "../../package-manager.js";
 import { safeSpawnAsync } from "../../safe-spawn.js";
 import { truncatedByOutputCap } from "../../spawn-output-cap.js";
 import {
@@ -74,20 +72,19 @@ export type OxlintNoFilesDecision =
 	| { kind: "ordinary-report" }
 	| { kind: "unconfirmed-no-files"; reason: OxlintNoFilesUnconfirmedReason };
 
+/**
+ * Vite+'s `vp` from the project's own `node_modules/.bin`.
+ *
+ * Delegates to THE shared bin walker (#2544 review F1). This was a private,
+ * UNCEILINGED copy of that walk, while `formatters.ts`'s `oxfmtFormatter`
+ * resolved the SAME binary — `vp` — through the ceilinged `findInNodeModules`:
+ * one `vp` resolver stopped at `$HOME` and the other climbed past it to the
+ * filesystem root, so which policy applied depended on whether the format path
+ * or the lint path asked. A `node_modules/.bin/vp` at or above `$HOME` can
+ * never be this project's own Vite+ install (#2514).
+ */
 function resolveLocalVp(cwd: string): string | null {
-	const isWin = process.platform === "win32";
-	for (const dir of walkUpDirs(cwd)) {
-		const candidates = isWin
-			? [
-					path.join(dir, "node_modules", ".bin", "vp.cmd"),
-					path.join(dir, "node_modules", ".bin", "vp"),
-				]
-			: [path.join(dir, "node_modules", ".bin", "vp")];
-		for (const candidate of candidates) {
-			if (fs.existsSync(candidate)) return candidate;
-		}
-	}
-	return null;
+	return findLocalBinUpwards("vp", cwd) ?? null;
 }
 
 async function resolveVitePlusCommand(cwd: string): Promise<string | null> {

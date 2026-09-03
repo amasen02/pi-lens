@@ -22,7 +22,12 @@ const { findGlobalBinary, safeSpawnAsync } = vi.hoisted(() => ({
 	})),
 }));
 
-vi.mock("../../clients/package-manager.js", () => ({ findGlobalBinary }));
+vi.mock("../../clients/package-manager.js", async (importOriginal) => ({
+	...(await importOriginal<
+		typeof import("../../clients/package-manager.js")
+	>()),
+	findGlobalBinary,
+}));
 vi.mock("../../clients/safe-spawn.js", async (importOriginal) => ({
 	...(await importOriginal<typeof import("../../clients/safe-spawn.js")>()),
 	safeSpawnAsync,

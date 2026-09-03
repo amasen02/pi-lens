@@ -74,6 +74,7 @@ import {
 	migrationSubject,
 } from "./records.js";
 import type { SourceTier } from "./provenance.js";
+import { errorClassName } from "../error-class.js";
 
 /**
  * A config whose every field is one the schema claims, of the declared type.
@@ -144,13 +145,15 @@ export function validate(
 		// A throw here is a bug in this module, not in the user's config, but the
 		// contract above still holds: a config load never fails a session. The
 		// record says the document was dropped and names the error CLASS only,
-		// never its message, which could quote the file.
+		// never its message, which could quote the file. `errorClassName` is the
+		// ONE implementation of that (#2451) — not `config-warn.ts`'s own
+		// `normalizeParseErrorReason`, which this "pure" module must not import:
+		// that is a sink (-> the degradation ledger), and importing one back in is
+		// exactly the cycle #2426 removed from `config-core/`.
 		record(context, {
 			code: "PILENS_CFG_0005",
 			key: "",
-			reason: `config validation failed internally (${
-				error instanceof Error ? error.name : "unknown error"
-			}); document ignored`,
+			reason: `config validation failed internally (${errorClassName(error)}); document ignored`,
 		});
 		walked = DROPPED;
 	}

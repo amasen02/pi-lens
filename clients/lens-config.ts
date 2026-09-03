@@ -3,6 +3,7 @@ import {
 	resetIgnoredConfigWarnCache,
 	warnIgnoredConfigOnce,
 } from "./config-warn.js";
+import { errorClassName } from "./error-class.js";
 import * as path from "node:path";
 import {
 	assignFlagConfigSection,
@@ -199,6 +200,7 @@ export function loadPiLensGlobalConfig(
 			location,
 			tier: "global",
 			error: outcome.error,
+			sourceText: outcome.sourceText,
 		});
 		return undefined;
 	}
@@ -388,12 +390,16 @@ export function loadPiLensGlobalConfig(
 		// own guard follows for the same reason. Round 5 used `0005` here, which
 		// is registered as a per-FIELD rejection: a user matching on it would
 		// have expected one setting to be missing rather than the whole file
-		// (#2426 review round 6, S1).
+		// (#2426 review round 6, S1). `errorClassName` (#2451) is the ONE
+		// implementation of "class name, never the message" — this loader
+		// already imports `config-warn.js` for the rest of the seam, so it could
+		// call `normalizeParseErrorReason({ classOnly: true })` directly, but
+		// calling the same leaf `config-warn.ts` itself delegates to keeps every
+		// caller of this guarantee, `config-core/` included, on ONE
+		// implementation rather than two that happen to agree today.
 		warnInvalidGlobalConfigOnce(
 			configPath,
-			`global config could not be interpreted (${
-				error instanceof Error ? error.name : "unknown error"
-			}); configuration ignored`,
+			`global config could not be interpreted (${errorClassName(error)}); configuration ignored`,
 			"PILENS_CFG_0008",
 		);
 		return undefined;
