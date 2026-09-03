@@ -68,6 +68,18 @@ export type DegradationKind =
 	| "installer-verification-output-truncated"
 	/** A git ls-files collection was truncated before parsing completed (#2075). */
 	| "git-tracked-ignore-truncated"
+	/**
+	 * #2523: an `await` on a hook path exceeded its per-hook wall budget, or
+	 * the hook's abort signal fired before it settled, so `bounded()`
+	 * (`clients/deadline-utils.ts`) abandoned it and the hook returned WITHOUT
+	 * that await's answer. Subject is `<hook>:<label>`, recorded ONCE per pair
+	 * so a hook that blows its budget every turn writes one row, not one per
+	 * turn. Deliberately NOT informational: the hook shipped a partial answer,
+	 * which is a degradation the reader has to act on (raise the budget, move
+	 * the work off-hook, or fix what wedged), not a designed-for tally like a
+	 * log rotation.
+	 */
+	| "hook-await-exceeded"
 	| "formatter-skip"
 	| "grammar-blocked"
 	| "lsp-breaker"
