@@ -209,8 +209,12 @@ export const SWEEP_HEURISTIC_LIMITS = [
  * A merge that shifts many keys at once (a line inserted near several
  * flagged sites) does not have to be re-keyed by hand: run
  * `node scripts/rekey-hook-await-exemptions.mjs` — it recomputes every
- * entry's key from the live scan and refuses to rewrite unless the table and
- * the scan agree exactly, one-to-one (#2530 round 3 F6).
+ * entry's key from the live scan and rewrites only keys whose
+ * `rel[#symbol]:hash` head (everything before `~context`) still matches
+ * exactly one current occurrence; anything else — a genuinely changed line,
+ * a removed one, or an ambiguous duplicate — is refused and left for a
+ * human (#2530 round 3 F6, tightened round 4 F1: a head match, not a
+ * count-matched zip, is what makes a rewrite safe).
  */
 const EXEMPT_SITES: Readonly<Record<string, SweepExemption>> = {
 	"clients/mcp/session.ts#getMcpSessionContext:3ab92062~01e3e700": {
