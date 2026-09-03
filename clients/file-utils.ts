@@ -20,6 +20,7 @@ import {
 	getPiLensGlobalConfigPath,
 } from "./lens-config.js";
 import {
+	homeRelativePath,
 	isExternalOrVendorFile,
 	isUnderDir,
 	normalizeEphemeralMapKey,
@@ -63,6 +64,61 @@ export function getProjectDataDir(cwd: string): string {
 		.replace(/^-+/, "") // trim leading dashes
 		.replace(/-+$/, ""); // trim trailing dashes
 	return path.join(base.trim(), slug || "default");
+}
+
+/**
+ * The project-data path to SHOW an agent or a human, for a file that
+ * {@link getProjectDataDir} owns.
+ *
+ * #2521: the turn-end actionable-warnings advisory told the agent to read a
+ * hardcoded `.pi-lens/cache/actionable-warnings.json`, but that spelling is
+ * only correct in the LEGACY arm of `getProjectDataDir` — a project with no
+ * `.pi-lens/` directory (the common case) stores the report under
+ * `~/.pi-lens/projects/<slug>/cache/`, and a `PILENS_DATA_DIR` project stores
+ * it somewhere else again. Agents followed the advisory literally and got
+ * `cat: .pi-lens/cache/actionable-warnings.json: No such file or directory`.
+ *
+ * Any instructional string that NAMES a project-data location must be built
+ * here, so the displayed path and the written path can never disagree. Guarded
+ * by `tests/clients/data-dir-display-path-sweep.test.ts`.
+ *
+ * Two output shapes, matching `toRunnerDisplayPath`'s convention
+ * (`clients/dispatch/runner-context.ts`) so one advisory never mixes styles:
+ *   - under `cwd` → a `/`-separated path relative to it
+ *     (`.pi-lens/cache/actionable-warnings.json`), which is what the legacy
+ *     arm produces and what an agent can paste straight into a shell.
+ *   - anywhere else → absolute, `/`-separated, and `~`-folded via
+ *     {@link homeRelativePath} so the default `~/.pi-lens/projects/...` store
+ *     does not leak the account name into agent context (#2440 F5).
+ *
+ * Pure string work on top of `getProjectDataDir`'s own resolution: it never
+ * stats the target, so it is safe to call for a file that has not been written
+ * yet and cannot throw on a surface whose whole job is to render a hint.
+ */
+export function displayProjectDataPath(
+	cwd: string,
+	...segments: string[]
+): string {
+	const absolute = path.resolve(getProjectDataDir(cwd), ...segments);
+	const relative = path
+		.relative(path.resolve(cwd), absolute)
+		.replace(/\\/g, "/");
+	if (
+		relative &&
+		relative !== "." &&
+		relative !== ".." &&
+		!relative.startsWith("../") &&
+		// A different Windows drive makes `path.relative` return an ABSOLUTE
+		// path; that is the "anywhere else" case, not a relative display path.
+		!path.isAbsolute(relative)
+	) {
+		return relative;
+	}
+	// Posix-ify BEFORE the `~` fold: `homeRelativePath` deliberately returns a
+	// path that is not under `$HOME` unchanged, separators included, so a
+	// `PILENS_DATA_DIR=D:\lens-data` store would otherwise render with
+	// backslashes while the legacy arm above renders with forward ones.
+	return homeRelativePath(absolute.replace(/\\/g, "/"));
 }
 
 /**
