@@ -189,9 +189,9 @@ finding with its red-run evidence.
   `scripts/check-pr-body.mjs`, one REST read, no hand-written `gh api`
   filter to get wrong. Report its table and exit code as the state — success,
   failure, DIRTY (absent), or pending. Never poll in a loop (stall watchdogs
-  kill the turn; if you must wait, `--wait <seconds>` polls at a fixed >=30s
-  interval under a hard cap, never a bare `gh pr checks --watch`), never
-  report "started" as green, and never quote a previous head's job ids. If no
+  kill the turn) and never use `--wait` yourself — that flag is for the
+  orchestrator only, never a bare `gh pr checks --watch` either. Never report
+  "started" as green, and never quote a previous head's job ids. If no
   `ci.yml` run registers within ~2 minutes, push one empty commit and read
   once more; if still absent, report that plainly — the orchestrator owns the
   next lever.
