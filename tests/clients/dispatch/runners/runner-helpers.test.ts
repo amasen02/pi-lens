@@ -400,14 +400,22 @@ describe("runner-helpers availability checker", () => {
 			};
 			const second = checkerB.isAvailableAsync(process.cwd());
 			// Let the second call's async prefix (findCommand's fs walk) settle
-			// before asserting it did or didn't start a second physical probe.
+			// so it has actually joined the existing flight-registry entry
+			// before that entry resolves and is removed below — releasing too
+			// early makes checkerB find no flight to join and spawn its own
+			// (proven: removing this sleep makes safeSpawnAsync observably
+			// called twice). The call-count assertion itself moves below both
+			// awaits: checking it here, right after the sleep and before
+			// release, only proves "not yet 2" at that instant — a
+			// false-green if the prefix were merely slow rather than actually
+			// deduped. Asserting after both `first`/`second` have fully
+			// settled is deterministic, since nothing can still be pending.
 			await new Promise((resolve) => setTimeout(resolve, 100));
-
-			expect(safeSpawnMod.safeSpawnAsync).toHaveBeenCalledTimes(1);
 
 			releaseProbe({ stdout: "1.0.0", stderr: "", status: 0 });
 			expect(await first).toBe(true);
 			expect(await second).toBe(true);
+			expect(safeSpawnMod.safeSpawnAsync).toHaveBeenCalledTimes(1);
 		} finally {
 			String.prototype.localeCompare = realLocaleCompare;
 		}
