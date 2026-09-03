@@ -1853,10 +1853,10 @@ async function callTool(
 //   pilens_read_symbol, pilens_read_enclosing  — stateless file reads, but no
 //     existing fresh-fork path either; warn rather than silently answer with
 //     however this stale build's tree-sitter/read-symbol logic behaves.
-//   pilens_effective_config                    — reads the warm per-workspace
-//     LSP registry to say which servers a file selects, and the merge/deny
-//     semantics it explains are compiled code; a stale build would explain a
-//     resolution the running one no longer performs.
+//   pilens_effective_config                    — derives (never reads) the
+//     LSP config for the file's directory to say which servers it selects,
+//     and the merge/deny semantics it explains are compiled code; a stale
+//     build would explain a resolution the running one no longer performs.
 //
 // `pilens_rebuild` is deliberately excluded: it doesn't answer with analysis
 // at all (it shells out to `npm run build`/`build:dist`), and it's the very

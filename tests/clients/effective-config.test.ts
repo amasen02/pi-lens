@@ -493,6 +493,16 @@ describe("effectiveConfig — asking changes no session state (#2427 round 3)", 
 		readonly home: string;
 		readonly liveRoot: string;
 		readonly foreignDir: string;
+		/**
+		 * A directory NESTED under `liveRoot` with its own `.pi-lens.json` —
+		 * `repo/sub/.pi-lens.json` layering (config.ts header point 3). It
+		 * denies `marksman` (P-E) and adds a custom server, `sub-only`, that
+		 * exists nowhere else (P-F). The runtime registers config at exactly
+		 * this directory for a file inside it —
+		 * `ensureLSPConfigInitialized(path.dirname(filePath))` in
+		 * `runtime-tool-call.ts:699-703` — never at `liveRoot`.
+		 */
+		readonly subDir: string;
 		readonly restore: () => void;
 	}
 
@@ -509,13 +519,39 @@ describe("effectiveConfig — asking changes no session state (#2427 round 3)", 
 		const globalConfig = path.join(home, ".pi-lens", "config.json");
 		const liveRoot = path.join(home, "live");
 		const foreignDir = path.join(home, "foreign");
-		for (const dir of [path.dirname(globalConfig), liveRoot, foreignDir]) {
+		const subDir = path.join(liveRoot, "sub");
+		for (const dir of [
+			path.dirname(globalConfig),
+			liveRoot,
+			foreignDir,
+			subDir,
+		]) {
 			fs.mkdirSync(dir, { recursive: true });
 		}
 		const ids = ["typos"];
 		const denySection = { disabledServers: ids };
 		const denyDocument: Record<string, unknown> = { lsp: denySection };
 		fs.writeFileSync(globalConfig, JSON.stringify(denyDocument));
+
+		// The nested layer P13 exists to prove reachable: a project-level deny
+		// (P-E) plus a custom server found NOWHERE else (P-F), both scoped to
+		// `sub` alone so a query derived from `liveRoot` cannot see either.
+		const subConfig = path.join(subDir, ".pi-lens.json");
+		const subDocument: Record<string, unknown> = {
+			lsp: {
+				disabledServers: ["marksman"],
+				servers: {
+					"sub-only": {
+						name: "Sub Only LSP",
+						extensions: [".md"],
+						command: "sub-only-lsp",
+						args: ["--stdio"],
+						rootMarkers: ["package.json"],
+					},
+				},
+			},
+		};
+		fs.writeFileSync(subConfig, JSON.stringify(subDocument));
 
 		const previousHome = process.env.PI_LENS_HOME;
 		const previousConfigPath = process.env.PI_LENS_CONFIG_PATH;
@@ -531,7 +567,7 @@ describe("effectiveConfig — asking changes no session state (#2427 round 3)", 
 			else process.env.PI_LENS_CONFIG_PATH = previousConfigPath;
 			resetLSPConfigStateForTests();
 		};
-		return { home, liveRoot, foreignDir, restore };
+		return { home, liveRoot, foreignDir, subDir, restore };
 	}
 
 	/** P11: the queried cwd never becomes a served root. */
@@ -586,25 +622,47 @@ describe("effectiveConfig — asking changes no session state (#2427 round 3)", 
 
 	/**
 	 * P13: deriving the config instead of reading the session registry must not
-	 * change the ANSWER. Every registered server, with its verdict and its
-	 * reason, is compared against what the session path reports for the same
-	 * file — the differential that makes the deletion safe rather than merely
-	 * smaller.
+	 * change the ANSWER — including for a NESTED `.pi-lens.json` the runtime
+	 * only reaches because it registers config at the FILE's OWN directory,
+	 * never at the workspace root (#2427 review round 4, F1).
+	 *
+	 * `repo/sub/.pi-lens.json` layers a project-level deny (`marksman`, P-E)
+	 * and a custom server that exists nowhere else (`sub-only`, P-F) onto the
+	 * global deny (`typos`) that already covers the whole tree. The session
+	 * mirrors what the runtime actually does for a tool call on a file under
+	 * `sub`: it registers `liveRoot` once (session start) AND `subDir`
+	 * separately (`ensureLSPConfigInitialized(path.dirname(filePath))`,
+	 * `runtime-tool-call.ts:699-703`) — it never re-registers `liveRoot` for
+	 * that call. `getConfigForFile` then answers with the deepest match,
+	 * `subDir`.
+	 *
+	 * Before F1, the query derived its config from `cwd` (`liveRoot`) alone,
+	 * which `resolvePiLensConfig` only walks UPWARD from — `subDir` is a
+	 * CHILD of `liveRoot`, so its `.pi-lens.json` was never read. The query
+	 * then answered `marksman` as `selected` (a denial the session enforces,
+	 * silently under-reported) and omitted `sub-only` entirely (an addition
+	 * the session serves, silently absent) — the differential this test pins.
 	 */
-	it("answers exactly what the session path answers for the same cwd", async () => {
+	it("answers exactly what the session path answers for a nested config", async () => {
 		const scenario = rootScenario();
 		try {
-			const liveFile = path.join(scenario.liveRoot, "notes.md");
+			const subFile = path.join(scenario.subDir, "notes.md");
 			await initLSPConfig(scenario.liveRoot);
-			const session = explainServersForFile(liveFile).map(registryDecision);
-			// Non-vacuous on both axes: a full registry, and a denial inside it.
+			await initLSPConfig(scenario.subDir);
+			const session = explainServersForFile(subFile).map(registryDecision);
+			// Non-vacuous on all three axes: the full registry, the global deny,
+			// the nested deny, and the nested addition.
 			expect(session.length).toBeGreaterThan(30);
-			const deniedTypos = session.some(isDeniedTypos);
-			expect(deniedTypos).toBe(true);
+			expect(session.some(isDeniedTypos)).toBe(true);
+			expect(session.some(isDeniedMarksman)).toBe(true);
+			expect(session.some(isSelectedSubOnly)).toBe(true);
 
-			const view = await effectiveConfig(
-				queryFor(scenario.liveRoot, scenario.home),
-			);
+			const view = await effectiveConfig({
+				cwd: scenario.liveRoot,
+				homeDir: scenario.home,
+				redact: true as const,
+				file: path.join("sub", "notes.md"),
+			});
 			const queried = (view.file?.servers ?? []).map(viewDecision);
 			expect(queried).toEqual(session);
 		} finally {
@@ -640,5 +698,14 @@ describe("effectiveConfig — asking changes no session state (#2427 round 3)", 
 	function isDeniedTypos(entry: Decision): boolean {
 		const denied = entry.reason === "disabled-by-config";
 		return entry.id === "typos" && denied;
+	}
+
+	function isDeniedMarksman(entry: Decision): boolean {
+		const denied = entry.reason === "disabled-by-config";
+		return entry.id === "marksman" && denied;
+	}
+
+	function isSelectedSubOnly(entry: Decision): boolean {
+		return entry.id === "sub-only" && entry.selected;
 	}
 });

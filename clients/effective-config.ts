@@ -289,7 +289,11 @@ interface FileQuery {
  * (the same loader `initLSPConfig` itself uses, minus the notices — rule 2)
  * through the same `registerLSPConfig` conversion, handed to
  * `explainServersForFile` as an explicit argument. Same gate, same answer, no
- * write. The differential is pinned in `tests/clients/effective-config.test.ts`.
+ * write. The load root is the FILE's own directory (matching what the
+ * runtime registers via `ensureLSPConfigInitialized(path.dirname(filePath))`),
+ * not the workspace `cwd` — a nested `repo/sub/.pi-lens.json` layer (config.ts
+ * header point 3) is otherwise invisible to the query (#2427 review round 4,
+ * F1). The differential is pinned in `tests/clients/effective-config.test.ts`.
  *
  * The load runs ONLY when a `file` is asked about. The whole-config view is
  * derived from `resolvePiLensConfig` alone, and `pilens_health` takes exactly
@@ -316,15 +320,28 @@ export async function effectiveConfig(
 	// names a workspace and then a file inside it means that file, and a bare
 	// `path.resolve` would silently answer for a same-named path under the host
 	// process's own directory — a wrong answer wearing a confident shape.
-	const fileQuery: FileQuery | undefined =
-		options.file === undefined
-			? undefined
-			: {
-					absolute: path.resolve(cwd, options.file),
-					lspConfig: registerLSPConfig(
-						await loadLSPConfig(cwd, homeDir, { report: false }),
-					),
-				};
+	//
+	// The LSP load root is the FILE's own directory, not the workspace `cwd`
+	// (#2427 review round 4, F1). The runtime registers config there too —
+	// `ensureLSPConfigInitialized(path.dirname(filePath))` in
+	// `runtime-tool-call.ts` — and `getConfigForFile` answers with the deepest
+	// registered ancestor, so a nested `repo/sub/.pi-lens.json` (config.ts
+	// header point 3) only reaches the runtime's decision through the file's
+	// own directory. Deriving from `cwd` made the query blind to a nested
+	// layer's denials AND additions — under-reporting a denial is the
+	// dangerous direction this surface exists to rule out.
+	let fileQuery: FileQuery | undefined;
+	if (options.file !== undefined) {
+		const absolute = path.resolve(cwd, options.file);
+		fileQuery = {
+			absolute,
+			lspConfig: registerLSPConfig(
+				await loadLSPConfig(path.dirname(absolute), homeDir, {
+					report: false,
+				}),
+			),
+		};
+	}
 
 	const resolution = resolvePiLensConfig({
 		cwd,
