@@ -77,6 +77,12 @@ instructions say so.
    the job id for CI lines — never from memory. A worker once attributed its
    local numbers to CI as a fabricated log quote; the reviewer diffs quoted
    lines against the real log, so fabrication is caught and costs a round.
+   New tests default to fake clocks (`vi.useFakeTimers()`) and
+   `tests/clients/interleaving-kit.ts`; a real spawn or a wall-clock wait/
+   assertion is a boundary decision with a stated reason, and
+   `tests/clients/flake-shape-ratchet.test.ts` (#2547) caps the population of
+   each — a new one needs a `// flake-shape:` header and
+   `wallClockBudgetInclude` membership to be admitted.
 5. Run targeted test files while iterating — through
    `npm run test:targeted -- <files>` (#2435), which takes one of 2 shared
    slots instead of bypassing the machine-wide lock; a bare `npx vitest run`
