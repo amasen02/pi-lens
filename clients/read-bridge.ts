@@ -58,6 +58,7 @@
  */
 
 /** Stable Symbol key — identical across module reloads in the same process. */
+import { registerProcessBridge } from "./process-bridge.js";
 import {
 	captureReadContentBinding,
 	type ReadContentBinding,
@@ -164,15 +165,12 @@ function isValidEntry(entry: unknown): entry is ReadBridgeEntry {
 
 /**
  * Mount the bridge singleton. Call once from inside the extension factory
- * (protected by the `_readBridgeRegistered` module-level flag).
- * Subsequent calls are no-ops.
+ * (protected by the `_readBridgeRegistered` module-level flag). Subsequent
+ * calls are no-ops (first-wins, `clients/process-bridge.ts` owns the mount
+ * body — see that module's header, #2437).
  */
 export function registerReadBridge(deps: BridgeDeps): void {
-	// Use `in` check so the frozen non-configurable property doesn't throw
-	// on a redundant defineProperty attempt.
-	if (READ_BRIDGE_KEY in (globalThis as object)) return;
-
-	const bridge: ReadBridge = Object.freeze({
+	registerProcessBridge(READ_BRIDGE_KEY, (): ReadBridge => ({
 		version: 1 as const,
 		recordRead(entry: ReadBridgeEntry): void {
 			// Validate the payload before doing anything else — this catches
@@ -182,8 +180,9 @@ export function registerReadBridge(deps: BridgeDeps): void {
 			if (!deps.isRecordable(entry.filePath)) return;
 
 			const offset = entry.requestedOffset;
-			// When no limit is given treat the whole file as covered — the guard
-			// clips to the actual line count via its own file-length probe.
+			// When no limit is given treat the whole file as covered — the
+			// guard clips to the actual line count via its own file-length
+			// probe.
 			const limit = entry.requestedLimit ?? Number.MAX_SAFE_INTEGER;
 			const contentBinding = captureReadContentBinding(
 				entry.filePath,
@@ -200,22 +199,14 @@ export function registerReadBridge(deps: BridgeDeps): void {
 				expandedByLsp: false,
 				turnIndex: deps.getTurnIndex(),
 				writeIndex: deps.peekWriteIndex(),
-				// Stamp the timestamp here, matching exactly how the internal read
-				// path works (runtime-tool-call.ts always uses Date.now()).
+				// Stamp the timestamp here, matching exactly how the internal
+				// read path works (runtime-tool-call.ts always uses Date.now()).
 				timestamp: Date.now(),
-				// Provenance: identifies this record as bridge-sourced in read-guard.log.
+				// Provenance: identifies this record as bridge-sourced in
+				// read-guard.log.
 				source: `bridge:${entry.consumer ?? "unknown"}`,
 				...(contentBinding !== undefined && { contentBinding }),
 			});
 		},
-	});
-
-	// Register as non-writable, non-configurable so no subsequent code can
-	// silently overwrite the bridge (first-wins is the contract).
-	Object.defineProperty(globalThis, READ_BRIDGE_KEY, {
-		value: bridge,
-		writable: false,
-		configurable: false,
-		enumerable: false,
-	});
+	}));
 }
