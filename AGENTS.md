@@ -3370,6 +3370,27 @@ LSP acquisition-race tests suspend the initialize/create-client seam with
 in-flight owner, lease count, publication cleanup, and shutdown reap so an
 aborted waiter cannot pass while pinning or orphaning a client.
 
+**New tests default to fake clocks and the interleaving kit, never a real
+spawn or a raw wall-clock wait/assertion** (#2547). Three deflake PRs in two
+days (#2531 alone fixed three shared-slot races) and nothing counted the
+contention surface those PRs kept fixing. `tests/clients/flake-shape-
+ratchet.test.ts` now caps it: a real child process (`child_process` import,
+`execFileSync`/`spawnSync`/`execSync`, or a spawn whose argv mentions
+`vitest`), a DELTA of two clock reads (`Date.now`/`performance.now`/
+`process.hrtime`) feeding a numeric matcher (`toBeLessThan`/`toBeGreaterThan`/
+…), a raw `setTimeout`/`setInterval` wait outside `vi.useFakeTimers()`, and a
+`vi.waitFor(` call outside `vi.useFakeTimers()` (round 2, the #1767 shape),
+are each a ratchet a new file cannot join and an existing file cannot grow
+in, without deliberate admission: a `// flake-shape: <detector> — <reason>`
+header naming why a mock is not faithful, AND membership in
+`vitest.config.ts`'s `wallClockBudgetInclude` project (the fully serialized
+lane). The ratchet is two-sided: a pinned file whose live count FALLS is
+also flagged (a stale ceiling that would otherwise silently re-admit
+regrowth up to the old pin) — tighten the baseline entry to the new count
+rather than leaving it stale. Reach for `vi.useFakeTimers()` and the
+interleaving kit first; a real spawn or a wall-clock assertion is a boundary
+decision, stated, not a convenience.
+
 A new always-absent dependency stub (a `vi.mock`/fixture that makes a dependency permanently unavailable) must ship with at least one present-path **behavior** test: the dependency's result must reach the caller, never just a bare no-throw assertion. #1251 is the failure case; #1310 is the pattern to follow.
 
 Every commit that adds or changes logic **must** include relevant tests before pushing. No exceptions:

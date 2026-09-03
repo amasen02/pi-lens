@@ -125,6 +125,17 @@ can trip, and say in your report which you ran and what each returned.
   dedupe key, a cache key, a hash input — the comparator must be
   locale-independent, so compare code units rather than calling
   `localeCompare`.
+- **New flake shapes.** A new test file that spawns a real process, asserts
+  on an elapsed-time delta, waits on a raw `setTimeout`/`setInterval`, or
+  calls `vi.waitFor(` — any of the last two outside `vi.useFakeTimers()` —
+  must red `tests/clients/flake-shape-ratchet.test.ts` (#2547) unless it
+  carries a `// flake-shape: <detector> — <reason>` header and is added to
+  `vitest.config.ts`'s `wallClockBudgetInclude`. A PR that adds one without
+  either is a finding. The ratchet is two-sided: a pinned file whose live
+  count FALLS below its pin is also a finding if the baseline entry is left
+  stale instead of tightened to the new count — a stale ceiling silently
+  re-admits regrowth up to the old pin without ever tripping the risen
+  check.
 
 ## Verification rounds
 
