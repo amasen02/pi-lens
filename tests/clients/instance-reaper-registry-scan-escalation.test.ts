@@ -19,6 +19,21 @@
  * `queryProcessTable` themselves. Only `node:child_process`'s `spawn` and
  * `process.kill` are mocked (same technique as
  * instance-reaper-backstop.test.ts), so no real OS process is ever touched.
+ *
+ * Round-3 fix (CI red on Linux): `instance-reaper.ts` captures `isWindows` as
+ * a MODULE-LOAD-TIME constant (`const isWindows = process.platform ===
+ * "win32"`), unlike `resource-sampler.ts`'s live per-call platform check. On
+ * Linux CI `sweepOrphans` therefore always takes the posix-`ps` branch and
+ * `findPidsByMarkerWindows` short-circuits to `[]` before spawning anything
+ * (it is `if (!isWindows || !marker) return [];`), so the round-2 version of
+ * this file's second case never produced a second scanner spawn there. Each
+ * case below now forces its OWN platform via `Object.defineProperty` BEFORE
+ * a `vi.resetModules()` + dynamic re-import of `instance-reaper.js` (and its
+ * `degradation-ledger.js`), so the module's `isWindows` constant is
+ * recomputed fresh for that platform on every host, Linux or Windows dev
+ * box alike — the same forcing technique
+ * `resource-sampler-scanner-attribution.test.ts` uses, adapted for a
+ * module-load-time constant rather than a live per-call check.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -99,19 +114,38 @@ vi.mock("../../clients/instance-registry.js", () => ({
 	readInstanceRegistry: async () => h.state.registry,
 }));
 
-import {
-	BACKSTOP_SCAN_TIMEOUT_MS,
-	sweepOrphans,
-} from "../../clients/instance-reaper.js";
-import {
-	getDegradationSummary,
-	resetDegradationLedger,
-} from "../../clients/degradation-ledger.js";
+const realPlatform = process.platform;
+function setPlatform(platform: NodeJS.Platform): void {
+	Object.defineProperty(process, "platform", {
+		value: platform,
+		configurable: true,
+	});
+}
 
-function reasonsFor(kind: string): Array<{ subject: string; reason: string }> {
-	return (
-		getDegradationSummary().find((g) => g.kind === kind)?.latestReasons ?? []
-	);
+/**
+ * `instance-reaper.ts` reads `process.platform` into a module-load-time
+ * `const isWindows`, so forcing the platform only takes effect on a FRESH
+ * module instance. `vi.resetModules()` + a dynamic re-import gets one; the
+ * degradation-ledger re-import right after resolves to the SAME fresh
+ * instance `instance-reaper.js` itself imported (no separate resetModules
+ * call between the two), so `getDegradationSummary` observes what
+ * `sweepOrphans` actually recorded.
+ */
+async function loadInstanceReaperFor(platform: NodeJS.Platform) {
+	setPlatform(platform);
+	vi.resetModules();
+	const { BACKSTOP_SCAN_TIMEOUT_MS, sweepOrphans } =
+		await import("../../clients/instance-reaper.js");
+	const { getDegradationSummary } =
+		await import("../../clients/degradation-ledger.js");
+	function reasonsFor(
+		kind: string,
+	): Array<{ subject: string; reason: string }> {
+		return (
+			getDegradationSummary().find((g) => g.kind === kind)?.latestReasons ?? []
+		);
+	}
+	return { BACKSTOP_SCAN_TIMEOUT_MS, sweepOrphans, reasonsFor };
 }
 
 function deadParentInstanceWithChild(child: {
@@ -145,7 +179,6 @@ beforeEach(() => {
 	h.state.scannerSpawnCount = 0;
 	h.state.hangOnScannerIndex = 0;
 	h.state.scannerPids.length = 0;
-	resetDegradationLedger();
 	vi.useFakeTimers();
 	vi.spyOn(process, "kill").mockImplementation(((pid: number) => {
 		if (h.state.alivePids.has(Math.abs(pid))) return true;
@@ -156,12 +189,20 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	setPlatform(realPlatform);
 	vi.restoreAllMocks();
 	vi.useRealTimers();
 });
 
 describe("#2527 review F2: sweepOrphans' own scanner queries escalate through terminateScannerChild", () => {
-	it("queryCommandLines' timed-out scanner is tree-killed and recorded under the backstop kind, not abandoned unverified", async () => {
+	it("queryCommandLines' timed-out scanner is tree-killed and recorded under the backstop kind, not abandoned unverified (forced posix — genuinely the ps branch on every host)", async () => {
+		// Forced "linux": instance-reaper.ts's module-load-time `isWindows`
+		// resolves false regardless of the host OS, so this genuinely exercises
+		// queryCommandLines' posix `ps` branch even on a Windows dev box, not
+		// just incidentally on Linux CI.
+		const { BACKSTOP_SCAN_TIMEOUT_MS, sweepOrphans, reasonsFor } =
+			await loadInstanceReaperFor("linux");
+
 		// Dead parent, dead child, no marker: queryCommandLines(candidatePids)
 		// still runs (it is unconditional, ahead of the dead/alive decision) and
 		// is this test's only scanner query.
@@ -184,7 +225,14 @@ describe("#2527 review F2: sweepOrphans' own scanner queries escalate through te
 		expect(reasons[0].subject).not.toContain("#100");
 	});
 
-	it("findPidsByMarkerWindows' timed-out scanner is tree-killed and recorded under the backstop kind, not abandoned unverified", async () => {
+	it("findPidsByMarkerWindows' timed-out scanner is tree-killed and recorded under the backstop kind, not abandoned unverified (forced win32 — the only host where this query runs at all)", async () => {
+		// Forced "win32": findPidsByMarkerWindows is `if (!isWindows || !marker)
+		// return [];` — on the real host platform of CI (Linux) it never spawns
+		// anything, so this branch can only be exercised by forcing the
+		// module's isWindows constant true before import, on every host.
+		const { BACKSTOP_SCAN_TIMEOUT_MS, sweepOrphans, reasonsFor } =
+			await loadInstanceReaperFor("win32");
+
 		// Dead parent, dead child, WITH a marker: queryCommandLines resolves
 		// cleanly (index 1, not hung), then decideOrphanReaping routes the dead
 		// child into markerSearches, and findPidsByMarkerWindows (scanner index
