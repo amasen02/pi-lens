@@ -164,6 +164,23 @@ export function withinRemaining<T>(
  */
 const BOUND_ABORTED: unique symbol = Symbol("pi-lens/bounded/aborted");
 
+/**
+ * Which bound abandoned the await — the three `abandonedError`
+ * (`clients/bootstrap.ts`) already distinguishes, kept identical so
+ * {@link bounded} is a true SUPERSET of that helper rather than a fourth
+ * dialect. They have opposite remedies, and only one of them is a defect:
+ *
+ * - `"deadline"` — the work was too slow for the hook's wall budget. The hook
+ *   shipped a partial answer. Raise the budget, move the work off-hook, or fix
+ *   what wedged. Recorded as `hook-await-exceeded` (warning tier).
+ * - `"caller-abort"` — the hook's own `ctx.signal` fired: Escape, a cancelled
+ *   turn. A deliberate USER action, nothing degraded, nothing to act on.
+ *   Recorded NOWHERE.
+ * - `"shutdown"` — the session is tearing down. Abandoning in-flight work is
+ *   what teardown is for. Recorded as `hook-await-abandoned`, informational.
+ */
+export type BoundCause = "deadline" | "caller-abort" | "shutdown";
+
 /** Everything {@link bounded} needs. Both bounds are REQUIRED — see below. */
 export interface BoundedOptions {
 	/**
@@ -181,6 +198,18 @@ export interface BoundedOptions {
 	 * (`still-blocked after 30011ms` with the ambient abort fired at t=2s).
 	 */
 	signal: AbortSignal;
+	/**
+	 * Optional TEARDOWN signal — the seam's own session-shutdown controller,
+	 * not a turn signal. Supplying it is what lets a caller whose work is not
+	 * turn-scoped still satisfy both bounds without binding a turn signal that
+	 * would cancel it for the wrong reason, exactly as
+	 * `clients/bootstrap.ts#ensureBootstrapClients` threads
+	 * `bootstrapShutdownController.signal` today.
+	 *
+	 * Optional because it is a THIRD bound, not half of the required pair: a
+	 * hook that has no teardown signal to offer still has both of its own.
+	 */
+	shutdownSignal?: AbortSignal;
 	/** Hook this await runs under, e.g. `"turn_end"`. Half of the ledger key. */
 	hook: string;
 	/** What is being awaited, e.g. `"sweepInlineBlockerFreshness"`. */
@@ -209,19 +238,36 @@ export interface BoundedOptions {
  * ## Semantics
  *
  * - Resolves to the promise's value when it settles inside both bounds.
- * - Resolves to `undefined` when the budget elapses OR the signal aborts,
- *   whichever comes first — and firing the signal settles IMMEDIATELY, it
+ * - Resolves to `undefined` when the budget elapses OR a signal aborts,
+ *   whichever comes first — and firing a signal settles IMMEDIATELY, it
  *   never waits the remaining deadline out.
  * - Rejections propagate: this helper decides how LONG to wait, never what an
  *   error means. Once a bound has fired, a later rejection from the
- *   superseded promise is suppressed (`withDeadline` attaches the no-op catch)
- *   so it cannot surface as an unhandled rejection.
- * - Exceeding a bound records ONE rising-edge `hook-await-exceeded`
- *   degradation per (hook, label) via `recordDegradationOnce`, naming the
- *   hook, the await, the budget, the actual elapsed ms, and which bound fired.
- *   Bounded by construction: a hook that blows its budget on every turn of a
- *   long session writes one ledger row, not one per turn. Promote it to
- *   `incrementDegradationCount` if slice 2 finds the exact tally is needed.
+ *   superseded promise is suppressed (a no-op catch is attached to the work
+ *   up front) so it cannot surface as an unhandled rejection.
+ *
+ * ## What reaches the ledger, and what deliberately does not
+ *
+ * Which bound fired decides this, via {@link BoundCause}. Only the DEADLINE
+ * records `hook-await-exceeded` — ONE rising-edge row per (hook, label) via
+ * `recordDegradationOnce`, naming the hook, the await, the budget, the actual
+ * elapsed ms and the cause. Bounded by construction: a hook that blows its
+ * budget on every turn of a long session writes one ledger row, not one per
+ * turn. Promote it to `incrementDegradationCount` if slice 2 finds the exact
+ * tally is needed.
+ *
+ * A `"caller-abort"` records NOTHING. The caller's signal is the user pressing
+ * Escape or a turn being cancelled — a deliberate action, not a degraded
+ * environment. `clients/bootstrap.ts` already carries this lesson at its
+ * `if (unavailableReason !== "aborted")` guard: writing a cancel to the ledger
+ * made it indistinguishable from an unhealthy analyzer graph in
+ * `pilens_health`. This helper is meant to become THE bound primitive at
+ * ~187 call sites, so recording a cancel here would ship that inversion
+ * everywhere at once.
+ *
+ * A `"shutdown"` records `hook-await-abandoned`, which is in
+ * `INFORMATIONAL_DEGRADATION_KINDS` — teardown abandoning in-flight work is
+ * the design, so it is a tally rather than a `⚠`.
  *
  * `undefined` therefore means "no answer inside the bound" and must never be
  * read as an empty/clean ANSWER (defect shape 10, and the #240 lesson that a
@@ -238,70 +284,98 @@ export async function bounded<T>(
 	promise: Promise<T>,
 	options: BoundedOptions,
 ): Promise<T | undefined> {
-	const { signal, hook, label } = options;
+	const { signal, shutdownSignal, hook, label } = options;
 	// A non-finite budget settles immediately rather than throwing. The type
 	// forbids it, but a JS caller (or a `@ts-expect-error` probe) can still
-	// hand one over, and `AbortSignal.timeout(NaN)` throws ERR_OUT_OF_RANGE —
-	// a helper whose whole job is keeping a hook from blowing up must not
-	// itself blow up inside one. Same `Number.isFinite`-before-`Math.max` gate
-	// the runtime-config readers use.
+	// hand one over, and `setTimeout(fn, NaN)` would fire on the next tick
+	// with a warning — a helper whose whole job is keeping a hook from blowing
+	// up must not itself misbehave inside one. Same
+	// `Number.isFinite`-before-`Math.max` gate the runtime-config readers use.
 	const ms = Number.isFinite(options.ms) ? Math.max(0, options.ms) : 0;
 	const startedAt = Date.now();
-	// One combined signal rather than two races: `combineAbortSignals` already
-	// owns the AbortSignal.any/fallback split, and folding the wall clock in as
-	// a signal keeps a single settle path for both bounds. Node's
-	// `AbortSignal.timeout` timer is unref'd, so it cannot hold the event loop
-	// open past the hook it bounds.
-	const timeoutSignal = AbortSignal.timeout(ms);
-	// Two live signals are always passed, so the combined result is never
-	// `undefined`; the assertion states that rather than inventing a fallback.
-	const combined = combineAbortSignals(signal, timeoutSignal) as AbortSignal;
-	let onAbort: (() => void) | undefined;
-	const aborted = new Promise<typeof BOUND_ABORTED>((resolve) => {
-		if (combined.aborted) {
+
+	// Late rejection from work a bound has already abandoned must not surface
+	// as an unhandled rejection. Attached to the BOXED promise, which is what
+	// the race below actually subscribes to; the caller still sees a rejection
+	// that arrives inside the bounds, because `Promise.race` attaches its own
+	// handler to the same promise.
+	const boxed = promise.then((value) => ({ value }) as const);
+	void boxed.catch(() => {});
+
+	// ONE timer and ONE listener per source signal, all released in `finally`
+	// (#2530 review F2/F4).
+	//
+	// The round-1 implementation folded the wall clock in as
+	// `AbortSignal.timeout(ms)` and combined it through `AbortSignal.any`,
+	// then ALSO passed `ms` to `withDeadline` — two timers for one budget, and
+	// a composite signal per call. `AbortSignal.any` does not add a listener
+	// to its sources: it appends the composite to an internal dependant list
+	// on each of them, which lives as long as the SOURCE does. The hook signal
+	// outlives one await by a whole turn, so 20 000 successful `bounded()`
+	// calls on one hook signal left 20 000 entries on it, and the `finally`'s
+	// `removeEventListener` — aimed at the throwaway composite — removed
+	// nothing from the source. Listening on the sources directly is what makes
+	// the cleanup reach the thing that outlives the call.
+	let cause: BoundCause | undefined;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let onCallerAbort: (() => void) | undefined;
+	let onShutdownAbort: (() => void) | undefined;
+
+	const abandoned = new Promise<typeof BOUND_ABORTED>((resolve) => {
+		// `abandonedError`'s precedence, unchanged: the caller's own signal
+		// first, then teardown, then the clock. A turn cancelled while the
+		// session also happens to be tearing down is still a cancel.
+		const fire = (reason: BoundCause) => {
+			cause ??= reason;
 			resolve(BOUND_ABORTED);
-			return;
-		}
-		onAbort = () => resolve(BOUND_ABORTED);
-		combined.addEventListener("abort", onAbort, { once: true });
-	});
-	try {
-		// The value is boxed so a promise that legitimately resolves `undefined`
-		// is still distinguishable from `withDeadline`'s timeout settlement.
-		const settled = await withDeadline<{ value: T } | typeof BOUND_ABORTED>(
-			Promise.race([
-				promise.then((value) => ({ value })),
-				aborted as Promise<{ value: T } | typeof BOUND_ABORTED>,
-			]),
-			{ ms, onTimeout: "undefined" },
-		);
-		if (settled === undefined || settled === BOUND_ABORTED) {
-			// `signal.aborted` is read AFTER the race settled, so it names the
-			// bound that actually fired rather than the one that was armed. A
-			// reader needs to know whether to raise the budget or to look at why
-			// the turn was cancelled — opposite remedies.
-			recordDegradationOnce({
-				kind: "hook-await-exceeded",
-				subject: `${hook}:${label}`,
-				reason: signal.aborted
-					? `aborted after ${Date.now() - startedAt}ms (budget ${ms}ms)`
-					: `exceeded ${ms}ms budget after ${Date.now() - startedAt}ms`,
-				metadata: {
-					hook,
-					label,
-					budgetMs: ms,
-					elapsedMs: Date.now() - startedAt,
-					cause: signal.aborted ? "abort" : "deadline",
-				},
+		};
+		if (signal.aborted) return fire("caller-abort");
+		if (shutdownSignal?.aborted) return fire("shutdown");
+		// A zero budget ("this hook may not await at all") is a bound that has
+		// already elapsed, not a timer to arm.
+		if (ms <= 0) return fire("deadline");
+		timer = setTimeout(() => fire("deadline"), ms);
+		// Never hold the event loop open past the hook this bounds.
+		timer.unref?.();
+		onCallerAbort = () => fire("caller-abort");
+		signal.addEventListener("abort", onCallerAbort, { once: true });
+		if (shutdownSignal) {
+			onShutdownAbort = () => fire("shutdown");
+			shutdownSignal.addEventListener("abort", onShutdownAbort, {
+				once: true,
 			});
-			return undefined;
 		}
-		return settled.value;
+	});
+
+	try {
+		// The value is boxed so a promise that legitimately resolves
+		// `undefined` stays distinguishable from a bound firing (defect shape
+		// 10: a silenced answer must not read as a clean one).
+		const settled = await Promise.race([boxed, abandoned]);
+		if (settled !== BOUND_ABORTED) return settled.value;
+
+		const elapsedMs = Date.now() - startedAt;
+		const fired = cause ?? "deadline";
+		// A caller's own abort is Escape or a cancelled turn — deliberate, not
+		// a degradation, and deliberately absent from the ledger.
+		if (fired === "deadline" || fired === "shutdown") {
+			recordDegradationOnce({
+				kind:
+					fired === "deadline" ? "hook-await-exceeded" : "hook-await-abandoned",
+				subject: `${hook}:${label}`,
+				reason:
+					fired === "deadline"
+						? `exceeded ${ms}ms budget after ${elapsedMs}ms`
+						: `abandoned after ${elapsedMs}ms: session is shutting down (budget ${ms}ms)`,
+				metadata: { hook, label, budgetMs: ms, elapsedMs, cause: fired },
+			});
+		}
+		return undefined;
 	} finally {
-		// The hook signal outlives this await by a whole turn, and
-		// `AbortSignal.any` keeps the composite alive only while it is
-		// referenced — dropping the listener here is what keeps a hook that
-		// awaits N times from accumulating N listeners on one turn signal.
-		if (onAbort) combined.removeEventListener("abort", onAbort);
+		if (timer !== undefined) clearTimeout(timer);
+		if (onCallerAbort) signal.removeEventListener("abort", onCallerAbort);
+		if (onShutdownAbort) {
+			shutdownSignal?.removeEventListener("abort", onShutdownAbort);
+		}
 	}
 }

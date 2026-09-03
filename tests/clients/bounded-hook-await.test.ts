@@ -12,6 +12,7 @@
  * silently stop guarding.
  */
 
+import { getEventListeners } from "node:events";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { bounded } from "../../clients/deadline-utils.js";
 import {
@@ -26,6 +27,36 @@ function wedged<T>(): Promise<T> {
 
 function summaryFor(kind: string) {
 	return getDegradationSummary().find((group) => group.kind === kind);
+}
+
+/**
+ * How many COMPOSITE signals `signal` is keeping alive, or `undefined` when
+ * none has ever been registered on it.
+ *
+ * `AbortSignal.any([source, ...])` does NOT add an `abort` listener to
+ * `source` — it appends the composite to an internal dependant list on it, so
+ * `getEventListeners(source, "abort")` stays 0 forever and a
+ * `removeEventListener` on the COMPOSITE (which is what the round-1
+ * implementation's `finally` did) removes nothing from the source. The list is
+ * reachable only through the internal symbol, so {@link dependantCount} reads
+ * it by description — and every test that uses it arms a POSITIVE CONTROL
+ * first, so a Node release that renames the symbol makes the probe fail loudly
+ * instead of passing blind (#1755 F4's "a scan that finds nothing is dead, not
+ * clean").
+ */
+function dependantCount(signal: AbortSignal): number | undefined {
+	const symbol = Object.getOwnPropertySymbols(signal).find((s) =>
+		String(s).includes("kDependantSignals"),
+	);
+	if (!symbol) return undefined;
+	const list = (signal as unknown as Record<symbol, unknown>)[symbol];
+	// Duck-typed on `size`, NOT `instanceof Set`: Node stores this in a
+	// `SafeSet` from its primordials, whose prototype chain is deliberately
+	// detached from the global `Set`, so `instanceof` is false and an
+	// `instanceof` probe reports "no list" on a list that is really there.
+	const size = (list as { size?: unknown } | undefined)?.size;
+	if (typeof size === "number") return size;
+	return Array.isArray(list) ? list.length : undefined;
 }
 
 /**
@@ -125,9 +156,82 @@ describe("#2523 AC2 bounded() requires BOTH bounds", () => {
 		controller.abort();
 		await expect(pending).resolves.toBeUndefined();
 		expect(Date.now() - startedAt).toBeLessThan(5_000);
-		const group = summaryFor("hook-await-exceeded");
-		expect(group?.latestReasons.at(-1)?.subject).toBe("turn_end:escape");
-		expect(group?.latestReasons.at(-1)?.reason).toContain("aborted");
+	});
+
+	it("records NOTHING when the caller's own signal aborts", async () => {
+		// Review round 2 (F1). The caller's signal IS Escape / turn cancel — a
+		// deliberate user action, not a degraded environment. Round 1 recorded
+		// `hook-await-exceeded` (warning tier, a `⚠` line in `pilens_health`)
+		// on BOTH causes, which is the exact inversion clients/bootstrap.ts
+		// already documents as fixed: `if (unavailableReason !== "aborted")`
+		// exists because writing a deliberate cancel to the ledger made it
+		// indistinguishable from an unhealthy analyzer graph. `bounded()` is
+		// meant to become THE bound primitive at 187 sites, so shipping the
+		// inversion here would ship it everywhere.
+		const controller = new AbortController();
+		const pending = bounded(wedged<string>(), {
+			ms: 60_000,
+			signal: controller.signal,
+			hook: "turn_end",
+			label: "escape",
+		});
+		controller.abort();
+		await expect(pending).resolves.toBeUndefined();
+		expect(summaryFor("hook-await-exceeded")).toBeUndefined();
+		expect(summaryFor("hook-await-abandoned")).toBeUndefined();
+		expect(getDegradationSummary()).toEqual([]);
+	});
+
+	it("records an INFORMATIONAL row when the shutdown signal fires", async () => {
+		// The third cause, modelled on `abandonedError`
+		// (clients/bootstrap.ts): teardown is neither a budget blow-out nor a
+		// user cancel. It is a tally — the same reasoning that put
+		// `log-sink-rotated` in `INFORMATIONAL_DEGRADATION_KINDS` rather than
+		// giving a designed-for event the marker a real degradation gets.
+		const caller = new AbortController();
+		const shutdown = new AbortController();
+		const startedAt = Date.now();
+		const pending = bounded(wedged<string>(), {
+			// Small enough that the PRE-FIX implementation (which ignores
+			// `shutdownSignal` entirely) reds on the assertion after ~1s rather
+			// than hanging the suite out to the vitest ceiling.
+			ms: 1_000,
+			signal: caller.signal,
+			shutdownSignal: shutdown.signal,
+			hook: "session_shutdown",
+			label: "drainPendingWrites",
+		});
+		shutdown.abort();
+		await expect(pending).resolves.toBeUndefined();
+		// Settles on the shutdown signal, it does not wait the budget out.
+		expect(Date.now() - startedAt).toBeLessThan(500);
+		expect(summaryFor("hook-await-exceeded")).toBeUndefined();
+		const group = summaryFor("hook-await-abandoned");
+		expect(group?.count).toBe(1);
+		expect(group?.latestReasons.at(-1)?.subject).toBe(
+			"session_shutdown:drainPendingWrites",
+		);
+	});
+
+	it("names the CALLER's abort ahead of both other causes", async () => {
+		// `abandonedError`'s precedence, kept exactly so `bounded()` is a true
+		// superset of `awaitWithinBounds`: caller, then shutdown, then the
+		// deadline. A turn cancelled while the session also happens to be
+		// tearing down is still a cancel, and still records nothing.
+		const caller = new AbortController();
+		const shutdown = new AbortController();
+		caller.abort();
+		shutdown.abort();
+		await expect(
+			bounded(wedged<void>(), {
+				ms: 0,
+				signal: caller.signal,
+				shutdownSignal: shutdown.signal,
+				hook: "turn_end",
+				label: "precedence",
+			}),
+		).resolves.toBeUndefined();
+		expect(getDegradationSummary()).toEqual([]);
 	});
 
 	it("settles on the DEADLINE when nothing aborts, naming the budget", async () => {
@@ -235,36 +339,67 @@ describe("#2523 AC2 bounded() requires BOTH bounds", () => {
 		}
 	});
 
-	it("does not accumulate listeners on the hook signal it is handed", async () => {
-		// The hook's signal outlives one await by a whole turn, and a handler
-		// that awaits N times must not leave N listeners behind on it.
+	it("leaves neither a listener nor a composite behind on the hook signal", async () => {
+		// Review round 2 (F2). The hook's signal outlives one await by a whole
+		// turn, so a handler that awaits N times must leave NOTHING behind on
+		// it. Round 1's version of this test asserted on
+		// `signal.listenerCount`, which does not exist on Node 24 (`typeof` is
+		// `"undefined"`), so its one assertion sat inside an `if` that never
+		// ran and deleting the cleanup left it 12/12 green — while the real
+		// leak grew unobserved: `AbortSignal.any` appends its composite to the
+		// SOURCE signal's dependant list, and the `finally` removed a listener
+		// from the throwaway composite instead.
 		const controller = new AbortController();
-		const before = (
-			controller.signal as AbortSignal & {
-				// Node exposes the count through the EventTarget shim's own API.
-				listenerCount?: (type: string) => number;
-			}
-		).listenerCount?.("abort");
-		for (let i = 0; i < 20; i++) {
+		const signal = controller.signal;
+
+		// POSITIVE CONTROL, first: this probe must be able to SEE the mechanism
+		// it goes on to assert the absence of. If a Node release renames the
+		// internal list, these two lines red rather than letting the assertions
+		// below pass vacuously — the failure mode that made round 1's test
+		// worthless.
+		expect(dependantCount(signal)).toBeUndefined();
+		AbortSignal.any([signal, new AbortController().signal]);
+		expect(dependantCount(signal)).toBe(1);
+
+		const listenersBefore = getEventListeners(signal, "abort").length;
+		const dependantsBefore = dependantCount(signal);
+
+		const calls = 200;
+		for (let i = 0; i < calls; i++) {
 			await bounded(Promise.resolve(i), {
 				ms: 1000,
-				signal: controller.signal,
+				signal,
 				hook: "session_start",
 				label: "loop",
 			});
 		}
-		const after = (
-			controller.signal as AbortSignal & {
-				listenerCount?: (type: string) => number;
-			}
-		).listenerCount?.("abort");
-		// Node's AbortSignal does not expose listenerCount on every version; the
-		// assertion is skipped rather than faked when it is absent, and the
-		// no-leak property is still covered by the composite signal being
-		// dropped with the call frame.
-		if (typeof before === "number" && typeof after === "number") {
-			expect(after).toBeLessThanOrEqual(before + 1);
+
+		// Measured on the round-1 implementation: 200 calls took the dependant
+		// list from 1 to 201, one permanent entry per call, and 20 000 calls on
+		// one hook signal took it to 20 000.
+		expect(dependantCount(signal)).toBe(dependantsBefore);
+		expect(getEventListeners(signal, "abort").length).toBe(listenersBefore);
+	});
+
+	it("removes its abort listener when the WORK wins the race", async () => {
+		// The mutation target for the `finally`: with the listener now
+		// registered on the SOURCE signal, dropping the cleanup makes the
+		// count grow with the loop instead of returning to baseline. Kept
+		// separate from the composite assertion above so the two failure modes
+		// do not share a message.
+		const controller = new AbortController();
+		const signal = controller.signal;
+		const before = getEventListeners(signal, "abort").length;
+		for (let i = 0; i < 50; i++) {
+			await bounded(Promise.resolve(i), {
+				ms: 60_000,
+				signal,
+				shutdownSignal: new AbortController().signal,
+				hook: "turn_end",
+				label: "cleanup",
+			});
 		}
+		expect(getEventListeners(signal, "abort").length).toBe(before);
 	});
 
 	it("settles immediately, and records, when the budget is zero", async () => {
@@ -299,5 +434,8 @@ describe("#2523 AC2 bounded() requires BOTH bounds", () => {
 			}),
 		).resolves.toBeUndefined();
 		expect(Date.now() - startedAt).toBeLessThan(5_000);
+		// Entering a hook after Escape was pressed is still the caller
+		// cancelling, so it is still not a degradation (F1).
+		expect(getDegradationSummary()).toEqual([]);
 	});
 });
