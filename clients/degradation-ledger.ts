@@ -69,6 +69,32 @@ export type DegradationKind =
 	| "installer-verification-output-truncated"
 	/** A git ls-files collection was truncated before parsing completed (#2075). */
 	| "git-tracked-ignore-truncated"
+	/**
+	 * #2523: an `await` on a hook path exceeded its per-hook wall BUDGET, so
+	 * `bounded()` (`clients/deadline-utils.ts`) abandoned it and the hook
+	 * returned WITHOUT that await's answer. Subject is `<hook>:<label>`,
+	 * recorded ONCE per pair so a hook that blows its budget every turn writes
+	 * one row, not one per turn. Deliberately NOT informational: the hook
+	 * shipped a partial answer, which is a degradation the reader has to act
+	 * on (raise the budget, move the work off-hook, or fix what wedged), not a
+	 * designed-for tally like a log rotation.
+	 *
+	 * The DEADLINE cause only. A caller's own abort (Escape, turn cancel) is a
+	 * deliberate user action and records nothing at all; a shutdown abort
+	 * records `hook-await-abandoned` below. Recording all three here inverted
+	 * the reader's signal exactly as `clients/bootstrap.ts` documents at its
+	 * `unavailableReason !== "aborted"` guard (#2530 review F1).
+	 */
+	| "hook-await-exceeded"
+	/**
+	 * #2523: a bounded hook await was abandoned because the SESSION is tearing
+	 * down, not because it was slow. A tally, not a call to action — teardown
+	 * abandoning in-flight work is the design — so it is in
+	 * `INFORMATIONAL_DEGRADATION_KINDS` and renders without the `⚠` a real
+	 * degradation gets. Subject is `<hook>:<label>`, same as above, so the two
+	 * causes stay separable in `pilens_health`.
+	 */
+	| "hook-await-abandoned"
 	| "formatter-skip"
 	| "grammar-blocked"
 	| "lsp-breaker"
@@ -1126,6 +1152,11 @@ const INFORMATIONAL_DEGRADATION_KINDS: ReadonlySet<string> = new Set([
 	// would.
 	"actionable-warnings-inband-superseded",
 	"actionable-warnings-deferred-superseded",
+	// #2523: a hook await abandoned because the session is tearing down. The
+	// teardown signal firing is the design working, so it is a tally; the
+	// BUDGET blow-out (`hook-await-exceeded`) is the line that has to stand
+	// out, and a caller's own Escape records nothing at all.
+	"hook-await-abandoned",
 	// #2524: can fire on a query that ultimately settles `ok` (see the kind's
 	// doc comment above) and is frequent/self-healing by design — a `⚠` would
 	// cry wolf on the sampler's ordinary best-effort data loss.

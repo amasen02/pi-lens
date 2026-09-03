@@ -1,6 +1,5 @@
 export const CONFLICT_LABEL: string;
 export const RED_CI_LABEL: string;
-export const REQUIRED_CHECKS: string[];
 export const PAGE_SIZE: number;
 export const MAX_PAGES: number;
 
@@ -17,9 +16,9 @@ export interface WardenCheckRun {
 	url?: string;
 }
 
-export function resolveCheckRuns(
-	checkRuns: WardenCheckRun[] | null | undefined,
-): Map<string, WardenCheckRun>;
+// REQUIRED_CHECKS and resolveCheckRuns moved to ./ci-checks.mjs (#2539 round
+// 2, F2) as REQUIRED_CHECKS / resolveLatestByName -- the shared seam for
+// this file, merge-train-lane.mjs, and ci-verdict.mjs.
 
 export interface WardenPr {
 	number: number;
