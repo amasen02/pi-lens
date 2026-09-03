@@ -238,7 +238,9 @@ describe("effectiveConfig — why is X running (#2415 AC)", () => {
 			{ file: "notes.md" },
 		);
 
-		const typos = resolvedFile(view)?.servers.find((entry) => entry.id === "typos");
+		const typos = resolvedFile(view)?.servers.find(
+			(entry) => entry.id === "typos",
+		);
 		expect(typos).toBeDefined();
 		expect(typos?.selected).toBe(false);
 		expect(typos?.reason).toBe("disabled-by-config");
@@ -304,8 +306,8 @@ describe("effectiveConfig — why is X running (#2415 AC)", () => {
 			{ file: "notes.md" },
 		);
 		const denied = new Set(
-			resolvedFile(view)?.servers
-				.filter((entry) => entry.reason === "disabled-by-config")
+			resolvedFile(view)
+				?.servers.filter((entry) => entry.reason === "disabled-by-config")
 				.map((entry) => entry.id),
 		);
 		expect(denied.has("typos")).toBe(true);
@@ -376,7 +378,9 @@ describe("effectiveConfig — why is X running (#2415 AC)", () => {
 		files[GLOBAL_CONFIG] = denyDoc("rust");
 		const layout: Layout = { files, startDir: "proj" };
 		const result = await viewFor(layout, { file: "notes.md" });
-		const rust = resolvedFile(result.view)?.servers.find((entry) => entry.id === "rust");
+		const rust = resolvedFile(result.view)?.servers.find(
+			(entry) => entry.id === "rust",
+		);
 		expect(rust).toBeDefined();
 		expect(rust?.selected).toBe(false);
 		expect(rust?.reason).toBe("disabled-by-config");
@@ -945,7 +949,7 @@ describe("effectiveConfig — asking changes no session state (#2427 round 3)", 
  * "SUPERSET of the workspace's" invariant the module doc claims did not hold.
  */
 describe("effectiveConfig — a file outside cwd is rejected, not silently resolved (#2520)", () => {
-	it("returns { error: \"file is outside cwd\" } instead of a foreign tree's answer", async () => {
+	it('returns { error: "file is outside cwd" } instead of a foreign tree\'s answer', async () => {
 		const home = fs.mkdtempSync(
 			path.join(os.tmpdir(), "pi-lens-effcfg-confine-"),
 		);

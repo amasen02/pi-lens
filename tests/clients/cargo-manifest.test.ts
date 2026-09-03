@@ -164,9 +164,9 @@ describe("readCargoWorkspaceMembers/readCargoWorkspaceExclude table-scoping (rev
 
 describe("hasCargoWorkspaceTable (#2498)", () => {
 	it("is true when [workspace] is present", () => {
-		expect(hasCargoWorkspaceTable('[package]\nname = "x"\n\n[workspace]\n')).toBe(
-			true,
-		);
+		expect(
+			hasCargoWorkspaceTable('[package]\nname = "x"\n\n[workspace]\n'),
+		).toBe(true);
 	});
 
 	it("is true for a present-but-empty [workspace] table (review round 3, F1 shape)", () => {
@@ -183,9 +183,9 @@ describe("hasCargoWorkspaceTable (#2498)", () => {
 		// `[workspace.metadata]` is its own table; `extractTomlTableSection`
 		// anchors the heading to the exact table name, so a sub-table alone
 		// must not read as the parent table being present.
-		expect(
-			hasCargoWorkspaceTable('[workspace.metadata]\nfoo = "bar"\n'),
-		).toBe(false);
+		expect(hasCargoWorkspaceTable('[workspace.metadata]\nfoo = "bar"\n')).toBe(
+			false,
+		);
 	});
 });
 
@@ -243,10 +243,7 @@ describe("no hand-rolled [workspace]-table regex outside cargo-manifest.ts (#249
 		const files = clientSourceFiles().filter(
 			(file) => clientsRelative(file) !== "cargo-manifest.ts",
 		);
-		assertNonEmptyScan(
-			"clients/*.ts (minus cargo-manifest.ts)",
-			files.length,
-		);
+		assertNonEmptyScan("clients/*.ts (minus cargo-manifest.ts)", files.length);
 		const offenders = files
 			.filter((file) => {
 				const stripped = stripSource(fs.readFileSync(file, "utf-8"), {
