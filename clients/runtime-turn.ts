@@ -201,6 +201,20 @@ const LATE_AUX_COVERAGE_GAP_DETAIL_CAP_PER_TURN = 20;
 export const TEST_RUNNER_BATCH_CONCURRENCY = 4;
 export const TEST_RUNNER_MAX_TARGETS = 12;
 export const TEST_RUNNER_BATCH_BUDGET_MS = 20_000;
+/**
+ * How many consecutive turn-end batches a target may be cut out of before it
+ * is retired from turn-end selection altogether.
+ *
+ * Without this the deferral is a LIVELOCK, and not hypothetically: this
+ * repo's own `tests/index-integration.test.ts` — which turn-end resolves
+ * through the `related` strategy whenever `clients/runtime-turn.ts` is
+ * edited — takes 26.4 s, MORE than the entire 20 s batch budget on its own.
+ * Deferring it puts it FIRST in the next batch, where it is cut again at
+ * 20 s, and again, every turn, forever. A target that cannot fit the budget
+ * is not a scheduling problem retrying can solve; it is reported once per
+ * occurrence and dropped, so the turn stops paying 20 s for it.
+ */
+export const TEST_RUNNER_MAX_DEFERRALS = 2;
 
 export interface BoundedTestBatchOutcome<R, T> {
 	/** One entry per target that was dispatched AND settled before the close. */
@@ -2088,6 +2102,8 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		const targets: Array<
 			Omit<TurnEndTestTarget, "strategy"> & {
 				strategy: TurnEndTestTarget["strategy"] | "deferred";
+				/** Cut-batch count carried in from the cache, for the cap below. */
+				deferralAttempts?: number;
 			}
 		> = [];
 
@@ -2138,6 +2154,21 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 		for (const carried of carriedDeferred) {
 			const testFile = path.resolve(cwd, carried.testFile);
 			if (seen.has(testFile)) continue;
+			const attempts = carried.attempts ?? 0;
+			if (attempts >= TEST_RUNNER_MAX_DEFERRALS) {
+				// Never silent, and counted rather than once-per-subject: this is
+				// the ledger entry that names WHICH suite is too slow to belong in
+				// a per-turn batch at all.
+				incrementDegradationCount({
+					kind: "test-runner-batch-capped",
+					subject: `${cwd}:deferral-exhausted`,
+					reason: `test target ${path.relative(cwd, testFile)} was cut at the turn-end batch budget ${attempts} turn(s) running and is retired from turn-end selection — too slow for a per-turn batch, run it explicitly`,
+				});
+				dbg(
+					`turn_end: retiring deferred test target ${path.relative(cwd, testFile)} after ${attempts} cut batch(es) — too slow for the turn-end budget, run it explicitly`,
+				);
+				continue;
+			}
 			// A RunnerConfig carries functions, so the cache stores the runner KEY
 			// and the config is re-resolved here from the single registry.
 			const config = RUNNERS[carried.runner];
@@ -2156,6 +2187,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 				runner: carried.runner,
 				config,
 				strategy: "deferred",
+				deferralAttempts: attempts,
 			});
 			dbg(
 				`turn_end: re-running deferred test target ${path.relative(cwd, testFile)} (${carried.runner}) from the previous turn's cut batch`,
@@ -2304,6 +2336,10 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 					const deferredTargets: DeferredTestTarget[] = deferred.map((t) => ({
 						testFile: t.testFile,
 						runner: t.runner,
+						// One more cut batch for this target. Read back by the
+						// selection loop above, which retires it at
+						// TEST_RUNNER_MAX_DEFERRALS rather than carrying it forever.
+						attempts: (t.deferralAttempts ?? 0) + 1,
 					}));
 					if (deferred.length > 0) {
 						// #2522 review round 2, F4: `incrementDegradationCount`, not

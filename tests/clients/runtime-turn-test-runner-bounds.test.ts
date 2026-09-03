@@ -15,12 +15,16 @@ import { CacheManager } from "../../clients/cache-manager.js";
 import { mergeGitGuardTestFailure } from "../../clients/git-guard.js";
 import { setAmbientAbortSignal } from "../../clients/safe-spawn.js";
 import { TestRunnerClient } from "../../clients/test-runner-client.js";
-import { resetDegradationLedger } from "../../clients/degradation-ledger.js";
+import {
+	getDegradationSummary,
+	resetDegradationLedger,
+} from "../../clients/degradation-ledger.js";
 import { peekTestFindings } from "../../clients/runtime-context.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import {
 	TEST_RUNNER_BATCH_BUDGET_MS,
 	TEST_RUNNER_BATCH_CONCURRENCY,
+	TEST_RUNNER_MAX_DEFERRALS,
 	TEST_RUNNER_MAX_TARGETS,
 	handleTurnEnd,
 	runTestTargetsBounded,
@@ -710,11 +714,18 @@ describe("#2522 R2 F1 — turn_end persists and re-runs the deferral set", () =>
 
 		const persisted = cacheManager.readCache<{
 			content: string;
-			deferredTargets?: { testFile: string; runner: string }[];
+			deferredTargets?: {
+				testFile: string;
+				runner: string;
+				attempts?: number;
+			}[];
 		}>("test-runner-findings", env.tmpDir)?.data;
 
 		// The deferral set exists, by identity, in the cache the next turn reads.
 		expect(persisted?.deferredTargets?.length ?? 0).toBeGreaterThan(0);
+		// ...stamped with its first cut, so a target that never fits the budget
+		// can be retired instead of carried forever.
+		expect(persisted?.deferredTargets?.[0]?.attempts).toBe(1);
 		// NOT a clean run: no empty-content record, and the agent is told.
 		expect(persisted?.content ?? "").toContain("deferred to the next turn");
 		expect(dbgLines.some((l) => l.includes("all tests passed"))).toBe(false);
@@ -805,5 +816,122 @@ describe("#2522 R2 F1 — turn_end persists and re-runs the deferral set", () =>
 			deferredTargets?: { testFile: string }[];
 		}>("test-runner-findings", env.tmpDir)?.data;
 		expect(persisted?.deferredTargets ?? []).toHaveLength(0);
+	});
+});
+
+/**
+ * #2522 review round 2 — the deferral must not become a livelock.
+ *
+ * The review's own measurement is the proof this is required, not
+ * hypothetical: editing `clients/runtime-turn.ts` resolves
+ * `tests/index-integration.test.ts` through the `related` strategy, and that
+ * file takes 26 393 ms — MORE than the whole 20 000 ms batch budget, on its
+ * own. Deferring it puts it first in the next batch, where it is cut again at
+ * 20 s, and again, forever: 20 s of spawned vitest burnt every single turn,
+ * with the target never finishing and never being reported.
+ *
+ * A target that has already outlived the budget `TEST_RUNNER_MAX_DEFERRALS`
+ * times is therefore retired from turn-end selection with a counted
+ * degradation naming it, rather than carried indefinitely.
+ */
+describe("#2522 R2 — a target that never fits the budget is retired, not carried forever", () => {
+	it("retires a target that has already been deferred to its attempt cap, and says so", async () => {
+		const runtime = new RuntimeCoordinator();
+		const cacheManager = new CacheManager(false);
+
+		fs.mkdirSync(path.join(env.tmpDir, "src"), { recursive: true });
+		fs.writeFileSync(
+			path.join(env.tmpDir, "vitest.config.ts"),
+			"export default {}\n",
+		);
+		const source = path.join(env.tmpDir, "src", "fresh.ts");
+		const freshTest = path.join(env.tmpDir, "src", "fresh.test.ts");
+		const forever = path.join(env.tmpDir, "src", "forever.test.ts");
+		fs.writeFileSync(source, "export const fresh = 1;\n");
+		fs.writeFileSync(freshTest, "export {};\n");
+		fs.writeFileSync(forever, "export {};\n");
+		cacheManager.addModifiedRange(
+			source,
+			{ start: 1, end: 1 },
+			false,
+			env.tmpDir,
+			runtime.telemetrySessionId,
+		);
+
+		// Already cut at the budget TEST_RUNNER_MAX_DEFERRALS times.
+		cacheManager.writeCache(
+			"test-runner-findings",
+			{
+				content: "1 test target(s) deferred to the next turn",
+				deferredTargets: [
+					{
+						testFile: forever,
+						runner: "vitest",
+						attempts: TEST_RUNNER_MAX_DEFERRALS,
+					},
+				],
+			},
+			env.tmpDir,
+		);
+
+		const ran: string[] = [];
+		const dbgLines: string[] = [];
+		const client = new TestRunnerClient(false);
+		(client as unknown as { runTestFileAsync: unknown }).runTestFileAsync =
+			async (testFile: string) => {
+				ran.push(testFile);
+				return {
+					file: testFile,
+					runner: "vitest",
+					passed: 1,
+					failed: 0,
+					duration: 1,
+				};
+			};
+
+		await handleTurnEnd({
+			ctxCwd: env.tmpDir,
+			getFlag: () => false,
+			dbg: (msg: string) => dbgLines.push(msg),
+			runtime,
+			cacheManager,
+			knipClient: {
+				ensureAvailable: async () => false,
+				analyze: async () => EMPTY_KNIP_RESULT,
+			},
+			deadCodeClients: [],
+			depChecker: { ensureAvailable: async () => false },
+			testRunnerClient: client,
+			resetLSPService: () => {},
+			resetFormatService: () => {},
+			// biome-ignore lint/suspicious/noExplicitAny: minimal turn_end deps
+		} as any);
+
+		const deadline = Date.now() + 5000;
+		while (Date.now() < deadline && ran.length < 1) await delay(20);
+		await delay(150);
+
+		// This turn's own target still runs; the exhausted one does not.
+		expect(ran).toContain(path.resolve(freshTest));
+		expect(ran).not.toContain(path.resolve(forever));
+		// Never silent: the agent is told which target was retired and why.
+		expect(
+			dbgLines.some(
+				(l) => l.includes("forever.test.ts") && l.includes("retiring deferred"),
+			),
+		).toBe(true);
+		// And it is gone from the carried list, not carried again.
+		const persisted = cacheManager.readCache<{
+			deferredTargets?: { testFile: string }[];
+		}>("test-runner-findings", env.tmpDir)?.data;
+		expect(
+			(persisted?.deferredTargets ?? []).some(
+				(t) => path.resolve(t.testFile) === path.resolve(forever),
+			),
+		).toBe(false);
+		// The retirement is counted in the ledger, not merely logged.
+		expect(JSON.stringify(getDegradationSummary())).toContain(
+			"forever.test.ts",
+		);
 	});
 });

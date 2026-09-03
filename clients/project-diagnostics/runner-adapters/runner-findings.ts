@@ -39,6 +39,15 @@ export interface DeferredTestTarget {
 	testFile: string;
 	/** `RUNNERS` key, re-resolved to a `RunnerConfig` on the next turn. */
 	runner: string;
+	/**
+	 * How many turn-end batches this target has now been cut out of. A target
+	 * whose own runtime EXCEEDS the whole batch budget would otherwise be
+	 * deferred, put first, cut, and deferred again — forever, burning the full
+	 * budget in spawned runners every turn. `TEST_RUNNER_MAX_DEFERRALS`
+	 * (`runtime-turn.ts`) retires it instead, with a counted degradation.
+	 * Absent on a record written before the cap existed, read as 0.
+	 */
+	attempts?: number;
 }
 
 export interface TestRunnerFindingsCache {
