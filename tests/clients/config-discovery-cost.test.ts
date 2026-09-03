@@ -174,3 +174,79 @@ describe("#2426 F-C: a warm project-config load is O(1) in filesystem stats", ()
 		).toBeGreaterThan(warm);
 	});
 });
+
+describe("#2483: a warm load with NO config found anywhere is bearing-scoped too", () => {
+	it("spends the same, small stat budget on every one of 500 warm loads", async () => {
+		const home = tmpRoot("pi-lens-cost4-home-");
+		process.env.PI_LENS_HOME = tmpRoot("pi-lens-cost4-global-");
+		process.env.PI_LENS_CONFIG_PATH = path.join(home, "absent", "config.json");
+		// Several ancestor levels between the project and the ceiling, so a
+		// pre-fix full-chain freshness key has room to show its cost.
+		const projectDir = path.join(home, "a", "b", "c", "proj");
+		fs.mkdirSync(projectDir, { recursive: true });
+		// No .pi-lens.json / pi-lens.json anywhere in the chain.
+
+		const { loadPiLensProjectConfig } = await loader();
+		loadPiLensProjectConfig(projectDir); // cold: populate the discovery cache
+
+		const perLoad: number[] = [];
+		for (let index = 0; index < 500; index += 1) {
+			perLoad.push(statsFor(() => loadPiLensProjectConfig(projectDir)));
+		}
+		const distinct = [...new Set(perLoad)];
+		// Constant per load, and independent of chain depth: only startDir's own
+		// mtime is re-statted (no legacy documents exist to add their own stamp).
+		expect(
+			distinct,
+			`stats per warm load (500 loads): ${JSON.stringify(distinct)}`,
+		).toEqual([1]);
+	});
+
+	it("does not re-walk when an ancestor ABOVE startDir churns", async () => {
+		const home = tmpRoot("pi-lens-cost5-home-");
+		process.env.PI_LENS_HOME = tmpRoot("pi-lens-cost5-global-");
+		process.env.PI_LENS_CONFIG_PATH = path.join(home, "absent", "config.json");
+		const ancestor = path.join(home, "workspace");
+		const projectDir = path.join(ancestor, "pkg");
+		fs.mkdirSync(projectDir, { recursive: true });
+
+		const { loadPiLensProjectConfig } = await loader();
+		loadPiLensProjectConfig(projectDir);
+		const warm = statsFor(() => loadPiLensProjectConfig(projectDir));
+
+		// Unrelated churn in an ancestor of the (config-less) project — the exact
+		// shape from the issue: `~/Desktop` or `~/projects` moving should not
+		// force a re-walk of a project that has no config at all.
+		fs.writeFileSync(path.join(ancestor, "unrelated.txt"), "churn");
+		const churnStamp = new Date(Date.now() + 10_000);
+		fs.utimesSync(ancestor, churnStamp, churnStamp);
+
+		const after = statsFor(() => loadPiLensProjectConfig(projectDir));
+		expect(after, `warm=${warm} after ancestor churn=${after}`).toBe(warm);
+	});
+
+	it("notices a config file newly created directly in startDir", async () => {
+		const home = tmpRoot("pi-lens-cost6-home-");
+		process.env.PI_LENS_HOME = tmpRoot("pi-lens-cost6-global-");
+		process.env.PI_LENS_CONFIG_PATH = path.join(home, "absent", "config.json");
+		const projectDir = path.join(home, "proj");
+		fs.mkdirSync(projectDir, { recursive: true });
+
+		const { loadPiLensProjectConfig } = await loader();
+		expect(loadPiLensProjectConfig(projectDir).maxProjectFiles).toBeUndefined();
+		statsFor(() => loadPiLensProjectConfig(projectDir)); // warm, cache settled
+
+		// A config file created directly in startDir bumps startDir's OWN mtime —
+		// the one directory this entry's freshness still tracks — so it is found
+		// on the very next load. Bounded staleness: a file created further up the
+		// chain is not noticed until some other invalidation (a legacy document's
+		// own edit stamp, or an explicit reset) reaches it; that gap is accepted
+		// and is strictly narrower than "any ancestor up to $HOME invalidates".
+		write(path.join(projectDir, ".pi-lens.json"), { maxProjectFiles: 42 });
+		const createStamp = new Date(Date.now() + 10_000);
+		fs.utimesSync(projectDir, createStamp, createStamp);
+
+		const config = loadPiLensProjectConfig(projectDir);
+		expect(config.maxProjectFiles).toBe(42);
+	});
+});

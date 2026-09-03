@@ -623,14 +623,35 @@ function legacyDeprecationRecords(
  * up is noticing a legacy file NEWLY CREATED above the bearing directory
  * mid-process — records-only, and strictly more than the pre-#2426 loader saw,
  * since it never looked above that directory at all.
+ *
+ * When NO config file is found anywhere (#2483), `info` is undefined and there
+ * is no bearing directory to stop at — but the majority of projects have no
+ * config at all, so this is the COMMON case, not an edge one. Falling back to
+ * the full chain here (the pre-fix behavior) keyed freshness on every
+ * directory up to just below `$HOME`: unrelated churn in `~/Desktop` or
+ * `~/projects` invalidated the entry and forced a full re-walk on the very
+ * next load, every load, forever.
+ *
+ * The nearest directory a config COULD have appeared in is `startDir` itself
+ * — `dirMtimes[0]`, first in the innermost-first walk order (`configSearchDirs`)
+ * — so that is what freshness is scoped to, the same bearing-directory
+ * principle as the presence case (a directory always includes itself as the
+ * degenerate bearing chain). A config file created directly in `startDir`
+ * bumps `startDir`'s own mtime and is found on the next load. A config file
+ * created further up the chain is not noticed until some other invalidation
+ * reaches it (an explicit `resetProjectLensConfigCache`, or a later load whose
+ * `startDir` differs) — bounded staleness, and strictly narrower than the
+ * pre-fix "any ancestor up to $HOME invalidates".
  */
 function bearingDirMtimes(
 	dirMtimes: readonly { dir: string; mtimeMs: number }[],
 	info: PiLensProjectConfigFileInfo | undefined,
 ): Array<{ dir: string; mtimeMs: number }> {
-	if (!info) return [...dirMtimes];
-	const bearing = dirMtimes.findIndex((entry) => entry.dir === info.dir);
-	return bearing < 0 ? [...dirMtimes] : dirMtimes.slice(0, bearing + 1);
+	if (info) {
+		const bearing = dirMtimes.findIndex((entry) => entry.dir === info.dir);
+		return bearing < 0 ? [...dirMtimes] : dirMtimes.slice(0, bearing + 1);
+	}
+	return dirMtimes.slice(0, 1);
 }
 
 function parseRulePolicyList(
