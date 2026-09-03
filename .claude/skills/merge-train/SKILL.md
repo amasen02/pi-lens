@@ -83,6 +83,13 @@ issue into the brief. AGENTS.md's net-count rule binds the brief author; the
 fixer and reviewer only enforce what the brief scoped. #2530 shipped a fifth
 bound helper because the brief deferred the fold without a reason.
 
+## Filing issues (orchestrator)
+
+Every `gh issue create` carries one TYPE label, at least one `area:*`, and
+exactly one `priority:p1|p2|p3` (AGENTS.md #1676 rubric). The priority labels
+were found deleted from the repo on 2026-09-03 and recreated (#2553); an
+issue filed without one is a triage defect, not a shortcut.
+
 ## Honesty rules
 
 - A finding is real when a probe proves it; a fix is real when the same probe
