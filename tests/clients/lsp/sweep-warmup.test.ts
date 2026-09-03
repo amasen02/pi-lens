@@ -751,4 +751,46 @@ describe("LSP warm-up telemetry pairing (#1374)", () => {
 			phases.filter((phase) => phase !== "lsp_sweep_warmup_start"),
 		).toEqual(["lsp_sweep_warmup_aborted"]);
 	});
+
+	it("#2525: warm-up records name only rooted candidates, with unrooted ones counted separately", async () => {
+		const filePath = path.join(tmp, "a.ts");
+		fs.writeFileSync(filePath, "const x = 1;\n");
+		const tsServer = makeTsServer(tmp);
+		// The DenoServer shape: registered for .ts as a `fallbackFor` of
+		// typescript, but root-gated on deno.json(c), which this project has
+		// not got — so it never spawns and never warms. `demonstratedReadyKeyFor`
+		// already returns undefined for it (that is what `stillColdServerIds`
+		// filters on), so the records must not claim it was warmed either.
+		const denoServer = {
+			id: "deno",
+			name: "deno",
+			fallbackFor: "typescript",
+			extensions: [".ts"],
+			root: async () => undefined,
+			spawn: vi.fn(async () => ({ process: {}, source: "test" })),
+		};
+		getServersForFileWithConfig.mockImplementation((fp: string) =>
+			fp.endsWith(".ts") ? [tsServer, denoServer] : [],
+		);
+		const { client } = makeFakeClient(tmp);
+		createLSPClient.mockResolvedValue(client);
+
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const service = new LSPService();
+		logLatency.mockReset();
+		await service.ensureWarmForSweep(filePath);
+
+		const warmupRecords = logLatency.mock.calls
+			.map(([entry]) => entry)
+			.filter((entry) => entry.phase?.startsWith("lsp_sweep_warmup_"));
+		expect(warmupRecords.length).toBeGreaterThan(0);
+		for (const record of warmupRecords) {
+			const metadata = record.metadata as {
+				serverIds: string[];
+				unrootedCandidates: { count: number; ids: string[] };
+			};
+			expect(metadata.serverIds).toEqual(["typescript"]);
+			expect(metadata.unrootedCandidates).toEqual({ count: 1, ids: ["deno"] });
+		}
+	});
 });

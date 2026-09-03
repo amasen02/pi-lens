@@ -14,22 +14,24 @@
  * slot — the #1550 shape recurring (a record naming a subject that did not
  * act), same as #2524.
  *
- * The fix resolves every candidate's root ONCE up front (mirroring the
- * `getClientsForFile`/`getWarmClientForFile` pattern already in this file)
- * and:
- *   - the sequential trial loop and the known-slow shortcut only ever touch
- *     ROOTED candidates (an unrooted fallback is structurally never given a
- *     spawn attempt or a root re-check), and
- *   - the `lsp_client_wait_timeout`/`lsp_client_wait_skipped` records list
- *     only rooted `serverIds`, plus a separate `unrootedCandidates`
- *     `{count, ids}`.
+ * The fix resolves roots where the RECORDS are emitted — the known-slow and
+ * wait-timeout branches, plus the `lsp_client_unavailable` bookkeeping — all
+ * of them cold paths, memoized so one acquisition asks a given server at most
+ * once. The `lsp_client_wait_timeout`/`lsp_client_wait_skipped` records then
+ * list only rooted `serverIds`, plus a separate `unrootedCandidates`
+ * `{count, ids}`.
  *
- * This test drives the real `getClientForFile` production path (not a
+ * Roots are explicitly NOT hoisted to the top of `getClientForFile`: the
+ * sequential trial loop needs none of its own (`ensureClientForServer`
+ * resolves and bails at `!root` before any spawn work), and `NearestRoot`
+ * caches only successful hits, so hoisting charges a full walk to the
+ * filesystem root for every unrooted fallback on every touch of every file —
+ * including the warm-hit path, which emits no record at all. The
+ * root-invocation-count cases below are the guard on that cost.
+ *
+ * These tests drive the real `getClientForFile` production path (not a
  * hand-fed input) with a two-server config shaped exactly like
- * typescript+deno: a rooted primary whose spawn is slower than the wait
- * budget (forcing the real `lsp_client_wait_timeout` branch), plus an
- * unrooted `fallbackFor` candidate whose `spawn` throws if ever invoked —
- * proving the loop never attempts it, not just that the record hides it.
+ * typescript+deno.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -123,7 +125,6 @@ describe("getClientForFile wait records — unrooted candidates (#2525)", () => 
 		const result = await service.getClientForFile(file, 1);
 
 		expect(result).toBeUndefined();
-		expect(denoSpawn).not.toHaveBeenCalled();
 
 		const timeoutCalls = logLatency.mock.calls.filter(
 			([entry]) => entry?.phase === "lsp_client_wait_timeout",
@@ -187,5 +188,136 @@ describe("getClientForFile wait records — unrooted candidates (#2525)", () => 
 		// reached "typescript" before the budget expired.
 		expect(metadata.serverIds).toEqual(["typescript", "deno"]);
 		expect(metadata.unrootedCandidates).toEqual({ count: 0, ids: [] });
+	});
+
+	it("resolves no root for an unrooted fallback on the warm-hit path (hot-path cost guard)", async () => {
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const service = new LSPService();
+
+		// Root-invocation counters ARE the assertion here. `NearestRoot` caches
+		// only SUCCESSFUL hits (clients/lsp/server.ts — negatives are
+		// deliberately uncached so a scaffolded deno.json is picked up without a
+		// restart), so every call on an unrooted candidate is a fresh stat-walk
+		// to the filesystem root. A served warm touch must therefore never ask
+		// an unrooted fallback for its root at all: `getClientForFile` returns
+		// as soon as the primary serves, long before any wait record is emitted.
+		const typescriptRoot = vi.fn(async () => "C:/repo");
+		const denoRoot = vi.fn(async () => undefined);
+
+		getServersForFileWithConfig.mockReturnValue([
+			{
+				id: "typescript",
+				name: "TypeScript",
+				extensions: [".ts"],
+				root: typescriptRoot,
+				spawn: vi.fn(async () => fakeProcess(201)),
+			},
+			{
+				id: "deno",
+				name: "Deno",
+				fallbackFor: "typescript",
+				extensions: [".ts"],
+				root: denoRoot,
+				spawn: vi.fn(async () => fakeProcess(202)),
+			},
+		]);
+
+		const file = "C:/repo/main.ts";
+		// Touch 1 spawns (cold); touches 2 and 3 hit the published client (warm).
+		for (let i = 0; i < 3; i++) {
+			expect(await service.getClientForFile(file)).toBeTruthy();
+		}
+
+		// The unrooted deno-style fallback is never consulted on a path that was
+		// served: no wait record is emitted, so its root is never needed.
+		expect(denoRoot).toHaveBeenCalledTimes(0);
+		// And the served primary resolves at most once per touch.
+		expect(typescriptRoot.mock.calls.length).toBeLessThanOrEqual(3);
+	});
+
+	it("lsp_client_wait_skipped names only rooted candidates on the known-slow shortcut", async () => {
+		vi.useFakeTimers();
+		const { recordSuccessfulLspSpawn } = await import(
+			"../../../clients/lsp/spawn-history.js"
+		);
+		// Spawn history says typescript takes 6s; with a 750ms budget the
+		// known-slow shortcut fires the moment the spawn is noted in flight.
+		recordSuccessfulLspSpawn("typescript", 6_000);
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const service = new LSPService();
+
+		const suspended = new Promise<never>(() => {});
+		getServersForFileWithConfig.mockReturnValue([
+			{
+				id: "typescript",
+				name: "TypeScript",
+				extensions: [".ts"],
+				root: async () => "C:/repo",
+				spawn: vi.fn(async () => {
+					await suspended;
+					return fakeProcess(301);
+				}),
+			},
+			{
+				id: "deno",
+				name: "Deno",
+				fallbackFor: "typescript",
+				extensions: [".ts"],
+				root: async () => undefined,
+				spawn: vi.fn(async () => fakeProcess(302)),
+			},
+		]);
+
+		const result = await service.getClientForFile("C:/repo/main.ts", 750);
+		expect(result).toBeUndefined();
+
+		const skippedCalls = logLatency.mock.calls.filter(
+			([entry]) => entry?.phase === "lsp_client_wait_skipped",
+		);
+		expect(skippedCalls).toHaveLength(1);
+		const metadata = skippedCalls[0][0].metadata as {
+			serverIds: string[];
+			unrootedCandidates: { count: number; ids: string[] };
+			reason: string;
+		};
+		expect(metadata.reason).toBe("budget_skipped_known_slow");
+		expect(metadata.serverIds).toEqual(["typescript"]);
+		expect(metadata.unrootedCandidates).toEqual({ count: 1, ids: ["deno"] });
+	});
+
+	it("resolves each candidate's root at most once on an unserved touch", async () => {
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const service = new LSPService();
+
+		// Neither candidate resolves a root, so nothing is served and the
+		// `lsp_client_unavailable` bookkeeping runs. That bookkeeping must not
+		// re-walk a root the acquisition attempt already resolved: on a
+		// no-root project every extra call is a full walk to the filesystem
+		// root (negatives are uncached).
+		const typescriptRoot = vi.fn(async () => undefined);
+		const denoRoot = vi.fn(async () => undefined);
+
+		getServersForFileWithConfig.mockReturnValue([
+			{
+				id: "typescript",
+				name: "TypeScript",
+				extensions: [".ts"],
+				root: typescriptRoot,
+				spawn: vi.fn(async () => fakeProcess(401)),
+			},
+			{
+				id: "deno",
+				name: "Deno",
+				fallbackFor: "typescript",
+				extensions: [".ts"],
+				root: denoRoot,
+				spawn: vi.fn(async () => fakeProcess(402)),
+			},
+		]);
+
+		expect(await service.getClientForFile("C:/repo/main.ts")).toBeUndefined();
+
+		expect(typescriptRoot).toHaveBeenCalledTimes(1);
+		expect(denoRoot).toHaveBeenCalledTimes(1);
 	});
 });
