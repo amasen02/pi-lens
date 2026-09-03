@@ -3,7 +3,7 @@
  *
  * Three deflake PRs in two days (#2531 alone fixed three shared-slot races)
  * and nothing counted the contention surface, so the set only grew. This
- * module owns the three detectors the ratchet (`tests/clients/flake-shape-
+ * module owns the four detectors the ratchet (`tests/clients/flake-shape-
  * ratchet.test.ts`) runs over `tests/**\/*.test.ts`:
  *
  * 1. {@link scanRealProcessSpawn} — a real child process: a `child_process`
@@ -18,6 +18,11 @@
  *    a `vi.useFakeTimers()` scope, and outside `interleaving-kit.ts` itself
  *    (the sanctioned primitive these three detectors exist to route callers
  *    toward instead).
+ * 4. {@link scanUngovernedWaitFor} — a `vi.waitFor(` call outside a
+ *    `vi.useFakeTimers()` scope — the #1767 shape
+ *    (`tests/clients/runtime-session.test.ts`'s own recorded flake, real
+ *    polling racing a real `testTimeout` budget). Reuses detector 3's exact
+ *    fake/real-timers file-order tracking.
  *
  * Built on `sweep-kit.ts` ({@link stripSource}, {@link listSourceFiles},
  * {@link relativePosix}) rather than a private walker — #2487's kit already
@@ -30,12 +35,13 @@
  *   (`const [s, ns] = process.hrtime(t0);`) is invisible unless the whole
  *   `process.hrtime(...)` call itself sits inside the `expect(...)` argument.
  *   False negative, the safe direction for a ratchet.
- * - Detector 3's fake/real-timers tracking is FILE-ORDER, not scope-accurate:
- *   it does not know which `describe`/`it` block a `vi.useFakeTimers()` call
+ * - Detectors 3 and 4's shared fake/real-timers tracking
+ *   ({@link fakeTimersStateAtLine}) is FILE-ORDER, not scope-accurate: it
+ *   does not know which `describe`/`it` block a `vi.useFakeTimers()` call
  *   belongs to, only its line position. A file that calls
- *   `vi.useFakeTimers()` in one `describe` and leaves a raw wait ungoverned
- *   in a LATER, unrelated `describe` reads as governed. False negative, same
- *   direction.
+ *   `vi.useFakeTimers()` in one `describe` and leaves a raw wait or
+ *   `vi.waitFor` ungoverned in a LATER, unrelated `describe` reads as
+ *   governed. False negative, same direction.
  * - Detector 1's `strings: "keep"` policy (needed to see `"vitest"` inside an
  *   argv string) means a string literal that merely CONTAINS
  *   `execFileSync(...)`-shaped text would false-positive; comments are
@@ -99,6 +105,7 @@ export const DETECTOR_NAMES = [
 	"real-process-spawn",
 	"elapsed-time-assertion",
 	"raw-timer-wait",
+	"ungoverned-wait-for",
 ] as const;
 
 export type DetectorName = (typeof DETECTOR_NAMES)[number];
@@ -258,29 +265,35 @@ const USE_FAKE_TIMERS = /\bvi\.useFakeTimers\s*\(/;
 const USE_REAL_TIMERS = /\bvi\.useRealTimers\s*\(/;
 
 /**
+ * Per-line "are fake timers active here" state, tracked in FILE-ORDER (see
+ * the module doc's known-limits note): `vi.useFakeTimers()` turns tracking
+ * on, the next `vi.useRealTimers()` turns it off, and every line in between
+ * reads as governed. Shared by {@link scanRawTimerWait} and
+ * {@link scanUngovernedWaitFor} — both key off the exact same toggle, so it
+ * is computed once rather than re-derived per detector.
+ */
+function fakeTimersStateAtLine(lines: readonly string[]): boolean[] {
+	let fakeTimersActive = false;
+	return lines.map((lineText) => {
+		if (USE_FAKE_TIMERS.test(lineText)) fakeTimersActive = true;
+		else if (USE_REAL_TIMERS.test(lineText)) fakeTimersActive = false;
+		return fakeTimersActive;
+	});
+}
+
+/**
  * A raw `setTimeout`/`setInterval` wait outside a `vi.useFakeTimers()` scope.
  *
  * `interleaving-kit.ts` itself is exempt by name (#2547's sanctioned
  * primitive; it is not a `.test.ts` file so the ratchet's own glob never
  * reaches it, but the exemption is stated here too so a caller that scans it
  * directly — this module's own self-test — gets the same answer).
- *
- * The fake/real-timers toggle is tracked in FILE-ORDER (see the module doc's
- * known-limits note): `vi.useFakeTimers()` turns tracking on, the next
- * `vi.useRealTimers()` turns it off, and every raw timer call in between
- * reads as governed.
  */
 export function scanRawTimerWait(file: string, source: string): FlakeHit[] {
 	if (path.posix.basename(file) === "interleaving-kit.ts") return [];
 	const stripped = stripSource(source, { strings: "blank" });
 	const lines = stripped.split("\n");
-
-	let fakeTimersActive = false;
-	const stateAtLine: boolean[] = lines.map((lineText) => {
-		if (USE_FAKE_TIMERS.test(lineText)) fakeTimersActive = true;
-		else if (USE_REAL_TIMERS.test(lineText)) fakeTimersActive = false;
-		return fakeTimersActive;
-	});
+	const stateAtLine = fakeTimersStateAtLine(lines);
 
 	const hits: FlakeHit[] = [];
 	lines.forEach((lineText, idx) => {
@@ -295,6 +308,41 @@ export function scanRawTimerWait(file: string, source: string): FlakeHit[] {
 	return hits;
 }
 
+// ── 4. Ungoverned vi.waitFor ────────────────────────────────────────────────
+
+const WAIT_FOR_CALL = /\bvi\.waitFor\s*\(/;
+
+/**
+ * A `vi.waitFor(` call outside a `vi.useFakeTimers()` scope — the #1767
+ * shape (`tests/clients/runtime-session.test.ts`'s own recorded flake):
+ * `vi.waitFor`'s default poll loop runs on the REAL clock, so under shared-
+ * slot machine contention its polling interval and the surrounding
+ * `describe`/`it` `testTimeout` race each other the same way a raw
+ * `setTimeout` wait does. Reuses detector 3's exact fake/real-timers
+ * file-order tracking ({@link fakeTimersStateAtLine}) — a `vi.waitFor` under
+ * `vi.useFakeTimers()` is a caller explicitly driving it with
+ * `vi.advanceTimersByTimeAsync`, not left to real wall-clock polling.
+ */
+export function scanUngovernedWaitFor(
+	_file: string,
+	source: string,
+): FlakeHit[] {
+	const stripped = stripSource(source, { strings: "blank" });
+	const lines = stripped.split("\n");
+	const stateAtLine = fakeTimersStateAtLine(lines);
+
+	const hits: FlakeHit[] = [];
+	lines.forEach((lineText, idx) => {
+		if (!WAIT_FOR_CALL.test(lineText) || stateAtLine[idx]) return;
+		hits.push({
+			line: idx + 1,
+			text: lineText.trim(),
+			reason: "vi.waitFor( outside vi.useFakeTimers()",
+		});
+	});
+	return hits;
+}
+
 export const DETECTORS: Record<
 	DetectorName,
 	(file: string, source: string) => FlakeHit[]
@@ -302,6 +350,7 @@ export const DETECTORS: Record<
 	"real-process-spawn": scanRealProcessSpawn,
 	"elapsed-time-assertion": scanElapsedTimeAssertion,
 	"raw-timer-wait": scanRawTimerWait,
+	"ungoverned-wait-for": scanUngovernedWaitFor,
 };
 
 /** file → hit count, for every `tests/**\/*.test.ts` file the detector flags. */

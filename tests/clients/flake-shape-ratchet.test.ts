@@ -68,6 +68,7 @@ import {
 	scanElapsedTimeAssertion,
 	scanRawTimerWait,
 	scanRealProcessSpawn,
+	scanUngovernedWaitFor,
 } from "../support/flake-shape-scan.js";
 
 // ── The baseline ─────────────────────────────────────────────────────────
@@ -248,6 +249,46 @@ describe("flake-shape ratchet — the compare function", () => {
 		]);
 	});
 
+	it("ATTACK: a fixture file that adds an ungoverned vi.waitFor is a NEW flagged file — RED", () => {
+		// Same acceptance-criterion shape as above, for detector 4: a real-timers
+		// vi.waitFor in a file the baseline has never seen.
+		const fixtureSource = [
+			'it("polls until ready, never allowlisted", async () => {',
+			"\tawait vi.waitFor(() => expect(client.isReady()).toBe(true));",
+			"});",
+		].join("\n");
+		const hits = scanUngovernedWaitFor(
+			"clients/never-baselined-waitfor-fixture.test.ts",
+			fixtureSource,
+		);
+		const live = {
+			"clients/never-baselined-waitfor-fixture.test.ts": hits.length,
+		};
+		const problems = auditAgainstBaseline("ungoverned-wait-for", live);
+		expect(problems.map(describeProblem)).toEqual([
+			expect.stringContaining(
+				"NEW flagged file clients/never-baselined-waitfor-fixture.test.ts",
+			),
+		]);
+
+		// GREEN under vi.useFakeTimers(): the same call, governed, produces no
+		// hit at all, so nothing reaches the ratchet in the first place.
+		const governedSource = [
+			'it("polls under fake time", async () => {',
+			"\tvi.useFakeTimers();",
+			"\tconst p = vi.waitFor(() => expect(client.isReady()).toBe(true));",
+			"\tawait vi.advanceTimersByTimeAsync(100);",
+			"\tawait p;",
+			"});",
+		].join("\n");
+		expect(
+			scanUngovernedWaitFor(
+				"clients/never-baselined-waitfor-fixture.test.ts",
+				governedSource,
+			),
+		).toEqual([]);
+	});
+
 	it("does not flag a file already at its pinned count — GREEN on the allowlist", () => {
 		const [firstFile, firstCount] = Object.entries(
 			FLAKE_SHAPE_BASELINE["raw-timer-wait"],
@@ -294,6 +335,7 @@ describe("flake-shape ratchet — the compare function", () => {
 			"real-process-spawn": {},
 			"elapsed-time-assertion": {},
 			"raw-timer-wait": { [file]: 5 },
+			"ungoverned-wait-for": {},
 		};
 
 		// Drops to 2 (an improvement — but the ceiling is now stale at 5).
@@ -624,6 +666,56 @@ describe("flake-shape scan — raw-timer-wait", () => {
 	});
 });
 
+describe("flake-shape scan — ungoverned-wait-for", () => {
+	it("ATTACK: a real-timers vi.waitFor is flagged", () => {
+		const source = [
+			'it("eventually settles", async () => {',
+			"\tawait vi.waitFor(() => expect(client.isReady()).toBe(true));",
+			"});",
+		].join("\n");
+		const hits = scanUngovernedWaitFor("fixture.test.ts", source);
+		expect(hits).toHaveLength(1);
+		expect(hits[0].reason).toContain("vi.waitFor");
+	});
+
+	it("does not flag a vi.waitFor governed by vi.useFakeTimers()", () => {
+		const source = [
+			'it("advances fake time to settle", async () => {',
+			"\tvi.useFakeTimers();",
+			"\tconst p = vi.waitFor(() => expect(ready).toBe(true));",
+			"\tawait vi.advanceTimersByTimeAsync(100);",
+			"\tawait p;",
+			"\tvi.useRealTimers();",
+			"});",
+		].join("\n");
+		expect(scanUngovernedWaitFor("fixture.test.ts", source)).toEqual([]);
+	});
+
+	it("flags a vi.waitFor AFTER vi.useRealTimers() restores real timers", () => {
+		const source = [
+			'it("goes back to real timers, then waits ungoverned", async () => {',
+			"\tvi.useFakeTimers();",
+			"\tvi.advanceTimersByTime(0);",
+			"\tvi.useRealTimers();",
+			"\tawait vi.waitFor(() => expect(ready).toBe(true));",
+			"});",
+		].join("\n");
+		const hits = scanUngovernedWaitFor("fixture.test.ts", source);
+		expect(hits).toHaveLength(1);
+		expect(hits[0].line).toBe(5);
+	});
+
+	it("does not flag a comment that merely names vi.waitFor", () => {
+		const source = [
+			"// This test used to call vi.waitFor(cond) directly.",
+			'it("no longer polls", () => {',
+			"\texpect(1).toBe(1);",
+			"});",
+		].join("\n");
+		expect(scanUngovernedWaitFor("fixture.test.ts", source)).toEqual([]);
+	});
+});
+
 describe("flake-shape scan — mutation-proof self-test", () => {
 	it("has exactly the three declared detectors, each catching its own canonical fixture", () => {
 		const canonicalFixtures: Record<DetectorName, string> = {
@@ -631,6 +723,8 @@ describe("flake-shape scan — mutation-proof self-test", () => {
 			"elapsed-time-assertion":
 				"const start = Date.now();\nexpect(Date.now() - start).toBeLessThan(1);\n",
 			"raw-timer-wait": "setTimeout(() => {}, 10);\n",
+			"ungoverned-wait-for":
+				"await vi.waitFor(() => expect(ready).toBe(true));\n",
 		};
 		expect(Object.keys(canonicalFixtures).sort()).toEqual(
 			[...DETECTOR_NAMES].sort(),
