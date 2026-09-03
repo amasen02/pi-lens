@@ -371,7 +371,21 @@ async function findPidsByMarkerWindows(marker: string): Promise<number[]> {
 			// without this exclusion the search matches itself.
 			excludeSelfPid: true,
 		},
-		{ timeoutMs: BACKSTOP_SCAN_TIMEOUT_MS },
+		{
+			timeoutMs: BACKSTOP_SCAN_TIMEOUT_MS,
+			// #2527 review F2: omitting `onTimeout` falls through to
+			// child-unref.ts's default — one bare, unverified `child.kill()`, no
+			// tree kill, no identity-carrying record — inside the orphan backstop
+			// path, the exact abandonment `terminateScannerChild`'s own doc
+			// comment says it exists to prevent. This query shares the backstop's
+			// scanner identity and budget (same producer as
+			// `enumerateManagedProcesses`), so it gets the same kind.
+			onTimeout: (child) =>
+				terminateScannerChild(child, {
+					kind: "orphan-backstop-scanner-escalated",
+					timeoutMs: BACKSTOP_SCAN_TIMEOUT_MS,
+				}),
+		},
 	);
 	if (result.status !== "ok") {
 		recordDegradationOnce({
@@ -402,7 +416,18 @@ async function queryCommandLines(pids: number[]): Promise<Map<number, string>> {
 			fields: ["pid", "command"],
 			filter: { column: "ProcessId", op: "eq", values: valid },
 		},
-		{ timeoutMs: BACKSTOP_SCAN_TIMEOUT_MS },
+		{
+			timeoutMs: BACKSTOP_SCAN_TIMEOUT_MS,
+			// #2527 review F2: same rationale as findPidsByMarkerWindows above —
+			// route through the reaper's own tree-kill-and-verify machinery with
+			// the backstop's kind rather than falling through to the unverified
+			// default kill with no ledger record.
+			onTimeout: (child) =>
+				terminateScannerChild(child, {
+					kind: "orphan-backstop-scanner-escalated",
+					timeoutMs: BACKSTOP_SCAN_TIMEOUT_MS,
+				}),
+		},
 	);
 	// POSIX `ps -p` exits nonzero when NONE of the requested pids exist, which
 	// is a legitimate clean result for this caller, so that one status is not
@@ -826,14 +851,22 @@ export interface TerminateScannerChildOptions {
 	verifyIntervalMs?: number;
 	/**
 	 * The degradation kind this escalation is attributed to. #2524: this
-	 * function has two callers with different budgets and cadences — the
-	 * registry-independent orphan backstop (one scan per cooldown window,
+	 * function has callers with two different budgets and cadences — the
+	 * registry-independent orphan backstop's own scanner queries
+	 * (`enumerateManagedProcesses`, `findPidsByMarkerWindows`,
+	 * `queryCommandLines`; one scan per cooldown window,
 	 * `BACKSTOP_SCAN_TIMEOUT_MS`) and the resource sampler's process-table
-	 * queries (every heartbeat/spawn-bracket tick, `RESOURCE_SAMPLE_QUERY_TIMEOUT_MS`).
+	 * queries (`sampleProcessesWindows`, `findDescendantPidsWindows`; every
+	 * heartbeat/spawn-bracket tick, `RESOURCE_SAMPLE_QUERY_TIMEOUT_MS`).
 	 * A hardcoded kind here mis-attributed every sampler escalation to the
 	 * backstop (defect shape: a record's subject must be its producer) — the
 	 * caller now supplies its own kind so the ledger names who actually timed
-	 * out.
+	 * out. #2527 review F2: `findPidsByMarkerWindows` and `queryCommandLines`
+	 * originally omitted `onTimeout` entirely, so a scanner they spawned that
+	 * blew `BACKSTOP_SCAN_TIMEOUT_MS` fell through to `child-unref.ts`'s bare,
+	 * unverified default kill with no identity-carrying record — the exact
+	 * abandonment this function exists to prevent, reachable from inside the
+	 * orphan backstop path itself. Both now route through here too.
 	 */
 	kind: DegradationKind;
 	/** The caller's own timeout budget in ms, folded into the reason text so

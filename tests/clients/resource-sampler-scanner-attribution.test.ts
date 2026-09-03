@@ -84,8 +84,11 @@ const {
 	renderDegradationLines,
 	resetDegradationLedger,
 } = await import("../../clients/degradation-ledger.js");
-const { sampleProcesses, __resetWindowsCpuHistoryForTests } =
-	await import("../../clients/resource-sampler.js");
+const {
+	sampleProcesses,
+	sampleProcessTreeCpuPercent,
+	__resetWindowsCpuHistoryForTests,
+} = await import("../../clients/resource-sampler.js");
 const { RESOURCE_SAMPLE_QUERY_TIMEOUT_MS } =
 	await import("../../clients/resource-sampler.js");
 
@@ -161,5 +164,40 @@ describe("#2524: resource-sampler scanner escalation is attributed to its own pr
 		);
 		expect(samplerLine).toBeDefined();
 		expect(samplerLine).not.toContain("⚠");
+	});
+
+	// #2527 review F1: `sampleProcesses`/`sampleProcessesWindows` above only
+	// exercises ONE of the sampler's two `terminateScannerChild` call sites.
+	// `findDescendantPidsWindows` (the pid/ppid descendant-tree query, used by
+	// `sampleProcessTreeCpuPercent` and `startSpawnUsageSampler` to resolve a
+	// Windows `shell:true` spawn's real worker pids) has its OWN `onTimeout`
+	// wiring a few lines above `sampleProcessesWindows`'s — reverting only that
+	// call site back to the pre-#2524 hardcoded kind must turn a test red, or
+	// the second call site is unguarded coverage.
+	it("also attributes the descendant-pid query's (findDescendantPidsWindows) escalation to the sampler's own kind", async () => {
+		vi.useFakeTimers();
+		h.state.hangQuery = true;
+
+		// windowMs=50 keeps the second (post-window) read's own query timeout
+		// the only slow leg to advance past; floorPercent is irrelevant since
+		// the query never resolves.
+		const resultPromise = sampleProcessTreeCpuPercent(444, 50, 10);
+		// First read's descendant-pid query times out.
+		await vi.advanceTimersByTimeAsync(RESOURCE_SAMPLE_QUERY_TIMEOUT_MS + 1_000);
+		// The inter-read window elapses, firing the second read, whose
+		// descendant-pid query also times out.
+		await vi.advanceTimersByTimeAsync(50 + RESOURCE_SAMPLE_QUERY_TIMEOUT_MS + 1_000);
+		const result = await resultPromise;
+
+		// Both queries were unresolvable, so the tree-CPU read itself is unmeasured.
+		expect(result.measured).toBe(false);
+
+		expect(reasonsFor("orphan-backstop-scanner-escalated")).toHaveLength(0);
+		const reasons = reasonsFor("resource-sampler-scanner-escalated");
+		// Two reads, each triggering one escalation of the descendant-pid query.
+		expect(reasons.length).toBeGreaterThanOrEqual(1);
+		for (const reason of reasons) {
+			expect(reason.reason).toContain(`${RESOURCE_SAMPLE_QUERY_TIMEOUT_MS}ms`);
+		}
 	});
 });
