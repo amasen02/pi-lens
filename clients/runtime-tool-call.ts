@@ -1048,6 +1048,11 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 		const complexityClient = (
 			await requestBootstrapClients({
 				reason: "tool-call-complexity-baseline",
+				// The pre-dispatch hook. It carries no wall budget in #2523's
+				// contract, which is why `LedgerHookKey` names it alongside the
+				// budgeted families rather than leaving this site to spell its
+				// own axis value (#2557 review F7).
+				hook: "tool_call",
 				signal: getAmbientAbortSignal(),
 			})
 		)?.complexityClient;

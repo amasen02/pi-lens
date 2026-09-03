@@ -79,8 +79,17 @@ const getDiagnostics = vi.fn(async (filePath: string) => {
 	return diagnosticsByFile.get(base) ?? [];
 });
 const codeAction = vi.fn(async (): Promise<LSPCodeAction[]> => codeActions);
-/** Nothing is ever primed: every file is a cold fresh pull, so it defers. */
-const getLastKnownDiagnostics = vi.fn(() => undefined);
+/**
+ * Basenames the LSP cache has already primed, and with what. Empty by default,
+ * so every file is a cold fresh pull and the report DEFERS — which is what all
+ * the cases below except the two-loop attribution one want. Priming even one
+ * file flips the same report to the IN-BAND path (`primed.length === 0` is the
+ * deferral's condition), which is how a single test can exercise both loops.
+ */
+let primedByFile = new Map<string, LSPDiagnostic[]>();
+const getLastKnownDiagnostics = vi.fn((filePath: string) =>
+	primedByFile.get(path.basename(filePath)),
+);
 
 const fakeService = {
 	supportsLSP: (filePath: string) => filePath.endsWith(".ts"),
@@ -134,6 +143,7 @@ beforeEach(() => {
 	env = setupTestEnvironment("pi-lens-2504-deferred-");
 	wedgedFiles = new Set();
 	wedgedOpens = new Set();
+	primedByFile = new Map();
 	diagnosticsByFile = new Map();
 	codeActions = [];
 	pullDelayMs = 0;
@@ -221,6 +231,177 @@ describe("#2504 r2 F3 — per-round-trip bound on the deferred loop", () => {
 		);
 		// And it moved PAST the wedged file rather than abandoning the batch.
 		expect(getDiagnostics.mock.calls.length).toBe(3);
+	});
+
+	// #2523 slice 2. `boundedLspCall` used to be `withDeadline` (deadline
+	// only) raced against an OPTIONAL `abortRace` leg carried on the deps —
+	// so a deps object built without that leg silently degraded to the
+	// deadline-only shape #2523 exists to remove, and the abandonment was
+	// recorded nowhere. It is `bounded()` now. Revert the fold and this reds
+	// on a missing `hook-await-exceeded` while the case above stays green,
+	// which is the whole point: an elapsed-time assertion cannot tell a
+	// hand-rolled both-bounds race from the shared one.
+	it("records the abandoned round trip under hook-await-exceeded", async () => {
+		const { buildActionableWarningsReport, _awaitDeferredLspPullForTest } =
+			await loadWarnings();
+		const files = makeSources(3);
+		wedgedFiles.add("f0.ts");
+
+		await buildActionableWarningsReport({
+			cwd: env.tmpDir,
+			sessionId: "lens-test",
+			turnIndex: 1,
+			files,
+			modifiedRangesByFile: new Map(),
+			dispatchWarnings: [],
+			includeLspCodeActions: true,
+			lspPullTimeoutMs: 150,
+			onDeferredReport: () => {},
+		});
+		expect(await settlesWithin(_awaitDeferredLspPullForTest(), 2_500)).toBe(
+			"settled",
+		);
+
+		const group = getDegradationSummary().find(
+			(entry) => entry.kind === "hook-await-exceeded",
+		);
+		// #2557 review F3: OFF the hook. This loop is the ANSWER to turn_end's
+		// budget, not a spender of it — it runs a macrotask later on its own
+		// ACTIONABLE_WARNINGS_DEFERRED_BUDGET_MS. Before, it recorded
+		// `turn_end:lspEnrichmentRoundTrip`, which charged deliberately deferred
+		// work to the hook that correctly deferred it.
+		expect(group?.latestReasons.at(-1)?.subject).toBe(
+			"off_hook:deferredLspEnrichmentRoundTrip",
+		);
+		// Rising edge, not one row per wedged file: three files share one row.
+		expect(group?.count).toBe(1);
+	});
+
+	// #2557 review F3. `boundedLspCall` hard-coded `hook: "turn_end"` /
+	// `label: "lspEnrichmentRoundTrip"` while being reached from BOTH loops, so
+	// the two shared ONE ledger subject. `recordDegradationOnce` is rising-edge
+	// per subject, which made that a mutual silencer: whichever loop blew its
+	// budget first took the row, and the other's exceedance never surfaced for
+	// the rest of the session. Revert the `site` field to a literal and this
+	// case reds with only one subject present.
+	it("keys the in-band and the deferred loop separately, so neither silences the other", async () => {
+		const { buildActionableWarningsReport, _awaitDeferredLspPullForTest } =
+			await loadWarnings();
+		const files = makeSources(2);
+		wedgedFiles.add("f0.ts");
+
+		// Turn 1 — nothing primed, so the cold set goes OFF the hook and its
+		// wedged pull blows the per-trip bound there.
+		await buildActionableWarningsReport({
+			cwd: env.tmpDir,
+			sessionId: "lens-test",
+			turnIndex: 1,
+			files: [files[0] as string],
+			modifiedRangesByFile: new Map(),
+			dispatchWarnings: [],
+			includeLspCodeActions: true,
+			lspPullTimeoutMs: 120,
+			onDeferredReport: () => {},
+		});
+		expect(await settlesWithin(_awaitDeferredLspPullForTest(), 2_500)).toBe(
+			"settled",
+		);
+
+		// Turn 2 — f1 is primed, which is exactly the condition that keeps the
+		// whole enrichment IN BAND (`primed.length === 0` is what defers). The
+		// same wedged f0 is now pulled on the AWAITED turn_end hook.
+		primedByFile.set("f1.ts", []);
+		await buildActionableWarningsReport({
+			cwd: env.tmpDir,
+			sessionId: "lens-test",
+			turnIndex: 2,
+			files,
+			modifiedRangesByFile: new Map(),
+			dispatchWarnings: [],
+			includeLspCodeActions: true,
+			lspPullTimeoutMs: 120,
+			onDeferredReport: () => {},
+		});
+
+		const subjects = (
+			getDegradationSummary().find(
+				(entry) => entry.kind === "hook-await-exceeded",
+			)?.latestReasons ?? []
+		).map((reason) => reason.subject);
+		expect(subjects).toContain("off_hook:deferredLspEnrichmentRoundTrip");
+		expect(subjects).toContain("turn_end:lspEnrichmentRoundTrip");
+	});
+
+	// #2557 review F-A. `boundedLspCall` passed `ms: Math.min(pullTimeoutMs,
+	// remainingMs)` into `bounded()`, so whenever the LOOP's own residual wall
+	// budget was smaller than the configured per-pull timeout, `bounded()`
+	// armed its timer at the SHRUNKEN value and — on firing — recorded
+	// `hook-await-exceeded` naming that shrunken value as the budget. A
+	// perfectly healthy pull that simply started late in the batch (the loop's
+	// OWN accounting running low, not the server being slow) was reported as
+	// an exceedance of a budget "65ms" that exists in no configuration.
+	// Reproduced here with three healthy 200 ms pulls against a 460 ms loop
+	// budget: the third pull starts with ~60 ms of loop budget left but a
+	// 10 s configured `lspPullTimeoutMs` — nowhere near exceeded.
+	it("does not record hook-await-exceeded for a healthy pull the loop's own shrinking residual cut short", async () => {
+		const { buildActionableWarningsReport } = await loadWarnings();
+		const files = makeSources(4);
+		// One cached file keeps the batch IN BAND (primed.length > 0), so the
+		// cold files below run through `inBandDeps` — the awaited `turn_end`
+		// loop, not the deferred one.
+		primedByFile.set("f0.ts", []);
+		pullDelayMs = 200;
+
+		await buildActionableWarningsReport({
+			cwd: env.tmpDir,
+			sessionId: "lens-test",
+			turnIndex: 1,
+			files,
+			modifiedRangesByFile: new Map(),
+			dispatchWarnings: [],
+			includeLspCodeActions: true,
+			// Far larger than any single healthy pull -- a call is a genuine
+			// exceedance only if IT outlives this, never the loop's residual.
+			lspPullTimeoutMs: 10_000,
+			// f1 + f2 healthy pulls cost ~400ms; f3 starts with ~60ms of loop
+			// budget left, well under its own 200ms pull time but nowhere near
+			// its 10s per-call timeout.
+			lspBudgetMs: 460,
+			onDeferredReport: () => {},
+		});
+
+		expect(getDegradationSummary()).toEqual([]);
+	});
+
+	// The companion half of the F-A fix: not recording on a residual clamp
+	// must not regress into not ENFORCING one either. `bounded()`'s own timer
+	// is armed at the full `pullTimeoutMs` (10 s below); only the outer
+	// `withDeadline` keyed to the loop's own `deadlineAt` can cut a wedged
+	// pull off after ~60 ms instead of the full per-call timeout. Raced with
+	// a generous ceiling (not an elapsed-time delta) so the assertion is the
+	// settle/pending outcome, not a wall-clock number.
+	it("still cuts a wedged pull off at the loop's own shrinking residual, not the full per-call timeout", async () => {
+		const { buildActionableWarningsReport } = await loadWarnings();
+		const files = makeSources(2);
+		primedByFile.set("f0.ts", []);
+		wedgedFiles.add("f1.ts");
+
+		const settled = await settlesWithin(
+			buildActionableWarningsReport({
+				cwd: env.tmpDir,
+				sessionId: "lens-test",
+				turnIndex: 1,
+				files,
+				modifiedRangesByFile: new Map(),
+				dispatchWarnings: [],
+				includeLspCodeActions: true,
+				lspPullTimeoutMs: 10_000,
+				lspBudgetMs: 60,
+				onDeferredReport: () => {},
+			}),
+			2_500,
+		);
+		expect(settled).toBe("settled");
 	});
 });
 

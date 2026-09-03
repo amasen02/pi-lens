@@ -1123,6 +1123,30 @@ const EXIT_PIPE_IDLE_MAX_WAIT_MS = 2000;
  * - Kills the process on timeout (preventing zombies)
  * - Supports cancellation via AbortSignal
  *
+ * ## Why this bound is NOT `bounded()` — the one documented exception (#2523)
+ *
+ * #2523 slice 2 folded every other "deadline AND abort signal" implementation
+ * in the tree onto `clients/deadline-utils.ts#bounded`. This one stays, and it
+ * is not a copy of the same idea:
+ *
+ * `bounded()` ABANDONS a promise — it stops waiting and lets the work run on
+ * unobserved, which is safe precisely because everything it wraps is in-process
+ * (a dynamic import, an LSP round trip, a `stat`). This function's work is a
+ * CHILD PROCESS, and abandoning one leaks it. So its timer does not settle a
+ * race at all: `timeoutId` sets `timedOut`, then runs `killTree()` — SIGTERM,
+ * an escalation timer, SIGKILL, and on Windows a `taskkill /T` of the whole
+ * tree — and the promise settles only when the child's own `close` arrives (or
+ * the escalation gives up). The result it produces carries the teardown
+ * EVIDENCE (`timeoutTeardown`, #2010): which signal killed it, whether the
+ * tree actually died, how long it took. Replacing that with `bounded()` would
+ * return `undefined` at the deadline and leave a live `vitest`/`gradle` behind
+ * — the orphan class #2504 measured as 59 concurrent spawns starving a turn.
+ *
+ * The rule the exception preserves: a bound that can CANCEL its work must
+ * cancel it. `bounded()` is for work that cannot be cancelled; this is not
+ * that. Anything wrapping THIS function still gets `bounded()` around its own
+ * await if it needs one.
+ *
  * @example
  * const result = await safeSpawnAsync("npm", ["test"], { timeout: 30000 });
  * if (result.error) console.error("Failed:", result.error);

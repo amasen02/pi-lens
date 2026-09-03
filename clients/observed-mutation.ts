@@ -118,6 +118,8 @@ import {
 } from "./opaque-mutation-scan.js";
 import { normalizeMapKey } from "./path-utils.js";
 import { getProcessSingleton } from "./process-singletons.js";
+import { bounded } from "./deadline-utils.js";
+import type { LedgerHookKey } from "./hook-budgets.js";
 import { lineContentHash } from "./read-guard.js";
 
 /**
@@ -465,45 +467,68 @@ type BoundedOutcome<T> =
 /**
  * Both bounds on one async step: a wall-clock timeout AND an abort race.
  *
+ * #2523 slice 2 folded the hand-rolled timer race out of here and onto
+ * `bounded()`. What is left is the ADAPTER: this seam needs a three-way
+ * outcome (`timeout` / `aborted` / `failed`) that `bounded()` deliberately
+ * does not hand back, because a throw and a blown budget have different
+ * remedies and folding them together is catalog shape 10.
+ *
  * A loser is DISCARDED, never awaited to completion — the underlying work is
  * stat/read only, so letting it finish unobserved costs nothing, while awaiting
- * it would defeat the bound this exists to enforce. The timer is cleared on
- * every settle path so it cannot outlive the call (catalog shape 4).
+ * it would defeat the bound this exists to enforce.
+ *
+ * `T extends object` is the load-bearing constraint, not decoration. `bounded()`
+ * spells "a bound fired" as a bare `undefined`, so a `work` that could itself
+ * resolve `undefined` would be indistinguishable from a timeout here. The first
+ * cut paid for that with a `.then((value) => ({ value }))` box — which was
+ * VACUOUS: all four call sites return object literals, so no mutation of the box
+ * could red a test, and the comment justifying it named `captureLineHashes`,
+ * which returns a record and not `undefined` (#2557 review F6). Constraining the
+ * type parameter makes the invariant the box was pretending to protect a COMPILE
+ * error at any future call site instead of a per-call allocation.
  */
-async function withBounds<T>(
+async function withBounds<T extends object>(
 	work: () => Promise<T>,
 	timeoutMs: number,
 	signal: AbortSignal | undefined,
+	site: { hook: LedgerHookKey; label: string },
 ): Promise<BoundedOutcome<T>> {
-	if (signal?.aborted === true) return { ok: false, reason: "aborted" };
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	let onAbort: (() => void) | undefined;
+	// A function, not an inline read: the signal is LIVE, so the compiler's
+	// narrowing from the pre-flight check below must not be carried across the
+	// await into the post-settle classification (it would fold that branch to
+	// "timeout" and hide every mid-await abort).
+	const isAborted = (): boolean => signal !== undefined && signal.aborted;
+	if (isAborted()) return { ok: false, reason: "aborted" };
 	try {
-		const bound = new Promise<BoundedOutcome<T>>((resolve) => {
-			timer = setTimeout(
-				() => resolve({ ok: false, reason: "timeout" }),
-				timeoutMs,
-			);
-			if (typeof timer.unref === "function") timer.unref();
-			if (signal) {
-				onAbort = () => resolve({ ok: false, reason: "aborted" });
-				signal.addEventListener("abort", onAbort, { once: true });
-			}
+		const settled = await bounded(work(), {
+			ms: timeoutMs,
+			// The observational net runs on hook paths that may or may not carry
+			// a signal; the wall budget is the bound that is always there, and
+			// `bounded()` reads a missing signal as one that never aborts.
+			signal,
+			hook: site.hook,
+			label: site.label,
 		});
-		return await Promise.race([
-			work().then((value): BoundedOutcome<T> => ({ ok: true, value })),
-			bound,
-		]);
+		if (settled !== undefined) return { ok: true, value: settled };
+		// `bounded()` applies the caller's signal FIRST, so reading it back here
+		// reproduces which bound fired without a second channel.
+		return { ok: false, reason: isAborted() ? "aborted" : "timeout" };
 	} catch {
 		// A THROW gets its own reason. Folding it into `timeout` is exactly the
 		// misclassification catalog shape 10 warns about: a reader tuning the
 		// budget would be chasing a bug that has nothing to do with time.
 		return { ok: false, reason: "failed" };
-	} finally {
-		if (timer !== undefined) clearTimeout(timer);
-		if (signal && onAbort) signal.removeEventListener("abort", onAbort);
 	}
 }
+
+/**
+ * Test-only alias so `tests/clients/hook-await-fold-bounds.test.ts` can pin
+ * `withBounds`'s `T extends object` constraint at compile time (#2557 review
+ * F-B). `withBounds` itself is module-private -- there is no other way for a
+ * test file to reference it in a `@ts-expect-error` probe. Never called
+ * outside that probe.
+ */
+export const _withBoundsForTests = withBounds;
 
 /** `splitLines` semantics from `read-guard.ts`, kept identical on purpose. */
 function splitLines(text: string): string[] {
@@ -762,6 +787,10 @@ export async function armObservedMutation(
 		},
 		timeoutMs,
 		args.signal,
+		// Reached from `clients/runtime-tool-call.ts`, which #2523's contract
+		// gives no wall budget of its own — the ledger key still names it so a
+		// blown capture budget is attributable.
+		{ hook: "tool_call", label: "armObservedMutation" },
 	);
 	chargeTurnBudget(args.turnIndex, Date.now() - started);
 
@@ -986,6 +1015,7 @@ export async function settleObservedMutation(
 			}),
 		OBSERVED_SETTLE_DEADLINE_MS * 4,
 		args.signal,
+		{ hook: "tool_result_edit", label: "settleObservedMutation" },
 	);
 	chargeTurnBudget(args.turnIndex, Date.now() - started);
 	if (!capture.ok) {
@@ -1390,6 +1420,7 @@ export async function runObservedSettledSweep(
 		// race exists only to bound a single wedged `stat` — hence the slack.
 		OBSERVED_CAPTURE_BUDGET_MS * 2,
 		args.signal,
+		{ hook: "agent_settled", label: "runObservedSettledSweep" },
 	);
 	if (!outcome.ok) {
 		emitBounded(
@@ -1528,6 +1559,7 @@ export async function refreshObservedMutationLedger(
 			}),
 		OBSERVED_CAPTURE_BUDGET_MS * 2,
 		args.signal,
+		{ hook: "agent_settled", label: "refreshObservedMutationLedger" },
 	);
 	return outcome.ok ? outcome.value.scanned : 0;
 }

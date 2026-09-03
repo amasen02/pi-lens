@@ -12,6 +12,7 @@
  */
 
 import { recordDegradationOnce } from "./degradation-ledger.js";
+import type { LedgerHookKey } from "./hook-budgets.js";
 
 /**
  * Combine multiple abort signals into one that aborts when ANY of them does.
@@ -192,12 +193,39 @@ export interface BoundedOptions {
 	ms: number;
 	/**
 	 * The HOOK's abort signal — `ctx.signal`, threaded down through the deps
-	 * object, never `getAmbientAbortSignal()`. NOT optional, for the same
-	 * reason `ms` is not: a wall-clock-only bound leaves Escape unable to
-	 * release the hook, which is precisely what #2523's probe measured
-	 * (`still-blocked after 30011ms` with the ambient abort fired at t=2s).
+	 * object, never `getAmbientAbortSignal()`.
+	 *
+	 * A REQUIRED property whose type admits `undefined`, which is a deliberate
+	 * pair of decisions, not a half-measure:
+	 *
+	 * - Required, so `bounded(p, { ms, hook, label })` stays a COMPILE error
+	 *   (TypeScript demands the key be written even when its type includes
+	 *   `undefined`). A wall-clock-only bound leaves Escape unable to release
+	 *   the hook, which is precisely what #2523's probe measured
+	 *   (`still-blocked after 30011ms` with the ambient abort fired at t=2s),
+	 *   so a call that never mentions a signal cannot type-check.
+	 * - Admitting `undefined`, because several real seams hold an OPTIONAL
+	 *   `AbortSignal | undefined` — `clients/bootstrap.ts`'s
+	 *   `SessionBootstrapAccess.request` takes none ON PURPOSE (#1394: a
+	 *   `session_start` can land mid-turn, and binding the outgoing turn's
+	 *   signal cancelled every startup scan with no retry), and
+	 *   `clients/observed-mutation.ts` / `clients/pipeline.ts` /
+	 *   `clients/actionable-warnings.ts` have one on every production path but
+	 *   an optional parameter in the type. This helper already treats a missing
+	 *   signal as one that never aborts (`signal?.` below); admitting it in the
+	 *   type is what stops each of those seams from spelling that same fallback
+	 *   for itself. #2557 review F2: a `NEVER_ABORTED` sentinel constant did
+	 *   exactly that, adding a SECOND concept for behaviour this helper already
+	 *   had — a net-count regression on an issue whose whole point is that one
+	 *   bound primitive replaces the private copies.
+	 *
+	 * Writing `signal: x` where `x` may be `undefined` is therefore legal and
+	 * greppable rather than clever. It is also ENUMERATED: every shipped
+	 * `bounded()` call site is registered in `tests/config/hook-await-bounds.
+	 * test.ts` with the provenance of its signal, so the set of seams running
+	 * on a possibly-single bound cannot grow without someone writing down why.
 	 */
-	signal: AbortSignal;
+	signal: AbortSignal | undefined;
 	/**
 	 * Optional TEARDOWN signal — the seam's own session-shutdown controller,
 	 * not a turn signal. Supplying it is what lets a caller whose work is not
@@ -210,8 +238,16 @@ export interface BoundedOptions {
 	 * hook that has no teardown signal to offer still has both of its own.
 	 */
 	shutdownSignal?: AbortSignal;
-	/** Hook this await runs under, e.g. `"turn_end"`. Half of the ledger key. */
-	hook: string;
+	/**
+	 * Hook family this await runs under, e.g. `"turn_end"`. Half of the ledger
+	 * key.
+	 *
+	 * Typed, not a free string: the subject this builds (`<hook>:<label>`) is
+	 * read against `HOOK_WALL_BUDGET_MS`, so a value that names something other
+	 * than a hook — a demand reason, a caller name — produces a row nothing can
+	 * join on (#2557 review F7). Put the caller's own identity in {@link label}.
+	 */
+	hook: LedgerHookKey;
 	/** What is being awaited, e.g. `"sweepInlineBlockerFreshness"`. */
 	label: string;
 }
@@ -329,15 +365,16 @@ export async function bounded<T>(
 			cause ??= reason;
 			resolve(BOUND_ABORTED);
 		};
-		// `signal?.` — same reason `ms` is `Number.isFinite`-guarded above: the
-		// type marks `signal` required (a deadline-only call is exactly the
-		// defect this helper exists to make unrepresentable), but a JS caller
-		// can still hand over `undefined`, and a helper whose whole job is
-		// keeping a hook from blowing up must not itself throw
-		// `Cannot read properties of undefined` when one does (#2530 round 3
-		// F5). A missing signal is treated as one that never aborts, which is
-		// the deadline-only behavior the type otherwise refuses — the caller
-		// opted out of the compiler, not out of the semantics.
+		// `signal?.` — a missing signal is treated as one that never aborts.
+		// The KEY is required (so a call that never mentions a signal does not
+		// compile), but its type admits `undefined` because several seams
+		// genuinely hold `AbortSignal | undefined` — see `BoundedOptions.signal`
+		// for which ones and why. This branch is what lets them pass it straight
+		// through instead of each spelling its own never-aborting stand-in
+		// (#2557 review F2), and it is also what keeps a JS caller, or a
+		// `@ts-expect-error` probe, from making a helper whose whole job is
+		// keeping a hook from blowing up throw `Cannot read properties of
+		// undefined` (#2530 round 3 F5).
 		if (signal?.aborted) return fire("caller-abort");
 		if (shutdownSignal?.aborted) return fire("shutdown");
 		// A zero budget ("this hook may not await at all") is a bound that has

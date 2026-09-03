@@ -72,7 +72,7 @@ import type { RuffClient } from "./ruff-client.js";
 import { RUNTIME_CONFIG } from "./runtime-config.js";
 import type { WordIndex } from "./word-index.js";
 import { getAmbientAbortSignal, safeSpawnAsync } from "./safe-spawn.js";
-import { combineAbortSignals } from "./deadline-utils.js";
+import { bounded } from "./deadline-utils.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
 import { dropFindingsForMissingPaths } from "./advisory-provenance.js";
 import {
@@ -1077,7 +1077,6 @@ export async function resyncLspFile(
 			const budgetMs = lspSyncBudgetMs();
 			const abort = getAmbientAbortSignal();
 			if (abort?.aborted) return;
-			const bail = combineAbortSignals(abort, AbortSignal.timeout(budgetMs));
 			const startedAt = Date.now();
 			const touch = lspService
 				.touchFile(filePath, fileContent, {
@@ -1091,12 +1090,26 @@ export async function resyncLspFile(
 					dbg(`LSP resync after autofix error: ${err}`);
 					return "done" as const;
 				});
-			const bailed = new Promise<"bailed">((resolve) => {
-				if (!bail || bail.aborted) return resolve("bailed");
-				bail.addEventListener("abort", () => resolve("bailed"), { once: true });
+			// #2523 slice 2: this was `combineAbortSignals(abort,
+			// AbortSignal.timeout(budgetMs))` fed into a hand-rolled
+			// `Promise.race` — a private fifth copy of "deadline AND signal".
+			// `bounded()` is the same thing with the abandonment recorded, and
+			// without the composite signal that #2530 review F4 measured
+			// accumulating on the SOURCE.
+			//
+			// `touch` never rejects (it catches above) and never resolves
+			// `undefined`, so `undefined` here means exactly "a bound fired".
+			const outcome = await bounded(touch, {
+				ms: budgetMs,
+				// The ambient turn signal: set for the whole tool_result path and
+				// absent only in a bare unit harness, where the wall budget is
+				// still live (`bounded()` reads a missing signal as one that
+				// never aborts).
+				signal: abort,
+				hook: "tool_result_edit",
+				label: "resyncLspFile",
 			});
-			const outcome = await Promise.race([touch, bailed]);
-			if (outcome === "bailed") {
+			if (outcome === undefined) {
 				// Abandon the still-pending write; the edit continues. Log it so this
 				// stall — previously an invisible hang — is queryable in latency.log.
 				//
