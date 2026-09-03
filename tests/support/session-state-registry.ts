@@ -360,6 +360,17 @@ export const SESSION_STATE_REGISTRY: SessionStateEntry[] = [
 		reason:
 			"#1723 review F4: the in-flight-phase live-bracket map is process-shared state that only a confirmed full session start may re-arm - the reset must sit INSIDE the #473 concurrent-secondary gate, yet outside handleSessionStart's own body (it runs before handleSessionStart), so it is called directly in index.ts's session_start closure, unreachable from the handleSessionStart walk. #2319 adds the closure-site evidence and this entry replaces the file's exemption. See resetCurrentPhaseForSession's own doc comment for the full placement reasoning.",
 	},
+	// ── #2526 once-per-session phase claims ─────────────────────────────
+	{
+		id: "latency-logger:oncePerSessionPhases",
+		module: "latency-logger.ts",
+		state:
+			"oncePerSessionPhases (which SESSION-fact phase rows have already been written this session)",
+		policy: "session_start",
+		resetName: "resetOncePerSessionPhases",
+		reason:
+			"#2526: `config_resolved` is a SESSION fact written by `loadLSPConfig`, which runs many times per session (session start, each served root, the MCP `ensureReady` boot, the first edit's ensure). The claim set is what collapses those to one row. It is re-armed from `handleSessionStart`'s own body — reachable from the walk, unlike liveBrackets above — and deliberately NOT behind the #473 concurrent-secondary gate: there is no in-flight state to wipe from under a sibling activation, and an extra re-arm costs one extra record, the safe direction for a claim whose ABSENCE is the smell (catalog shape 17).",
+	},
 	// #2319 survey catch: the session_start closure ALSO resets the
 	// #1999 rising-edge memory-sample cadence. Its state is two module-scope
 	// SCALARS, so the container scan cannot flag the file (SWEEP_HEURISTIC_LIMITS
@@ -1485,7 +1496,7 @@ export const SESSION_STATE_SYMBOL_COUNTS: Readonly<Record<string, number>> = {
 	// BoundedLruCache, so this file's module-level bounded cache is counted.
 	"installer/index.ts": 13,
 	"instance-registry.ts": 0,
-	"latency-logger.ts": 2,
+	"latency-logger.ts": 3,
 	// #2418 removed lens-config.ts's row: its only module-scope state was the
 	// warn-once set, now owned by config-warn.ts, so the scan no longer flags
 	// the file at all.

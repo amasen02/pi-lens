@@ -629,6 +629,51 @@ export function resetCurrentPhaseForSession(): void {
 	closedBrackets = [];
 }
 
+/**
+ * Phases already written ONCE for the current session (#2526).
+ *
+ * Session-scoped telemetry bookkeeping, which is this module's own domain —
+ * the same reason `liveBrackets` and `recentPhases` live here rather than in
+ * each producer. A producer that is called many times per session but whose
+ * record is a SESSION fact (`config_resolved`: `loadLSPConfig` runs at session
+ * start, per served root, and on the first edit, all resolving the same
+ * config) asks here instead of keeping its own latch, so the "one row per
+ * session" a log reader counts against is a property of the logger rather than
+ * a convention each producer re-implements.
+ */
+const oncePerSessionPhases = new Set<string>();
+
+/**
+ * Claim the session's one record for `phase`.
+ *
+ * Returns true exactly once per session; every later call for the same phase
+ * returns false until {@link resetOncePerSessionPhases} re-arms it. Callers
+ * should claim BEFORE building the payload, so a claim that loses the race
+ * costs nothing.
+ */
+export function claimPhaseOncePerSession(phase: string): boolean {
+	if (oncePerSessionPhases.has(phase)) return false;
+	oncePerSessionPhases.add(phase);
+	return true;
+}
+
+/**
+ * Re-arm every once-per-session phase claim for a new session.
+ *
+ * Called from `handleSessionStart` beside the other per-session latch resets:
+ * a latch that is never re-armed silences its record for the rest of the
+ * PROCESS (AGENTS.md catalog shape 17), which for a positive-observability
+ * record is the exact silence it exists to end.
+ *
+ * Unlike `resetCurrentPhaseForSession` this is NOT gated behind the #473
+ * concurrent-secondary check: there is no in-flight state to wipe out from
+ * under a sibling activation, and the worst case of an extra re-arm is one
+ * additional record — the safe direction for a claim whose absence is a smell.
+ */
+export function resetOncePerSessionPhases(): void {
+	oncePerSessionPhases.clear();
+}
+
 export function logLatency(entry: LatencyEntry): void {
 	const ts = new Date().toISOString();
 	if (

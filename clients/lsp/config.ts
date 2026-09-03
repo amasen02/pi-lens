@@ -69,7 +69,11 @@ import {
 	summarizeConfigResolution,
 } from "../config-resolve.js";
 import { getGlobalPiLensDir } from "../file-utils.js";
-import { logLatency } from "../latency-logger.js";
+import {
+	claimPhaseOncePerSession,
+	logLatency,
+	resetOncePerSessionPhases,
+} from "../latency-logger.js";
 import { getPiLensGlobalConfigPath } from "../lens-config.js";
 import { logSessionStart } from "../sessionstart-logger.js";
 import { launchLSP } from "./launch.js";
@@ -199,35 +203,8 @@ export interface LoadLSPConfigOptions {
 	readonly report?: boolean;
 }
 
-/**
- * Has this session already written its `config_resolved` record? (#2526)
- *
- * Process-lifetime state reset per session by
- * {@link resetConfigResolvedTelemetryForSession}, exactly the shape of the
- * other per-session latches `handleSessionStart` re-arms (catalog shape 17): a
- * latch that is never re-armed silences the record for the rest of the
- * process, which is the very silence #2526 exists to end.
- *
- * The latch — rather than an unconditional emit — is what makes the record a
- * SESSION fact. `loadLSPConfig` is the funnel every config resolution goes
- * through (`initLSPConfig` at session start and at each served root, the MCP
- * `ensureReady` boot, `ensureLSPConfigInitialized` on the first edit), so an
- * unconditional emit would write one row per resolution and the "one row per
- * session" the smell analyzer counts against would be unrecoverable from the
- * log.
- */
-let configResolvedRecorded = false;
-
-/**
- * Re-arm the `config_resolved` record for a new session (#2526).
- *
- * Called from `handleSessionStart`, beside the other per-session latch resets.
- * Deliberately NOT folded into any of them: those live in their own modules
- * for the same reason, and this one is loader state.
- */
-export function resetConfigResolvedTelemetryForSession(): void {
-	configResolvedRecorded = false;
-}
+/** The session-scoped phase this loader claims (#2526). */
+const CONFIG_RESOLVED_PHASE = "config_resolved";
 
 /**
  * Write the session's ONE `config_resolved` record (#2526).
@@ -246,6 +223,14 @@ export function resetConfigResolvedTelemetryForSession(): void {
  * caller already performed. And it adds no `await` — `logLatency` and
  * `logSessionStart` are synchronous buffered writers — so the session-start
  * hook path gains nothing to wait on (#2523).
+ *
+ * ONE row per session, claimed through the logger's own session-scoped
+ * bookkeeping rather than a latch kept here. `loadLSPConfig` is the funnel
+ * every config resolution goes through (`initLSPConfig` at session start and
+ * at each served root, the MCP `ensureReady` boot,
+ * `ensureLSPConfigInitialized` on the first edit), so an unconditional write
+ * would emit one row per resolution and the "one row per session" the smell
+ * analyzer counts against would be unrecoverable from the log.
  */
 function recordConfigResolved(
 	cwd: string,
@@ -254,8 +239,7 @@ function recordConfigResolved(
 	homeDir: string,
 	resolveMs: number,
 ): void {
-	if (configResolvedRecorded) return;
-	configResolvedRecorded = true;
+	if (!claimPhaseOncePerSession(CONFIG_RESOLVED_PHASE)) return;
 	const summary = summarizeConfigResolution(resolution, homeDir);
 	// The deny UNION's size, read off the same projection the gates consume
 	// (`lspConfigOf`) rather than re-read from the raw value — one definition of
@@ -267,7 +251,7 @@ function recordConfigResolved(
 	).length;
 	logLatency({
 		type: "phase",
-		phase: "config_resolved",
+		phase: CONFIG_RESOLVED_PHASE,
 		filePath: cwd,
 		durationMs: resolveMs,
 		metadata: {
@@ -708,10 +692,10 @@ export function resetLSPConfigStateForTests(): void {
 	// The warn latch is loader state too: a test that re-reads the same broken
 	// path after this reset must see the warning again, not a latched silence.
 	resetLSPConfigWarnCache();
-	// #2526: same reasoning for the per-session `config_resolved` latch — a
+	// #2526: same reasoning for the per-session `config_resolved` claim — a
 	// test that resolves again after this reset must produce its record, not
-	// inherit a previous test's "already reported" claim.
-	resetConfigResolvedTelemetryForSession();
+	// inherit a previous test's "already recorded" claim.
+	resetOncePerSessionPhases();
 }
 
 /**

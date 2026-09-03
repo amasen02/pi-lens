@@ -89,7 +89,10 @@ function buildRoot(options: {
 		{ length: options.sessionStarts },
 		() => `[${NOW}] session_start cwd: /home/u/Desktop/proj`,
 	);
-	fs.writeFileSync(path.join(dir, "sessionstart.log"), `${starts.join("\n")}\n`);
+	fs.writeFileSync(
+		path.join(dir, "sessionstart.log"),
+		`${starts.join("\n")}\n`,
+	);
 	return dir;
 }
 

@@ -39,6 +39,7 @@ import {
 	clearLatencyLog,
 	flushLatencyLog,
 	getLatencyLogPath,
+	resetOncePerSessionPhases,
 } from "../../clients/latency-logger.js";
 import {
 	flushSessionStartLog,
@@ -69,7 +70,11 @@ function write(file: string, value: unknown): void {
 
 /** Every `config_resolved` phase row currently on disk. */
 async function configResolvedRows(): Promise<
-	Array<{ durationMs: number; filePath: string; metadata: ConfigResolvedMetadata }>
+	Array<{
+		durationMs: number;
+		filePath: string;
+		metadata: ConfigResolvedMetadata;
+	}>
 > {
 	await flushLatencyLog();
 	const file = getLatencyLogPath();
@@ -256,9 +261,7 @@ describe("config_resolved: the session's one positive config record (#2526)", ()
 		expect(await configResolvedRows()).toHaveLength(1);
 
 		// A new session re-arms it, so the next session gets its own row.
-		const { resetConfigResolvedTelemetryForSession } =
-			await import("../../clients/lsp/config.js");
-		resetConfigResolvedTelemetryForSession();
+		resetOncePerSessionPhases();
 		await loadLSPConfig(projectDir, home);
 		expect(await configResolvedRows()).toHaveLength(2);
 	});
@@ -386,9 +389,9 @@ describe("MCP parity: the warm boot's config resolution records too (#2526)", ()
 		// `runSessionStart` drives `handleSessionStart`. It resolves against the
 		// real `os.homedir()` (that is `initLSPConfig`'s own hard-wired seam), so
 		// this asserts the RECORD, not a document list a temp `$HOME` would fix.
-		const { resetConfigResolvedTelemetryForSession } =
+		const { resetLSPConfigStateForTests } =
 			await import("../../clients/lsp/config.js");
-		resetConfigResolvedTelemetryForSession();
+		resetLSPConfigStateForTests();
 		const { ensureLspConfig } = await import("../../clients/lens-engine.js");
 		await ensureLspConfig(projectDir);
 
@@ -397,5 +400,7 @@ describe("MCP parity: the warm boot's config resolution records too (#2526)", ()
 		expect(rows[0].metadata.documents.length).toBeGreaterThanOrEqual(1);
 		expect(rows[0].metadata.deniedServers).toBeGreaterThanOrEqual(2);
 		expect(await sessionStartLinesSince(offset)).toHaveLength(1);
-	});
+		// `lens-engine.js` is the widest import in the tree; a cold transform of
+		// it alone can exceed the 5s default before the assertion is reached.
+	}, 30000);
 });

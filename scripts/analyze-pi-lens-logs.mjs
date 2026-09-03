@@ -1034,7 +1034,10 @@ function summarizeConfigResolved(entry, note) {
 		project: projectOf(entry.filePath),
 		note,
 		documents: documents
-			.map((doc) => `${doc?.tier ?? "?"}:${doc?.file ?? "?"}${doc?.legacy ? " (legacy)" : ""}`)
+			.map(
+				(doc) =>
+					`${doc?.tier ?? "?"}:${doc?.file ?? "?"}${doc?.legacy ? " (legacy)" : ""}`,
+			)
 			.slice(0, 8),
 		recordCount: md.recordCount,
 		deniedServers: md.deniedServers,
