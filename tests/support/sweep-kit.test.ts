@@ -297,7 +297,7 @@ describe("sweep-kit: stripSource", () => {
 	});
 
 	// #2502 review F1.
-	it("ATTACK_TEMPLATE_EXPRESSION_CALL: a call inside a template's ${...} expression stays visible under strings: \"blank\"", () => {
+	it('ATTACK_TEMPLATE_EXPRESSION_CALL: a call inside a template\'s ${...} expression stays visible under strings: "blank"', () => {
 		const stripped = stripSource(ATTACK_TEMPLATE_EXPRESSION_CALL);
 		expect(stripped).toContain("resetThing()");
 	});
