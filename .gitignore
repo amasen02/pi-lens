@@ -176,3 +176,6 @@ tests/fixtures/**/bin/
 
 # Live native-TS7 integration temp projects (removed in afterAll; survive hard aborts)
 tests/native-ts7-live-*/
+
+# prepack backup of package.json (scripts/strip-dev-deps-for-pack.mjs)
+.pack-backup/

@@ -90,7 +90,15 @@ const FLAKE_SHAPE_BASELINE: Baseline = JSON.parse(
  */
 const ADMITTED_AFTER_BASELINE: Readonly<
 	Record<string, { detector: DetectorName; reason: string }>
-> = {};
+> = {
+	// 2026-09-03: the published-manifest guard must run the real `npm pack`
+	// (prepack/postpack are npm lifecycle hooks); header on the file states why.
+	"real-process-spawn:packaging-pack-manifest.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"observes the real npm pack lifecycle (prepack/postpack); no in-process double is faithful",
+	},
+};
 
 /** The `wallClockBudgetInclude` project's `include` list, read from the live config — not a hand-copied mirror of it (single-source-of-truth). */
 function wallClockBudgetInclude(): string[] {

@@ -18,6 +18,8 @@
 		"build:dist": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && npx --yes -p typescript@7.0.2 tsc --project tsconfig.dist.json --noCheck && npm run bundle:dist",
 		"bundle:dist": "node scripts/bundle-dist.mjs",
 		"prepare": "npm run build:dist && node scripts/download-grammars.js --core --dest grammars && node scripts/setup-git-hooks.mjs && node scripts/warm-loader-cache.mjs",
+		"prepack": "node scripts/strip-dev-deps-for-pack.mjs --strip",
+		"postpack": "node scripts/strip-dev-deps-for-pack.mjs --restore",
 		"lint": "tsc --project tsconfig.json && npm run lint:js",
 		"lint:js": "oxlint --deny-warnings --ignore-pattern \"tests/**/*.ts\" --ignore-pattern \"tests/**/*.tsx\" --ignore-pattern \"**/*.d.mts\" --ignore-pattern \"tests/fixtures/autofix-smoke/**\" --ignore-pattern \"tests/fixtures/format-smoke/**\" --ignore-pattern \"tests/fixtures/tool-smoke/**\" --ignore-pattern \"tests/fixtures/call-graph/javascript/**\" --ignore-pattern \"tests/fixtures/function-facts/javascript-parameter.js\" .",
 		"depcruise:check": "depcruise --validate --config .dependency-cruiser.cjs --ignore-known .dependency-cruiser-known-violations.json --output-type err index.ts \"clients/**/*.ts\"",
