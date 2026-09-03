@@ -28,7 +28,7 @@ import {
 } from "./lsp-mutation.js";
 import { toRunnerDisplayPath } from "./dispatch/runner-context.js";
 import { logActionableWarningsEvent } from "./actionable-warnings-logger.js";
-import { getProjectDataDir } from "./file-utils.js";
+import { displayProjectDataPath, getProjectDataDir } from "./file-utils.js";
 import { commitDurableStore } from "./durable-store.js";
 
 export interface ActionableWarningAction {
@@ -153,7 +153,7 @@ export interface ActionableWarningsReport {
 		 * countable instead of arriving indistinguishable from a real warning.
 		 *
 		 * OPTIONAL on purpose: this report is persisted to
-		 * `.pi-lens/cache/actionable-warnings.json` and read back by
+		 * `<project-data-dir>/cache/actionable-warnings.json` and read back by
 		 * `clients/runtime-agent-end.ts` and `tools/lens-diagnostics.ts`, which
 		 * can find a file written by a pi-lens build that predates the field.
 		 * Every reader must tolerate its absence.
@@ -1243,7 +1243,7 @@ function assembleReport(
 	updateWarningState(cwd, merged);
 	// legacyId is #1816 migration bookkeeping for updateWarningState above —
 	// strip it before the report leaves this function, so it never lands in
-	// the `.pi-lens/cache/actionable-warnings.json` cache file or any
+	// the `<project-data-dir>/cache/actionable-warnings.json` cache file or any
 	// agent-facing rendering of a warning record.
 	const reportWarnings = merged.map(({ legacyId: _legacyId, ...rest }) => rest);
 	const byFile = new Map<string, ActionableWarningRecord[]>();
@@ -2028,8 +2028,20 @@ export async function applyConservativeActionableWarningFixes(args: {
 	return summary;
 }
 
+/**
+ * The turn-end advisory for this report.
+ *
+ * `cwd` is REQUIRED (#2521): the advisory names where the report lives, and
+ * that location is `getProjectDataDir(cwd)`-resolved, not a constant. It was a
+ * hardcoded `.pi-lens/cache/actionable-warnings.json` — correct only for a
+ * project that already had a legacy `.pi-lens/` directory — so in every other
+ * project the agent's `cat` of the advised path failed while the report sat
+ * unread under `~/.pi-lens/projects/<slug>/cache/`. An OPTIONAL `cwd` would
+ * have kept that bug alive behind a default, so callers must pass it.
+ */
 export function formatActionableWarningsAdvisory(
 	report: ActionableWarningsReport,
+	cwd: string,
 ): string | undefined {
 	if (report.summary.unsuppressed === 0) return undefined;
 	const files = report.files.filter((file) =>
@@ -2057,12 +2069,24 @@ export function formatActionableWarningsAdvisory(
 		quiet > 0
 			? `${quiet} of those are hint/info tier — style opinions, worth fixing only while you are already in that code.`
 			: undefined;
+	// #2521: lead with the TOOL route. `lens_diagnostics mode=delta` reads the
+	// same cache this advisory describes, so an agent never needs to know the
+	// store's layout — which is exactly the knowledge the old hardcoded path
+	// got wrong. The resolved file stays as a named fallback for a human
+	// reading the transcript, rendered through the one helper that cannot
+	// disagree with the writer.
+	const reportPath = displayProjectDataPath(
+		cwd,
+		"cache",
+		"actionable-warnings.json",
+	);
 	return [
 		`🟡 Fixable warnings introduced this turn: ${report.summary.unsuppressed}.${safe}`,
 		tierLine,
-		`Details written to .pi-lens/cache/actionable-warnings.json`,
+		"Use lens_diagnostics with mode=delta to inspect these warnings.",
 		fileList ? `Files:\n${fileList}${more}` : undefined,
-		"If continuing in these files, read that JSON and resolve warnings that are safe and relevant. Do not apply broad refactors unless requested.",
+		"If continuing in these files, resolve warnings that are safe and relevant. Do not apply broad refactors unless requested.",
+		`Raw report (only if you need the JSON): ${reportPath}`,
 	]
 		.filter(Boolean)
 		.join("\n");

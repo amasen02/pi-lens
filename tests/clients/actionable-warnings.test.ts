@@ -230,7 +230,7 @@ describe("actionable warnings", () => {
 			expect(report.files[0]?.warnings[0]?.fixSuggestion).toBe(
 				"remove this statement",
 			);
-			expect(formatActionableWarningsAdvisory(report)).toContain(
+			expect(formatActionableWarningsAdvisory(report, cwd)).toContain(
 				"Fixable warnings introduced this turn: 1",
 			);
 		} finally {
@@ -278,7 +278,7 @@ describe("actionable warnings", () => {
 			// routes it to the blocking path), so `byTier` no longer carries a vestigial
 			// always-0 `error` field.
 			expect(report.summary.byTier).not.toHaveProperty("error");
-			expect(formatActionableWarningsAdvisory(report)).toContain(
+			expect(formatActionableWarningsAdvisory(report, cwd)).toContain(
 				"2 of those are hint/info tier",
 			);
 		} finally {
@@ -303,7 +303,7 @@ describe("actionable warnings", () => {
 				includeLspCodeActions: false,
 			});
 			expect(report.summary.byTier).toMatchObject({ warning: 1, hint: 0 });
-			expect(formatActionableWarningsAdvisory(report)).not.toContain(
+			expect(formatActionableWarningsAdvisory(report, cwd)).not.toContain(
 				"hint/info tier",
 			);
 		} finally {
@@ -334,7 +334,7 @@ describe("actionable warnings", () => {
 				...report,
 				summary: { ...report.summary, byTier: undefined },
 			};
-			expect(formatActionableWarningsAdvisory(legacy)).toContain(
+			expect(formatActionableWarningsAdvisory(legacy, cwd)).toContain(
 				"Fixable warnings introduced this turn: 1",
 			);
 		} finally {

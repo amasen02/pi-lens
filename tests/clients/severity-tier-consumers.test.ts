@@ -92,7 +92,7 @@ describe("code-quality warnings render the hint and info tiers distinctly (#1777
 			warnings: warnings.map((warning) => warning!),
 			modifiedRangesByFile: new Map(),
 		});
-		const advisory = formatCodeQualityWarningsAdvisory(report) ?? "";
+		const advisory = formatCodeQualityWarningsAdvisory(report, cwd) ?? "";
 		expect(advisory).toContain("1 warning");
 		expect(advisory).toContain("1 hint");
 	});
@@ -183,7 +183,7 @@ describe("tier-aware advisories tolerate a pre-#1777 cached report", () => {
 			...report,
 			summary: { ...report.summary, byTier: undefined },
 		};
-		expect(formatCodeQualityWarningsAdvisory(legacy)).toContain(
+		expect(formatCodeQualityWarningsAdvisory(legacy, cwd)).toContain(
 			"Code-quality warnings introduced/touched this turn: 1",
 		);
 	});
