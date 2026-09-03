@@ -743,10 +743,8 @@ describe("#2504 r4 F1 — the deferred report merges into the persisted one", ()
 			getFileSeq: (filePath) => (filePath === a ? 6 : 2),
 		});
 
-		expect(result.written).toBe(true);
-		expect(result.mergedFiles).toBe(1);
-		expect(result.droppedFiles).toBe(1);
-
+		// Behaviour first, counters second: the red on pre-fix code has to be
+		// "it published the stale entry", not "the result object grew a field".
 		const persisted = cacheManager.readCache<ActionableWarningsReport>(
 			"actionable-warnings",
 			env.tmpDir,
@@ -754,6 +752,9 @@ describe("#2504 r4 F1 — the deferred report merges into the persisted one", ()
 		expect(
 			(persisted?.files ?? []).flatMap((f) => f.warnings.map((w) => w.id)),
 		).toEqual(["b1"]);
+		expect(result.written).toBe(true);
+		expect(result.mergedFiles).toBe(1);
+		expect(result.droppedFiles).toBe(1);
 
 		// Never silent: the per-file loss is on the ledger, bounded and named.
 		const superseded = getDegradationSummary().filter(
