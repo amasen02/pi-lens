@@ -16,7 +16,7 @@ import { createSubsystemLogger } from "./extension-log.js";
 import { incrementDegradationCount } from "./degradation-ledger.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { findLocalBinsUpwards, VENV_BIN_DIRS } from "./package-manager.js";
+import { findLocalBinsAt, VENV_BIN_DIRS } from "./package-manager.js";
 import { findNearestMarkerRoot } from "./path-utils.js";
 import { getScratchTreeFnmatchPatterns } from "./scratch-tree-policy.js";
 import { safeSpawnAsync } from "./safe-spawn.js";
@@ -250,19 +250,24 @@ export class PythonDeadCodeClient implements DeadCodeClient {
 	 * (#1731, discipline B — the same venv-first shape sqlfluff's binary
 	 * resolution already uses, `runner-helpers.ts` `createVenvFinder`).
 	 *
-	 * The directory list is the shared `VENV_BIN_DIRS` and the search is the
-	 * shared ancestor walk, HOME-ceilinged (#2544 review F1): this was a third
-	 * private spelling of the same four venv directories, and its
-	 * `process.platform` branch meant the ubuntu lane never saw the `Scripts`
-	 * half at all (defect shape 30). `findLocalBinsUpwards` returns EVERY match
-	 * rather than the first, because `doEnsureAvailable` probes candidates in
-	 * order and must keep the `venv/` fallback when a `.venv/` vulture exists
-	 * but cannot run.
+	 * The directory list is the shared `VENV_BIN_DIRS` — this was a third
+	 * private spelling of the same four venv directories, with a
+	 * `process.platform` branch that meant the ubuntu lane never saw the
+	 * `Scripts` half at all (defect shape 30).
+	 *
+	 * The search is a fixed lookup at `root` ONLY (`findLocalBinsAt`, no
+	 * ancestor walk) — #2544 review round 3 folded this onto the shared
+	 * ancestor walker, reasoning a monorepo package should find its
+	 * repo-root venv, but that was an unrequested behaviour change with no
+	 * #2514 defect behind it. Reverted in round 4 F2. `findLocalBinsAt`
+	 * returns EVERY match at `root` rather than the first, because
+	 * `doEnsureAvailable` probes candidates in order and must keep the
+	 * `venv/` fallback when a `.venv/` vulture exists but cannot run.
 	 */
 	private venvCandidates(
 		root: string,
 	): Array<{ cmd: string; prefix: string[] }> {
-		return findLocalBinsUpwards(["vulture"], root, {
+		return findLocalBinsAt(["vulture"], root, {
 			windowsExt: ".exe",
 			binDirs: VENV_BIN_DIRS,
 		}).map((full) => ({ cmd: full, prefix: [] }));

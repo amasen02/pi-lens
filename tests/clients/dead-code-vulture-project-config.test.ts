@@ -73,15 +73,18 @@ describe("PythonDeadCodeClient (vulture) — project-first resolution (#1731)", 
 	});
 
 	/**
-	 * #2544 review F1. `venvCandidates` joined its venv directories onto `root`
-	 * and nothing else — a third private spelling of the same four directories,
-	 * with a `process.platform` branch that hid the `Scripts` half from the
-	 * ubuntu lane entirely (defect shape 30). Folded onto the shared
-	 * ancestor walk, which is also where the #2514 HOME ceiling lives, so a
-	 * monorepo package resolves the repo-root venv's vulture instead of
-	 * falling through to whatever `vulture` answers on PATH.
+	 * #2544 round 4 F2 (reverted). `venvCandidates` joined its venv directories
+	 * onto `root` and nothing else — a third private spelling of the same four
+	 * directories, with a `process.platform` branch that hid the `Scripts`
+	 * half from the ubuntu lane entirely (defect shape 30, fixed and kept).
+	 * Round 3 ALSO folded the resolution onto the shared ancestor walker,
+	 * reasoning a monorepo package should find its repo-root venv — an
+	 * unrequested behaviour change with no #2514 defect behind it. Reverted:
+	 * a `.venv` at a repo root is invisible from a package subdirectory, and
+	 * resolution falls through to the bare `vulture`/`python -m vulture`
+	 * PATH candidates instead.
 	 */
-	it("probes a .venv vulture from an ANCESTOR of the analyzed root", async () => {
+	it("does not probe a .venv vulture from an ANCESTOR of the analyzed root (#2544 round 4 F2)", async () => {
 		const env = setupTestEnvironment("pi-lens-vulture-venv-ancestor-");
 		tmpDirs.push(env.tmpDir);
 		const isWin = process.platform === "win32";
@@ -103,9 +106,14 @@ describe("PythonDeadCodeClient (vulture) — project-first resolution (#1731)", 
 
 		expect(await client.ensureAvailable(pkg)).toBe(true);
 		const [cmd] = safeSpawnAsync.mock.calls[0] as [string, ...unknown[]];
-		expect(cmd).toBe(venvVulture);
+		expect(cmd).not.toBe(venvVulture);
+		expect(cmd).toBe("vulture");
 	});
 
+	// After #2544 round 4 F2's revert to a fixed `root`-only lookup, this
+	// holds for a simpler reason than a ceiling: `project` (root) and
+	// `fakeHome` are different directories, and `venvCandidates` never looks
+	// anywhere but `root` — the ceiling is moot for a lookup that never climbs.
 	it("never probes a .venv vulture planted at HOME (#2514)", async () => {
 		const env = setupTestEnvironment("pi-lens-vulture-venv-home-");
 		tmpDirs.push(env.tmpDir);

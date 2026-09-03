@@ -17,11 +17,14 @@ section: Fixed
   your home directory, including project-root and tool-config discovery. The
   ceiling now covers every project-local tool-bin lookup, not just the
   formatter one: Vite+'s `vp` for the oxlint runner, the ast-grep availability
-  sweep, Composer `vendor/bin` tools such as phpstan, and the Python venv
-  lookups behind ruff/sqlfluff/vulture — all of which previously climbed past
-  your home directory. Two of those also gained the same "check the project's
-  ancestors" behaviour the others already had, so in a monorepo a package now
-  finds the virtualenv at the repository root (ruff/sqlfluff/vulture) instead
-  of silently falling back to whatever tool is on your PATH; on Windows, a
-  virtualenv that somehow contains BOTH layouts now prefers the runnable
-  `Scripts\<tool>.exe` over `bin\<tool>` consistently everywhere.
+  sweep's project-local check, and Composer `vendor/bin` tools such as
+  phpstan — all of which previously climbed past your home directory. The
+  ast-grep availability sweep also checks pi-lens's OWN install directory
+  (deliberately NOT ceilinged there — a `pi install npm:pi-lens` install can
+  legitimately sit at your home directory itself), so pi-lens's bundled
+  `@ast-grep/cli` keeps resolving regardless of where pi-lens itself is
+  installed. On Windows, a virtualenv that somehow contains BOTH layouts
+  (ruff/sqlfluff) now prefers the runnable `Scripts\<tool>.exe` over
+  `bin\<tool>` consistently everywhere. The Python venv lookups behind
+  ruff/sqlfluff/vulture stay fixed lookups at the project directory, as
+  before — they do not check ancestor directories.

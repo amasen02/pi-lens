@@ -18,6 +18,7 @@ import {
 	resolveToolCommandWithInstallFallback,
 	resetDispatchAvailabilityState,
 	resolveVendorToolCommand,
+	_setThisDirForTests,
 } from "../../../../clients/dispatch/runners/utils/runner-helpers.js";
 import type { DispatchContext } from "../../../../clients/dispatch/types.js";
 import { findGlobalBinary } from "../../../../clients/package-manager.js";
@@ -47,6 +48,12 @@ const availabilityDecisions = () =>
 	logLatencySpy.mock.calls
 		.map((call) => call[0])
 		.filter((entry) => entry?.phase === "availability_decision");
+
+/** #2544 round 4 F4: F1's own-install-vs-project class, visible in latency.log. */
+const toolBinResolutions = () =>
+	logLatencySpy.mock.calls
+		.map((call) => call[0])
+		.filter((entry) => entry?.phase === "tool_bin_resolved");
 
 vi.mock("../../../../clients/safe-spawn.js", () => ({
 	safeSpawn: vi.fn(() => ({ stdout: "", stderr: "", status: 1 })),
@@ -585,6 +592,145 @@ describe("runner-helpers availability checker", () => {
 		}
 	});
 
+	/**
+	 * #2544 round 4 F1. The ceiling above stops the PROJECT walk (from
+	 * `process.cwd()`) at HOME — correctly. But `buildSgLocalBins` ALSO walks
+	 * from `_thisDir`, pi-lens's own install directory, to find its OWN
+	 * bundled `@ast-grep/cli` shim. `pi install npm:pi-lens` installs into the
+	 * HOME-level manifest (`~/package.json` -> `~/node_modules/pi-lens`), so
+	 * that shim can sit AT `~/node_modules/.bin/ast-grep` — exactly the
+	 * directory the ceiling exists to stop the PROJECT walk at. Applying the
+	 * same ceiling to the own-install walk made it return nothing for this
+	 * layout: PATH, `findGlobalBinary` and npx do not cover this location
+	 * either, so ast-grep silently went unavailable on a box installed this
+	 * way. `_setThisDirForTests` places the own-install walk's start directory
+	 * under a synthetic HOME (real `_thisDir` cannot be relocated without
+	 * writing into this process's actual shared `node_modules`).
+	 */
+	it("resolves pi-lens's OWN bundled ast-grep even when its install tree sits AT HOME (#2544 round 4 F1)", async () => {
+		const env = setupTestEnvironment("pi-lens-sg-own-install-home-");
+		const cwdEnv = setupTestEnvironment("pi-lens-sg-own-install-cwd-");
+		const originalHome = process.env.HOME;
+		const originalUserProfile = process.env.USERPROFILE;
+		const originalCwd = process.cwd();
+		try {
+			const fakeHome = env.tmpDir;
+			// `pi install npm:pi-lens`'s layout: the running file sits deep under
+			// the HOME-level node_modules install, e.g.
+			// ~/node_modules/pi-lens/dist/clients/dispatch/runners/utils/....js
+			const ownInstallThisDir = path.join(
+				fakeHome,
+				"node_modules",
+				"pi-lens",
+				"dist",
+				"clients",
+				"dispatch",
+				"runners",
+				"utils",
+			);
+			fs.mkdirSync(ownInstallThisDir, { recursive: true });
+			const homeBinDir = path.join(fakeHome, "node_modules", ".bin");
+			fs.mkdirSync(homeBinDir, { recursive: true });
+			const ext = process.platform === "win32" ? ".cmd" : "";
+			const homeShim = path.join(homeBinDir, `ast-grep${ext}`);
+			fs.writeFileSync(homeShim, "#!/bin/sh\nexit 0\n");
+
+			process.env.HOME = fakeHome;
+			process.env.USERPROFILE = fakeHome;
+			process.chdir(cwdEnv.tmpDir);
+			_setThisDirForTests(ownInstallThisDir);
+			resetDispatchAvailabilityState();
+			logLatencySpy.mockClear();
+
+			const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
+			vi.mocked(safeSpawnMod.safeSpawnAsync).mockReset();
+			vi.mocked(safeSpawnMod.safeSpawnAsync).mockImplementation(
+				async (cmd) => {
+					if (String(cmd) === homeShim) {
+						return { stdout: "ast-grep 0.1.0", stderr: "", status: 0 };
+					}
+					return { stdout: "", stderr: "missing", status: 1 };
+				},
+			);
+
+			expect(await isSgAvailableAsync()).toBe(true);
+			expect(getSgCommand().cmd).toBe(homeShim);
+
+			// #2544 round 4 F4: the own-install/project distinction F1 fixed is
+			// now visible in latency.log, not only inferable from a bin's
+			// absence.
+			const resolutions = toolBinResolutions();
+			expect(resolutions).toHaveLength(1);
+			expect(resolutions[0]?.metadata).toMatchObject({
+				tool: "ast-grep",
+				source: "own-install",
+				ceilingApplied: false,
+			});
+		} finally {
+			_setThisDirForTests(undefined);
+			process.chdir(originalCwd);
+			if (originalHome === undefined) delete process.env.HOME;
+			else process.env.HOME = originalHome;
+			if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+			else process.env.USERPROFILE = originalUserProfile;
+			resetDispatchAvailabilityState();
+			env.cleanup();
+			cwdEnv.cleanup();
+		}
+	});
+
+	/**
+	 * #2544 round 4 F4, the other half: a match from the PROJECT walk
+	 * (`process.cwd()`) logs `source: "project"` / `ceilingApplied: true`, so
+	 * the two branches of F1's fix are distinguishable in latency.log rather
+	 * than looking identical.
+	 */
+	it("logs source: project, ceilingApplied: true for a project-local ast-grep match (#2544 round 4 F4)", async () => {
+		const cwdEnv = setupTestEnvironment("pi-lens-sg-project-bin-");
+		const originalCwd = process.cwd();
+		try {
+			const projectBinDir = path.join(
+				cwdEnv.tmpDir,
+				"node_modules",
+				".bin",
+			);
+			fs.mkdirSync(projectBinDir, { recursive: true });
+			const ext = process.platform === "win32" ? ".cmd" : "";
+			const projectBin = path.join(projectBinDir, `ast-grep${ext}`);
+			fs.writeFileSync(projectBin, "#!/bin/sh\nexit 0\n");
+
+			process.chdir(cwdEnv.tmpDir);
+			resetDispatchAvailabilityState();
+			logLatencySpy.mockClear();
+
+			const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
+			vi.mocked(safeSpawnMod.safeSpawnAsync).mockReset();
+			vi.mocked(safeSpawnMod.safeSpawnAsync).mockImplementation(
+				async (cmd) => {
+					if (String(cmd) === projectBin) {
+						return { stdout: "ast-grep 0.1.0", stderr: "", status: 0 };
+					}
+					return { stdout: "", stderr: "missing", status: 1 };
+				},
+			);
+
+			expect(await isSgAvailableAsync()).toBe(true);
+			expect(getSgCommand().cmd).toBe(projectBin);
+
+			const resolutions = toolBinResolutions();
+			expect(resolutions).toHaveLength(1);
+			expect(resolutions[0]?.metadata).toMatchObject({
+				tool: "ast-grep",
+				source: "project",
+				ceilingApplied: true,
+			});
+		} finally {
+			process.chdir(originalCwd);
+			resetDispatchAvailabilityState();
+			cwdEnv.cleanup();
+		}
+	});
+
 	it("resets the shared ast-grep availability memo at session start", async () => {
 		const safeSpawnMod = await import("../../../../clients/safe-spawn.js");
 		const installerMod = await import("../../../../clients/installer/index.js");
@@ -1099,15 +1245,18 @@ describe("createVenvFinder: managed tools dir (#1638)", () => {
 	});
 
 	/**
-	 * #2544 review F1. `createVenvFinder` joined its four venv directories onto
-	 * `cwd` and nothing else, so the "project's own venv first" discipline its
-	 * own doc comment claims (#1731 discipline B) did not hold for a monorepo
-	 * package: the venv sits at the repo root, the dispatch cwd is the package,
-	 * and resolution fell straight through to whatever `python` happened to be
-	 * active in the CALLING shell. It now uses the shared ancestor walk, which
-	 * is where the HOME ceiling lives.
+	 * #2544 round 4 F2 (reverted). Round 3 folded `createVenvFinder` onto the
+	 * shared ANCESTOR walker, reasoning that a monorepo package should find its
+	 * repo-root venv the way project-root discovery would — but that was an
+	 * unrequested behaviour change with no #2514 defect behind it (#2514 is
+	 * about the HOME ceiling, not about climbing ancestors at all), and the
+	 * inversion is real: `~/code/app` with no venv of its own would resolve
+	 * `~/code/.venv/bin/ruff` — an unrelated SIBLING project's interpreter —
+	 * ahead of PATH. Reverted to a fixed lookup at `cwd` only: a venv at a
+	 * repo root is invisible from a package subdirectory, and the caller falls
+	 * through to the bare command name (PATH) instead.
 	 */
-	it("resolves a venv from an ANCESTOR of cwd (monorepo package)", async () => {
+	it("does not resolve a venv from an ANCESTOR of cwd (monorepo package, #2544 round 4 F2)", async () => {
 		const env = setupTestEnvironment("pi-lens-venv-ancestor-");
 		try {
 			const repoRoot = path.join(env.tmpDir, "repo");
@@ -1120,12 +1269,16 @@ describe("createVenvFinder: managed tools dir (#1638)", () => {
 			fs.mkdirSync(path.dirname(venvBin), { recursive: true });
 			fs.writeFileSync(venvBin, "#!/bin/sh\nexit 0\n");
 
-			expect(await createVenvFinder("ruff", ".exe")(pkg)).toBe(venvBin);
+			expect(await createVenvFinder("ruff", ".exe")(pkg)).toBe("ruff");
 		} finally {
 			env.cleanup();
 		}
 	});
 
+	// After #2544 round 4 F2's revert to a fixed `cwd`-only lookup, this holds
+	// for a simpler reason than a ceiling: `project` (cwd) and `fakeHome` are
+	// different directories, and `findLocalBinsAt` never looks anywhere but
+	// `cwd` — the ceiling is moot for a lookup that never climbs.
 	it("does not resolve a venv planted at HOME (#2514)", async () => {
 		const env = setupTestEnvironment("pi-lens-venv-home-ceiling-");
 		const originalHome = process.env.HOME;
