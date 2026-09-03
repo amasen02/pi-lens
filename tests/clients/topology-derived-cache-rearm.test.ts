@@ -121,6 +121,23 @@ describe("topology-derived cache re-arm (#2263)", () => {
 			fs.writeFileSync(path.join(env.tmpDir, "index.ts"), "export {}\n");
 			const sourceDir = path.join(env.tmpDir, "src");
 			fs.mkdirSync(sourceDir);
+			// #2495: `homeDir` is a SUBDIRECTORY of `env.tmpDir` (never created on
+			// disk), not a real ancestor — this only pins the ceiling check, it
+			// does not confine the walk. `findNearestProjectRoot` is contractually
+			// unbounded (startup-scan.ts's own docstring: a marker at/above $HOME
+			// must still be *returned*, with rejection applied by the caller — see
+			// tests/clients/startup-scan-home-ceiling.test.ts's "above-home cwd"
+			// cases for the same shape), so on a box with a real marker anywhere
+			// above `env.tmpDir` (here: `C:\Users\R3LiC\package.json`, the
+			// manifest for the user's pi extensions) the walk finds THAT marker
+			// and `projectRoot` comes back as that real path, not null — the
+			// ceiling only forces `canWarmCaches: false`, it never nulls
+			// `projectRoot` for a found-but-rejected root. Asserting the
+			// warm-cache verdict (what quick mode actually branches on, per the
+			// "quick mode active - skipping" dbg check below) instead of the
+			// found root's exact identity is deterministic on every host: since
+			// `homeDir` is nested inside `env.tmpDir`, ANY root the walk can find
+			// starting from `env.tmpDir` is necessarily at-or-above `homeDir`.
 			const homeDir = path.join(env.tmpDir, "home");
 			const firstLanguage = languageProfile.detectProjectLanguageProfile(
 				env.tmpDir,
@@ -129,7 +146,7 @@ describe("topology-derived cache re-arm (#2263)", () => {
 				homeDir,
 			});
 			expect(firstLanguage.configured.jsts).toBeUndefined();
-			expect(firstScan.projectRoot).toBeNull();
+			expect(firstScan.canWarmCaches).toBe(false);
 			const tsconfig = path.join(env.tmpDir, "tsconfig.json");
 			fs.writeFileSync(
 				tsconfig,
@@ -225,9 +242,16 @@ describe("topology-derived cache re-arm (#2263)", () => {
 	it("re-derives startup scan context after topology reset", () => {
 		const env = setupTestEnvironment("pi-lens-topology-startup-");
 		try {
+			// #2495: see the sibling test above — `homeDir` only pins the ceiling
+			// check (nested inside `env.tmpDir`, so any found root is necessarily
+			// at-or-above it); it does not confine the unbounded upward walk, so
+			// `projectRoot` itself can legitimately come back as a real marker
+			// found above `env.tmpDir` on this host. Assert the warm-cache verdict
+			// instead, which is deterministic regardless of what the host's real
+			// ancestor tree contains.
 			const homeDir = path.join(env.tmpDir, "home");
 			const before = resolveStartupScanContext(env.tmpDir, { homeDir });
-			expect(before.projectRoot).toBeNull();
+			expect(before.canWarmCaches).toBe(false);
 
 			fs.mkdirSync(path.join(env.tmpDir, ".git"));
 			resetWorkspaceTopology();

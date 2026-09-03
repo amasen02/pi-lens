@@ -2594,5 +2594,14 @@ describe("turn_end test runner — cascade neighbors get their own test companio
 			}
 			env.cleanup();
 		}
-	});
+		// #2512: spawns a REAL child process (process.execPath -e ...) through
+		// the real TestRunnerClient — same #1022/#2332 contention class as the
+		// LSP-spawn-heavy lane siblings. Seen timing out at vitest's 5000ms
+		// default under a 47-file parallel batch (5153/5013ms), green solo every
+		// time (7.67s) and on CI alone (405ms) — scheduler contention, not code
+		// speed. An explicit spawn-sized timeout here is belt-and-braces; the
+		// real cure is phasing the whole file into the "wall-clock-budget"
+		// project below (vitest.config.ts), which removes the contention
+		// entirely instead of just outrunning it.
+	}, 20_000);
 });
