@@ -84,8 +84,8 @@ readable live: `GET https://api.anthropic.com/api/oauth/usage` with the OAuth
 token from `~/.claude/.credentials.json` (`anthropic-beta: oauth-2025-04-20`)
 returns `five_hour.utilization` / `seven_day.utilization` and reset times; the
 `~/.claude/hooks/quota-gate.mjs` PreToolUse hook on `Agent` reads them and
-blocks dispatch above the thresholds (`~/.claude/quota.json` is the fallback
-and the `override: true` switch). Read the meters at session start and before
+blocks dispatch above the thresholds (no hand-written fallback;
+`QUOTA_GATE_OVERRIDE=1` lifts it when the maintainer says so). Read the meters at session start and before
 every refill; state them in the lane ledger. Standing rule from
 2026-09-03, lifted only when the maintainer says so.
 
