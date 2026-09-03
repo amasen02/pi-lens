@@ -12,11 +12,10 @@
 import { logExtension } from "./extension-log.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 import { BoundedLruCache } from "./bounded-cache.js";
 import { createGenerationSource } from "./generation-guard.js";
-import { isAtOrAboveHomeDir, normalizeMapKey } from "./path-utils.js";
+import { normalizeMapKey } from "./path-utils.js";
 import { resolveCargoPackageEdition } from "./cargo-manifest.js";
 import { resolveKtfmtGradleStyle } from "./gradle-ktfmt-style.js";
 import { resolvePhpCsFixerConfig } from "./php-cs-fixer-config.js";
@@ -598,53 +597,49 @@ async function resolveGoFmtBinary(): Promise<string | null> {
 // --- Venv / Local Binary Helpers ---
 
 /**
+ * Project-relative bin directories, most-preferred first, for each of the three
+ * ecosystems this module resolves tools from. Passed to `findLocalBinUpwards`,
+ * which owns the walk itself.
+ *
+ * #2514/#2544 F2: these WERE three private copies of one ancestor-walk loop
+ * that had already drifted apart — only `findLocalBinUpwards` resolved a
+ * relative `startDir`, and #2514's HOME ceiling had to be applied to each copy
+ * by hand. There is now exactly ONE walker; these constants are the only thing
+ * that differs between the callers.
+ */
+const VENV_BIN_DIRS: readonly string[] =
+	process.platform === "win32"
+		? [path.join(".venv", "Scripts"), path.join("venv", "Scripts")]
+		: [path.join(".venv", "bin"), path.join("venv", "bin")];
+const VENDOR_BIN_DIRS: readonly string[] = [path.join("vendor", "bin")];
+
+/**
  * Walk up from cwd looking for a binary in .venv or venv.
  * Returns the absolute path if found, null otherwise.
  *
  * Tool-resolution walker, not a config lookup (#2514/#2517 policy): escaping
  * the project upward past HOME means STOP, not keep reading — a `.venv`/`venv`
- * bin found at or above HOME can never be THIS project's own virtualenv.
- * `homeDir` is injectable (default `os.homedir()`) so tests can pin a fake
- * HOME instead of touching the real one, the same shape
- * `resolveKtfmtGradleStyle`/`resolveCargoPackageEdition` already use.
+ * bin found at or above HOME can never be THIS project's own virtualenv. The
+ * ceiling lives in `findLocalBinUpwards`; `homeDir` is injectable (default
+ * `os.homedir()`) so tests can pin a fake HOME instead of touching the real
+ * one.
+ *
+ * On Windows the candidate order is EXT-OUTER, DIR-INNER — `.venv/Scripts/x.exe`,
+ * `venv/Scripts/x.exe`, then the bare names — which is what the pre-fold copy
+ * did and what `findLocalBinUpwards` preserves.
  */
 async function findInVenv(
 	binary: string,
 	cwd: string,
-	homeDir: string = os.homedir(),
-): Promise<string | null> {
-	const isWin = process.platform === "win32";
-	const candidates = isWin
-		? [
-				`.venv/Scripts/${binary}.exe`,
-				`venv/Scripts/${binary}.exe`,
-				`.venv/Scripts/${binary}`,
-				`venv/Scripts/${binary}`,
-			]
-		: [`.venv/bin/${binary}`, `venv/bin/${binary}`];
-
-	let dir = cwd;
-	const root = path.parse(dir).root;
-	while (dir !== root) {
-		if (isAtOrAboveHomeDir(dir, homeDir)) return null;
-		for (const candidate of candidates) {
-			const full = path.join(dir, candidate);
-			if (await fileExists(full)) return full;
-		}
-		const parent = path.dirname(dir);
-		if (parent === dir) break;
-		dir = parent;
-	}
-	return null;
-}
-
-/** Test-only access to the real `.venv`/`venv` walker. */
-export function _findInVenvForTests(
-	binary: string,
-	cwd: string,
 	homeDir?: string,
 ): Promise<string | null> {
-	return findInVenv(binary, cwd, homeDir);
+	return (
+		findLocalBinUpwards(binary, cwd, {
+			windowsExt: ".exe",
+			homeDir,
+			binDirs: VENV_BIN_DIRS,
+		}) ?? null
+	);
 }
 
 /**
@@ -654,38 +649,21 @@ export function _findInVenvForTests(
  * Tool-resolution walker, not a config lookup (#2514/#2517 policy): escaping
  * the project upward past HOME means STOP, not keep reading — a `vendor/bin`
  * match found at or above HOME can never be THIS project's own Composer
- * install. `homeDir` is injectable (default `os.homedir()`) for the same
- * reason `findInVenv` above takes one.
+ * install. Same single walker as `findInVenv` above; only `binDirs` and the
+ * Windows extension differ.
  */
 async function findInVendorBin(
 	binary: string,
 	cwd: string,
-	homeDir: string = os.homedir(),
-): Promise<string | null> {
-	const isWin = process.platform === "win32";
-	const names = isWin ? [`${binary}.bat`, binary] : [binary];
-	let dir = cwd;
-	const root = path.parse(dir).root;
-	while (dir !== root) {
-		if (isAtOrAboveHomeDir(dir, homeDir)) return null;
-		for (const name of names) {
-			const full = path.join(dir, "vendor", "bin", name);
-			if (await fileExists(full)) return full;
-		}
-		const parent = path.dirname(dir);
-		if (parent === dir) break;
-		dir = parent;
-	}
-	return null;
-}
-
-/** Test-only access to the real `vendor/bin` walker. */
-export function _findInVendorBinForTests(
-	binary: string,
-	cwd: string,
 	homeDir?: string,
 ): Promise<string | null> {
-	return findInVendorBin(binary, cwd, homeDir);
+	return (
+		findLocalBinUpwards(binary, cwd, {
+			windowsExt: ".bat",
+			homeDir,
+			binDirs: VENDOR_BIN_DIRS,
+		}) ?? null
+	);
 }
 
 /**
@@ -709,7 +687,7 @@ async function findInNodeModules(
 	cwd: string,
 	homeDir?: string,
 ): Promise<string | null> {
-	return findLocalBinUpwards(binary, cwd, undefined, homeDir) ?? null;
+	return findLocalBinUpwards(binary, cwd, { homeDir }) ?? null;
 }
 
 /**

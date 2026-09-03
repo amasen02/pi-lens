@@ -522,20 +522,51 @@ export async function findGlobalBinary(
 	return undefined;
 }
 
+/** Tuning for {@link findLocalBinUpwards}. */
+export interface LocalBinWalkOptions {
+	/** Extension tried BEFORE the bare name on Windows. Default `.cmd`. */
+	readonly windowsExt?: string;
+	/** HOME ceiling; injectable so tests never touch the real home. */
+	readonly homeDir?: string;
+	/**
+	 * Project-relative directories that hold the bin, most-preferred first.
+	 * Default `["node_modules/.bin"]`. `vendor/bin` (Composer) and
+	 * `.venv/bin`+`venv/bin` (Python) are the other three shapes in the repo.
+	 */
+	readonly binDirs?: readonly string[];
+}
+
 /**
- * Local `node_modules/.bin/<tool>` walking up from `startDir` to the fs root.
+ * THE project-local tool-bin walker: looks for `<binDir>/<tool>` in `startDir`
+ * and each ancestor, stopping at the HOME ceiling (never the fs root — see
+ * below).
  *
  * Exported so callers that must NOT pay for global-bin discovery can reuse this
  * walk instead of copying it. `findNodeToolBinary` below adds `findGlobalBinary`,
  * which spawns a probe per package manager; a caller resolving a command on
  * every run (knip, #1721) needs the filesystem half only.
+ *
+ * `binDirs` makes this the ONLY such walker in the repo: `formatters.ts`'s
+ * `findInNodeModules`, `findInVendorBin` and `findInVenv` were four copies of
+ * this loop that drifted apart (only one resolved a relative `startDir`, and
+ * #2514 had to fix the HOME ceiling in each separately). They now all delegate
+ * here, so the ceiling, the candidate ordering and the `path.resolve` of
+ * `startDir` have exactly one implementation (#2544 review F2).
+ *
+ * Candidate order is EXT-OUTER, DIR-INNER: on Windows every `binDir` is tried
+ * with `windowsExt` before any is tried with the bare name, matching what the
+ * `.venv/Scripts` walker did before the fold.
  */
 export function findLocalBinUpwards(
 	tool: string,
 	startDir: string,
-	windowsExt = ".cmd",
-	homeDir: string = os.homedir(),
+	options: LocalBinWalkOptions = {},
 ): string | undefined {
+	const {
+		windowsExt = ".cmd",
+		homeDir = os.homedir(),
+		binDirs = [path.join("node_modules", ".bin")],
+	} = options;
 	const names = onWindows() ? [`${tool}${windowsExt}`, tool] : [tool];
 	let dir = path.resolve(startDir);
 	const root = path.parse(dir).root;
@@ -552,8 +583,10 @@ export function findLocalBinUpwards(
 		// bin from outside the project tree.
 		if (isAtOrAboveHomeDir(dir, homeDir)) return undefined;
 		for (const name of names) {
-			const full = path.join(dir, "node_modules", ".bin", name);
-			if (fs.existsSync(full)) return full;
+			for (const binDir of binDirs) {
+				const full = path.join(dir, binDir, name);
+				if (fs.existsSync(full)) return full;
+			}
 		}
 		if (dir === root) break;
 		const parent = path.dirname(dir);
@@ -581,7 +614,7 @@ export async function findNodeToolBinary(
 	homeDir?: string,
 ): Promise<string | undefined> {
 	return (
-		findLocalBinUpwards(tool, cwd, windowsExt, homeDir) ??
+		findLocalBinUpwards(tool, cwd, { windowsExt, homeDir }) ??
 		(await findGlobalBinary(tool, windowsExt))
 	);
 }

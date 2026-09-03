@@ -624,6 +624,51 @@ describe("isAtOrAboveHomeDir (#253)", () => {
 			false,
 		);
 	});
+
+	it("does not treat a directory whose name merely PREFIXES home as at-or-above it", () => {
+		// `…/user2` → `path.relative` gives `../user`; a bare "is home a prefix of
+		// dir" test would call this the home directory itself.
+		expect(isAtOrAboveHomeDir(`${home}2`, home)).toBe(false);
+		expect(isAtOrAboveHomeDir(path.join(`${home}2`, "proj"), home)).toBe(false);
+	});
+
+	/**
+	 * #2544 review F1. `isAtOrAboveHomeDir` used to short-circuit on
+	 * `path.resolve(dir) === path.resolve(homeDir)`, a case-SENSITIVE string
+	 * compare, and then require `rel !== ""`. On win32 the two clauses
+	 * disagreed: `c:\Users\jane` (the lowercase-drive form VS Code URIs produce,
+	 * and the form 46 records of a real `latency.log` carry) failed the equality
+	 * test, `path.relative` folded the case to `""`, and `rel !== ""` rejected
+	 * it — so the helper answered "not at home" FOR THE HOME DIRECTORY, and
+	 * every ceilinged walker (#250/#253: findNearestMarkerRoot,
+	 * findLocalToolConfig, workspace-topology, startup-scan, project-lens-config,
+	 * and #2514's bin walkers) climbed straight past HOME.
+	 *
+	 * No skip: the assertion is two-sided, because BOTH platform behaviours are
+	 * load-bearing. win32 must fold (or the ceiling is bypassed); POSIX must NOT
+	 * fold (or a legitimately distinct `~/Code` vs `~/code` gets over-blocked).
+	 */
+	it("re-spelled home: folds drive-letter case on win32, stays case-sensitive on POSIX", () => {
+		// On win32 the re-spelling also flips the separator form, per the
+		// read-guard path-key rule (record one form, check the other); POSIX has
+		// only one separator form, so there is nothing to flip there.
+		const respelled =
+			process.platform === "win32"
+				? home
+						.replace(/^([A-Za-z]):/, (_m, d: string) => `${d.toLowerCase()}:`)
+						.split(path.sep)
+						.join("/")
+				: path.join(path.dirname(home), path.basename(home).toUpperCase());
+		expect(respelled).not.toBe(home);
+
+		expect(isAtOrAboveHomeDir(respelled, home)).toBe(
+			process.platform === "win32",
+		);
+		// …and symmetrically, with the re-spelled form as the HOME argument.
+		expect(isAtOrAboveHomeDir(home, respelled)).toBe(
+			process.platform === "win32",
+		);
+	});
 });
 
 describe("isExternalOrVendorFile", () => {

@@ -484,19 +484,32 @@ export function findNearestMarkerRoot(
  * `=== os.homedir()` check (which a marker found *above* `$HOME` slips past).
  * A normal project *under* home (e.g. `~/code/app`) is NOT at-or-above home,
  * so it still resolves fine. Refs #253.
+ *
+ * ONE expression, deliberately: `path.relative` alone answers "is home inside
+ * `dir`, or the same directory as `dir`", and it answers with the PLATFORM's
+ * path-equality semantics — case-folding on win32, case-sensitive on POSIX.
+ * The `resolvedDir === resolvedHome` shortcut that used to precede it was
+ * case-SENSITIVE on every platform, so `c:\Users\jane` (the lowercase-drive
+ * form VS Code URIs produce, and the form 46 records in a real `latency.log`
+ * carry) missed the equality test AND was then rejected by a `rel !== ""`
+ * clause — reporting "not at home" for the home directory itself and letting
+ * every ceilinged walker climb straight past HOME (#2544 review F1).
+ *
+ *   rel === ""                       ⇢ `dir` IS home
+ *   rel relative, no leading `..`    ⇢ home is INSIDE `dir` (an ancestor)
+ *   rel starts with `..`             ⇢ home is elsewhere — sibling, or the
+ *                                      prefix trap `C:\Users\jane2` → home
+ *                                      `C:\Users\jane` gives `..\jane`
+ *   rel absolute                     ⇢ different Windows drive
+ *
+ * Same shape as `isUnderDir` above; keep the two in step.
  */
 export function isAtOrAboveHomeDir(
 	dir: string,
 	homeDir: string = os.homedir(),
 ): boolean {
-	const resolvedDir = path.resolve(dir);
-	const resolvedHome = path.resolve(homeDir);
-	if (resolvedDir === resolvedHome) return true;
-	// `dir` is an ancestor of home ⇢ home lies inside dir ⇢ the relative path
-	// from dir to home has no leading `..` and is not absolute (cross-drive on
-	// Windows yields an absolute rel, correctly treated as "not above").
-	const rel = path.relative(resolvedDir, resolvedHome);
-	return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+	const rel = path.relative(path.resolve(dir), path.resolve(homeDir));
+	return !rel.startsWith("..") && !path.isAbsolute(rel);
 }
 
 /**
