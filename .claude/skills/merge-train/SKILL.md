@@ -75,6 +75,16 @@ merges first (the consumer then rebases and wires the new surface). Two PRs
 editing the same file get an explicit order decided up front. Log-schema
 changes must extend exact-key pins (`BASELINE_KEYS`-style), never loosen them.
 
+## Quota gate (orchestrator)
+
+Before ANY new dispatch (not a fix round on an open PR): know the account's
+5h and weekly usage. Above 75% of the 5h window or 85% of the weekly window,
+no new work — finish in-flight lanes and merge on green. The numbers come
+from the maintainer's `/usage`; write them to `~/.claude/quota.json` so the
+`quota-gate.mjs` PreToolUse hook enforces the rule mechanically, and ask for a
+fresh reading when the file is older than the 5h window. Standing rule from
+2026-09-03, lifted only when the maintainer says so.
+
 ## Brief contract (orchestrator)
 
 Before dispatching any issue that adds a shared helper or seam: grep for
