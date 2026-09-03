@@ -313,22 +313,44 @@ describe("#2521 displayProjectDataPath", () => {
 	it("is separator-agnostic on its input (cross-form, #210 shape)", () => {
 		const cwd = makeProject("crossform", true);
 		try {
-			const backslashed = cwd.replace(/\//g, "\\");
-			const forwardSlashed = cwd.replace(/\\/g, "/");
-			const a = displayProjectDataPath(
-				backslashed,
+			// A backslash is a LEGAL POSIX filename character, so mechanically
+			// swapping `/` for `\` only produces a genuine alternate-separator
+			// form of `cwd` on win32. On POSIX it turns `cwd` into an unrelated,
+			// nonexistent single-segment relative name, which makes
+			// `getProjectDataDir` fall through to the global arm -- a false
+			// finding, not the #210 shape this test targets (AGENTS.md: tests
+			// must be OS-agnostic, but a Windows-only divergence gets a guarded
+			// or platform-appropriate variant, never a silently vacuous one).
+			if (process.platform === "win32") {
+				const backslashed = cwd.replace(/\//g, "\\");
+				const forwardSlashed = cwd.replace(/\\/g, "/");
+				const a = displayProjectDataPath(
+					backslashed,
+					"cache",
+					"actionable-warnings.json",
+				);
+				const b = displayProjectDataPath(
+					forwardSlashed,
+					"cache",
+					"actionable-warnings.json",
+				);
+				expect(a).toBe(b);
+				expect(a).toBe(".pi-lens/cache/actionable-warnings.json");
+			}
+			// Display and write must agree on any platform, native separator
+			// form: `displayProjectDataPath` composes through
+			// `getProjectDataDir`, so the two can never name different files.
+			const shown = displayProjectDataPath(
+				cwd,
 				"cache",
 				"actionable-warnings.json",
 			);
-			const b = displayProjectDataPath(
-				forwardSlashed,
-				"cache",
-				"actionable-warnings.json",
+			expect(shown).toBe(".pi-lens/cache/actionable-warnings.json");
+			expect(path.resolve(cwd, shown)).toBe(
+				path.join(getProjectDataDir(cwd), "cache", "actionable-warnings.json"),
 			);
-			expect(a).toBe(b);
-			expect(a).toBe(".pi-lens/cache/actionable-warnings.json");
 			// Never a backslash in agent-facing output, on any platform.
-			expect(a).not.toContain("\\");
+			expect(shown).not.toContain("\\");
 		} finally {
 			removeTempDirSync(cwd);
 		}
@@ -371,6 +393,10 @@ describe("#2521 displayProjectDataPath", () => {
 			expect(path.isAbsolute(shown) || shown.startsWith("~/")).toBe(true);
 			expect(shown.startsWith("../")).toBe(false);
 			expect(shown.endsWith("/cache/x.json")).toBe(true);
+			// Pins the posix-ify-before-fold order (clients/file-utils.ts): the
+			// absolute path is forward-slashed BEFORE homeRelativePath runs, so an
+			// out-of-home store never renders with backslashes on any platform.
+			expect(shown).not.toContain("\\");
 		} finally {
 			removeTempDirSync(cwd);
 			removeTempDirSync(dataDir);

@@ -27,6 +27,10 @@
  * `.pi-lens/`. A path assembled at runtime from pieces (`".pi-lens" + "/cache"`)
  * is invisible here, as is a wrong path that never spells `.pi-lens` at all.
  * This closes the shape that actually recurred, not every conceivable one.
+ * Clearance is also per FILE, not per line: once a file is in `EXEMPT` (e.g.
+ * `clients/config-locations.ts`), a new offending literal planted anywhere in
+ * that same file passes silently, since the sweep only asks "is this file
+ * cleared", never "is this specific literal the one the reason describes".
  */
 
 import * as fs from "node:fs";

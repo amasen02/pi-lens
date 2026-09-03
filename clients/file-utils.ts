@@ -25,6 +25,7 @@ import {
 	isUnderDir,
 	normalizeEphemeralMapKey,
 	normalizeFilePath,
+	toProjectRelativePath,
 } from "./path-utils.js";
 import {
 	findPiLensConfigInDir,
@@ -94,31 +95,37 @@ export function getProjectDataDir(cwd: string): string {
  * Pure string work on top of `getProjectDataDir`'s own resolution: it never
  * stats the target, so it is safe to call for a file that has not been written
  * yet and cannot throw on a surface whose whole job is to render a hint.
+ *
+ * The relative-or-absolute decision reuses `toProjectRelativePath`
+ * (`clients/path-utils.ts`) — the same shape-aware, non-stat'ing primitive
+ * `toRunnerDisplayPath` (`clients/dispatch/runner-context.ts`) composes for
+ * the analogous "relative path if under this root, else something else"
+ * decision — rather than a second hand-rolled `path.relative` fold. It is NOT
+ * `toRunnerDisplayPath` itself: that helper routes its result through
+ * `normalizeMapKey`, which on win32 calls `realpathSync.native()` (or, for a
+ * not-yet-existing path, lowercases the unresolved tail) — exactly the
+ * stat-and-mutate-casing behavior this function's contract above rules out.
  */
 export function displayProjectDataPath(
 	cwd: string,
 	...segments: string[]
 ): string {
 	const absolute = path.resolve(getProjectDataDir(cwd), ...segments);
-	const relative = path
-		.relative(path.resolve(cwd), absolute)
-		.replace(/\\/g, "/");
-	if (
-		relative &&
-		relative !== "." &&
-		relative !== ".." &&
-		!relative.startsWith("../") &&
-		// A different Windows drive makes `path.relative` return an ABSOLUTE
-		// path; that is the "anywhere else" case, not a relative display path.
-		!path.isAbsolute(relative)
-	) {
+	const absolutePosix = absolute.replace(/\\/g, "/");
+	const relative = toProjectRelativePath(absolute, cwd);
+	if (relative !== absolutePosix) {
 		return relative;
 	}
-	// Posix-ify BEFORE the `~` fold: `homeRelativePath` deliberately returns a
-	// path that is not under `$HOME` unchanged, separators included, so a
-	// `PILENS_DATA_DIR=D:\lens-data` store would otherwise render with
-	// backslashes while the legacy arm above renders with forward ones.
-	return homeRelativePath(absolute.replace(/\\/g, "/"));
+	// `toProjectRelativePath` fell back to the (posix-ified) absolute path —
+	// `absolute` is not under `cwd`. Fold `~` so the default
+	// `~/.pi-lens/projects/...` store does not leak the account name into
+	// agent context (#2440 F5). Posix-ify BEFORE the fold: `homeRelativePath`
+	// deliberately returns a path that is not under `$HOME` unchanged,
+	// separators included, so a `PILENS_DATA_DIR=D:\lens-data` store would
+	// otherwise render with backslashes while the legacy arm above renders
+	// with forward ones — `absolutePosix` is already folded, so this is a
+	// no-op fold, not a second one.
+	return homeRelativePath(absolutePosix);
 }
 
 /**
