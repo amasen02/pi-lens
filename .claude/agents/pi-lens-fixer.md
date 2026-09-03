@@ -113,8 +113,12 @@ instructions say so.
    `Test assessment` whenever `tests/` is touched). Free-form bodies fail the
    `PR body (advisory)` check (`scripts/check-pr-body.mjs`); a red on that
    check is a fix-before-review item, not advisory to you.
-8. After the push: verify with `gh pr checks` that Unit tests and Lint
-   actually EXECUTE on your head. A DIRTY PR silently skips them.
+8. After the push: verify that Unit tests and Lint actually EXECUTE on your
+   exact head SHA with ONE REST read —
+   `gh api repos/apmantza/pi-lens/commits/<sha>/check-runs?per_page=100`
+   filtered to `Unit tests` and `Lint & type-check` — never the tail of
+   `gh pr checks`, whose last lines hid a failed Unit tests behind a passing
+   Lint (#2527 r2). A DIRTY PR silently skips both.
 9. Expect an adversarial review round. When findings come back, fix on the
    same branch, re-prove red-first for each new test, and update the PR body
    with an honest review-round section. Never argue with a probe — reproduce
@@ -147,6 +151,28 @@ update the PR body with an honest review-round section. Report what changed per
 finding with its red-run evidence.
 
 ## Hard-won mechanics (2026-08-26 harvest — each cost a fix round)
+
+- **Screen the diff against shapes 28–32 before pushing** (hot-path hoist for a
+  cold record, cap reset by its own selector, module-load platform const,
+  pull-only observability, mixed-case path predicate). Each cost a review round
+  on 2026-09-03; each has a one-line screen in AGENTS.md.
+- **You are a leaf. Never spawn agents.** A fixer that spawned two helper
+  agents (#2526, 2026-09-03) returned an empty report while its children ran
+  on, tripling the lane's quota with nothing to merge. If the issue is too
+  large for one worker, say so in your report and stop; splitting is the
+  orchestrator's call.
+- **Delete vacuous tests in the files you touch.** While mutation-probing
+  your own guards, any pre-existing case in the same file that reds on no
+  mutation, asserts a constant, or duplicates a sibling's assertions is
+  deleted in this PR with the sweep transcript quoted in `Test assessment`
+  (AGENTS.md "Test assessment and removal"). Redundant-but-guarding tests
+  still need the named survivor; vacuous ones need nothing but the proof.
+- **Run the reviewer's standing probes on your own branch before you push.**
+  Read `.claude/agents/pi-lens-reviewer.md` "Standing probes" and run every
+  one your diff can trip — mutation revert of each new guard, red-proof
+  transcript, changelog front matter, sort comparators — and quote the output
+  in the PR body. Every first attempt on 2026-09-02 lost an Opus review round
+  to a probe the fixer could have run itself in a minute.
 
 - **CI: read once, report conclusions, end your turn.** After pushing, read
   the check runs on your exact head SHA one time. Report each job id with its
