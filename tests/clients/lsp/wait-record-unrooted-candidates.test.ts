@@ -136,9 +136,13 @@ describe("getClientForFile wait records — unrooted candidates (#2525)", () => 
 		const metadata = timeoutCalls[0][0].metadata as {
 			serverIds: string[];
 			unrootedCandidates: { count: number; ids: string[] };
+			partition?: string;
 		};
 		expect(metadata.serverIds).toEqual(["typescript"]);
 		expect(metadata.unrootedCandidates).toEqual({ count: 1, ids: ["deno"] });
+		// The partition resolved well within its own budget — `partition` must
+		// be absent here, not unconditionally stamped "timed-out" (round 3, L2).
+		expect(metadata.partition).toBeUndefined();
 	});
 
 	it("names both candidates when deno.json makes deno a real rooted fallback", async () => {
@@ -382,6 +386,7 @@ describe("getClientForFile wait records — unrooted candidates (#2525)", () => 
 				ids: string[];
 				reasons?: Record<string, string>;
 			};
+			partition?: string;
 		};
 		expect(metadata.serverIds).toEqual(["typescript"]);
 		expect(metadata.unrootedCandidates.count).toBe(1);
@@ -389,6 +394,10 @@ describe("getClientForFile wait records — unrooted candidates (#2525)", () => 
 		expect(metadata.unrootedCandidates.reasons?.deno).toContain(
 			"deno root probe",
 		);
+		// The rejection degrades gracefully within the L2 partition budget — it
+		// is not the timed-out-and-gave-up-on-everything case, so `partition`
+		// must be absent, not stamped "timed-out".
+		expect(metadata.partition).toBeUndefined();
 	});
 
 	it("bounds partitionCandidates's own root walk so the timeout record still emits when a candidate's root() never resolves (round 3, L2)", async () => {
