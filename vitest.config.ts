@@ -308,6 +308,8 @@ const lspSpawnHeavyInclude = [
 // host. Sweep coverage for other members lives in this list; new entries must
 // carry a wall-clock budget assertion, not just slowness.
 const wallClockBudgetInclude = [
+	// published-manifest guard runs the real `npm pack` (flake-shape admission).
+	"tests/packaging-pack-manifest.test.ts",
 	// #2528: the bounded batch helper tests race a real wall-clock budget against settle latency (flake-shape admission).
 	"tests/clients/runtime-turn-test-runner-bounds.test.ts",
 	// #2557 review round 3: a real 30s deadline margin is the subject of an abort-vs-deadline precedence assertion (flake-shape admission).
