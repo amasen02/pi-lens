@@ -186,7 +186,9 @@ describe("#2524: resource-sampler scanner escalation is attributed to its own pr
 		await vi.advanceTimersByTimeAsync(RESOURCE_SAMPLE_QUERY_TIMEOUT_MS + 1_000);
 		// The inter-read window elapses, firing the second read, whose
 		// descendant-pid query also times out.
-		await vi.advanceTimersByTimeAsync(50 + RESOURCE_SAMPLE_QUERY_TIMEOUT_MS + 1_000);
+		await vi.advanceTimersByTimeAsync(
+			50 + RESOURCE_SAMPLE_QUERY_TIMEOUT_MS + 1_000,
+		);
 		const result = await resultPromise;
 
 		// Both queries were unresolvable, so the tree-CPU read itself is unmeasured.

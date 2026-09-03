@@ -165,9 +165,7 @@ describe("#2527 review F2: sweepOrphans' own scanner queries escalate through te
 		// Dead parent, dead child, no marker: queryCommandLines(candidatePids)
 		// still runs (it is unconditional, ahead of the dead/alive decision) and
 		// is this test's only scanner query.
-		h.state.registry = [
-			deadParentInstanceWithChild({ pid: 100 }),
-		];
+		h.state.registry = [deadParentInstanceWithChild({ pid: 100 })];
 		h.state.hangOnScannerIndex = 1; // the queryCommandLines spawn
 
 		const sweep = sweepOrphans();
