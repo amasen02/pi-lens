@@ -66,6 +66,7 @@
 
 import {
 	type DenyContribution,
+	denyMemberProvenance,
 	denyProvenance,
 	resolveArrayDeny,
 	resolveBooleanDeny,
@@ -312,6 +313,18 @@ function mergeDeny(
 			: resolveArrayDeny(denyContributions);
 	const entry = denyProvenance(denyContributions, resolution, key);
 	if (entry) context.provenance.set(key, entry);
+	// Plus one entry per surviving MEMBER of a union (#2427 review round 2,
+	// F2). The array's own entry answers "which tier denied first"; a caller
+	// asking about one member — "why is THIS server off" — needs the tier that
+	// contributed that member, and reading the array entry for it reported the
+	// wrong tier for every member after the first.
+	for (const member of denyMemberProvenance(
+		denyContributions,
+		resolution,
+		key,
+	)) {
+		context.provenance.set(member.key, member);
+	}
 	return resolution.value;
 }
 

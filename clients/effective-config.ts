@@ -215,10 +215,16 @@ function provenanceOfSubtree(
 /**
  * The provenance entry governing a pointer, projected and home-relative.
  *
- * Goes through `provenanceFor`, which walks to the nearest ancestor: a deny
- * union is recorded at the ARRAY's own pointer, so asking for
- * `/lsp/disabledServers/0` and asking for `/lsp/disabledServers` must give the
- * same answer.
+ * Goes through `provenanceFor`, which walks to the nearest ancestor — and for
+ * a deny union that ancestry now MATTERS (#2427 review round 2, F2).
+ * `merge()` records an entry at the array's own pointer AND one per surviving
+ * member, so `/lsp/disabledServers/0` and `/lsp/disabledServers`
+ * deliberately give DIFFERENT answers: the array names the tier that denied
+ * first, the member names the tier that contributed that member. Round 1 of
+ * this PR asserted they were the same, read the array entry for every server,
+ * and reported a project-tier denial as a global one. Asking about a member
+ * that has no entry of its own still falls back to the array, which is the
+ * walk doing its job rather than an accident.
  */
 function viewOf(
 	entry: Provenance | undefined,
@@ -233,6 +239,19 @@ function viewOf(
 			: { file: homeRelativePath(entry.file, homeDir) }),
 		...(entry.trust === undefined ? {} : { trust: entry.trust }),
 	};
+}
+
+/**
+ * `{ decidedBy }`, or nothing when there is no provenance to report.
+ *
+ * A named helper because the alternative at the call site is a ternary inside a
+ * spread inside a ternary, which is the nesting SonarCloud flags and a reader
+ * has to unpick to learn one fact.
+ */
+function decidedByOrNothing(
+	entry: ProvenanceViewEntry | undefined,
+): { decidedBy?: ProvenanceViewEntry } {
+	return entry === undefined ? {} : { decidedBy: entry };
 }
 
 /**
@@ -321,17 +340,34 @@ async function fileView(
 			? (section.servers as Record<string, unknown>)
 			: {};
 
-	// The provenance that answers "who denied this". Read at the ARRAY's own
-	// pointer — the deny union records the FIRST tier that contributed a
-	// surviving member there, which is precisely the tier a nearer file cannot
-	// out-rank. The legacy root spelling is the fallback because `lspSectionOf`
-	// lets the canonical key win per key: a file that has not migrated still
-	// reaches the same disable set through `/disabledServers`.
-	const denyProvenance = viewOf(
-		provenanceFor(resolved, `/${LSP_NAMESPACE_KEY}/disabledServers`) ??
-			provenanceFor(resolved, "/disabledServers"),
-		homeDir,
-	);
+	// The provenance that answers "why can I not turn THIS one back on".
+	//
+	// Per MEMBER, not per array (#2427 review round 2, F2). The union is
+	// assembled from several tiers, so the array's own entry names only the tier
+	// that denied FIRST; stamping it on every disabled server reported a
+	// project-tier denial as a global one. `merge()` records an entry at each
+	// member's pointer, so the answer is a lookup at the member's index in the
+	// resolved list.
+	//
+	// The legacy root spelling is no longer a fallback: `resolvePiLensConfig`
+	// normalizes it into the namespace at source injection, so `/disabledServers`
+	// is not a pointer any resolution produces any more (F1).
+	const denied = Array.isArray(section.disabledServers)
+		? (section.disabledServers as unknown[])
+		: [];
+	const denyPointer = `/${LSP_NAMESPACE_KEY}/disabledServers`;
+	const decidedByDeny = (id: string): ProvenanceViewEntry | undefined => {
+		const index = denied.indexOf(id);
+		// `provenanceFor` walks UP, so a member with no entry of its own still
+		// answers with the array's — the right degradation, not a silent gap.
+		return viewOf(
+			provenanceFor(
+				resolved,
+				index >= 0 ? `${denyPointer}/${index}` : denyPointer,
+			),
+			homeDir,
+		);
+	};
 
 	const servers: EffectiveServerDecision[] = explainServersForFile(
 		absolute,
@@ -342,8 +378,8 @@ async function fileView(
 			selected: entry.selected,
 			reason: entry.reason,
 			...(entry.server.role === undefined ? {} : { role: entry.server.role }),
-			...(entry.reason === "disabled-by-config" && denyProvenance
-				? { decidedBy: denyProvenance }
+			...(entry.reason === "disabled-by-config"
+				? decidedByOrNothing(decidedByDeny(entry.server.id))
 				: {}),
 			...(spec === undefined
 				? {}

@@ -59,15 +59,23 @@ export interface DenyResolution {
 	readonly winner: number;
 	/** True when a denial is in force and no nearer tier could lift it. */
 	readonly denied: boolean;
+	/**
+	 * For an `array-union`, the contribution that introduced each SURVIVING
+	 * member, positionally parallel to `value` (#2427 review round 2, F2).
+	 *
+	 * A union is one array assembled from several tiers, so `winner` — the first
+	 * tier that contributed anything — cannot answer "why can I not turn THIS
+	 * one back on" for every member. It answered `global` for a server the
+	 * project denied. Empty for `boolean-false`, where the leaf has no members
+	 * and `winner` is the whole answer.
+	 */
+	readonly memberWinners: readonly number[];
 }
 
-/** Build a provenance entry for a resolved deny leaf. */
-export function denyProvenance(
-	contributions: readonly DenyContribution[],
-	resolution: DenyResolution,
+function provenanceOfContribution(
+	source: DenyContribution | undefined,
 	key: string,
 ): Provenance | undefined {
-	const source = contributions[resolution.winner];
 	if (!source) return undefined;
 	return {
 		tier: source.tier,
@@ -76,6 +84,41 @@ export function denyProvenance(
 		...(source.trust === undefined ? {} : { trust: source.trust }),
 	};
 }
+
+/** Build a provenance entry for a resolved deny leaf. */
+export function denyProvenance(
+	contributions: readonly DenyContribution[],
+	resolution: DenyResolution,
+	key: string,
+): Provenance | undefined {
+	return provenanceOfContribution(contributions[resolution.winner], key);
+}
+
+/**
+ * One provenance entry per SURVIVING member of an `array-union`, keyed by the
+ * member's own JSON pointer.
+ *
+ * The array's own entry still exists and still names the first denying tier;
+ * these are strictly additional, so a consumer that asks about the array is
+ * unaffected and a consumer that asks about a member gets the tier that
+ * actually denied it (#2427 review round 2, F2).
+ */
+export function denyMemberProvenance(
+	contributions: readonly DenyContribution[],
+	resolution: DenyResolution,
+	key: string,
+): Provenance[] {
+	const entries: Provenance[] = [];
+	resolution.memberWinners.forEach((index, position) => {
+		const pointer = `${key}/${position}`;
+		const entry = provenanceOfContribution(contributions[index], pointer);
+		if (entry) entries.push(entry);
+	});
+	return entries;
+}
+
+/** The `memberWinners` of a leaf with no members. One shared frozen empty. */
+const EMPTY_MEMBER_WINNERS: readonly number[] = Object.freeze([]);
 
 /** Contributions sorted by tier precedence, lowest first, ties in caller order. */
 function byPrecedence(
@@ -120,7 +163,12 @@ export function resolveBooleanDeny(
 ): DenyResolution {
 	const ordered = byPrecedence(contributions);
 	if (ordered.length === 0)
-		return { value: undefined, winner: -1, denied: false };
+		return {
+			value: undefined,
+			winner: -1,
+			denied: false,
+			memberWinners: EMPTY_MEMBER_WINNERS,
+		};
 
 	const denials = ordered.filter((entry) => entry.contribution.value === false);
 	if (denials.length === 0) {
@@ -129,6 +177,7 @@ export function resolveBooleanDeny(
 			value: last.contribution.value,
 			winner: last.index,
 			denied: false,
+			memberWinners: EMPTY_MEMBER_WINNERS,
 		};
 	}
 
@@ -136,7 +185,12 @@ export function resolveBooleanDeny(
 		isOperatorTier(entry.contribution.tier),
 	);
 	if (operatorDenial) {
-		return { value: false, winner: operatorDenial.index, denied: true };
+		return {
+			value: false,
+			winner: operatorDenial.index,
+			denied: true,
+			memberWinners: EMPTY_MEMBER_WINNERS,
+		};
 	}
 
 	// Every denial came from a shipped default or from repo content. An operator
@@ -149,8 +203,20 @@ export function resolveBooleanDeny(
 			tierPrecedence(entry.contribution.tier) >
 				tierPrecedence(firstDenial.contribution.tier),
 	);
-	if (lift) return { value: true, winner: lift.index, denied: false };
-	return { value: false, winner: firstDenial.index, denied: true };
+	if (lift) {
+		return {
+			value: true,
+			winner: lift.index,
+			denied: false,
+			memberWinners: EMPTY_MEMBER_WINNERS,
+		};
+	}
+	return {
+		value: false,
+		winner: firstDenial.index,
+		denied: true,
+		memberWinners: EMPTY_MEMBER_WINNERS,
+	};
 }
 
 /**
@@ -170,6 +236,10 @@ export function resolveArrayDeny(
 	const ordered = byPrecedence(contributions);
 	const seen = new Set<string>();
 	const members: ConfigValue[] = [];
+	// Positionally parallel to `members`: the contribution that introduced each
+	// surviving member, which is the per-member answer to "who denied this"
+	// (#2427 review round 2, F2).
+	const memberWinners: number[] = [];
 	let winner = -1;
 	for (const entry of ordered) {
 		const value = entry.contribution.value;
@@ -181,6 +251,7 @@ export function resolveArrayDeny(
 				seen.add(identity);
 			}
 			members.push(member);
+			memberWinners.push(entry.index);
 			if (winner === -1) winner = entry.index;
 		}
 	}
@@ -192,9 +263,10 @@ export function resolveArrayDeny(
 			value: members,
 			winner: last ? last.index : -1,
 			denied: false,
+			memberWinners,
 		};
 	}
-	return { value: members, winner, denied: members.length > 0 };
+	return { value: members, winner, denied: members.length > 0, memberWinners };
 }
 
 /**

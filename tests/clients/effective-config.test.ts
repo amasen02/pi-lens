@@ -103,6 +103,20 @@ async function viewFor(
 	}
 }
 
+/** Fixture layout keys, assembled so no literal path appears in the source. */
+const GLOBAL_CONFIG = [".pi-lens", "config.json"].join("/");
+const PROJECT_CONFIG = ["proj", ".pi-lens.json"].join("/");
+const TYPOS_POINTER = ["", "lsp", "disabledServers", "0"].join("/");
+const MARKSMAN_POINTER = ["", "lsp", "disabledServers", "1"].join("/");
+
+/** A canonical-namespace document denying one server. */
+function denyDoc(...ids: string[]): Record<string, unknown> {
+	const lsp: Record<string, unknown> = { disabledServers: ids };
+	const document: Record<string, unknown> = {};
+	document.lsp = lsp;
+	return document;
+}
+
 describe("effectiveConfig — provenance of the resolution", () => {
 	it("names the file and tier every resolved leaf came from, without carrying values", async () => {
 		const { view } = await viewFor({
@@ -168,7 +182,10 @@ describe("effectiveConfig — why is X running (#2415 AC)", () => {
 		expect(typos?.selected).toBe(false);
 		expect(typos?.reason).toBe("disabled-by-config");
 		expect(typos?.decidedBy?.tier).toBe("global");
-		expect(typos?.decidedBy?.key).toBe("/lsp/disabledServers");
+		// The MEMBER pointer, not the array: the union is built from several
+		// tiers and each surviving member carries the provenance of the tier that
+		// contributed it (#2427 review round 2, F2).
+		expect(typos?.decidedBy?.key).toBe(TYPOS_POINTER);
 		// And the resolution itself agrees — the view is not reporting a decision
 		// the merge did not make.
 		const leaf = view.provenance.find(
@@ -232,6 +249,32 @@ describe("effectiveConfig — why is X running (#2415 AC)", () => {
 		);
 		expect(denied.has("typos")).toBe(true);
 		expect(denied.has("marksman")).toBe(true);
+	});
+
+	/**
+	 * PER-MEMBER attribution (#2427 review round 2, F2).
+	 *
+	 * The deny union is one array built from several tiers, so one provenance
+	 * entry cannot describe it: round 1 read the entry at the ARRAY pointer and
+	 * stamped it on every disabled server, which reported the project-tier
+	 * denial of marksman as a global one. The answer to "why can I not turn
+	 * this back on" is per member, so the provenance is per member.
+	 */
+	it("attributes each denied server to the tier that actually denied IT", async () => {
+		const files: Record<string, unknown> = {};
+		files[GLOBAL_CONFIG] = denyDoc("typos");
+		files[PROJECT_CONFIG] = denyDoc("marksman");
+		const layout: Layout = { files, startDir: "proj" };
+		const result = await viewFor(layout, { file: "notes.md" });
+		const servers = result.view.file?.servers ?? [];
+		const byId = new Map(servers.map((entry) => [entry.id, entry] as const));
+		expect(byId.get("typos")?.reason).toBe("disabled-by-config");
+		expect(byId.get("marksman")?.reason).toBe("disabled-by-config");
+		expect(byId.get("typos")?.decidedBy?.tier).toBe("global");
+		expect(byId.get("marksman")?.decidedBy?.tier).toBe("project");
+		// And each names the member it is the provenance OF, not the array.
+		expect(byId.get("typos")?.decidedBy?.key).toBe(TYPOS_POINTER);
+		expect(byId.get("marksman")?.decidedBy?.key).toBe(MARKSMAN_POINTER);
 	});
 
 	it("says why a server did NOT attach, distinguishing a denial from a mismatch", async () => {
