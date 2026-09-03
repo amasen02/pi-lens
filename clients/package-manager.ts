@@ -610,7 +610,7 @@ function* localBinMatches(
 	tools: readonly string[],
 	startDir: string,
 	options: LocalBinWalkOptions,
-): Generator<string> {
+): Generator<string, undefined> {
 	const {
 		windowsExt = ".cmd",
 		homeDir = os.homedir(),
@@ -656,8 +656,12 @@ export function findLocalBinUpwards(
 	startDir: string,
 	options: LocalBinWalkOptions = {},
 ): string | undefined {
-	for (const match of localBinMatches([tool], startDir, options)) return match;
-	return undefined;
+	// `.next().value`, not a `for…of` that returns on its first iteration: the
+	// latter is a single-iteration loop (SonarCloud S1751, and it reads as one
+	// too). The generator is simply left suspended after the first match — it
+	// holds no resource that needs closing, which is exactly why the walk above
+	// never stats an ancestor beyond the hit.
+	return localBinMatches([tool], startDir, options).next().value;
 }
 
 /**
