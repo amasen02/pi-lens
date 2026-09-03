@@ -1878,24 +1878,40 @@ only the orphan sweep and the kill-what-holds-the-tree step; when it fails or
 is skipped, both degrade visibly and the removal still runs. Budgets come from
 the timeouts registered in `.claude/settings.json` (`HOOK_TIMEOUT_MS`, pinned
 to that file by a conformance test): `hookBudgetMs` gives SessionStart
-`90s - 60s removal reserve - 5s margin = 25s` and SubagentStop
-`15s - 5s removal reserve - 5s margin = 5s`, floored at
-`DEFAULT_HOOK_BUDGET_MS` (2s) for an unregistered event. The removal reserve is
-per hook (`HOOK_REMOVE_RESERVE_MS`) and is the SAME number `git()` bounds the
-removal with (`removeBoundMs`), so `budget + removal + margin <= hook timeout`
-is enforced rather than asserted — a reserve no call honors is a claim, not a
-bound. 60s is right where there is room (SIGKILLing git mid-delete leaves a
-half-removed tree); SubagentStop has none, so it takes 5s against a measured
-`git worktree remove --force --force` cost of 956/1049/1171ms min/median/max
-over a 4000-file worktree (146/181/755ms over a 300-file one), 2026-09-02 on
-the #2435 box. The process listing has its own ceiling,
+`90s - 60s removal reserve - 1s recheck reserve - 5s margin = 24s` and
+SubagentStop `15s - 5s removal reserve - 1s recheck reserve - 5s margin = 4s`,
+floored at `DEFAULT_HOOK_BUDGET_MS` (2s) for an unregistered event. The removal
+reserve is per hook (`HOOK_REMOVE_RESERVE_MS`) and is the SAME number `git()`
+bounds the removal with (`removeBoundMs`); the recheck reserve
+(`RECHECK_TIMEOUT_MS`, 1s) is the SAME number the pre-remove `isDirty()`
+recheck is bounded with (`recheckBoundMs`) — so
+`budget + recheck + removal + margin <= hook timeout` is enforced rather than
+asserted — a reserve no call honors is a claim, not a bound. The recheck used
+to silently reuse `removeBoundMs`, a SECOND removeBound-sized `git()` call the
+invariant never counted, and subagent-stop's real worst case reached ~20s
+against its own 15s timeout (PR #2493 review round 4, N3) before it got a
+reserve of its own. `removeBoundMs`'s 60s is right where there is room
+(SIGKILLing git mid-delete leaves a half-removed tree); SubagentStop has none,
+so it takes 5s against a measured `git worktree remove --force --force` cost
+of 956/1049/1171ms min/median/max over a 4000-file worktree (146/181/755ms
+over a 300-file one), 2026-09-02 on the #2435 box; the recheck's own 1s is a
+`git status --porcelain`, far cheaper still, and a timeout there reads as
+`"unreadable"` — kept, exactly like a genuinely dirty tree, never destroyed.
+The recheck runs BEFORE `unlinkTopLevelLinks` unlinks the shared
+`node_modules` junction (PR #2493 round 4, N1): unlinking first meant a tree
+kept for "became dirty" had already silently lost that junction, with no
+record of it anywhere a `--quiet` hook run would surface. The
+enrichment-to-removal gap is narrowed by this recheck, not closed: a write
+landing in the few hundred milliseconds between the recheck itself and
+`git worktree remove` is not caught by any ledger record. The process listing
+has its own ceiling,
 `DEFAULT_SCAN_TIMEOUT_MS` = 4000ms against a measured 584/651/707ms
 min/median/max for a 467-row Windows listing, overridable with
 `--scan-timeout-ms` so a short listing ceiling can never squeeze the `git`
 calls that decide whether a tree is removable — and the enrichment reserves
 that ceiling only up to HALF the sweep budget (`scanReserveMs`), because
-reserving all 4s out of SubagentStop's 5s left every enrichment `git` call on
-its 250ms floor, which `isDirty` reads as `"unreadable"` and the dirty rail
+reserving all 4s out of SubagentStop's 4s budget would leave every enrichment
+`git` call on its 250ms floor, which `isDirty` reads as `"unreadable"` and the dirty rail
 still keeps the very tree the hook fired to reap — but as of PR #2493 review
 round 3 (F2) the ledger says WHY with a `keptReason` of `"status-unreadable"`,
 not `"dirty"`, so a budget too tight to ask is never misread as protected

@@ -12,6 +12,7 @@ export const DEFAULT_GIT_TIMEOUT_MS: number;
 export const MIN_GIT_TIMEOUT_MS: number;
 export const REMOVE_TIMEOUT_MS: number;
 export const HOOK_REMOVE_RESERVE_MS: Readonly<Record<string, number>>;
+export const RECHECK_TIMEOUT_MS: number;
 
 export interface PruneCliOptions {
 	dryRun: boolean;
@@ -54,6 +55,11 @@ export function hookBudgetMs(
 ): number;
 
 export function removeBoundMs(
+	hook: string | null | undefined,
+	policy: HookPolicy,
+): number;
+
+export function recheckBoundMs(
 	hook: string | null | undefined,
 	policy: HookPolicy,
 ): number;

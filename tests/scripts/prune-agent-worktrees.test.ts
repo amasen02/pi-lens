@@ -1252,6 +1252,21 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 			git(["commit", "-qm", "keepalive helper"], worktree);
 			git(["push", "-q", "-u", "origin", "pr-9001"], worktree);
 
+			// PR #2493 round 4, N1: a top-level reparse point (agents junction
+			// `node_modules` into the main checkout) stands in for the real
+			// shared-`node_modules` link `unlinkTopLevelLinks` unlinks before
+			// `git worktree remove`. Untracked and gitignore-shaped -- exactly
+			// what a real agent worktree carries -- so it never makes `git
+			// status` dirty on its own; only the late write below does that.
+			const junctionTarget = path.join(root, "shared-node_modules");
+			fs.mkdirSync(junctionTarget, { recursive: true });
+			const junctionPath = path.join(worktree, "node_modules");
+			fs.symlinkSync(
+				junctionTarget,
+				junctionPath,
+				process.platform === "win32" ? "junction" : "dir",
+			);
+
 			const processScanPath = path.join(
 				repo,
 				"scripts",
@@ -1385,6 +1400,13 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 					removed: false,
 					error: "became dirty between enrichment and removal",
 				});
+				// PR #2493 round 4, N1: the recheck used to run AFTER
+				// `unlinkTopLevelLinks`, so a tree KEPT for "became dirty" had
+				// already silently lost its shared `node_modules` junction --
+				// visible only in a `--quiet` hook run's suppressed `say()` line.
+				// A kept tree must be untouched, not merely undeleted.
+				expect(fs.existsSync(junctionPath)).toBe(true);
+				expect(fs.lstatSync(junctionPath).isSymbolicLink()).toBe(true);
 			} finally {
 				// Await the actual exit, not just the kill signal: `afterEach`
 				// removes the whole fixture root right after this test returns,
