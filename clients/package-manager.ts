@@ -31,6 +31,7 @@ import {
 	createGenerationSource,
 	type GenerationHandle,
 } from "./generation-guard.js";
+import { isAtOrAboveHomeDir } from "./path-utils.js";
 
 export type NodePackageManager = "npm" | "pnpm" | "yarn" | "bun";
 
@@ -533,11 +534,23 @@ export function findLocalBinUpwards(
 	tool: string,
 	startDir: string,
 	windowsExt = ".cmd",
+	homeDir: string = os.homedir(),
 ): string | undefined {
 	const names = onWindows() ? [`${tool}${windowsExt}`, tool] : [tool];
 	let dir = path.resolve(startDir);
 	const root = path.parse(dir).root;
 	while (true) {
+		// Tool-resolution walker, not a config lookup (#2514/#2517 policy):
+		// escaping the project upward past HOME means STOP, not keep reading. A
+		// config-file lookup (`findLocalToolConfig`) keeps climbing past HOME
+		// because the underlying tool would find a legitimate global config
+		// there too; a `node_modules/.bin` match found at or above HOME can
+		// never be THIS project's own installed dependency — it is some
+		// unrelated home-level manifest (the pi-extensions bin shim, #2514).
+		// Default-on (not opt-in like `findLocalToolConfig`'s `options.homeDir`)
+		// because there is no legitimate case for this resolver to hand back a
+		// bin from outside the project tree.
+		if (isAtOrAboveHomeDir(dir, homeDir)) return undefined;
 		for (const name of names) {
 			const full = path.join(dir, "node_modules", ".bin", name);
 			if (fs.existsSync(full)) return full;
@@ -565,9 +578,10 @@ export async function findNodeToolBinary(
 	tool: string,
 	cwd: string,
 	windowsExt = ".cmd",
+	homeDir?: string,
 ): Promise<string | undefined> {
 	return (
-		findLocalBinUpwards(tool, cwd, windowsExt) ??
+		findLocalBinUpwards(tool, cwd, windowsExt, homeDir) ??
 		(await findGlobalBinary(tool, windowsExt))
 	);
 }

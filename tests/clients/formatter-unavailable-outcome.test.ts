@@ -88,6 +88,51 @@ describe("formatFile classifies an unavailable tool distinctly from a failure (#
 		}
 	});
 
+	it("real oxfmt stays unavailable even on a box whose HOME contains its own node_modules/.bin/oxfmt (#2514)", async () => {
+		const env = setupTestEnvironment("pi-lens-unavail-oxfmt-home-");
+		// Reproduces the exact reported trap without touching the real
+		// maintainer HOME: pin HOME/USERPROFILE to a throwaway temp dir that
+		// itself carries a `node_modules/.bin/oxfmt` (the shape the home-level
+		// pi-extensions manifest installs), then format a file under an
+		// UNRELATED project nested inside that fake home. Pre-#2514,
+		// `findInNodeModules`'s ancestor walk had no HOME ceiling, so climbing
+		// from the project past its own (empty) node_modules found the
+		// home-level stray and handed it to `resolveCommand` as "the project's
+		// oxfmt" — spawning it instead of declaring the tool unavailable.
+		const fakeHome = env.tmpDir;
+		const projectDir = path.join(fakeHome, "project");
+		fs.mkdirSync(projectDir, { recursive: true });
+		const filePath = path.join(projectDir, "a.ts");
+		fs.writeFileSync(filePath, "const x=1\n");
+
+		const homeBinDir = path.join(fakeHome, "node_modules", ".bin");
+		fs.mkdirSync(homeBinDir, { recursive: true });
+		fs.writeFileSync(path.join(homeBinDir, "oxfmt.cmd"), "@ECHO off\r\n");
+		fs.writeFileSync(path.join(homeBinDir, "oxfmt"), "#!/bin/sh\nexit 0\n", {
+			mode: 0o755,
+		});
+
+		const originalHome = process.env.HOME;
+		const originalUserProfile = process.env.USERPROFILE;
+		process.env.HOME = fakeHome;
+		process.env.USERPROFILE = fakeHome;
+		try {
+			const { formatFile, oxfmtFormatter } = await loadFormatters();
+			const result = await formatFile(filePath, oxfmtFormatter);
+
+			expect(result.outcome).toBe("unavailable");
+			expect(result.success).toBe(true);
+			// The home-level bin must never be spawned as "the project's" oxfmt.
+			expect(formatSpawns()).toEqual([]);
+		} finally {
+			if (originalHome === undefined) delete process.env.HOME;
+			else process.env.HOME = originalHome;
+			if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+			else process.env.USERPROFILE = originalUserProfile;
+			env.cleanup();
+		}
+	});
+
 	it("real php-cs-fixer with no vendor/bin and no PATH binary resolves to unavailable, never spawning fix (#2472 review F4)", async () => {
 		const env = setupTestEnvironment("pi-lens-unavail-phpcsfixer-");
 		try {
