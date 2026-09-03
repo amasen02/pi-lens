@@ -94,7 +94,7 @@ describe("code quality warnings", () => {
 		expect(report.summary.topRules).toEqual([
 			{ rule: "high-complexity", count: 1 },
 		]);
-		expect(formatCodeQualityWarningsAdvisory(report)).toContain(
+		expect(formatCodeQualityWarningsAdvisory(report, cwd)).toContain(
 			"Code-quality warnings introduced/touched this turn: 1",
 		);
 	});
