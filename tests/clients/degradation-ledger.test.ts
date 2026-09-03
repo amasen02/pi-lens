@@ -302,7 +302,8 @@ describe("session degradation ledger", () => {
 				latestReasons: [
 					{
 						subject: "/repo:inband-carry-superseded",
-						reason: "1 carried-forward deferred file entry changed before this turn's in-band publish could keep them (src/a.ts)",
+						reason:
+							"1 carried-forward deferred file entry changed before this turn's in-band publish could keep them (src/a.ts)",
 					},
 				],
 			},
@@ -313,7 +314,8 @@ describe("session degradation ledger", () => {
 				latestReasons: [
 					{
 						subject: "/repo:deferred-file-superseded",
-						reason: "1 file(s) changed while the deferred LSP pull was reading them (src/b.ts)",
+						reason:
+							"1 file(s) changed while the deferred LSP pull was reading them (src/b.ts)",
 					},
 				],
 			},
