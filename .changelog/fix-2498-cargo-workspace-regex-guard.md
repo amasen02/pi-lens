@@ -13,9 +13,12 @@ section: Fixed
   probed shape (comments, indentation, CRLF, trailing content on the
   heading), so no runtime behavior changes. New export
   `hasCargoWorkspaceTable(content)` in `clients/cargo-manifest.ts` names the
-  presence check; `clients/lsp/server.ts` and both of
+  presence check; `clients/lsp/server.ts`, both of
   `resolveCargoPackageEdition`'s own "is this manifest also the workspace
-  root" checks now call it instead of repeating the `!== undefined` idiom.
+  root" checks, and `clients/review-graph/workspace-modules.ts`'s
+  `detectWorkspaceType` (round 2 of this PR — it was still calling
+  `extractTomlTableSection(content, "workspace") !== undefined` directly)
+  now call it instead of repeating the `!== undefined` idiom.
   A new sweep (`tests/clients/cargo-manifest.test.ts`) fails the build if a
   future edit reintroduces a hand-rolled `\[workspace\]` regex anywhere in
   `clients/` outside `cargo-manifest.ts` — proven to actually fire via a

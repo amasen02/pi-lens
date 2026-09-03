@@ -948,8 +948,23 @@ describe("effectiveConfig — asking changes no session state (#2427 round 3)", 
  * workspace, `documents` omitted the workspace's own config, and the
  * "SUPERSET of the workspace's" invariant the module doc claims did not hold.
  */
+/**
+ * The rejection message names the `cwd` it was measured against (home-
+ * relative, like every other path this module reports) plus the remedy — an
+ * agent seeing `{ error }` with no `cwd` and no next step has no way to tell
+ * a real mistake from a workspace boundary it should re-query around (#2520
+ * round 2, F3).
+ */
+function outsideCwdError(homeRelativeCwd: string): { error: string } {
+	return {
+		error:
+			`file is outside cwd (${homeRelativeCwd}); query with cwd set ` +
+			"to the file's own workspace instead",
+	};
+}
+
 describe("effectiveConfig — a file outside cwd is rejected, not silently resolved (#2520)", () => {
-	it('returns { error: "file is outside cwd" } instead of a foreign tree\'s answer', async () => {
+	it("returns an informative { error } instead of a foreign tree's answer", async () => {
 		const home = fs.mkdtempSync(
 			path.join(os.tmpdir(), "pi-lens-effcfg-confine-"),
 		);
@@ -988,7 +1003,7 @@ describe("effectiveConfig — a file outside cwd is rejected, not silently resol
 			// `cwd` still names the workspace the caller actually asked about —
 			// the confinement must not silently re-root the answer at `foreign`.
 			expect(view.cwd).toBe(homeRelativePath(ws, home));
-			expect(view.file).toEqual({ error: "file is outside cwd" });
+			expect(view.file).toEqual(outsideCwdError(homeRelativePath(ws, home)));
 			// The workspace's OWN document is what this view is resolved from —
 			// never the foreign tree's, and never omitted.
 			const files = view.documents.map((document) => document.file);
@@ -1002,6 +1017,42 @@ describe("effectiveConfig — a file outside cwd is rejected, not silently resol
 			else process.env.PI_LENS_CONFIG_PATH = previousConfigPath;
 			resetLSPConfigStateForTests();
 		}
+	});
+
+	/**
+	 * The DOCUMENTED trade (docs/configuration.md, #2520 round 2 F3): a sibling
+	 * PACKAGE inside the SAME monorepo — sharing a real repo root, not two
+	 * unrelated temp trees like the foreign-tree case above — is still
+	 * rejected. Confinement is measured against `cwd`, not "shares a git/repo
+	 * ancestor with `cwd`", so `cwd` at `repo/packages/a` and `file` under
+	 * `repo/packages/b` has no containment relationship even though both
+	 * nest under `repo` — the caller wants package `b`'s answer, and gets it
+	 * by re-querying with `cwd` set to `repo/packages/b`, per the remedy in
+	 * the error itself.
+	 */
+	it("rejects a sibling package in the same monorepo, not just an unrelated foreign tree", async () => {
+		const { view, home, projectDir } = await viewFor(
+			{
+				files: {
+					"repo/.pi-lens.json": {},
+					"repo/packages/a/.pi-lens.json": {},
+					"repo/packages/b/.pi-lens.json": {
+						lsp: { disabledServers: ["typos"] },
+					},
+				},
+				startDir: "repo/packages/a",
+			},
+			{ file: path.join("..", "b", "notes.md") },
+		);
+
+		expect(view.file).toEqual(
+			outsideCwdError(homeRelativePath(projectDir, home)),
+		);
+		// Package `b`'s document never leaks into an answer scoped to `a`.
+		const files = view.documents.map((document) => document.file);
+		expect(files).not.toContain(
+			homeRelativePath(path.join(home, "repo/packages/b/.pi-lens.json"), home),
+		);
 	});
 
 	it("still answers normally for a file nested INSIDE cwd (confinement must not reject the common case)", async () => {

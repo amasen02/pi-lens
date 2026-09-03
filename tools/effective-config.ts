@@ -61,7 +61,11 @@ export function createEffectiveConfigTool(getProjectRoot: () => string) {
 			file: Type.Optional(
 				Type.String({
 					description:
-						"Path to explain: adds the resolved language plus the per-server and per-runner selection decisions for it.",
+						"Path to explain: adds the resolved language plus the per-server and " +
+						"per-runner selection decisions for it. Must resolve inside `cwd` " +
+						"(a sibling package in the same monorepo does not count) — a file " +
+						"outside it is rejected with the `cwd` it was measured against; " +
+						"re-query with `cwd` set to that file's own workspace instead.",
 				}),
 			),
 		}),

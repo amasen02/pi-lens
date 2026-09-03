@@ -87,10 +87,15 @@ export interface EffectiveConfigOptions {
 /**
  * One config document that contributed to the resolution.
  *
- * When a `file` is asked about, the resolution — and therefore this list — is
- * taken at that file's own directory, so it names the nested documents that
- * decided the file half too (#2427 review round 5, F-R4-1). The walk is
- * upward, so the workspace's own documents are always included.
+ * When a `file` is asked about AND it resolves inside `cwd`, the resolution —
+ * and therefore this list — is taken at that file's own directory, so it
+ * names the nested documents that decided the file half too (#2427 review
+ * round 5, F-R4-1); the walk is upward and CONFINED to `cwd`, so the
+ * workspace's own documents are always included too. A `file` outside `cwd`
+ * is CONFINED, not answered from its own unrelated tree (#2520): it is
+ * rejected (`file: { error: ... }`, see {@link effectiveConfig}) and this
+ * list is taken at `cwd` itself, exactly as if no `file` had been asked
+ * about at all.
  */
 export interface EffectiveConfigDocument {
 	readonly tier: SourceTier;
@@ -339,9 +344,16 @@ function decidedByOrNothing(entry: ProvenanceViewEntry | undefined): {
  * relationship: its own ancestry can omit the workspace's document entirely
  * while `cwd` above still names the workspace, mislabelling a foreign tree's
  * config as this workspace's own (#2520). So the containment is CONFINED, not
- * assumed: a `file` that does not resolve inside `cwd` is rejected —
- * `file: { error: "file is outside cwd" }` — rather than answered from an
- * unrelated root. When no `file` is asked about, or the confined one is
+ * assumed: a `file` that does not resolve inside `cwd` is rejected — with
+ * `file: { error }` naming the `cwd` it was measured against and the remedy
+ * (re-query with `cwd` set to the file's own workspace) — rather than
+ * answered from an unrelated root. This confinement is a trade the query
+ * makes deliberately, not a limitation to route around: it also rejects a
+ * SIBLING package in the SAME monorepo (`cwd` at `repo/packages/a`, `file`
+ * under `repo/packages/b`) even though both share a repo root, because the
+ * per-file half is only ever correct when it is a superset of the workspace
+ * half — a caller who wants package `b`'s answer queries with `cwd` set to
+ * `repo/packages/b`. When no `file` is asked about, or the confined one is
  * used, the root IS (or nests under) the workspace `cwd`, and the fileless
  * case is the view `pilens_health` takes on every call.
  *
@@ -425,8 +437,14 @@ export async function effectiveConfig(
 	const counts = emptyTierCounts();
 	for (const entry of resolution.provenance.values()) counts[entry.tier] += 1;
 
+	// Home-relative, like every path this module reports (rule 3) — including
+	// the one named back in the rejection message below, so an agent reading
+	// `file: { error }` sees the SAME `cwd` spelling the rest of the view
+	// uses, not a second, raw-path rendering of it.
+	const homeRelativeCwd = homeRelativePath(cwd, homeDir);
+
 	const view: EffectiveConfigView = {
-		cwd: homeRelativePath(cwd, homeDir),
+		cwd: homeRelativeCwd,
 		documents: resolution.documents.map((document) => ({
 			tier: document.tier,
 			file: homeRelativePath(document.file, homeDir),
@@ -436,7 +454,13 @@ export async function effectiveConfig(
 		provenanceCounts: counts,
 		recordCounts: countBy(resolution.records, (record) => record.code),
 		...(fileOutsideCwd
-			? { file: { error: "file is outside cwd" } }
+			? {
+					file: {
+						error:
+							`file is outside cwd (${homeRelativeCwd}); query with cwd set ` +
+							"to the file's own workspace instead",
+					},
+				}
 			: absolute === undefined
 				? {}
 				: {

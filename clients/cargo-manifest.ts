@@ -104,9 +104,20 @@ function stripTomlLineComment(line: string): string {
  * `# "member",` line stayed live because nothing removed it before the
  * quoted-string scan ran over the whole bracketed span). A commented-out
  * entry must never survive into a captured table/array body.
+ *
+ * A leading UTF-8 BOM (`\uFEFF`) is stripped first — valid at the start of a
+ * Cargo.toml (rust-lang/cargo#2031) — because it sits OUTSIDE every reader's
+ * heading/key anchor below (`[ \t]*`, not `\s*`) and would otherwise hide a
+ * table or key on the file's very first line. #2498's `RustWorkspaceRoot`
+ * walk-up used to carry its own `/^\s*\[workspace\]/m` check, and ES's `\s`
+ * class DOES include `\uFEFF` — so that hand-rolled regex accepted a
+ * BOM-prefixed manifest by accident; folding it onto this shared reader
+ * without this strip would have silently regressed that shape (review round
+ * 2, F4).
  */
 function normalizeToml(content: string): string {
 	return content
+		.replace(/^\uFEFF/, "")
 		.replace(/\r\n/g, "\n")
 		.split("\n")
 		.map(stripTomlLineComment)

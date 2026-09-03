@@ -201,20 +201,36 @@ describe("hasCargoWorkspaceTable (#2498)", () => {
  */
 describe("no hand-rolled [workspace]-table regex outside cargo-manifest.ts (#2498)", () => {
 	/**
-	 * A literal backslash immediately before `[`/`]` is not something ordinary
-	 * prose writes — TOML syntax in a comment reads `[workspace]`, never
-	 * `\[workspace\]` — so this substring, surviving a comment-blanking pass,
-	 * is specific to an actual regex pattern (literal or `new RegExp(...)`)
-	 * that tests for the table heading.
+	 * A hand-rolled `[workspace]`-table check reads as one of three shapes in
+	 * source, all real defect instances this repo has shipped:
+	 *
+	 *   M1: a fully-escaped regex literal — `/^\s*\[workspace\]/m`
+	 *       (`clients/lsp/server.ts:2599`, pre-#2498).
+	 *   M2: a PARTIALLY-escaped regex literal — `]` needs no backslash outside
+	 *       a character class, so `/^\s*\[workspace]/m` matches the identical
+	 *       text with the trailing backslash simply dropped. The original
+	 *       detector (a literal `\\[workspace\\]` substring match) missed this
+	 *       spelling entirely (review round 2, F2).
+	 *   M3: no regex at all — `content.includes("[workspace]")`, a bare
+	 *       substring test. True for a COMMENTED-OUT `# [workspace]` heading
+	 *       too, which is exactly why `workspace-modules.ts`'s pre-#2473
+	 *       `detectWorkspaceType` reading this way was a defect (AGENTS.md,
+	 *       "the one Cargo.toml reader" entry) — and the original detector
+	 *       missed this spelling too, having no backslashes at all.
+	 *
+	 * All three read the literal bracket text `[workspace]` with the
+	 * backslash before each bracket independently optional, so one pattern —
+	 * `/\\?\[workspace\\?\]/` — catches all three. Comments are blanked
+	 * before the check runs (this sweep's `strings: "keep"` policy only
+	 * spares STRING content), so a doc comment quoting any of these forms —
+	 * escaped or bare — never trips it; verified below.
 	 */
 	function hasWorkspaceRegexLiteral(strippedSource: string): boolean {
-		return strippedSource.includes("\\[workspace\\]");
+		return /\\?\[workspace\\?\]/.test(strippedSource);
 	}
 
-	it("detects the exact pre-#2498 defect shape (mutation check)", () => {
-		// `clients/lsp/server.ts:2599`, verbatim, before the fix. Proves the
-		// detector actually fires before the real-tree sweep below is trusted
-		// to mean anything.
+	it("M1: detects the exact pre-#2498 defect shape (clients/lsp/server.ts, fully escaped)", () => {
+		// `clients/lsp/server.ts:2599`, verbatim, before the fix.
 		const mutant = [
 			"if (",
 			"\tparentCargoContent !== undefined &&",
@@ -227,12 +243,33 @@ describe("no hand-rolled [workspace]-table regex outside cargo-manifest.ts (#249
 		).toBe(true);
 	});
 
+	it("M2: detects a partially-escaped regex literal (unescaped closing bracket)", () => {
+		const mutant = [
+			"if (",
+			"\tparentCargoContent !== undefined &&",
+			"\t/^\\s*\\[workspace]/m.test(parentCargoContent)",
+			") {",
+			"}",
+		].join("\n");
+		expect(
+			hasWorkspaceRegexLiteral(stripSource(mutant, { strings: "keep" })),
+		).toBe(true);
+	});
+
+	it("M3: detects the exact pre-#2473 defect shape (workspace-modules.ts, bare .includes)", () => {
+		const mutant = 'if (content.includes("[workspace]")) return "cargo";';
+		expect(
+			hasWorkspaceRegexLiteral(stripSource(mutant, { strings: "keep" })),
+		).toBe(true);
+	});
+
 	it("a bare comment naming [workspace] does not trip the detector", () => {
 		// The un-escaped form a doc comment or a TOML file actually writes.
 		// Comments are blanked before the check runs, so this also proves the
-		// blanking is load-bearing: without it, a doc comment quoting the
-		// escaped form (as this very repo's cargo-manifest.ts does) would
-		// false-positive on itself.
+		// blanking is load-bearing: without it, a doc comment quoting any of
+		// the M1/M2/M3 spellings (as this very repo's cargo-manifest.ts,
+		// lsp/server.ts and workspace-topology.ts all do) would false-positive
+		// on itself.
 		const source = "// the [workspace] table\nconst x = 1;\n";
 		expect(
 			hasWorkspaceRegexLiteral(stripSource(source, { strings: "keep" })),
@@ -250,6 +287,58 @@ describe("no hand-rolled [workspace]-table regex outside cargo-manifest.ts (#249
 					strings: "keep",
 				});
 				return hasWorkspaceRegexLiteral(stripped);
+			})
+			.map(clientsRelative);
+		expect(offenders).toEqual([]);
+	});
+});
+
+/**
+ * A SECOND way to reimplement `hasCargoWorkspaceTable` without a regex at
+ * all: call the shared `extractTomlTableSection(content, "workspace")` and
+ * compare the result to `undefined` inline, instead of naming the exported
+ * presence check. Behaviorally identical (it IS `hasCargoWorkspaceTable`'s
+ * own body), so the M1-M3 sweep above — which only looks for `[workspace]`
+ * bracket text — cannot see it; this is a separate signature entirely. This
+ * was `clients/review-graph/workspace-modules.ts`'s `detectWorkspaceType`
+ * until round 2 of #2498/#2520's tidy PR routed it through
+ * `hasCargoWorkspaceTable`, closing the last caller AGENTS.md's "every
+ * caller shares it" claim did not yet cover.
+ */
+describe("every workspace-table presence check names hasCargoWorkspaceTable (#2498/#2520 round 2, F1)", () => {
+	function hasInlinePresenceCheck(strippedSource: string): boolean {
+		return /extractTomlTableSection\([^)]*,\s*["']workspace["']\s*\)\s*!==\s*undefined/.test(
+			strippedSource,
+		);
+	}
+
+	it("detects the exact pre-round-2 workspace-modules.ts shape (mutation check)", () => {
+		const mutant =
+			'if (extractTomlTableSection(content, "workspace") !== undefined) {\n\treturn "cargo";\n}';
+		expect(
+			hasInlinePresenceCheck(stripSource(mutant, { strings: "keep" })),
+		).toBe(true);
+	});
+
+	it("a hasCargoWorkspaceTable(content) call does not trip the detector", () => {
+		const source =
+			'if (hasCargoWorkspaceTable(content)) {\n\treturn "cargo";\n}';
+		expect(
+			hasInlinePresenceCheck(stripSource(source, { strings: "keep" })),
+		).toBe(false);
+	});
+
+	it("clients/ names hasCargoWorkspaceTable for presence, never the inline reimplementation", () => {
+		const files = clientSourceFiles().filter(
+			(file) => clientsRelative(file) !== "cargo-manifest.ts",
+		);
+		assertNonEmptyScan("clients/*.ts (minus cargo-manifest.ts)", files.length);
+		const offenders = files
+			.filter((file) => {
+				const stripped = stripSource(fs.readFileSync(file, "utf-8"), {
+					strings: "keep",
+				});
+				return hasInlinePresenceCheck(stripped);
 			})
 			.map(clientsRelative);
 		expect(offenders).toEqual([]);
