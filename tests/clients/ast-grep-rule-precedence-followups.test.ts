@@ -3,7 +3,24 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { js as sgJs, ts as sgTs } from "@ast-grep/napi";
 import * as yaml from "js-yaml";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+// Controllable `os.homedir()` override — `vi.spyOn(os, "homedir")` fails
+// under Vitest's ESM interop ("Cannot redefine property"), so the module is
+// replaced with a thin wrapper that defers to the REAL os.homedir() unless a
+// test has set an override (refs #2472 review round 3, F1). Never used to
+// touch the real HOME directory — only to redirect os.homedir() to a temp
+// dir for the duration of one test; every OTHER test in this file gets the
+// real os.homedir() unchanged.
+const homedirOverride = vi.hoisted(() => ({
+	value: undefined as string | undefined,
+}));
+vi.mock("node:os", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:os")>();
+	const homedir = () => homedirOverride.value ?? actual.homedir();
+	return { ...actual, default: { ...actual, homedir }, homedir };
+});
+
 import { safeSpawn } from "../../clients/safe-spawn.js";
 import {
 	evaluateAstGrepRules,
@@ -724,6 +741,33 @@ describe(
 			const config = path.join(root, "packages", "app", "sgconfig.yml");
 			fs.writeFileSync(config, "ruleDirs: []\n");
 			expect(findLocalSgconfig(nested)).toBe(config);
+		});
+
+		// #2472 review round 3, F1 (maintainer-decision reversal): a round-2
+		// fold made findLocalSgconfig's ancestor climb stop at $HOME by
+		// default, but ast-grep itself resolves `~/sgconfig.yml` as a
+		// legitimate global root config — the ceiling hid it from pi-lens for
+		// no benefit. The climb is unceilinged again: a config sitting exactly
+		// AT `os.homedir()` resolves.
+		it("finds a config sitting AT (mocked) $HOME — no default ceiling (#2472 review round 3 F1)", () => {
+			const root = makeProject();
+			const mockedHome = path.join(root, "mocked-home");
+			fs.mkdirSync(mockedHome, { recursive: true });
+			homedirOverride.value = mockedHome;
+			try {
+				const config = path.join(mockedHome, "sgconfig.yml");
+				fs.writeFileSync(config, "ruleDirs: []\n");
+				const startDir = path.join(mockedHome, "project", "src");
+				fs.mkdirSync(startDir, { recursive: true });
+
+				expect(findLocalSgconfig(startDir)).toBe(config);
+
+				// Cross-form (forward-slash) startDir resolves identically.
+				const crossFormStartDir = startDir.split(path.sep).join("/");
+				expect(findLocalSgconfig(crossFormStartDir)).toBe(config);
+			} finally {
+				homedirOverride.value = undefined;
+			}
 		});
 	},
 );

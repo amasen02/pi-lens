@@ -369,7 +369,30 @@ export function findNearestContaining(
  * directory in `names` order. Single source of truth for the "walk up
  * looking for one of these config filenames" loop that `opengrep-config.ts`,
  * `typos-config.ts`, `zizmor-config.ts`, and `sgconfig.ts` each hand-rolled
- * independently (refs #680).
+ * independently (refs #680), and that `php-cs-fixer-config.ts` now delegates
+ * to as well (refs #2472 review F2).
+ *
+ * UNCEILINGED by default (refs #2472 review round 3, F1) — `options.homeDir`
+ * is opt-in, not default-on. A prior version applied the SAME `$HOME`
+ * ceiling as `findNearestMarkerRoot` unconditionally, which broke every one
+ * of these tools' actual discovery contract: each of them treats a config
+ * living directly at `$HOME` (`~/typos.toml`, `~/sgconfig.yml`, …) as the
+ * user's legitimate GLOBAL config, and reads it itself regardless of pi-lens
+ * — the ceiling didn't stop pi-lens from seeing an unrelated ancestor
+ * config, it stopped pi-lens from seeing the SAME config the tool was about
+ * to read on its own, so pi-lens silently fell back to (or, for typos,
+ * injected and let its own shipped `_typos.toml` merge over) the user's
+ * config where the tool's own resolver would have honored it. `php-cs-fixer`
+ * makes the same mismatch concrete: its detection gates
+ * (`hasPhpCsFixerConfig` via `findNearestContaining`, `phpCsFixerFormatter
+ * .detect` via its own `findUp`) are both unceilinged, so a ceilinged
+ * carriage here disagreed with its own gate — "config exists" from the gate,
+ * "config not found" from the resolver — and dropped the very `--config`
+ * argv #2472 exists to carry. Pass `options.homeDir` only when a caller
+ * affirmatively wants the ceiling (a config found at or above THAT directory
+ * is never returned); omitting it walks all the way to the filesystem root,
+ * matching `findNearestContaining`'s unceilinged behavior and every
+ * underlying tool's own discovery.
  *
  * Distinct from `findNearestContaining`, which returns the containing
  * directory rather than the matched file path — use that one when the caller
@@ -382,8 +405,14 @@ export function findNearestContaining(
 export function findLocalToolConfig(
 	startDir: string,
 	names: readonly string[],
+	options: { homeDir?: string } = {},
 ): string | undefined {
+	const homeDir =
+		options.homeDir !== undefined ? path.resolve(options.homeDir) : undefined;
 	for (const dir of walkUpDirs(startDir || process.cwd())) {
+		if (homeDir !== undefined && isAtOrAboveHomeDir(dir, homeDir)) {
+			return undefined;
+		}
 		for (const name of names) {
 			const candidate = path.join(dir, name);
 			if (existsSync(candidate)) return candidate;

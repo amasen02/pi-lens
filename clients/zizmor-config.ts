@@ -32,6 +32,9 @@ export const LOCAL_ZIZMOR_CONFIG_NAMES = [
 	"zizmor.yaml",
 ] as const;
 
+// Deliberately UNCEILINGED at $HOME (refs #2472 review round 3, F1): a
+// user-level `~/zizmor.yml` (or `~/.github/zizmor.yml`) is a legitimate
+// global config, not an escaped-workspace accident.
 export function findLocalZizmorConfig(startDir: string): string | undefined {
 	return findLocalToolConfig(startDir, LOCAL_ZIZMOR_CONFIG_NAMES);
 }
