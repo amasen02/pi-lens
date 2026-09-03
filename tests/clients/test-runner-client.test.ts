@@ -3188,3 +3188,114 @@ describe("resolveExec argv preservation matrix (#1098)", () => {
 			});
 	});
 });
+
+/**
+ * #2522 review round 2, F5/F6 — two ways the built-in exclusion opened when
+ * it had to stay shut.
+ *
+ * F5: the globs were matched case-SENSITIVELY, so a repo that names the
+ * directory `tests/Integration/` or `tests/E2E/` (or a file
+ * `foo.E2E.test.ts`) got the unbounded pre-#2522 behaviour back. The
+ * exclusion is a safety bound on what turn_end may auto-fire, and a safety
+ * bound that a capital letter defeats is not one. Windows and macOS default
+ * to case-insensitive filesystems, so the SAME repo excluded or admitted the
+ * same file depending on which box the agent ran on.
+ *
+ * F6: a target that resolves OUTSIDE the project root produced a `..`-leading
+ * relative path, which matches none of the globs — so it fell through as
+ * "not excluded" and turn_end would spawn a runner against a file it has no
+ * business auto-running. Out-of-tree must fail CLOSED.
+ */
+describe("#2522 R2 — the built-in exclusion fails closed", () => {
+	const r2Cleanups: Array<() => void> = [];
+	afterEach(() => {
+		while (r2Cleanups.length > 0) r2Cleanups.pop()?.();
+	});
+
+	it("excludes integration/e2e directories regardless of case (F5)", () => {
+		const cwd = path.resolve("/repo");
+		for (const rel of [
+			"tests/Integration/opencode-delegate.test.ts",
+			"tests/INTEGRATION/opencode-delegate.test.ts",
+			"tests/E2E/prune-worktrees.test.ts",
+			"tests/E2e/prune-worktrees.test.ts",
+		]) {
+			expect(isExcludedTestTarget(path.join(cwd, rel), cwd)).toBe(true);
+		}
+	});
+
+	it("excludes *.integration.*/*.e2e.* basenames regardless of case (F5)", () => {
+		const cwd = path.resolve("/repo");
+		for (const rel of [
+			"tests/clients/delegate.Integration.test.ts",
+			"tests/clients/delegate.E2E.test.ts",
+		]) {
+			expect(isExcludedTestTarget(path.join(cwd, rel), cwd)).toBe(true);
+		}
+	});
+
+	it("still admits an ordinary unit test whose name merely contains the words", () => {
+		const cwd = path.resolve("/repo");
+		// `integrationHelpers` / `e2eSupport` are not directory or dotted-suffix
+		// matches — case-insensitivity must not widen WHAT the globs match.
+		expect(
+			isExcludedTestTarget(
+				path.join(cwd, "tests/clients/integrationHelpers.test.ts"),
+				cwd,
+			),
+		).toBe(false);
+		expect(
+			isExcludedTestTarget(
+				path.join(cwd, "tests/clients/e2eSupport.test.ts"),
+				cwd,
+			),
+		).toBe(false);
+	});
+
+	it("fails CLOSED for a target that resolves outside the project root (F6)", () => {
+		const cwd = path.resolve("/repo/project");
+		// A `..`-leading relative target and an absolute sibling-tree target
+		// both land outside cwd; neither matches any glob, so pre-fix they were
+		// reported as "not excluded" and would have been spawned.
+		expect(isExcludedTestTarget("../other/tests/thing.test.ts", cwd)).toBe(
+			true,
+		);
+		expect(
+			isExcludedTestTarget(
+				path.resolve("/repo/other/tests/thing.test.ts"),
+				cwd,
+			),
+		).toBe(true);
+		// The project root itself is not a test target either.
+		expect(isExcludedTestTarget(cwd, cwd)).toBe(true);
+	});
+
+	it("still admits an in-tree unit test after the out-of-tree guard", () => {
+		const cwd = path.resolve("/repo/project");
+		expect(
+			isExcludedTestTarget(path.join(cwd, "tests/clients/widget.test.ts"), cwd),
+		).toBe(false);
+	});
+
+	it("fails closed through the REAL getTestRunTarget when the resolved target is out of tree", () => {
+		const root = setupTestEnvironment("pi-lens-2522-r2-");
+		r2Cleanups.push(root.cleanup);
+		const project = path.join(root.tmpDir, "project");
+		const outside = path.join(root.tmpDir, "outside");
+		fs.mkdirSync(project, { recursive: true });
+		fs.mkdirSync(outside, { recursive: true });
+		fs.writeFileSync(
+			path.join(project, "vitest.config.ts"),
+			"export default {}\n",
+		);
+		const strayTest = path.join(outside, "stray.test.ts");
+		fs.writeFileSync(strayTest, "export {};\n");
+
+		const client = new TestRunnerClient(false);
+		// The real "self" strategy resolves the edited test file itself — here
+		// one that lives outside the project root the turn is running in.
+		const target = client.getTestRunTarget(strayTest, project);
+		expect(target?.strategy).toBe("self");
+		expect(isExcludedTestTarget(target!.testFile, project)).toBe(true);
+	});
+});

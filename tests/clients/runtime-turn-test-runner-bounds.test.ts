@@ -12,6 +12,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { CacheManager } from "../../clients/cache-manager.js";
+import { mergeGitGuardTestFailure } from "../../clients/git-guard.js";
+import { setAmbientAbortSignal } from "../../clients/safe-spawn.js";
+import { TestRunnerClient } from "../../clients/test-runner-client.js";
 import { resetDegradationLedger } from "../../clients/degradation-ledger.js";
 import { peekTestFindings } from "../../clients/runtime-context.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
@@ -94,7 +97,7 @@ describe("#2504 AC2 — bounded test-runner batch helper", () => {
 			},
 		});
 		expect(started).toBeLessThan(40);
-		expect(outcome.skipped).toBeGreaterThan(0);
+		expect(outcome.deferred.length).toBeGreaterThan(0);
 		expect(outcome.stopReason).toBe("budget");
 	});
 
@@ -114,7 +117,7 @@ describe("#2504 AC2 — bounded test-runner batch helper", () => {
 			},
 		});
 		expect(started).toBeLessThan(40);
-		expect(outcome.skipped).toBeGreaterThan(0);
+		expect(outcome.deferred.length).toBeGreaterThan(0);
 		expect(outcome.stopReason).toBe("abort");
 	});
 
@@ -132,7 +135,7 @@ describe("#2504 AC2 — bounded test-runner batch helper", () => {
 		expect(outcome.results.filter((r) => r.status === "rejected")).toHaveLength(
 			1,
 		);
-		expect(outcome.skipped).toBe(0);
+		expect(outcome.deferred).toHaveLength(0);
 	});
 });
 
@@ -511,5 +514,296 @@ describe("#2522 AC2 — batch wall budget reconciled below the turn", () => {
 	it("is well under a turn and well under the 60s per-target timeout", () => {
 		expect(TEST_RUNNER_BATCH_BUDGET_MS).toBeLessThanOrEqual(20_000);
 		expect(TEST_RUNNER_BATCH_BUDGET_MS).toBeLessThan(60_000);
+	});
+});
+
+/**
+ * #2522 review round 2, F1 — the deferral AC2 promised was never built.
+ *
+ * `runTestTargetsBounded` returned only a skipped COUNT: the identity of the
+ * targets that never produced a result was thrown away, so "deferred to the
+ * next turn" was a comment, not a mechanism. Three consequences, all
+ * reproduced below through the REAL production path:
+ *
+ *  - a single target slower than the 20s batch budget yields `results: []` —
+ *    no cache record at all, zero output, every turn, forever;
+ *  - a PARTIAL batch (>=1 target settled clean, the rest cut at the bound)
+ *    fell through to the `results.length > 0` branch and wrote `content: ""`
+ *    plus "all tests passed", relaxing the commit gate on the strength of a
+ *    batch that never finished;
+ *  - the worker pool kept running after the batch returned, so an in-flight
+ *    spawn ran to its own 60s timeout and then MUTATED the results array the
+ *    caller had already consumed.
+ */
+describe("#2522 R2 F1 — the batch bound kills in flight and hands back a deferral set", () => {
+	it("kills in-flight targets at the wall budget and never mutates results after returning", async () => {
+		const abortsSeen: string[] = [];
+		const outcome = await runTestTargetsBounded<string, string>({
+			targets: ["a", "b", "c", "d", "e", "f"],
+			concurrency: 2,
+			budgetMs: 60,
+			// Production-faithful double: the real `run` hands its target to
+			// `runTestFileAsync` -> `safeSpawnAsync`, which kills the child when
+			// the signal it was handed aborts. A double that ignored the signal
+			// would let an inert fix look green.
+			run: async (target, signal) => {
+				await new Promise<void>((resolve) => {
+					const onAbort = (): void => {
+						abortsSeen.push(target);
+						resolve();
+					};
+					if (signal.aborted) return onAbort();
+					signal.addEventListener("abort", onAbort, { once: true });
+				});
+				return target;
+			},
+		});
+
+		expect(outcome.stopReason).toBe("budget");
+		// Every target is accounted for: nothing settled, so all six defer.
+		expect(outcome.deferred).toHaveLength(6);
+		expect(outcome.results).toHaveLength(0);
+		// The in-flight pair was actually KILLED, not left to its own timeout.
+		expect(abortsSeen.length).toBeGreaterThan(0);
+
+		// The killed runs resolve after the batch has already returned. The
+		// consumed results array must not grow under the caller.
+		const lengthAtReturn = outcome.results.length;
+		await delay(250);
+		expect(outcome.results).toHaveLength(lengthAtReturn);
+	});
+
+	it("defers a single target that outlives the budget, and returns it by identity", async () => {
+		const outcome = await runTestTargetsBounded<{ testFile: string }, string>({
+			targets: [{ testFile: "/repo/tests/slow.test.ts" }],
+			concurrency: 4,
+			budgetMs: 50,
+			run: async (_target, signal) =>
+				new Promise<string>((resolve) => {
+					signal.addEventListener("abort", () => resolve("killed"), {
+						once: true,
+					});
+				}),
+		});
+
+		expect(outcome.results).toHaveLength(0);
+		expect(outcome.deferred.map((t) => t.testFile)).toEqual([
+			"/repo/tests/slow.test.ts",
+		]);
+	});
+});
+
+/**
+ * #2522 review round 2, F1 — the same defect through the REAL `handleTurnEnd`
+ * fan-out and the REAL `test-runner-findings` cache, not the helper in
+ * isolation: a partial batch must never be recorded as a clean run, and the
+ * cut targets must come back next turn.
+ */
+describe("#2522 R2 F1 — turn_end persists and re-runs the deferral set", () => {
+	it("records a partial batch as deferred, not clean, and leaves the commit gate standing", async () => {
+		const runtime = new RuntimeCoordinator();
+		const cacheManager = new CacheManager(false);
+
+		fs.mkdirSync(path.join(env.tmpDir, "src"), { recursive: true });
+		fs.writeFileSync(
+			path.join(env.tmpDir, "vitest.config.ts"),
+			"export default {}\n",
+		);
+		const TARGETS = 8;
+		for (let i = 0; i < TARGETS; i++) {
+			const source = path.join(env.tmpDir, "src", `p${i}.ts`);
+			fs.writeFileSync(source, `export const p${i} = ${i};\n`);
+			fs.writeFileSync(
+				path.join(env.tmpDir, "src", `p${i}.test.ts`),
+				"export {};\n",
+			);
+			cacheManager.addModifiedRange(
+				source,
+				{ start: 1, end: 1 },
+				false,
+				env.tmpDir,
+				runtime.telemetrySessionId,
+			);
+		}
+
+		// A REAL prior test-failure blocker on the first target, seeded through
+		// the production commit-gate API. It names a file that then settles
+		// CLEAN in this turn's partial batch — pre-fix, the "all tests passed"
+		// branch cleared it on the strength of a batch that never finished.
+		const clearedTarget = path.join(env.tmpDir, "src", "p0.test.ts");
+		mergeGitGuardTestFailure(
+			cacheManager,
+			env.tmpDir,
+			runtime,
+			"[Tests] p0.test.ts FAIL 0p/1f",
+			[clearedTarget],
+		);
+
+		const controller = new AbortController();
+		setAmbientAbortSignal(controller.signal);
+		let calls = 0;
+		const ran: string[] = [];
+		const dbgLines: string[] = [];
+		const client = new TestRunnerClient(false);
+		// Real getTestRunTarget / real selection loop; only the spawn is doubled,
+		// and the double honours the per-target signal exactly as safeSpawnAsync
+		// does.
+		(client as unknown as { runTestFileAsync: unknown }).runTestFileAsync =
+			async (
+				testFile: string,
+				_cwd: string,
+				request: { signal?: AbortSignal },
+			) => {
+				const n = ++calls;
+				ran.push(testFile);
+				if (n <= 2) {
+					return {
+						file: testFile,
+						runner: "vitest",
+						passed: 1,
+						failed: 0,
+						duration: 1,
+					};
+				}
+				await delay(30);
+				if (n === 3) controller.abort();
+				await new Promise<void>((resolve) => {
+					if (request.signal?.aborted) return resolve();
+					request.signal?.addEventListener("abort", () => resolve(), {
+						once: true,
+					});
+				});
+				return {
+					file: testFile,
+					runner: "vitest",
+					passed: 0,
+					failed: 0,
+					error: "killed at the batch bound",
+				};
+			};
+
+		try {
+			await handleTurnEnd({
+				ctxCwd: env.tmpDir,
+				getFlag: (name: string) => name === "lens-guard",
+				dbg: (msg: string) => dbgLines.push(msg),
+				runtime,
+				cacheManager,
+				knipClient: {
+					ensureAvailable: async () => false,
+					analyze: async () => EMPTY_KNIP_RESULT,
+				},
+				deadCodeClients: [],
+				depChecker: { ensureAvailable: async () => false },
+				testRunnerClient: client,
+				resetLSPService: () => {},
+				resetFormatService: () => {},
+				// biome-ignore lint/suspicious/noExplicitAny: minimal turn_end deps
+			} as any);
+
+			const deadline = Date.now() + 5000;
+			while (Date.now() < deadline && calls < 3) await delay(20);
+			await delay(300);
+		} finally {
+			setAmbientAbortSignal(undefined);
+		}
+
+		const persisted = cacheManager.readCache<{
+			content: string;
+			deferredTargets?: { testFile: string; runner: string }[];
+		}>("test-runner-findings", env.tmpDir)?.data;
+
+		// The deferral set exists, by identity, in the cache the next turn reads.
+		expect(persisted?.deferredTargets?.length ?? 0).toBeGreaterThan(0);
+		// NOT a clean run: no empty-content record, and the agent is told.
+		expect(persisted?.content ?? "").toContain("deferred to the next turn");
+		expect(dbgLines.some((l) => l.includes("all tests passed"))).toBe(false);
+
+		// And the commit gate was not relaxed by an unfinished batch.
+		const guard = cacheManager.readCache<{ testFailures?: boolean }>(
+			"turn-end-findings",
+			env.tmpDir,
+		)?.data;
+		expect(guard?.testFailures).toBe(true);
+	});
+
+	it("runs the persisted deferral set FIRST on the next turn, ahead of this turn's own target", async () => {
+		const runtime = new RuntimeCoordinator();
+		const cacheManager = new CacheManager(false);
+
+		fs.mkdirSync(path.join(env.tmpDir, "src"), { recursive: true });
+		fs.writeFileSync(
+			path.join(env.tmpDir, "vitest.config.ts"),
+			"export default {}\n",
+		);
+		const source = path.join(env.tmpDir, "src", "fresh.ts");
+		const freshTest = path.join(env.tmpDir, "src", "fresh.test.ts");
+		const carried = path.join(env.tmpDir, "src", "carried.test.ts");
+		fs.writeFileSync(source, "export const fresh = 1;\n");
+		fs.writeFileSync(freshTest, "export {};\n");
+		fs.writeFileSync(carried, "export {};\n");
+		cacheManager.addModifiedRange(
+			source,
+			{ start: 1, end: 1 },
+			false,
+			env.tmpDir,
+			runtime.telemetrySessionId,
+		);
+
+		// Exactly what the previous turn's partial batch persists.
+		cacheManager.writeCache(
+			"test-runner-findings",
+			{
+				content: "1 test target(s) deferred to the next turn",
+				deferredTargets: [{ testFile: carried, runner: "vitest" }],
+			},
+			env.tmpDir,
+		);
+
+		const ran: string[] = [];
+		const client = new TestRunnerClient(false);
+		(client as unknown as { runTestFileAsync: unknown }).runTestFileAsync =
+			async (testFile: string) => {
+				ran.push(testFile);
+				return {
+					file: testFile,
+					runner: "vitest",
+					passed: 1,
+					failed: 0,
+					duration: 1,
+				};
+			};
+
+		await handleTurnEnd({
+			ctxCwd: env.tmpDir,
+			getFlag: () => false,
+			dbg: () => {},
+			runtime,
+			cacheManager,
+			knipClient: {
+				ensureAvailable: async () => false,
+				analyze: async () => EMPTY_KNIP_RESULT,
+			},
+			deadCodeClients: [],
+			depChecker: { ensureAvailable: async () => false },
+			testRunnerClient: client,
+			resetLSPService: () => {},
+			resetFormatService: () => {},
+			// biome-ignore lint/suspicious/noExplicitAny: minimal turn_end deps
+		} as any);
+
+		const deadline = Date.now() + 5000;
+		while (Date.now() < deadline && ran.length < 2) await delay(20);
+		await delay(150);
+
+		// Deferred first, then this turn's own related/self target.
+		expect(ran[0]).toBe(path.resolve(carried));
+		expect(ran).toContain(path.resolve(freshTest));
+		// Consumed: the list is retired once it has been dispatched, so a target
+		// can never be carried forever.
+		const persisted = cacheManager.readCache<{
+			deferredTargets?: { testFile: string }[];
+		}>("test-runner-findings", env.tmpDir)?.data;
+		expect(persisted?.deferredTargets ?? []).toHaveLength(0);
 	});
 });

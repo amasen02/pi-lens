@@ -26,6 +26,21 @@ import {
  * Older caches written before `results` existed won't have it — treated as
  * "nothing to adapt", not an error.
  */
+/**
+ * #2522 review round 2, F1: one target the turn-end batch could not finish —
+ * killed when the batch hit its wall budget, or never dispatched at all.
+ * Persisted by IDENTITY (not merely counted) so the next turn can run it
+ * FIRST. Plain JSON only: a `RunnerConfig` carries functions and cannot
+ * round-trip through the cache, so the runner is stored by key and its config
+ * re-resolved from `RUNNERS` at selection time.
+ */
+export interface DeferredTestTarget {
+	/** Absolute path to the test file that did not get to run. */
+	testFile: string;
+	/** `RUNNERS` key, re-resolved to a `RunnerConfig` on the next turn. */
+	runner: string;
+}
+
 export interface TestRunnerFindingsCache {
 	content: string;
 	stale?: boolean;
@@ -36,15 +51,24 @@ export interface TestRunnerFindingsCache {
 	provenance?: AdvisoryProvenance;
 	superseded?: boolean;
 	/**
-	 * #2522: true when every entry in `content` is a RUNNER error (timeout,
-	 * missing provider/binary, a rejected promise — `TestResult.error` with
-	 * `failed === 0`), never a genuine failing test. Read by
-	 * `peekTestFindings`/`consumeTestFindings` (`runtime-context.ts`) to
+	 * #2522: true when NOTHING in `content` is a genuine failing test — every
+	 * entry is either a RUNNER error (timeout, missing provider/binary, a
+	 * rejected promise — `TestResult.error` with `failed === 0`) or, since
+	 * review round 2, a target the batch was cut before it could finish. Read
+	 * by `peekTestFindings`/`consumeTestFindings` (`runtime-context.ts`) to
 	 * deliver these as advisory rather than "fix before continuing" — the
 	 * agent introduced nothing here to fix. Absent on older cache writes,
 	 * which fall back to the pre-#2522 blocking framing.
 	 */
 	runnerErrorOnly?: boolean;
+	/**
+	 * #2522 review round 2, F1: the targets this turn's batch could not finish.
+	 * The turn-end selection loop (`runtime-turn.ts`) dispatches these FIRST on
+	 * the next turn, ahead of failed-first/related/self and under the same
+	 * `TEST_RUNNER_MAX_TARGETS` cap, then clears the list. A non-empty list is
+	 * also what stops an unfinished batch from being recorded as a clean run.
+	 */
+	deferredTargets?: DeferredTestTarget[];
 }
 
 function failureMessage(failure: TestFailure): string {

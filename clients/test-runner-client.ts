@@ -180,8 +180,27 @@ export function isExcludedTestTarget(
 	cwd: string,
 ): boolean {
 	const rel = toPosix(path.relative(cwd, path.resolve(cwd, testFilePath)));
+	// #2522 review round 2, F6: a target that resolves OUTSIDE the project root
+	// yields a `..`-leading relative path (or, across Windows drives, a still
+	// absolute one), which matches none of the globs — so the bare `some()`
+	// below reported it as "not excluded" and turn_end would have auto-spawned a
+	// runner against a file outside the project the turn is running in. An
+	// out-of-tree target, and the project root itself, fail CLOSED.
+	if (
+		rel === "" ||
+		rel === ".." ||
+		rel.startsWith("../") ||
+		path.isAbsolute(rel)
+	)
+		return true;
+	// #2522 review round 2, F5: case-INSENSITIVE. `tests/Integration/`,
+	// `tests/E2E/` and `foo.E2E.test.ts` are the same hazard as their lowercase
+	// spellings, and on the case-insensitive filesystems Windows and macOS ship
+	// by default they are literally the same files — so a case-sensitive match
+	// made the SAME repo excluded on one box and unbounded on another. A safety
+	// bound a capital letter defeats is not a bound.
 	return TURN_END_EXCLUDED_TEST_GLOBS.some((glob) =>
-		minimatch(rel, glob, { dot: true }),
+		minimatch(rel, glob, { dot: true, nocase: true }),
 	);
 }
 
@@ -328,6 +347,15 @@ interface TestRunRequest {
 	runner: string;
 	config: RunnerConfig;
 	turnIndex?: number;
+	/**
+	 * #2522 review round 2, F1: the turn-end BATCH's own abort signal, distinct
+	 * from this spawn's 60s timeout. When the batch's 20s wall budget is spent
+	 * the batch aborts it, which tree-kills this child immediately instead of
+	 * leaving it to burn the remaining 40s and then hand back a result nobody
+	 * is waiting for. Absent (`undefined`) falls back to `safeSpawnAsync`'s
+	 * ambient turn signal exactly as before.
+	 */
+	signal?: AbortSignal;
 }
 
 interface FailedTargetStateRecord {
@@ -1268,7 +1296,7 @@ export class TestRunnerClient {
 		} else {
 			request = runnerOrRequest;
 		}
-		const { runner, config, turnIndex } = request;
+		const { runner, config, turnIndex, signal } = request;
 		if (!fs.existsSync(absoluteTestFile)) {
 			return this.emptyResult(
 				absoluteTestFile,
@@ -1291,6 +1319,9 @@ export class TestRunnerClient {
 				cwd,
 				timeout: 60000,
 				env,
+				// #2522 R2 F1. `safeSpawnAsync` resolves `options.signal ?? ambient`,
+				// so an absent batch signal keeps the pre-#2522 ambient behaviour.
+				signal,
 			});
 
 			const stdout = result.stdout || "";

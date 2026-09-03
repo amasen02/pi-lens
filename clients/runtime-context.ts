@@ -214,15 +214,21 @@ export function consumeTestFindings(
 	// pass the strictly-greater suppression check, and resurrect a consumed
 	// one-shot advisory with stale results. An empty-content record peeks as
 	// undelivered while keeping late-generation ordering intact.
-	const priorGeneration = cacheManager.readCache<TestRunnerFindingsCache>(
+	const prior = cacheManager.readCache<TestRunnerFindingsCache>(
 		"test-runner-findings",
 		cwd,
-	)?.data?.testRunGeneration;
+	)?.data;
+	// #2522 review round 2, F1: `deferredTargets` survives the retire, for the
+	// same reason `testRunGeneration` does. Delivering the advisory says the
+	// agent has SEEN the deferral; it does not mean those targets ran. Dropping
+	// the list here would silently un-defer them and the batch that was cut
+	// would never be finished.
 	cacheManager.writeCache(
 		"test-runner-findings",
 		{
 			content: "",
-			testRunGeneration: priorGeneration,
+			testRunGeneration: prior?.testRunGeneration,
+			deferredTargets: prior?.deferredTargets,
 		} as TestRunnerFindingsCache,
 		cwd,
 	);
