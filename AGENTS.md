@@ -1882,7 +1882,13 @@ the timeouts registered in `.claude/settings.json` (`HOOK_TIMEOUT_MS`, pinned
 to that file by a conformance test): `hookBudgetMs` gives SessionStart
 `90s - 60s removal reserve - 1s recheck reserve - 5s margin = 24s` and
 SubagentStop `15s - 5s removal reserve - 1s recheck reserve - 5s margin = 4s`,
-floored at `DEFAULT_HOOK_BUDGET_MS` (2s) for an unregistered event. The removal
+floored at `DEFAULT_HOOK_BUDGET_MS` (2s) for an unregistered event. Adding that
+1s recheck reserve (round 4, N3) shrank SubagentStop's own enrichment window
+too, as a side effect: `scanReserveMs(budgetMs, scanTimeoutMs)` reserves
+`min(scanTimeoutMs, budgetMs / 2)` for the process listing, so the 4000ms
+budget above (down from 5000ms before N3 added the recheck reserve) halves to
+a 2000ms listing reserve — leaving enrichment `4000 - 2000 = 2000ms`, down from
+`5000 - 2500 = 2500ms` pre-N3 (PR #2493 round 5, R3). The removal
 reserve is per hook (`HOOK_REMOVE_RESERVE_MS`) and is the SAME number `git()`
 bounds the removal with (`removeBoundMs`); the recheck reserve
 (`RECHECK_TIMEOUT_MS`, 1s) is the SAME number the pre-remove `isDirty()`

@@ -1586,13 +1586,20 @@ async function main(argv) {
 	/** Trees actually removed — 0 on a dry run, which the record also says. */
 	let removedCount = 0;
 	/**
-	 * Paths the enrichment pass certified clean but that turned up dirty on
-	 * the immediate pre-remove recheck (review round 3, F1) -- fed into the
-	 * run-level `keptReason` below so a late write reads exactly like an
-	 * enrichment-time one, not `removed: 0` with no stated reason.
-	 * @type {Set<string>}
+	 * Paths the enrichment pass certified clean but that turned up dirty (or
+	 * unreadable) on the immediate pre-remove recheck (review round 3, F1) --
+	 * fed into the run-level `keptReason` below so a late write reads exactly
+	 * like an enrichment-time one, not `removed: 0` with no stated reason.
+	 * Maps to the recheck's OWN `keptReason` spelling (PR #2493 round 5, R2):
+	 * `isDirty()`'s tri-state used to be collapsed by `!== "clean"` here, so a
+	 * recheck that could not read `git status` at all (a wedged git, the
+	 * recheck's own bound) was folded into the same `"dirty"` verdict as one
+	 * that genuinely found uncommitted work -- reading a scan that never got
+	 * to look as protected work, the exact confusion review round 3, F2
+	 * already closed for the ENRICHMENT-time call.
+	 * @type {Map<string, "dirty"|"status-unreadable">}
 	 */
-	const lateDirty = new Set();
+	const lateDirty = new Map();
 
 	if (!options.dryRun) {
 		for (const removal of removals) {
@@ -1631,26 +1638,43 @@ async function main(argv) {
 			// also uses its OWN small bound (`recheckBound`), not `removeBound`:
 			// see `recheckBoundMs` for why a second removeBound-sized call here
 			// blew the hook-timeout invariant (round 4, N3).
-			if (isDirty(removal.path, recheckBound) !== "clean") {
+			const recheckState = isDirty(removal.path, recheckBound);
+			if (recheckState !== "clean") {
+				// PR #2493 round 5, R2: the recheck's tri-state used to be
+				// collapsed by `!== "clean"` straight into a single "became dirty"
+				// verdict, so a recheck bound too tight to even ask (or a wedged
+				// git) read on the ledger exactly like a genuine late write --
+				// the same "a scan that never got to look" confusion review
+				// round 3, F2 already closed for the ENRICHMENT-time call, now
+				// closed here too.
+				const unreadable = recheckState === "unreadable";
 				console.error(
-					`[hygiene] ${removal.path} became dirty after enrichment; ` +
-						"skipping removal",
+					`[hygiene] ${removal.path} ${
+						unreadable
+							? "could not be re-checked before removal"
+							: "became dirty after enrichment"
+					}; skipping removal`,
 				);
 				// Keyed by `toComparablePath`, not the raw string: `removal.path`
 				// comes from `git worktree list` (forward slashes) while the run's
 				// `targetPath` is `--only`'s argv verbatim (backslashes on
-				// Windows) -- a raw-string `Set.has` below would silently miss
+				// Windows) -- a raw-string `Map.has` below would silently miss
 				// every match and report `keptReason: null` for a run that DID
 				// catch a late write (the same path-key invariant this repo
 				// already learned the hard way for the read-guard's maps).
-				lateDirty.add(toComparablePath(removal.path));
+				lateDirty.set(
+					toComparablePath(removal.path),
+					unreadable ? "status-unreadable" : "dirty",
+				);
 				records.push(
 					formatWorktreeRecord({
 						path: removal.path,
 						branch: removal.branch,
 						ageMs: removal.ageMs,
 						removed: false,
-						error: "became dirty between enrichment and removal",
+						error: unreadable
+							? "recheck could not read git status before removal"
+							: "became dirty between enrichment and removal",
 						nowIso,
 					}),
 				);
@@ -1786,7 +1810,7 @@ async function main(argv) {
 		candidates.some((c) => toComparablePath(c.path) === targetKey);
 	const keptReason =
 		targetKey && lateDirty.has(targetKey)
-			? "dirty"
+			? lateDirty.get(targetKey)
 			: targetPath && !targetRegistered && removedCount === 0
 				? "not-a-worktree"
 				: keptReasonFor({ targetPath, plan, deferred, policy });

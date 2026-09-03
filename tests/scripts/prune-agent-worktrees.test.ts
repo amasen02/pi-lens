@@ -937,6 +937,19 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 		git(["add", "a.txt"], repo);
 		git(["commit", "-qm", "init"], repo);
 		git(["remote", "add", "origin", origin], repo);
+		// PR #2493 round 5, R1: committed BEFORE `git worktree add` below, so
+		// every worktree this describe block creates -- not just the F1 test's
+		// `node_modules` junction fixture -- inherits it the same way a real
+		// agent worktree's checkout does (`node_modules` is gitignored in this
+		// repo too). Without it the F1 fixture's untracked junction makes `git
+		// status --porcelain` report `?? node_modules` on Linux the moment it
+		// is created (git-for-Windows silently treats the empty-target
+		// junction as absent and never reports it, which is why round 4 read
+		// the F1 case as win32-only -- it was never gated on the platform,
+		// only on this gap in the fixture).
+		fs.writeFileSync(path.join(repo, ".gitignore"), "node_modules\n");
+		git(["add", ".gitignore"], repo);
+		git(["commit", "-qm", "gitignore node_modules"], repo);
 		git(["push", "-q", "-u", "origin", "master"], repo);
 
 		const scriptsDir = path.resolve(__dirname, "../../scripts");
@@ -1424,6 +1437,106 @@ describe("SubagentStop hook, end to end (#2486)", () => {
 					helper.kill();
 				});
 			}
+		},
+	);
+
+	it(
+		"tells an unreadable recheck apart from a genuinely dirty one (PR #2493 round 5, R2)",
+		{ timeout: 90_000 },
+		async () => {
+			// The gap R2 names: `isDirty(removal.path, recheckBound) !== "clean"`
+			// collapsed the recheck's tri-state, so a recheck that could not
+			// read `git status` at all (a wedged git, a bound too tight) was
+			// folded into the same "became dirty" verdict as a genuine late
+			// write -- reading a scan that never got to look as protected work,
+			// the exact confusion review round 3, F2 already closed for the
+			// ENRICHMENT-time call.
+			//
+			// Enrichment must see the tree CLEAN, or the candidate never reaches
+			// the removal loop's recheck at all -- it goes straight to
+			// `plan.keep` with `dirtyUnreadable` via planWorktreePrune's own
+			// dirty rail, which is the enrichment-time path F2 already covers,
+			// not this one. So the `.git` gitlink is corrupted only AFTER
+			// enrichment has had time to run (a handful of git spawns against
+			// ONE candidate, observed under 100ms even on a loaded box), timed
+			// into the recheck gap the same way review round 3, F1 does: this
+			// fixture's copy of `process-scan.mjs` wraps `snapshotProcesses`
+			// with a fixed, generous delay so the window between enrichment and
+			// the recheck is controlled regardless of machine speed. Corrupting
+			// the gitlink (not a tiny forced recheck bound) makes the recheck's
+			// `git status --porcelain` fail OUTRIGHT rather than merely risk
+			// timing out against `RECHECK_TIMEOUT_MS`'s floor
+			// (`MIN_GIT_TIMEOUT_MS`, 250ms) -- comfortably long enough for a
+			// real `git status` on this tiny fixture to answer, which would
+			// make a bound-forcing version of this test flaky rather than red
+			// for the right reason.
+			const processScanPath = path.join(
+				repo,
+				"scripts",
+				"lib",
+				"process-scan.mjs",
+			);
+			const realProcessScanPath = path.join(
+				repo,
+				"scripts",
+				"lib",
+				"process-scan-real.mjs",
+			);
+			fs.renameSync(processScanPath, realProcessScanPath);
+			fs.writeFileSync(
+				processScanPath,
+				[
+					'import * as real from "./process-scan-real.mjs";',
+					'export * from "./process-scan-real.mjs";',
+					"// Deliberately delayed (PR #2493 round 5, R2, following review",
+					"// round 3, F1's technique): widens the gap between enrichment's",
+					"// isDirty() and the pre-remove recheck's so the gitlink",
+					"// corruption below is guaranteed to land inside it.",
+					"export async function snapshotProcesses(...args) {",
+					"\tawait new Promise((resolve) => setTimeout(resolve, 400));",
+					"\treturn real.snapshotProcesses(...args);",
+					"}",
+					"",
+				].join("\n"),
+			);
+
+			const cliRun = new Promise<void>((resolve, reject) => {
+				const child = spawn(process.execPath, [cli, ...registeredArgv()], {
+					cwd: repo,
+					env: {
+						...gitFixtureEnv(root),
+						PILENS_DATA_DIR: ledgerDir,
+					},
+					stdio: ["pipe", "pipe", "pipe"],
+				});
+				child.on("error", reject);
+				child.on("close", () => resolve());
+				child.stdin.write(subagentStopPayload(AGENT_ID));
+				child.stdin.end();
+			});
+			// Well after enrichment, comfortably inside the artificial 400ms
+			// process-table delay above.
+			await new Promise((resolve) => setTimeout(resolve, 150));
+			// Same unlink-then-write trick review round 3, F2 uses: Windows
+			// denies the O_TRUNC open `writeFileSync` performs on a `.git`
+			// gitlink file `git worktree add` just created.
+			const gitLinkPath = path.join(worktree, ".git");
+			fs.unlinkSync(gitLinkPath);
+			fs.writeFileSync(gitLinkPath, "gitdir: /nonexistent\n");
+			await cliRun;
+
+			expect(fs.existsSync(worktree)).toBe(true);
+			expect(
+				ledgerRecords().find((record) => record.event === "hygiene.run"),
+			).toMatchObject({ removed: 0, keptReason: "status-unreadable" });
+			expect(
+				ledgerRecords().find(
+					(record) => record.event === "hygiene.worktree-removed",
+				),
+			).toMatchObject({
+				removed: false,
+				error: "recheck could not read git status before removal",
+			});
 		},
 	);
 
