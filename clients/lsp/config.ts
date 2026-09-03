@@ -117,7 +117,14 @@ export interface LSPConfig {
 	warmFiles?: string[];
 }
 
-interface RegisteredLSPConfig {
+/**
+ * A workspace's LSP config in the shape the gates consume: custom servers
+ * already constructed, the deny set already a `Set`, overrides already a `Map`.
+ *
+ * Exported since #2427 review round 3 because `effectiveConfig` derives one
+ * rather than reading the session registry — see `registerLSPConfig`.
+ */
+export interface RegisteredLSPConfig {
 	customServers: LSPServerInfo[];
 	disabledServerIds: Set<string>;
 	serverOverrides: Map<string, ServerInitOverride>;
@@ -169,13 +176,19 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
  * `homeDir` is a test seam only, matching `findNestedProjectMutationValue`'s.
  *
  * `report: false` performs the same resolution and returns the same config
- * WITHOUT firing a user-facing notice (#2427 review round 2, F6). It
- * exists for `effectiveConfig`, whose whole contract is that asking what your
+ * WITHOUT firing a user-facing notice (#2427 review round 2, F6). It exists for
+ * `effectiveConfig`, whose whole contract is that asking what your
  * configuration is must not warn you about it or consume the warn-once latch
  * that the session-start load needs. Suppressing means suppressing BOTH sinks —
  * the record report and the per-document read-failure report — because a
  * question that answers "your global config is unreadable" by emitting the
  * loader's own degradation notice has reported all the same.
+ *
+ * It lives HERE and only here. `initLSPConfig` used to take the same option so
+ * that `effectiveConfig` could initialize a workspace quietly; round 3 removed
+ * that call outright, which removed the option, the parallel "which run is
+ * silent" set beside `configInFlight`, and the reporting-caller-never-joins-a-
+ * silent-run rule the two of them needed.
  */
 export interface LoadLSPConfigOptions {
 	/** Fire the user-facing config notices. Defaults to true. */
@@ -271,14 +284,6 @@ const EMPTY_CONFIG: RegisteredLSPConfig = {
 const workspaceConfigs = new BoundedLruCache<string, RegisteredLSPConfig>(32);
 /** In-flight config initialization promises to prevent duplicate concurrent loads */
 const configInFlight = new Map<string, Promise<void>>();
-/**
- * The cwds whose in-flight init is running with reporting SUPPRESSED.
- *
- * A parallel set rather than a richer in-flight value, so the map stays exactly
- * what the identity-guarded release and `_peekConfigInFlightForTests` already
- * reason about (#1968) and the ordinary reporting path allocates nothing.
- */
-const silentInFlight = new Set<string>();
 
 function normalizeWorkspacePath(cwd: string): string {
 	return path.resolve(cwd);
@@ -304,75 +309,88 @@ function getConfigForFile(filePath: string): RegisteredLSPConfig {
 }
 
 /**
- * Initialize LSP configuration (call at session start)
- * Deduplicates concurrent calls for the same workspace.
+ * THE `LSPConfig` → `RegisteredLSPConfig` conversion: construct the custom
+ * servers, index the deny list, index the overrides. Pure — it reads no
+ * module state and writes none.
+ *
+ * Extracted from `initLSPConfig`'s body in #2427 review round 3 so that
+ * `effectiveConfig` can build the config its question needs WITHOUT calling
+ * `initLSPConfig`. That call was the finding: a read-only query ran a full
+ * session initialization, which (a) registered the caller's cwd as a served
+ * session root, widening the #2052 access gate for a tree the session never
+ * opened, and (b) wrote the 32-entry `workspaceConfigs` LRU, so ~40 queries
+ * against other directories evicted a live root's config and silently lifted
+ * the operator's `disabledServers` denial — the exact inversion the surface
+ * promises cannot happen. With the conversion spelled here, both writes stop
+ * being something the query has to opt out of: it never reaches them.
+ *
+ * Still ONE definition, so the derived config and the session-registered one
+ * cannot disagree about what a document means.
  */
-export async function initLSPConfig(
-	cwd: string,
-	options: LoadLSPConfigOptions = {},
-): Promise<void> {
-	const reporting = options.report !== false;
+export function registerLSPConfig(config: LSPConfig): RegisteredLSPConfig {
+	const customServers: LSPServerInfo[] = [];
+	const disabledServerIds = new Set(config.disabledServers ?? []);
+
+	if (config.servers) {
+		for (const [id, serverConfig] of Object.entries(config.servers)) {
+			try {
+				const server = createCustomServer(serverConfig, id);
+				customServers.push(server);
+			} catch {
+				// pi-lens-ignore: missing-error-propagation — per-server registration, skip bad entries
+			}
+		}
+	}
+
+	const serverOverrides = new Map<string, ServerInitOverride>();
+	if (config.serverOverrides) {
+		for (const [id, entry] of Object.entries(config.serverOverrides)) {
+			if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+				const initOpts = (entry as Record<string, unknown>)
+					.initializationOptions;
+				if (
+					initOpts !== undefined &&
+					typeof initOpts === "object" &&
+					initOpts !== null &&
+					!Array.isArray(initOpts)
+				) {
+					serverOverrides.set(id, {
+						initializationOptions: initOpts as Record<string, unknown>,
+					});
+				}
+			}
+		}
+	}
+
+	return { customServers, disabledServerIds, serverOverrides };
+}
+
+/**
+ * Initialize LSP configuration (call at session start).
+ * Deduplicates concurrent calls for the same workspace.
+ *
+ * It takes no options on purpose. Every one of its callers is a session
+ * DECLARING a root it will serve — `ensureLSPConfigInitialized`, `ensureReady`,
+ * `runtime-session.ts`, `lens-engine.ts` — and a session-start load is exactly
+ * the caller that must report its config notices. There is no mode in which
+ * this function runs silently, because there is no caller that is not a
+ * session (#2427 review round 3).
+ */
+export async function initLSPConfig(cwd: string): Promise<void> {
 	const normalizedCwd = normalizeWorkspacePath(cwd);
 	// #2052: this cwd is now a served session root. Registered BEFORE the
 	// in-flight dedup return below, so a concurrent duplicate init still
 	// registers it rather than returning early with the root unrecorded.
 	registerSessionRoot(normalizedCwd);
 
-	// A REPORTING caller never joins a non-reporting run (#2427 review round
-	// 2, F6). The dedup exists to avoid a duplicate resolution, not to make
-	// one caller inherit another sinks: session start joining an
-	// `effectiveConfig` query silent load would drop that session config
-	// notices entirely, which is a worse failure than resolving twice. The other
-	// direction is safe and still dedupes — a silent caller joining a reporting
-	// run gets notices that were going to fire anyway.
 	const existing = configInFlight.get(normalizedCwd);
-	if (existing && (!reporting || !silentInFlight.has(normalizedCwd))) {
-		return existing;
-	}
-	if (reporting) silentInFlight.delete(normalizedCwd);
-	else silentInFlight.add(normalizedCwd);
+	if (existing) return existing;
 
 	const promise = (async () => {
-		const config = await loadLSPConfig(cwd, os.homedir(), options);
-		const customServers: LSPServerInfo[] = [];
-		const disabledServerIds = new Set(config.disabledServers ?? []);
-
-		if (config.servers) {
-			for (const [id, serverConfig] of Object.entries(config.servers)) {
-				try {
-					const server = createCustomServer(serverConfig, id);
-					customServers.push(server);
-				} catch {
-					// pi-lens-ignore: missing-error-propagation — per-server registration, skip bad entries
-				}
-			}
-		}
-
-		const serverOverrides = new Map<string, ServerInitOverride>();
-		if (config.serverOverrides) {
-			for (const [id, entry] of Object.entries(config.serverOverrides)) {
-				if (entry && typeof entry === "object" && !Array.isArray(entry)) {
-					const initOpts = (entry as Record<string, unknown>)
-						.initializationOptions;
-					if (
-						initOpts !== undefined &&
-						typeof initOpts === "object" &&
-						initOpts !== null &&
-						!Array.isArray(initOpts)
-					) {
-						serverOverrides.set(id, {
-							initializationOptions: initOpts as Record<string, unknown>,
-						});
-					}
-				}
-			}
-		}
-
-		workspaceConfigs.set(normalizedCwd, {
-			customServers,
-			disabledServerIds,
-			serverOverrides,
-		});
+		workspaceConfigs.set(
+			normalizedCwd,
+			registerLSPConfig(await loadLSPConfig(cwd, os.homedir())),
+		);
 	})();
 
 	configInFlight.set(normalizedCwd, promise);
@@ -385,10 +403,6 @@ export async function initLSPConfig(
 		// mid-flight, after which the next caller starts a duplicate config load.
 		if (configInFlight.get(normalizedCwd) === promise) {
 			configInFlight.delete(normalizedCwd);
-			// Same identity guard covers the silent-mode flag: it describes the
-			// run this release is retiring, so it goes only when that run is still
-			// the registered one.
-			silentInFlight.delete(normalizedCwd);
 		}
 	}
 }
@@ -491,9 +505,20 @@ function selectionReason(
 	return "selected";
 }
 
-/** Every registered server's decision for a file, with the reason for each. */
-export function explainServersForFile(filePath: string): ServerSelection[] {
-	const config = getConfigForFile(filePath);
+/**
+ * Every registered server's decision for a file, with the reason for each.
+ *
+ * `config` defaults to the SESSION's registered config for the file's tree —
+ * what the runtime would actually use. An explicit one is for a caller that
+ * must not touch session state to ask: `effectiveConfig` derives its own from
+ * `loadLSPConfig(..., { report: false })` rather than initializing the
+ * workspace (#2427 review round 3). Both spellings run the identical gate, and
+ * `tests/clients/effective-config.test.ts` pins them equal for the same cwd.
+ */
+export function explainServersForFile(
+	filePath: string,
+	config: RegisteredLSPConfig = getConfigForFile(filePath),
+): ServerSelection[] {
 	const ext = path.extname(filePath).toLowerCase();
 	const base = path.basename(filePath).toLowerCase();
 	return registeredServers(config).map((server) => {
@@ -551,7 +576,6 @@ export function getServerInitOverride(
 
 export function resetLSPConfigStateForTests(): void {
 	workspaceConfigs.clear();
-	silentInFlight.clear();
 	resetLSPCaseSensitivityState();
 	// Reset both together: a cleared config store beside a live session-root
 	// registry would decline files for roots nothing can serve any more.

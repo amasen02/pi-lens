@@ -952,9 +952,16 @@ export function ignoredRecordCollector(
  * injection (`configSources`): by the time a value reaches here, every legacy
  * root LSP key a document carried is already inside the namespace and has been
  * resolved against every tier through the SAME schema node as its canonical
- * spelling. Canonical still wins a per-key collision inside one document —
- * that is caller order in `configSources` — but the winner is now chosen by
- * `merge()`, which is the only place that can see all the tiers at once.
+ * spelling. Canonical still wins a collision inside one document — that is
+ * caller order in `configSources` — but the winner is now chosen by `merge()`,
+ * which is the only place that can see all the tiers at once.
+ *
+ * "Wins" is PER LEAF, not per key. A document that spells both root `servers`
+ * and `lsp.servers` no longer has one object replace the other: the two are
+ * merged by server id, and canonical wins only the ids they both define. A
+ * server defined only in the legacy root spelling therefore survives beside
+ * the canonical ones instead of disappearing — which is the same fix, one
+ * level down, as the vanishing legacy denial below (#2427 review round 3).
  *
  * The projection-time combination this used to do could only ever see two
  * independently resolved nodes, and picking one of them is how a global denial

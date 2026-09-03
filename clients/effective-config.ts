@@ -51,7 +51,9 @@ import { type LanguageEntry, resolveLanguage } from "./language-registry.js";
 import { getPiLensGlobalConfigPath } from "./lens-config.js";
 import {
 	explainServersForFile,
-	initLSPConfig,
+	loadLSPConfig,
+	registerLSPConfig,
+	type RegisteredLSPConfig,
 	type ServerSelectionReason,
 } from "./lsp/config.js";
 import { homeRelativePath } from "./path-utils.js";
@@ -256,35 +258,73 @@ function decidedByOrNothing(entry: ProvenanceViewEntry | undefined): {
 }
 
 /**
+ * Everything the per-file half needs and the whole-config half must not pay
+ * for: the file it answers about, and the LSP config that answer is read
+ * against. One value, so the two are produced under a single condition.
+ */
+interface FileQuery {
+	readonly absolute: string;
+	readonly lspConfig: RegisteredLSPConfig;
+}
+
+/**
  * The resolved model of pi-lens's configuration, with the provenance of every
  * decision — and, for one file, which servers and tools that configuration
  * selects or denies and why.
  *
- * Async because the per-file half drives `initLSPConfig` first. That is not
- * incidental: the per-workspace disable set is materialized by `initLSPConfig`
- * and `getConfigForFile` falls back to an EMPTY config for an un-initialized
- * tree, so a view taken before it would report every server as selected — the
- * introspection surface confidently contradicting the runtime it describes.
- * `initLSPConfig` is idempotent and in-flight-deduplicated, so paying for it
- * costs nothing when a session already ran it.
+ * ASKING CHANGES NOTHING (#2427 review round 3). The per-file half needs a
+ * workspace's registered LSP config — `getConfigForFile` answers EMPTY for a
+ * tree nothing initialized, which would report every server as selected — and
+ * round 2 got it by calling `initLSPConfig(cwd, { report: false })`. That
+ * inverted this surface's own guarantee: `initLSPConfig` is the session-root
+ * registry's single writer and the `workspaceConfigs` LRU's only producer, so
+ * a question about a foreign directory enrolled it as a served LSP root
+ * (widening the #2052 access gate) and, after ~40 such questions, evicted a
+ * live root's config from the 32-entry LRU — silently lifting the operator's
+ * `disabledServers` denial, which is precisely what this surface promises
+ * cannot happen. `sessionRoots` is capped at 128, so `shouldInitializeSessionRoot`
+ * never repaired it either.
  *
- * It runs ONLY when a `file` is asked about. The whole-config view is derived
- * from `resolvePiLensConfig` alone, and `pilens_health` takes exactly that
- * view on every call — initializing a workspace's LSP config as a side effect
- * of asking for a health line would be a query that changes the thing it
- * reports on.
+ * So the query DERIVES the config instead: `loadLSPConfig(..., report: false)`
+ * (the same loader `initLSPConfig` itself uses, minus the notices — rule 2)
+ * through the same `registerLSPConfig` conversion, handed to
+ * `explainServersForFile` as an explicit argument. Same gate, same answer, no
+ * write. The differential is pinned in `tests/clients/effective-config.test.ts`.
+ *
+ * The load runs ONLY when a `file` is asked about. The whole-config view is
+ * derived from `resolvePiLensConfig` alone, and `pilens_health` takes exactly
+ * that view on every call.
  */
 export async function effectiveConfig(
 	options: EffectiveConfigOptions = {},
 ): Promise<EffectiveConfigView> {
 	const cwd = options.cwd ?? process.cwd();
 	const homeDir = options.homeDir ?? os.homedir();
-	// `report: false` — rule 2 (#2427 review round 2, F6). This init is a step
+	// `report: false` — rule 2 (#2427 review round 2, F6). This load is a step
 	// in answering a QUESTION, and the query contract is that asking must not
 	// warn: an uninitialized cwd used to have its deprecation notices fired here
 	// and the loader warn-once latch consumed, so the session-start load that
 	// owns those notices then said nothing.
-	if (options.file !== undefined) await initLSPConfig(cwd, { report: false });
+	//
+	// `homeDir` is threaded, unlike `initLSPConfig`'s hard-wired `os.homedir()`:
+	// this call answers for the workspace the CALLER named, so the project walk
+	// must stop at the `$HOME` the rest of the view is resolved against.
+	//
+	// The path resolves HERE too, beside the load, so "is there a file half"
+	// is one condition rather than two that a later edit could disagree on.
+	// It is relative to the WORKSPACE, not to `process.cwd()`: a caller that
+	// names a workspace and then a file inside it means that file, and a bare
+	// `path.resolve` would silently answer for a same-named path under the host
+	// process's own directory — a wrong answer wearing a confident shape.
+	const fileQuery: FileQuery | undefined =
+		options.file === undefined
+			? undefined
+			: {
+					absolute: path.resolve(cwd, options.file),
+					lspConfig: registerLSPConfig(
+						await loadLSPConfig(cwd, homeDir, { report: false }),
+					),
+				};
 
 	const resolution = resolvePiLensConfig({
 		cwd,
@@ -313,18 +353,14 @@ export async function effectiveConfig(
 		provenance: provenanceView(resolved, homeDir).entries,
 		provenanceCounts: counts,
 		recordCounts: countBy(resolution.records, (record) => record.code),
-		...(options.file === undefined
+		...(fileQuery === undefined
 			? {}
 			: {
-					// Relative to the WORKSPACE, not to `process.cwd()`. A caller that
-					// names a workspace and then a file inside it means that file; a
-					// bare `path.resolve` would silently answer for a same-named path
-					// under the host process's own directory, which is a wrong answer
-					// wearing a confident shape.
 					file: await fileView(
-						path.resolve(cwd, options.file),
+						fileQuery.absolute,
 						resolved,
 						homeDir,
+						fileQuery.lspConfig,
 					),
 				}),
 	};
@@ -351,6 +387,7 @@ async function fileView(
 	absolute: string,
 	resolved: Resolved<Record<string, unknown>>,
 	homeDir: string,
+	lspConfig: RegisteredLSPConfig,
 ): Promise<EffectiveFileView> {
 	const language: LanguageEntry | undefined = resolveLanguage(absolute);
 	const kind = detectFileKind(absolute);
@@ -393,6 +430,7 @@ async function fileView(
 
 	const servers: EffectiveServerDecision[] = explainServersForFile(
 		absolute,
+		lspConfig,
 	).map((entry) => {
 		const spec = redactServerSpec(customServers[entry.server.id]);
 		return {

@@ -21,12 +21,21 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	effectiveConfig,
 	type EffectiveConfigView,
+	type EffectiveServerDecision,
 } from "../../clients/effective-config.js";
 import {
+	explainServersForFile,
+	initLSPConfig,
+	isServerDisabled,
 	loadLSPConfig,
 	resetLSPConfigStateForTests,
 	resetLSPConfigWarnCache,
+	type ServerSelection,
 } from "../../clients/lsp/config.js";
+import {
+	isOutsideAllSessionRoots,
+	isSessionRootRegistered,
+} from "../../clients/lsp/session-roots.js";
 import { removeTempDirSync } from "./test-utils.js";
 
 // The extension log is an ndjson sink, not the terminal; a fixture that
@@ -455,4 +464,181 @@ describe("effectiveConfig — asking must not report (#2427 rule 2)", () => {
 		}
 		expect(logSink.messages.join("\n")).toContain("deprecated");
 	});
+});
+
+/**
+ * A QUESTION MUST CHANGE NO SESSION STATE (#2427 review round 3, N2).
+ *
+ * The per-file half used to answer by calling `initLSPConfig(cwd)`, which is
+ * the session-root registry's single writer and the `workspaceConfigs` LRU's
+ * only producer. Both are session DECLARATIONS — "this process serves this
+ * root, and here is its resolved server config" — so routing a read-only query
+ * through them inverted the surface's own contract in two ways:
+ *
+ *  1. It enrolled a caller-supplied foreign directory as a served LSP root,
+ *     permanently widening the #2052 access gate for a tree the session never
+ *     opened.
+ *  2. It wrote the 32-entry LRU. Enough queries against other directories
+ *     EVICT a live root's config, after which `getConfigForFile` falls back to
+ *     EMPTY and the operator's `disabledServers` denial silently lifts — and
+ *     because `sessionRoots` is capped at 128, `shouldInitializeSessionRoot`
+ *     never re-initializes the evicted root.
+ *
+ * The fix is that the query derives its own registered config from
+ * `loadLSPConfig(..., { report: false })` and hands it to
+ * `explainServersForFile`, so there is no write to delete later.
+ */
+describe("effectiveConfig — asking changes no session state (#2427 round 3)", () => {
+	interface RootScenario {
+		readonly home: string;
+		readonly liveRoot: string;
+		readonly foreignDir: string;
+		readonly restore: () => void;
+	}
+
+	/**
+	 * One fixture home with a GLOBAL deny, a directory a session really
+	 * initializes, and a second directory only ever named by a query. The env
+	 * pin is held across the whole scenario rather than per call: the defect is
+	 * about state that survives between calls, so a helper that reset the
+	 * registry each time could not observe it.
+	 */
+	function rootScenario(): RootScenario {
+		const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-effcfg-r-"));
+		tempRoots.push(home);
+		const globalConfig = path.join(home, ".pi-lens", "config.json");
+		const liveRoot = path.join(home, "live");
+		const foreignDir = path.join(home, "foreign");
+		for (const dir of [path.dirname(globalConfig), liveRoot, foreignDir]) {
+			fs.mkdirSync(dir, { recursive: true });
+		}
+		const ids = ["typos"];
+		const denySection = { disabledServers: ids };
+		const denyDocument: Record<string, unknown> = { lsp: denySection };
+		fs.writeFileSync(globalConfig, JSON.stringify(denyDocument));
+
+		const previousHome = process.env.PI_LENS_HOME;
+		const previousConfigPath = process.env.PI_LENS_CONFIG_PATH;
+		process.env.PI_LENS_HOME = path.join(home, ".pi-lens");
+		process.env.PI_LENS_CONFIG_PATH = globalConfig;
+		resetLSPConfigStateForTests();
+		resetLSPConfigWarnCache();
+		const restore = (): void => {
+			if (previousHome === undefined) delete process.env.PI_LENS_HOME;
+			else process.env.PI_LENS_HOME = previousHome;
+			if (previousConfigPath === undefined)
+				delete process.env.PI_LENS_CONFIG_PATH;
+			else process.env.PI_LENS_CONFIG_PATH = previousConfigPath;
+			resetLSPConfigStateForTests();
+		};
+		return { home, liveRoot, foreignDir, restore };
+	}
+
+	/** P11: the queried cwd never becomes a served root. */
+	it("does not enrol the queried directory as a session root", async () => {
+		const scenario = rootScenario();
+		try {
+			// A session declares exactly ONE root, the way every real entry point
+			// does. The registry is non-empty, so the #2052 gate is live and
+			// declining is possible at all (it fails OPEN on an empty registry).
+			await initLSPConfig(scenario.liveRoot);
+			expect(isSessionRootRegistered(scenario.liveRoot)).toBe(true);
+			expect(isSessionRootRegistered(scenario.foreignDir)).toBe(false);
+
+			await effectiveConfig(queryFor(scenario.foreignDir, scenario.home));
+
+			expect(isSessionRootRegistered(scenario.foreignDir)).toBe(false);
+			// And the gate still refuses a file under it — asking about a tree is
+			// not the same as the session serving that tree.
+			const foreignFile = path.join(scenario.foreignDir, "notes.md");
+			expect(isOutsideAllSessionRoots(foreignFile)).toBe(true);
+		} finally {
+			scenario.restore();
+		}
+	});
+
+	/** P12: the LRU is never written, so a live root's config cannot be evicted. */
+	it("leaves a live root's denial intact after 40 queries elsewhere", async () => {
+		const scenario = rootScenario();
+		try {
+			await initLSPConfig(scenario.liveRoot);
+			const liveFile = path.join(scenario.liveRoot, "notes.md");
+			expect(isServerDisabled("typos", liveFile)).toBe(true);
+
+			// More than the LRU's 32 slots. Every directory is a SIBLING of the
+			// live root, so none of them is an ancestor that could legitimately
+			// answer for `liveFile`.
+			for (let index = 0; index < 40; index += 1) {
+				const other = path.join(scenario.home, `other-${index}`);
+				fs.mkdirSync(other, { recursive: true });
+				await effectiveConfig(queryFor(other, scenario.home));
+			}
+
+			// The operator's denial is still in force ...
+			expect(isServerDisabled("typos", liveFile)).toBe(true);
+			// ... and the root is still served, so nothing has to reinitialize
+			// it — which `shouldInitializeSessionRoot` would not do anyway.
+			expect(isSessionRootRegistered(scenario.liveRoot)).toBe(true);
+		} finally {
+			scenario.restore();
+		}
+	}, 60_000);
+
+	/**
+	 * P13: deriving the config instead of reading the session registry must not
+	 * change the ANSWER. Every registered server, with its verdict and its
+	 * reason, is compared against what the session path reports for the same
+	 * file — the differential that makes the deletion safe rather than merely
+	 * smaller.
+	 */
+	it("answers exactly what the session path answers for the same cwd", async () => {
+		const scenario = rootScenario();
+		try {
+			const liveFile = path.join(scenario.liveRoot, "notes.md");
+			await initLSPConfig(scenario.liveRoot);
+			const session = explainServersForFile(liveFile).map(registryDecision);
+			// Non-vacuous on both axes: a full registry, and a denial inside it.
+			expect(session.length).toBeGreaterThan(30);
+			const deniedTypos = session.some(isDeniedTypos);
+			expect(deniedTypos).toBe(true);
+
+			const view = await effectiveConfig(
+				queryFor(scenario.liveRoot, scenario.home),
+			);
+			const queried = (view.file?.servers ?? []).map(viewDecision);
+			expect(queried).toEqual(session);
+		} finally {
+			scenario.restore();
+		}
+	});
+
+	function queryFor(cwd: string, homeDir: string) {
+		const file = "notes.md";
+		return { cwd, homeDir, redact: true as const, file };
+	}
+
+	interface Decision {
+		readonly id: string;
+		readonly selected: boolean;
+		readonly reason: string;
+	}
+
+	function registryDecision(entry: ServerSelection): Decision {
+		const id = entry.server.id;
+		const selected = entry.selected;
+		const reason = entry.reason;
+		return { id, selected, reason };
+	}
+
+	function viewDecision(entry: EffectiveServerDecision): Decision {
+		const id = entry.id;
+		const selected = entry.selected;
+		const reason = entry.reason;
+		return { id, selected, reason };
+	}
+
+	function isDeniedTypos(entry: Decision): boolean {
+		const denied = entry.reason === "disabled-by-config";
+		return entry.id === "typos" && denied;
+	}
 });
