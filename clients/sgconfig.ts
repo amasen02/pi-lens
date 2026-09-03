@@ -39,7 +39,12 @@ interface CachedBaseline {
 	mergedDir: string;
 }
 
-/** Nearest `sgconfig.y[a]ml` walking up from `startDir`, or undefined if none. */
+/**
+ * Nearest `sgconfig.y[a]ml` walking up from `startDir`, or undefined if none.
+ * Deliberately UNCEILINGED at $HOME (refs #2472 review round 3, F1): ast-grep
+ * itself resolves `~/sgconfig.yml` as a legitimate global root config, not an
+ * escaped-workspace accident.
+ */
 export function findLocalSgconfig(startDir: string): string | undefined {
 	return findLocalToolConfig(startDir, SGCONFIG_NAMES);
 }

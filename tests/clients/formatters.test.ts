@@ -363,13 +363,13 @@ describe("resolveCommand — vendor/bin", () => {
 		expect(cmd).toContain(filePath);
 	});
 
-	it("php-cs-fixer: returns null when no vendor/bin", async () => {
-		const cmd = await phpCsFixerFormatter.resolveCommand!(
-			fileIn(tmpDir, "app.php"),
-			tmpDir,
-		);
-		expect(cmd).toBeNull();
-	});
+	// The "no vendor/bin AND no PATH binary" case is NOT covered here: this
+	// file never mocks `safe-spawn.js`, so a real `php-cs-fixer` on the host
+	// PATH would make that assertion PATH-dependent (#2472 review F1). It is
+	// covered instead in `formatter-unavailable-outcome.test.ts`, which
+	// mocks `safeSpawnAsync` so every `where`/`which` probe deterministically
+	// reports the tool absent — and asserts the actual current contract
+	// (`FORMATTER_UNAVAILABLE`, not `null`; #2472 review F4).
 });
 
 // ---------------------------------------------------------------------------
