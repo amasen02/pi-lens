@@ -97,6 +97,19 @@ function loggerModules(): string[] {
 		.filter((file) => /-logger\.ts$/.test(path.basename(file)));
 }
 
+/**
+ * Every `clients/` module that actually CALLS `createNdjsonLogger` — the
+ * `*-logger.ts` naming population above PLUS the non-suffix producers (#2516,
+ * refs #2506/#2511). This is the population the log-dir resolver conformance
+ * test below screens, since it is exactly the set of modules that write into
+ * one of the two machine-global roots the #2506 split created.
+ */
+function createLoggerCallerModules(): string[] {
+	return clientSourceFiles()
+		.filter((file) => path.basename(file) !== "ndjson-logger.ts")
+		.filter((file) => CREATE_LOGGER_IMPORT.test(fs.readFileSync(file, "utf8")));
+}
+
 describe("NDJSON writer conformance (#2505)", () => {
 	it("every *-logger.ts module (except ndjson-logger.ts itself) delegates to createNdjsonLogger", () => {
 		const population = loggerModules();
@@ -149,5 +162,46 @@ describe("NDJSON writer conformance (#2505)", () => {
 		// session-start sweep happens to look at it — which, in a long-lived
 		// process (the warm MCP server), may be never.
 		expect(unbounded).toEqual([]);
+	});
+
+	it("every createNdjsonLogger caller resolves its directory through getGlobalPiLensLogDir, never getGlobalPiLensDir (#2516)", () => {
+		// #2506 split machine-global state into two resolvers:
+		// `getGlobalPiLensDir()` for state a session must KEEP across restarts
+		// (installed tools, the instance registry), and
+		// `getGlobalPiLensLogDir()` for the log family, which alone gets the
+		// per-worktree/tmpdir probe redirect. A new logger wired to the wrong
+		// resolver silently loses that redirect and leaks straight into the
+		// maintainer's real `~/.pi-lens` the moment it runs as an ad-hoc probe
+		// — the exact #2506 shape, one module at a time. The population is
+		// DERIVED (every `createNdjsonLogger` caller under `clients/`), so a new
+		// logger is covered automatically without a hand-maintained list.
+		const population = createLoggerCallerModules();
+
+		assertNonEmptyScan(
+			"clients/ createNdjsonLogger caller population",
+			population.length,
+			12,
+		);
+
+		const sources = population.map((file) => ({
+			file: relativeToClients(file),
+			source: fs.readFileSync(file, "utf8"),
+		}));
+
+		const wrongResolver = sources
+			.filter(({ source }) => /\bgetGlobalPiLensDir\s*\(/.test(source))
+			.map(({ file }) => file);
+		expect(wrongResolver).toEqual([]);
+
+		// #2516 round 2, F4: banning the WRONG resolver is only half the rule.
+		// A logger that hand-rolls `path.join(os.homedir(), ".pi-lens")` — or
+		// takes any other route to a log root — names neither resolver and
+		// passed the ban above while missing the redirect entirely. Require the
+		// RIGHT one positively, so the only way into this population is through
+		// the seam that carries the redirect.
+		const noResolver = sources
+			.filter(({ source }) => !/\bgetGlobalPiLensLogDir\s*\(/.test(source))
+			.map(({ file }) => file);
+		expect(noResolver).toEqual([]);
 	});
 });
