@@ -48,22 +48,23 @@
  * says that none applies and why. That is a fact a reviewer can check against
  * the source; a reachability heuristic's silence is not.
  *
- * ## But the walked file set is itself partial — this scan under-includes too
+ * ## The walked file set — and the widening slice 2 added
  *
  * Round 1's header claimed "over-inclusion is the safe direction for a guard"
- * without saying that the FILE SET is a partial walk of its own (#2530 review
- * F6). It is: hook work reached through a helper MODULE leaves this scan's
- * view entirely, and those modules carry more unbounded awaits than the
- * four scanned groups suggest. Measured with this file's own detector:
- * `clients/pipeline.ts` 46, `clients/bootstrap.ts` 24,
- * `clients/actionable-warnings.ts` 12, `clients/dispatch/dispatcher.ts` 7,
- * `clients/quiet-window.ts` 6, `clients/format-service.ts` 5 — 100 unbounded
- * awaits reachable from hooks that this sweep does NOT flag and the table
- * below does NOT record. The ratchet is real for the files it covers and
- * silent outside them, which is stated here rather than left for a reader to
- * discover. #2523 slice 2's structural answer is threading the hook signal
- * into the deps types, which follows the work across module boundaries in a
- * way a file-group scan cannot.
+ * without saying that the FILE SET was a partial walk of its own (#2530 review
+ * F6): hook work reached through a helper MODULE left the scan's view
+ * entirely, and those modules carried 100 unbounded awaits the sweep neither
+ * flagged nor recorded. The counts were prose in this header — a measurement,
+ * not a ratchet, so a 47th could be added with the guard green.
+ *
+ * Slice 2 walks them. {@link HOOK_HELPER_MODULES} pins each module's count
+ * exactly, so an added unbounded await fails this file and a bounded one
+ * forces the number down. The granularity is per-MODULE rather than
+ * per-occurrence on purpose, and its own doc comment states the trade: ~100
+ * `EXEMPT_SITES` entries all reading "a later slice owns bounding this" would
+ * be 500 lines carrying one fact. The counts go to zero as #2523 threads the
+ * hook signal into the deps types, which is the structural answer a file list
+ * only approximates.
  *
  * ## The table is a BASELINE, deliberately
  *
@@ -153,15 +154,14 @@ export const SWEEP_HEURISTIC_LIMITS = [
 		"candidate; whether a site is actually on a hook path is recorded in the " +
 		"exemption table's `site` field, which a reviewer checks against the " +
 		"source. Over-inclusion WITHIN those files is the safe direction.",
-	"The FILE SET is itself a partial walk, so this sweep also UNDER-includes " +
-		"and is silent about it. Hook work that moves into a helper module " +
-		"leaves the scan's view: measured with this file's own detector, " +
-		"clients/pipeline.ts has 46 unbounded awaits, clients/bootstrap.ts 24, " +
-		"clients/actionable-warnings.ts 12, clients/dispatch/dispatcher.ts 7, " +
-		"clients/quiet-window.ts 6 and clients/format-service.ts 5 — 100 " +
-		"reachable from hooks, none of them flagged or recorded below. #2523 " +
-		"slice 2's deps-type threading is the structural answer; this is the " +
-		"slice-2 worklist those counts belong to.",
+	"The file set covers the four HOOK-HANDLER groups per-occurrence and the " +
+		"six HELPER modules hook work reaches through per-MODULE COUNT " +
+		"(`HOOK_HELPER_MODULES`). Slice 1 walked only the first group and said " +
+		"so in prose, so a 47th unbounded await in clients/pipeline.ts left the " +
+		"guard green (#2530 review F6). Both are now ratchets; only the first " +
+		"names individual lines. A count cannot tell 'bounded one, added one' " +
+		"from 'changed nothing' — the deps-type threading #2523 still owes is " +
+		"what removes the need for the coarser half.",
 	"`bounded()` is recognised SYNTACTICALLY, by call shape. A helper that " +
 		"wraps `bounded()` one level down reads as unbounded here and needs an " +
 		"exemption naming the wrapper — mechanically visible, unlike a walk that " +
@@ -174,11 +174,11 @@ export const SWEEP_HEURISTIC_LIMITS = [
 		"accepted even when `signal` appears in it: a signal-only race is the " +
 		"mirror image of the deadline-only defect this guard exists for, and a " +
 		"new race is forbidden by the hand-rolled-race family anyway.",
-	"Awaits in `clients/` modules OTHER than `runtime-*.ts` are out of scope of " +
-		"the hook-await family, so a hook whose work moves into a new helper " +
-		"module leaves that scan's view. #2523 slice 2 threads the hook signal " +
-		"into the deps types, which is the structural answer; this sweep covers " +
-		"the hook FILES.",
+	"A helper module NOT listed in `HOOK_HELPER_MODULES` is still outside both " +
+		"scans, so a hook whose work moves into a brand-new module leaves the " +
+		"guard's view until someone adds it. #2523's deps-type threading is the " +
+		"structural answer — it follows the work across module boundaries in a " +
+		"way a file list cannot — and until it lands the list is the screen.",
 	"The hand-rolled-race scan reads the race's own parentheses PLUS the 25 " +
 		"lines above it, because the dominant spelling hoists the timer arm into " +
 		"a named local. A timer built further away, in a helper, or in another " +
@@ -1938,16 +1938,6 @@ const EXEMPT_SITES: Readonly<Record<string, SweepExemption>> = {
 			"request; no pi hook budget applies.",
 		owner: "#2523 slice 2",
 	},
-	"race:clients/bootstrap.ts#awaitWithinBounds:888067f6~9dc2335c": {
-		family: "hand-rolled-race",
-		site: "off-hook",
-		reason:
-			"Hand-rolled timeout race in the analyzer-bootstrap loader " +
-			"(`awaitWithinBounds`). Reached from every hook that needs " +
-			"analyzer clients, so folding it into `bounded()` is high-value " +
-			"slice-2 work; slice 1 only forbids NEW ones.",
-		owner: "#2523 slice 2",
-	},
 	"race:clients/dispatch/dispatcher.ts#runRunner:5dbd3dcf~c580947c": {
 		family: "hand-rolled-race",
 		site: "off-hook",
@@ -1993,23 +1983,6 @@ const EXEMPT_SITES: Readonly<Record<string, SweepExemption>> = {
 			"family #2523's inventory names). Slice 2's fold worklist.",
 		owner: "#2523 slice 2",
 	},
-	"race:clients/observed-mutation.ts#withBounds:888067f6~411d7c3a": {
-		family: "hand-rolled-race",
-		site: "off-hook",
-		reason:
-			"`withBounds`: the observed-mutation capture budget " +
-			"(OBSERVED_CAPTURE_BUDGET_MS) as a hand-rolled race. Slice 2's " +
-			"fold worklist.",
-		owner: "#2523 slice 2",
-	},
-	"race:clients/pipeline.ts#resyncLspFile:5f7e02c1~e0e223f7": {
-		family: "hand-rolled-race",
-		site: "off-hook",
-		reason:
-			"`resyncLspFile`'s touch-versus-bail race with a hand-rolled " +
-			"timer arm. Slice 2's fold worklist.",
-		owner: "#2523 slice 2",
-	},
 	"race:clients/quiet-window.ts#buildHeartbeatResourcePatchBounded:888067f6~f7fcd4ba":
 		{
 			family: "hand-rolled-race",
@@ -2046,6 +2019,85 @@ const EXEMPT_SITES: Readonly<Record<string, SweepExemption>> = {
 			"standalone process entry point, no pi hook involved. Slice 2's " +
 			"fold worklist for uniformity, not for a hook budget.",
 		owner: "#2523 slice 2",
+	},
+};
+
+/**
+ * The HELPER modules hook work reaches through, and how many unbounded awaits
+ * each still holds (#2523 slice 2).
+ *
+ * ## Why this exists, and why it is coarser than {@link EXEMPT_SITES}
+ *
+ * Slice 1's sweep walked four file groups and was SILENT outside them
+ * (#2530 review F6): hook work that moves into a helper module left its view,
+ * so `clients/pipeline.ts` could grow a 47th unbounded await with the guard
+ * green. The counts were written into the header as prose, which is a
+ * measurement, not a ratchet.
+ *
+ * These modules are now WALKED. What is not per-occurrence is the exemption:
+ * the alternative was ~100 `EXEMPT_SITES` entries whose reason field would all
+ * read "slice 3 owns bounding this", which is the hand-maintained mirror
+ * AGENTS.md's single-source rule exists to prevent — 500 lines carrying one
+ * fact. A per-MODULE count carries that same one fact, and carries it as a
+ * ratchet: the number may only go DOWN, so a new unbounded await in any of
+ * these modules fails this file even though no per-line key names it.
+ *
+ * The trade, stated plainly: a count cannot tell "bounded one, added one"
+ * from "changed nothing". Per-occurrence keying (which `EXEMPT_SITES` still
+ * has for the four hook-handler groups) can. The counts here shrink to zero as
+ * #2523's remaining slices thread the hook signal into `TurnEndDeps` /
+ * `AgentEndDeps` / `SessionStartDeps`, at which point this table goes away
+ * rather than hardening into a permanent second dialect.
+ *
+ * `unbounded` is EXACT, not a ceiling: bounding one await here fails this test
+ * with the new number, so the burn-down is recorded rather than absorbed.
+ */
+const HOOK_HELPER_MODULES: Readonly<
+	Record<string, { unbounded: number; reason: string }>
+> = {
+	"clients/actionable-warnings.ts": {
+		unbounded: 12,
+		reason:
+			"`buildActionableWarningsReport` is awaited ON turn_end. Its LSP " +
+			"round trips ARE bounded (`boundedLspCall`, folded onto bounded() " +
+			"in this PR); the remainder is cache and filesystem work.",
+	},
+	"clients/bootstrap.ts": {
+		unbounded: 23,
+		reason:
+			"The analyzer-bootstrap seam every hook reaches for clients " +
+			"through. The DEMAND is bounded (`requestBootstrapClients`, folded " +
+			"onto bounded() in this PR); the awaits below it are the load " +
+			"itself, which the demand's bound abandons rather than cancels.",
+	},
+	"clients/dispatch/dispatcher.ts": {
+		unbounded: 7,
+		reason:
+			"Reached from the edit tool_result path. `runRunner`'s own " +
+			"RUNNER_TIMEOUT_MS race is a leaf bound with no signal arm — " +
+			"#2523's fold worklist, and 10x turn_end's whole budget.",
+	},
+	"clients/format-service.ts": {
+		unbounded: 5,
+		reason:
+			"#2523 AC6's target: `runFormattersWithConcurrency` is a sequential " +
+			"loop with a per-item 30s timer, no aggregate cap and no signal in " +
+			"the race. The 3-wedged-formatter probe measured `still-blocked " +
+			"after 45011ms`.",
+	},
+	"clients/pipeline.ts": {
+		unbounded: 45,
+		reason:
+			"The edit tool_result pipeline. `resyncLspFile`'s bound is folded " +
+			"onto bounded() in this PR; `_pendingCascadeRuns` (AC6) and the " +
+			"rest of the pipeline's awaits are the remaining worklist.",
+	},
+	"clients/quiet-window.ts": {
+		unbounded: 6,
+		reason:
+			"Heartbeat resource sampling, reached from the turn boundary. " +
+			"`buildHeartbeatResourcePatchBounded` has a timer arm and no signal " +
+			"arm — the same half-bound shape, on a smaller budget.",
 	},
 };
 
@@ -2570,6 +2622,94 @@ describe("#2523 AC1 every hook-path await is bounded, and no new hand-rolled rac
 		expect(count(/\baddEventListener\s*\(/g)).toBe(
 			count(/\bremoveEventListener\s*\(/g),
 		);
+	});
+
+	it("walks the helper modules hook work reaches through, and ratchets each count", () => {
+		// #2530 review F6, closed. Slice 1's file set was a partial walk that
+		// said so only in prose: a 47th unbounded await in `clients/pipeline.ts`
+		// left the guard green. Each module below is walked with THIS file's own
+		// detector and pinned to an exact count, so adding one fails here.
+		const measured: Record<string, number> = {};
+		for (const rel of Object.keys(HOOK_HELPER_MODULES)) {
+			const absolute = path.join(REPO_ROOT, rel);
+			expect(
+				fs.existsSync(absolute),
+				`${rel} is listed here but does not exist — a dead entry is not a clean one`,
+			).toBe(true);
+			measured[rel] = findUnboundedAwaitLines(
+				stripSource(fs.readFileSync(absolute, "utf8")),
+			).length;
+		}
+		const declared = Object.fromEntries(
+			Object.entries(HOOK_HELPER_MODULES).map(([rel, entry]) => [
+				rel,
+				entry.unbounded,
+			]),
+		);
+		expect(
+			measured,
+			"An unbounded await was ADDED to a module hook work reaches through, " +
+				"or one was bounded and the count here was not lowered. Wrap it in " +
+				"bounded() (clients/deadline-utils.ts) and lower the number, or " +
+				"raise the number with the reason why it had to grow.",
+		).toEqual(declared);
+		// Vacuity floor: an all-zero table would assert nothing at all, and the
+		// point of this ratchet is the burn-down it measures.
+		expect(
+			Object.values(measured).reduce((total, n) => total + n, 0),
+		).toBeGreaterThan(0);
+		for (const [rel, entry] of Object.entries(HOOK_HELPER_MODULES)) {
+			expect(entry.reason.length, `${rel}: reason too thin`).toBeGreaterThan(
+				60,
+			);
+		}
+	});
+
+	it("enumerates every shipped use of NEVER_ABORTED, with a reason", () => {
+		// #2523 slice 2. `bounded()` refuses a deadline-only call by TYPE, and
+		// `NEVER_ABORTED` is the one shape that can get past that: a seam whose
+		// caller signal is `AbortSignal | undefined` substitutes it and is then
+		// running on ONE live bound whenever the caller genuinely had none.
+		// That is weaker than #2523's contract, so it is not forbidden — it is
+		// ENUMERATED. A new file reaching for it fails here and has to say why,
+		// which is the same ratchet the exemption table above is.
+		//
+		// Keyed by FILE, not by occurrence: the question this answers is "which
+		// seams run on a possibly-single bound", and that is a property of the
+		// seam, not of a line.
+		const declared: Readonly<Record<string, string>> = {
+			[DEFINITION_FILE]: "declares it",
+			"clients/bootstrap.ts":
+				"`SessionBootstrapAccess.request` takes NO signal on purpose " +
+				"(#1394: a session_start can land mid-turn, and binding the " +
+				"ambient turn signal cancelled every startup scan with no " +
+				"retry). Two live bounds regardless — it supplies the seam's " +
+				"own `bootstrapShutdownController` as `shutdownSignal`.",
+			"clients/observed-mutation.ts":
+				"`ArmObservationArgs.signal` / `SettledSweepArgs.signal` are " +
+				"optional parameters that every production hook path fills; the " +
+				"fallback is fail-safe, not the normal case.",
+			"clients/pipeline.ts":
+				"`resyncLspFile` reads the AMBIENT turn signal, which is set for " +
+				"the whole tool_result path and only absent in a bare unit " +
+				"harness; the wall budget is live either way.",
+			"clients/actionable-warnings.ts":
+				"`LspEnrichmentDeps.signal` is optional for the in-band caller; " +
+				"the deferred loop always builds one from the turn signal and " +
+				"the deferral controller.",
+		};
+		const users: string[] = [];
+		for (const absolute of shippedSourceFiles()) {
+			const rel = relativePosix(REPO_ROOT, absolute);
+			const stripped = stripSource(fs.readFileSync(absolute, "utf8"));
+			if (/\bNEVER_ABORTED\b/.test(stripped)) users.push(rel);
+		}
+		// Vacuity floor: a scan that finds nothing is dead, not clean (#1755 F4).
+		expect(users.length).toBeGreaterThanOrEqual(2);
+		expect(users.sort()).toEqual(Object.keys(declared).sort());
+		for (const [file, reason] of Object.entries(declared)) {
+			expect(reason.length, `${file}: reason too thin`).toBeGreaterThan(10);
+		}
 	});
 
 	it("documents the heuristic's limits", () => {

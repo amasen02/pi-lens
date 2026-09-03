@@ -165,6 +165,41 @@ export function withinRemaining<T>(
 const BOUND_ABORTED: unique symbol = Symbol("pi-lens/bounded/aborted");
 
 /**
+ * The stand-in for a caller signal the seam does not have (#2523 slice 2).
+ *
+ * {@link bounded} refuses a deadline-only call BY TYPE, which is the point.
+ * Some seams nonetheless reach it with an OPTIONAL `AbortSignal | undefined`
+ * in hand, for two different reasons, and both are real:
+ *
+ * - Structurally absent. `clients/bootstrap.ts`'s
+ *   `SessionBootstrapAccess.request` takes no signal ON PURPOSE — a
+ *   `session_start` can land mid-turn (sequential replacement, `/new`), and
+ *   binding the ambient turn signal there cancelled every startup scan with no
+ *   retry (#1394). That seam still holds two live bounds, because it supplies
+ *   its own teardown controller as `shutdownSignal`.
+ * - Absent only at the type level. `clients/pipeline.ts`'s ambient abort and
+ *   `clients/observed-mutation.ts`'s `args.signal` are present on every
+ *   production hook path and optional only because their parameter is. There
+ *   the fallback is a fail-safe, not the normal case.
+ *
+ * Before this existed each such seam wrote `new AbortController().signal`
+ * inline — the same idiom, four times over, and four places a reviewer had to
+ * re-derive whether the missing signal was deliberate. One named constant
+ * makes the claim once and makes every use greppable.
+ *
+ * What it is NOT: a way to satisfy the type without a bound. A call that
+ * passes this has ONE live bound whenever the caller genuinely had no signal,
+ * which is weaker than the contract and must stay rare and written down —
+ * `tests/config/hook-await-bounds.test.ts` enumerates every shipped file that
+ * names it, with a reason per file, so the set cannot grow silently.
+ *
+ * Shared rather than per-call because {@link bounded} removes its listener in a
+ * `finally`: the live listener count on this signal is the number of `bounded()`
+ * calls currently in flight against it, never a running total.
+ */
+export const NEVER_ABORTED: AbortSignal = new AbortController().signal;
+
+/**
  * Which bound abandoned the await — the three `abandonedError`
  * (`clients/bootstrap.ts`) already distinguishes, kept identical so
  * {@link bounded} is a true SUPERSET of that helper rather than a fourth

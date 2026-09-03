@@ -12,7 +12,11 @@ import type { LSPCodeAction, LSPDiagnostic } from "./lsp/client.js";
 import { applyWorkspaceEdit } from "./lsp/edits.js";
 import { getLSPService } from "./lsp/index.js";
 import { isUnderDir, normalizeMapKey } from "./path-utils.js";
-import { combineAbortSignals, withDeadline } from "./deadline-utils.js";
+import {
+	bounded,
+	combineAbortSignals,
+	NEVER_ABORTED,
+} from "./deadline-utils.js";
 import {
 	armDeferredLspWork,
 	awaitDeferredLspWork,
@@ -661,32 +665,33 @@ interface LspEnrichmentDeps {
 	 * loop does, one macrotask after these deps are built.
 	 */
 	deadlineAt?: number;
-	/** The loop's live abort signal. */
-	signal?: AbortSignal;
 	/**
-	 * One pre-built abort leg for the whole loop. Built once so racing every
-	 * round trip against the signal adds exactly ONE listener to it rather than
-	 * three per file.
+	 * The loop's live abort signal — the SECOND bound every round trip races.
+	 *
+	 * Optional only because the in-band caller may have none; `boundedLspCall`
+	 * substitutes `NEVER_ABORTED` in that case, so the deadline is still live.
+	 * There is no longer a separate pre-built abort leg to forget to supply.
 	 */
-	abortRace?: Promise<undefined>;
+	signal?: AbortSignal;
 }
 
 /** A promise that resolves (never rejects) the moment `signal` aborts. */
-function makeAbortRace(signal: AbortSignal): Promise<undefined> {
-	return new Promise<undefined>((resolve) => {
-		if (signal.aborted) {
-			resolve(undefined);
-			return;
-		}
-		signal.addEventListener("abort", () => resolve(undefined), { once: true });
-	});
-}
-
 /**
  * Both bounds on ONE LSP round trip (#2504 review round 2, F3), as AGENTS.md
  * requires of any async step in a sweep loop: a per-call timeout AND the abort
  * signal. Resolves `undefined` when either bound wins; the caller reads that
  * as "this file was not checked", never as "this file is clean".
+ *
+ * #2523 slice 2 folded this onto `bounded()`. It used to be `withDeadline`
+ * (deadline only) raced against a hand-built `abortRace` leg carried on the
+ * deps — the fifth private spelling of "deadline AND signal", and one whose
+ * signal half was OPTIONAL, so a deps object built without `abortRace`
+ * silently degraded to the deadline-only shape this issue exists to remove.
+ * `bounded()` takes both by type, so that degradation is no longer
+ * expressible. The pre-built leg is gone with it: `bounded()` adds one
+ * listener per call and removes it in a `finally`, so the live count on the
+ * loop signal is the number of trips in flight rather than the three-per-file
+ * accumulation `abortRace` existed to avoid.
  */
 async function boundedLspCall<T>(
 	call: () => Promise<T>,
@@ -699,15 +704,27 @@ async function boundedLspCall<T>(
 	// awaited hook for minutes past a spent batch budget.
 	const remainingMs =
 		deps.deadlineAt !== undefined ? deps.deadlineAt - Date.now() : undefined;
+	// Returned BEFORE `bounded()` rather than handed to it as a zero budget: a
+	// trip that never started did not exceed anything, and recording it as an
+	// exceedance would attribute the loop's spent budget to whichever call
+	// happened to be next.
 	if (remainingMs !== undefined && remainingMs <= 0) return undefined;
-	const timed: Promise<T | undefined> = withDeadline(call(), {
-		ms:
-			remainingMs !== undefined
-				? Math.min(deps.pullTimeoutMs, remainingMs)
-				: deps.pullTimeoutMs,
-		onTimeout: "undefined",
-	});
-	return deps.abortRace ? Promise.race([timed, deps.abortRace]) : timed;
+	const boxed = await bounded(
+		call().then((value) => ({ value })),
+		{
+			ms:
+				remainingMs !== undefined
+					? Math.min(deps.pullTimeoutMs, remainingMs)
+					: deps.pullTimeoutMs,
+			signal: deps.signal ?? NEVER_ABORTED,
+			hook: "turn_end",
+			label: "lspEnrichmentRoundTrip",
+		},
+	);
+	// Boxed because an LSP pull legitimately resolves `undefined` (no
+	// diagnostics for this file), which must stay distinguishable from a bound
+	// firing even though both currently mean "not checked" to the caller.
+	return boxed?.value;
 }
 
 /** Positive finite bound, else the default. Guards NaN from env/config. */
@@ -863,7 +880,6 @@ export async function buildActionableWarningsReport(
 			// files get started.
 			deadlineAt: deadline,
 			signal: args.signal,
-			abortRace: args.signal ? makeAbortRace(args.signal) : undefined,
 		};
 
 		let unchecked = 0;
@@ -939,7 +955,6 @@ export async function buildActionableWarningsReport(
 					lspService,
 					pullTimeoutMs,
 					signal: loopSignal,
-					abortRace: makeAbortRace(loopSignal),
 				};
 				const deferredWork = (async () => {
 					// Yield a full macrotask first. Without this the loop would run

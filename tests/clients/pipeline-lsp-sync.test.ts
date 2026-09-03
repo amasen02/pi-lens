@@ -19,6 +19,10 @@ vi.mock("../../clients/latency-logger.js", async (importActual) => ({
 	logLatency: (entry: unknown) => logLatencyMock(entry),
 }));
 
+import {
+	getDegradationSummary,
+	resetDegradationLedger,
+} from "../../clients/degradation-ledger.js";
 import { resyncLspFile } from "../../clients/pipeline.js";
 import { getLSPService } from "../../clients/lsp/index.js";
 import { setAmbientAbortSignal } from "../../clients/safe-spawn.js";
@@ -41,6 +45,7 @@ beforeEach(() => {
 	starveBudget("PI_LENS_LSP_SYNC_BUDGET_MS", 50);
 	setAmbientAbortSignal(undefined);
 	logLatencyMock.mockClear();
+	resetDegradationLedger();
 });
 afterEach(() => {
 	delete process.env.PI_LENS_LSP_SYNC_BUDGET_MS;
@@ -61,6 +66,59 @@ describe("resyncLspFile — bounded pre-dispatch LSP sync", () => {
 		expect(elapsed).toBeGreaterThanOrEqual(45);
 		expect(elapsed).toBeLessThan(2000); // returned, did not hang
 		gate.resolve(null); // release the gate so nothing dangles into teardown
+	});
+
+	// #2523 slice 2. The bound above used to be `combineAbortSignals(abort,
+	// AbortSignal.timeout(budgetMs))` fed into a hand-rolled `Promise.race` —
+	// a private fifth copy of "deadline AND signal" that recorded nothing.
+	// It is `bounded()` now, and the ledger row is the only difference an
+	// elapsed-time assertion cannot see: revert the fold and this reds on a
+	// missing `hook-await-exceeded`, while every case around it stays green.
+	it("records the abandonment under hook-await-exceeded, naming the seam", async () => {
+		const gate = gatedPromise<unknown>();
+		mockService(() => gate.promise);
+		await resyncLspFile("/proj/a.ts", "content", true, false, getFlag, dbg);
+		const group = getDegradationSummary().find(
+			(entry) => entry.kind === "hook-await-exceeded",
+		);
+		expect(group?.latestReasons.at(-1)?.subject).toBe(
+			"tool_result_edit:resyncLspFile",
+		);
+		// The pre-existing latency record is NOT replaced by the ledger row —
+		// the two answer different questions (which server stalled, versus
+		// which hook budget was spent).
+		expect(
+			logLatencyMock.mock.calls
+				.map((call) => call[0])
+				.some((entry: any) => entry.phase === "lsp_sync_abandoned"),
+		).toBe(true);
+		gate.resolve(null);
+	});
+
+	it("records NOTHING when Escape aborts mid-flight — a cancel is not a degradation", async () => {
+		// `bounded()`'s cause precedence, at this call site: a caller abort
+		// must not surface in `pilens_health` next to a wedged server. Fold the
+		// signal back out of the race and this case reds, because the deadline
+		// would then be the only way out.
+		mockService(() => new Promise(() => {}));
+		const controller = new AbortController();
+		setAmbientAbortSignal(controller.signal);
+		process.env.PI_LENS_LSP_SYNC_BUDGET_MS = "10000";
+		const pending = resyncLspFile(
+			"/proj/a.ts",
+			"content",
+			true,
+			false,
+			getFlag,
+			dbg,
+		);
+		setTimeout(() => controller.abort(), 20);
+		await pending;
+		// The WHOLE summary, not just `hook-await-exceeded`: recording a cancel
+		// under the informational `hook-await-abandoned` kind instead would be
+		// the same inversion in a quieter tier, and a kind-specific assertion
+		// would wave it through (measured — that mutation left this green).
+		expect(getDegradationSummary()).toEqual([]);
 	});
 
 	it("returns immediately when the turn is already aborted, without touching", async () => {

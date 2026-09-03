@@ -118,6 +118,7 @@ import {
 } from "./opaque-mutation-scan.js";
 import { normalizeMapKey } from "./path-utils.js";
 import { getProcessSingleton } from "./process-singletons.js";
+import { bounded, NEVER_ABORTED } from "./deadline-utils.js";
 import { lineContentHash } from "./read-guard.js";
 
 /**
@@ -471,43 +472,55 @@ type BoundedOutcome<T> =
 /**
  * Both bounds on one async step: a wall-clock timeout AND an abort race.
  *
+ * #2523 slice 2 folded the hand-rolled timer race out of here and onto
+ * `bounded()`. What is left is the ADAPTER: this seam needs a three-way
+ * outcome (`timeout` / `aborted` / `failed`) that `bounded()` deliberately
+ * does not hand back, because a throw and a blown budget have different
+ * remedies and folding them together is catalog shape 10.
+ *
  * A loser is DISCARDED, never awaited to completion — the underlying work is
  * stat/read only, so letting it finish unobserved costs nothing, while awaiting
- * it would defeat the bound this exists to enforce. The timer is cleared on
- * every settle path so it cannot outlive the call (catalog shape 4).
+ * it would defeat the bound this exists to enforce.
+ *
+ * The result is BOXED through `bounded()` because `work` may legitimately
+ * resolve `undefined` (`captureLineHashes` does exactly that for an
+ * over-budget file), and `bounded()` uses a bare `undefined` to mean "a bound
+ * fired". Unboxed, an over-budget capture would have read as a timeout.
  */
 async function withBounds<T>(
 	work: () => Promise<T>,
 	timeoutMs: number,
 	signal: AbortSignal | undefined,
+	site: { hook: string; label: string },
 ): Promise<BoundedOutcome<T>> {
-	if (signal?.aborted === true) return { ok: false, reason: "aborted" };
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	let onAbort: (() => void) | undefined;
+	// A function, not an inline read: the signal is LIVE, so the compiler's
+	// narrowing from the pre-flight check below must not be carried across the
+	// await into the post-settle classification (it would fold that branch to
+	// "timeout" and hide every mid-await abort).
+	const isAborted = (): boolean => signal !== undefined && signal.aborted;
+	if (isAborted()) return { ok: false, reason: "aborted" };
 	try {
-		const bound = new Promise<BoundedOutcome<T>>((resolve) => {
-			timer = setTimeout(
-				() => resolve({ ok: false, reason: "timeout" }),
-				timeoutMs,
-			);
-			if (typeof timer.unref === "function") timer.unref();
-			if (signal) {
-				onAbort = () => resolve({ ok: false, reason: "aborted" });
-				signal.addEventListener("abort", onAbort, { once: true });
-			}
-		});
-		return await Promise.race([
-			work().then((value): BoundedOutcome<T> => ({ ok: true, value })),
-			bound,
-		]);
+		const boxed = await bounded(
+			work().then((value) => ({ value })),
+			{
+				ms: timeoutMs,
+				// The observational net runs on hook paths that may or may not
+				// carry a signal; the wall budget is the bound that is always
+				// there. See `NEVER_ABORTED`.
+				signal: signal ?? NEVER_ABORTED,
+				hook: site.hook,
+				label: site.label,
+			},
+		);
+		if (boxed) return { ok: true, value: boxed.value };
+		// `bounded()` applies the caller's signal FIRST, so reading it back here
+		// reproduces which bound fired without a second channel.
+		return { ok: false, reason: isAborted() ? "aborted" : "timeout" };
 	} catch {
 		// A THROW gets its own reason. Folding it into `timeout` is exactly the
 		// misclassification catalog shape 10 warns about: a reader tuning the
 		// budget would be chasing a bug that has nothing to do with time.
 		return { ok: false, reason: "failed" };
-	} finally {
-		if (timer !== undefined) clearTimeout(timer);
-		if (signal && onAbort) signal.removeEventListener("abort", onAbort);
 	}
 }
 
@@ -768,6 +781,10 @@ export async function armObservedMutation(
 		},
 		timeoutMs,
 		args.signal,
+		// Reached from `clients/runtime-tool-call.ts`, which #2523's contract
+		// gives no wall budget of its own — the ledger key still names it so a
+		// blown capture budget is attributable.
+		{ hook: "tool_call", label: "armObservedMutation" },
 	);
 	chargeTurnBudget(args.turnIndex, Date.now() - started);
 
@@ -992,6 +1009,7 @@ export async function settleObservedMutation(
 			}),
 		OBSERVED_SETTLE_DEADLINE_MS * 4,
 		args.signal,
+		{ hook: "tool_result_edit", label: "settleObservedMutation" },
 	);
 	chargeTurnBudget(args.turnIndex, Date.now() - started);
 	if (!capture.ok) {
@@ -1396,6 +1414,7 @@ export async function runObservedSettledSweep(
 		// race exists only to bound a single wedged `stat` — hence the slack.
 		OBSERVED_CAPTURE_BUDGET_MS * 2,
 		args.signal,
+		{ hook: "agent_settled", label: "runObservedSettledSweep" },
 	);
 	if (!outcome.ok) {
 		emitBounded(
@@ -1534,6 +1553,7 @@ export async function refreshObservedMutationLedger(
 			}),
 		OBSERVED_CAPTURE_BUDGET_MS * 2,
 		args.signal,
+		{ hook: "agent_settled", label: "refreshObservedMutationLedger" },
 	);
 	return outcome.ok ? outcome.value.scanned : 0;
 }

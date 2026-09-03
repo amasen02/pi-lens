@@ -222,6 +222,45 @@ describe("#2504 r2 F3 — per-round-trip bound on the deferred loop", () => {
 		// And it moved PAST the wedged file rather than abandoning the batch.
 		expect(getDiagnostics.mock.calls.length).toBe(3);
 	});
+
+	// #2523 slice 2. `boundedLspCall` used to be `withDeadline` (deadline
+	// only) raced against an OPTIONAL `abortRace` leg carried on the deps —
+	// so a deps object built without that leg silently degraded to the
+	// deadline-only shape #2523 exists to remove, and the abandonment was
+	// recorded nowhere. It is `bounded()` now. Revert the fold and this reds
+	// on a missing `hook-await-exceeded` while the case above stays green,
+	// which is the whole point: an elapsed-time assertion cannot tell a
+	// hand-rolled both-bounds race from the shared one.
+	it("records the abandoned round trip under hook-await-exceeded", async () => {
+		const { buildActionableWarningsReport, _awaitDeferredLspPullForTest } =
+			await loadWarnings();
+		const files = makeSources(3);
+		wedgedFiles.add("f0.ts");
+
+		await buildActionableWarningsReport({
+			cwd: env.tmpDir,
+			sessionId: "lens-test",
+			turnIndex: 1,
+			files,
+			modifiedRangesByFile: new Map(),
+			dispatchWarnings: [],
+			includeLspCodeActions: true,
+			lspPullTimeoutMs: 150,
+			onDeferredReport: () => {},
+		});
+		expect(await settlesWithin(_awaitDeferredLspPullForTest(), 2_500)).toBe(
+			"settled",
+		);
+
+		const group = getDegradationSummary().find(
+			(entry) => entry.kind === "hook-await-exceeded",
+		);
+		expect(group?.latestReasons.at(-1)?.subject).toBe(
+			"turn_end:lspEnrichmentRoundTrip",
+		);
+		// Rising edge, not one row per wedged file: three files share one row.
+		expect(group?.count).toBe(1);
+	});
 });
 
 describe("#2504 r2 F3 — session_shutdown aborts the deferred loop", () => {
