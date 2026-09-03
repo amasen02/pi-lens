@@ -62,12 +62,16 @@ import path from "node:path";
 import { BoundedLruCache } from "../bounded-cache.js";
 import {
 	lspSectionOf,
+	type PiLensConfigResolution,
 	reportConfigReadFailure,
 	reportPiLensConfigRecords,
 	resolvePiLensConfig,
+	summarizeConfigResolution,
 } from "../config-resolve.js";
 import { getGlobalPiLensDir } from "../file-utils.js";
+import { logLatency } from "../latency-logger.js";
 import { getPiLensGlobalConfigPath } from "../lens-config.js";
+import { logSessionStart } from "../sessionstart-logger.js";
 import { launchLSP } from "./launch.js";
 import {
 	registerSessionRoot,
@@ -195,12 +199,98 @@ export interface LoadLSPConfigOptions {
 	readonly report?: boolean;
 }
 
+/**
+ * Has this session already written its `config_resolved` record? (#2526)
+ *
+ * Process-lifetime state reset per session by
+ * {@link resetConfigResolvedTelemetryForSession}, exactly the shape of the
+ * other per-session latches `handleSessionStart` re-arms (catalog shape 17): a
+ * latch that is never re-armed silences the record for the rest of the
+ * process, which is the very silence #2526 exists to end.
+ *
+ * The latch — rather than an unconditional emit — is what makes the record a
+ * SESSION fact. `loadLSPConfig` is the funnel every config resolution goes
+ * through (`initLSPConfig` at session start and at each served root, the MCP
+ * `ensureReady` boot, `ensureLSPConfigInitialized` on the first edit), so an
+ * unconditional emit would write one row per resolution and the "one row per
+ * session" the smell analyzer counts against would be unrecoverable from the
+ * log.
+ */
+let configResolvedRecorded = false;
+
+/**
+ * Re-arm the `config_resolved` record for a new session (#2526).
+ *
+ * Called from `handleSessionStart`, beside the other per-session latch resets.
+ * Deliberately NOT folded into any of them: those live in their own modules
+ * for the same reason, and this one is loader state.
+ */
+export function resetConfigResolvedTelemetryForSession(): void {
+	configResolvedRecorded = false;
+}
+
+/**
+ * Write the session's ONE `config_resolved` record (#2526).
+ *
+ * Positive observability for the Phase 0 config stack: before this, a correct
+ * canonical-only resolution proved itself only by the ABSENCE of
+ * `PILENS_CFG_*` rows — the silent-success gap AGENTS.md warns about.
+ *
+ * REDACTED by construction, not by mode. Everything it can say comes from
+ * `summarizeConfigResolution`, the same projection `pilens_effective_config`
+ * embeds: document PATHS (home-relative), tiers, the legacy flag, per-tier
+ * leaf counts, and a record COUNT. No config value, and no absolute `$HOME`,
+ * can reach the log through it.
+ *
+ * NO SECOND RESOLUTION (#2513's facade rule): it reads the resolution its
+ * caller already performed. And it adds no `await` — `logLatency` and
+ * `logSessionStart` are synchronous buffered writers — so the session-start
+ * hook path gains nothing to wait on (#2523).
+ */
+function recordConfigResolved(
+	cwd: string,
+	resolution: PiLensConfigResolution,
+	lspConfig: LSPConfig,
+	homeDir: string,
+	resolveMs: number,
+): void {
+	if (configResolvedRecorded) return;
+	configResolvedRecorded = true;
+	const summary = summarizeConfigResolution(resolution, homeDir);
+	// The deny UNION's size, read off the same projection the gates consume
+	// (`lspConfigOf`) rather than re-read from the raw value — one definition of
+	// "which servers are denied", so the record cannot describe a different
+	// deny set than the one that actually suppresses a server.
+	const deniedServers = lspConfig.disabledServers?.length ?? 0;
+	const legacyDocuments = summary.documents.filter(
+		(document) => document.legacy,
+	).length;
+	logLatency({
+		type: "phase",
+		phase: "config_resolved",
+		filePath: cwd,
+		durationMs: resolveMs,
+		metadata: {
+			documents: summary.documents,
+			countsByTier: summary.countsByTier,
+			recordCount: summary.recordCount,
+			deniedServers,
+			resolveMs,
+		},
+	});
+	logSessionStart(
+		`config resolved documents=${summary.documents.length} legacy=${legacyDocuments} ` +
+			`records=${summary.recordCount} deniedServers=${deniedServers} resolveMs=${resolveMs}`,
+	);
+}
+
 export async function loadLSPConfig(
 	cwd: string,
 	homeDir: string = os.homedir(),
 	options: LoadLSPConfigOptions = {},
 ): Promise<LSPConfig> {
 	const reporting = options.report !== false;
+	const resolveStartedAt = Date.now();
 	const resolution = resolvePiLensConfig({
 		cwd,
 		globalDir: getGlobalPiLensDir(),
@@ -227,7 +317,21 @@ export async function loadLSPConfig(
 	// owned record from a document only this multi-file resolution discovered.
 	if (reporting) reportPiLensConfigRecords(resolution.records);
 
-	return lspConfigOf(resolution.value);
+	const config = lspConfigOf(resolution.value);
+	// #2526: the session's one positive record that config resolution HAPPENED,
+	// written where the resolution actually exists. `report: false` is not a
+	// gate here — the option suppresses USER-FACING notices, and a record in
+	// the latency log is not a notice; gating on it would let a session whose
+	// only resolution was a quiet one look, in the log, like a session that
+	// never resolved config at all.
+	recordConfigResolved(
+		cwd,
+		resolution,
+		config,
+		homeDir,
+		Date.now() - resolveStartedAt,
+	);
+	return config;
 }
 
 /**
@@ -604,6 +708,10 @@ export function resetLSPConfigStateForTests(): void {
 	// The warn latch is loader state too: a test that re-reads the same broken
 	// path after this reset must see the warning again, not a latched silence.
 	resetLSPConfigWarnCache();
+	// #2526: same reasoning for the per-session `config_resolved` latch — a
+	// test that resolves again after this reset must produce its record, not
+	// inherit a previous test's "already reported" claim.
+	resetConfigResolvedTelemetryForSession();
 }
 
 /**

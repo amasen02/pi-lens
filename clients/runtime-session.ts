@@ -44,7 +44,11 @@ import { logLatency } from "./latency-logger.js";
 import { runLogCleanup } from "./log-cleanup.js";
 import { resetCascadeTierSessionState } from "./lsp/cascade-tier.js";
 import type { LSPShutdownOptions } from "./lsp/client.js";
-import { initLSPConfig, loadLSPConfig } from "./lsp/config.js";
+import {
+	initLSPConfig,
+	loadLSPConfig,
+	resetConfigResolvedTelemetryForSession,
+} from "./lsp/config.js";
 import { resetWorkspaceDiagnosticsCacheSession } from "./lsp/workspace-diagnostics-session.js";
 import {
 	resetDirectLspCommandAvailability,
@@ -1884,6 +1888,14 @@ export async function handleSessionStart(
 	// live anchor into one bounded previous slot so the queued event keeps the
 	// replaced session's attribution until a newer live message_end is seen.
 	rotateMessageEndAttribution();
+	// #2526: re-arm the once-per-session `config_resolved` record so THIS
+	// session's config resolution — the deferred `loadLSPConfig` below, an MCP
+	// `ensureReady` boot, or the first edit's `ensureLSPConfigInitialized` —
+	// writes its own row instead of inheriting the previous session's "already
+	// recorded" claim. Same shape, and the same catalog-17 reason, as the
+	// latch resets above; the record itself is written where the resolution
+	// happens, so nothing is resolved twice.
+	resetConfigResolvedTelemetryForSession();
 	const handlerEnteredAt = Date.now();
 	const sessionStartMs = deps.sessionStartFiredAt ?? handlerEnteredAt;
 	const cwdForTelemetry = deps.ctxCwd ?? process.cwd();

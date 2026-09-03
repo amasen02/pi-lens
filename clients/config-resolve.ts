@@ -89,7 +89,11 @@ import {
 	migrationSubject,
 	type RecordAnchor,
 } from "./config-core/records.js";
-import type { Provenance, SourceTier } from "./config-core/provenance.js";
+import {
+	type Provenance,
+	SOURCE_TIERS,
+	type SourceTier,
+} from "./config-core/provenance.js";
 import { PI_LENS_CONFIG_SCHEMA } from "./config-schema.js";
 import {
 	type IgnoredConfigSubsystem,
@@ -284,6 +288,77 @@ export function collectPiLensConfigDocuments(
 	}
 
 	return documents;
+}
+
+/**
+ * One contributing config document, reduced to what a telemetry or
+ * introspection surface may carry: WHICH file, at which tier, and whether the
+ * location is on a removal schedule. Never the document's value.
+ */
+export interface ConfigDocumentSummary {
+	readonly tier: SourceTier;
+	/** Home-relative when the file is under `$HOME`. */
+	readonly file: string;
+	/** True for a location on a removal schedule (`DEPRECATED_CONFIG_SURFACES`). */
+	readonly legacy: boolean;
+}
+
+/**
+ * The redacted shape of a resolution: what contributed, how much each tier
+ * decided, and how many records the resolution produced.
+ *
+ * ONE definition, two consumers (#2526). `effectiveConfig` embeds it in the
+ * `pilens_effective_config` view and `loadLSPConfig` writes it to the
+ * `config_resolved` latency phase, so the answer a user reads on demand and
+ * the one the session-start record carries cannot drift apart — the
+ * single-source-of-truth rule applied to an observability surface rather than
+ * to a registry.
+ */
+export interface ConfigResolutionSummary {
+	readonly documents: readonly ConfigDocumentSummary[];
+	/** How many resolved leaves each tier decided. Zero-filled for every tier. */
+	readonly countsByTier: Readonly<Record<SourceTier, number>>;
+	/** Migration/notice records the resolution produced (`PILENS_CFG_*`). */
+	readonly recordCount: number;
+}
+
+/** A zero for every tier, so a consumer never has to test for an absent key. */
+function emptyTierCounts(): Record<SourceTier, number> {
+	return Object.fromEntries(SOURCE_TIERS.map((tier) => [tier, 0])) as Record<
+		SourceTier,
+		number
+	>;
+}
+
+/**
+ * Project a resolution onto its redacted summary.
+ *
+ * Values never appear: a document contributes its PATH (home-relative), its
+ * tier and its legacy flag, and nothing else — the same structural redaction
+ * `pilens_effective_config` applies, spelled once rather than twice (rule 3 of
+ * `clients/effective-config.ts`: the redacted view is the only view).
+ *
+ * Pure and synchronous: it reads a resolution the caller already performed and
+ * resolves nothing itself, so no caller can turn "report what we resolved"
+ * into a second walk of the config tree (#2513's facade rule).
+ */
+export function summarizeConfigResolution(
+	resolution: PiLensConfigResolution,
+	homeDir?: string,
+): ConfigResolutionSummary {
+	const countsByTier = emptyTierCounts();
+	for (const entry of resolution.provenance.values()) {
+		countsByTier[entry.tier] += 1;
+	}
+	return {
+		documents: resolution.documents.map((document) => ({
+			tier: document.tier,
+			file: homeRelativePath(document.file, homeDir),
+			legacy: document.location.legacy,
+		})),
+		countsByTier,
+		recordCount: resolution.records.length,
+	};
 }
 
 /** Resolve every discovered document into one configuration. */

@@ -221,6 +221,16 @@ function createState(files) {
 				progress: [],
 			},
 		},
+		// #2526: the config stack's positive-observability rows. `resolved`
+		// counts `config_resolved` phase records; `legacyWithoutRecords` counts
+		// the rows that carry a deprecated document but produced no
+		// migration/notice record — the deprecation machinery gone silent.
+		config: {
+			resolved: 0,
+			legacyDocuments: 0,
+			legacyWithoutRecords: 0,
+			examples: [],
+		},
 		diagnostics: {
 			bySeverity: counter(),
 			byTool: counter(),
@@ -352,6 +362,28 @@ async function analyzeLatency(files, state) {
 				const phase = entry.phase ?? "unknown";
 				state.latency.phaseCounts.inc(phase);
 				if (phase.endsWith("_timeout")) state.latency.phaseTimeouts.inc(phase);
+				if (phase === "config_resolved") {
+					// #2526. Counted here rather than derived from phaseCounts so the
+					// legacy/record cross-check reads the same row it counts.
+					state.config.resolved += 1;
+					const md = entry.metadata ?? {};
+					const documents = Array.isArray(md.documents) ? md.documents : [];
+					const legacy = documents.filter((doc) => doc?.legacy === true);
+					state.config.legacyDocuments += legacy.length;
+					// A deprecated document that produced NO record means the
+					// migration notices went silent — the user is on a removal
+					// schedule and is never told. Zero records with zero legacy
+					// documents is the correct canonical-only answer, not a smell.
+					if (legacy.length > 0 && Number(md.recordCount ?? 0) === 0) {
+						state.config.legacyWithoutRecords += 1;
+						pushTop(
+							state.config.examples,
+							summarizeConfigResolved(entry, "legacy document with 0 records"),
+							limit * 3,
+							byDuration,
+						);
+					}
+				}
 				if (
 					phase === "total" &&
 					(entry.durationMs ?? 0) >= thresholds.totalSlowMs
@@ -985,6 +1017,30 @@ function summarizeLatency(entry) {
 	};
 }
 
+/**
+ * A `config_resolved` row (#2526), summarised for a smell example.
+ *
+ * Deliberately NOT `summarizeLatency`: that helper's metadata whitelist would
+ * drop every field this row carries, so the example would print a phase name
+ * and nothing a reader could act on.
+ */
+function summarizeConfigResolved(entry, note) {
+	const md = entry.metadata ?? {};
+	const documents = Array.isArray(md.documents) ? md.documents : [];
+	return {
+		ts: entry.ts,
+		durationMs: entry.durationMs,
+		phase: entry.phase,
+		project: projectOf(entry.filePath),
+		note,
+		documents: documents
+			.map((doc) => `${doc?.tier ?? "?"}:${doc?.file ?? "?"}${doc?.legacy ? " (legacy)" : ""}`)
+			.slice(0, 8),
+		recordCount: md.recordCount,
+		deniedServers: md.deniedServers,
+	};
+}
+
 function summarizeWorkspaceSweep(entry) {
 	const md = entry.metadata ?? {};
 	const bits = [];
@@ -1193,6 +1249,28 @@ function buildReport(state) {
 		`session_start background tasks >= ${thresholds.backgroundSlowMs}ms`,
 		state.session.slowTasks.slice(0, limit),
 	);
+	// #2526: config resolution has to prove it HAPPENED. Two shapes, one smell:
+	//
+	// (a) session starts with no `config_resolved` row. Counted as a DEFICIT
+	//     against `session_start cwd:` lines, because the two live in different
+	//     logs and a line-oriented analyzer cannot join them per session. A
+	//     session that never resolves config at all (`--no-lsp`, a one-shot
+	//     print run that touches no file) legitimately contributes here; the
+	//     signal worth acting on is a deficit that approaches the session count,
+	//     which is what "the config stack went silent" looks like.
+	// (b) a legacy document present with zero records — the deprecation
+	//     machinery went silent while the user is on a removal schedule.
+	const sessionsWithoutConfigResolution = Math.max(
+		0,
+		state.session.starts - state.config.resolved,
+	);
+	addSmell(
+		smells,
+		"config-resolution",
+		sessionsWithoutConfigResolution + state.config.legacyWithoutRecords,
+		`Session starts with no config_resolved row (${sessionsWithoutConfigResolution} of ${state.session.starts}) or a legacy config document that produced no migration record (${state.config.legacyWithoutRecords})`,
+		state.config.examples.slice(0, limit),
+	);
 	addSmell(
 		smells,
 		"cascade-fallbacks",
@@ -1351,6 +1429,15 @@ function buildReport(state) {
 			cwds: state.session.cwds.top(limit),
 			rotations: state.session.rotations.toJSON(),
 			errors: state.session.errors.slice(0, limit),
+		},
+		// #2526: the positive-observability counters behind the
+		// `config-resolution` smell, so a reader can see WHY it fired (or that
+		// it correctly did not) without re-deriving the deficit.
+		config: {
+			resolved: state.config.resolved,
+			sessionsWithoutResolution: sessionsWithoutConfigResolution,
+			legacyDocuments: state.config.legacyDocuments,
+			legacyWithoutRecords: state.config.legacyWithoutRecords,
 		},
 		actionable: {
 			events: state.actionable.events.toJSON(),
