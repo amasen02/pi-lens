@@ -13,7 +13,10 @@
  * is enough to trigger both.
  */
 import { describe, expect, it } from "vitest";
-import { getMutationBridge, MUTATION_BRIDGE_KEY } from "../clients/mutation-bridge.js";
+import {
+	getMutationBridge,
+	MUTATION_BRIDGE_KEY,
+} from "../clients/mutation-bridge.js";
 import { READ_BRIDGE_KEY } from "../clients/read-bridge.js";
 import extension from "../index.js";
 import { createPiMock } from "./support/pi-mock.js";

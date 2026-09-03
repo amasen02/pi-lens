@@ -170,46 +170,43 @@ function isValidEntry(entry: unknown): entry is ReadBridgeEntry {
  * body — see that module's header, #2437).
  */
 export function registerReadBridge(deps: BridgeDeps): void {
-	registerProcessBridge(
-		READ_BRIDGE_KEY,
-		(): ReadBridge => ({
-			version: 1 as const,
-			recordRead(entry: ReadBridgeEntry): void {
-				// Validate the payload before doing anything else — this catches
-				// integration bugs in callers (malformed fields, bad numbers).
-				if (!isValidEntry(entry)) return;
+	registerProcessBridge(READ_BRIDGE_KEY, (): ReadBridge => ({
+		version: 1 as const,
+		recordRead(entry: ReadBridgeEntry): void {
+			// Validate the payload before doing anything else — this catches
+			// integration bugs in callers (malformed fields, bad numbers).
+			if (!isValidEntry(entry)) return;
 
-				if (!deps.isRecordable(entry.filePath)) return;
+			if (!deps.isRecordable(entry.filePath)) return;
 
-				const offset = entry.requestedOffset;
-				// When no limit is given treat the whole file as covered — the
-				// guard clips to the actual line count via its own file-length
-				// probe.
-				const limit = entry.requestedLimit ?? Number.MAX_SAFE_INTEGER;
-				const contentBinding = captureReadContentBinding(
-					entry.filePath,
-					offset,
-					limit,
-				);
+			const offset = entry.requestedOffset;
+			// When no limit is given treat the whole file as covered — the
+			// guard clips to the actual line count via its own file-length
+			// probe.
+			const limit = entry.requestedLimit ?? Number.MAX_SAFE_INTEGER;
+			const contentBinding = captureReadContentBinding(
+				entry.filePath,
+				offset,
+				limit,
+			);
 
-				deps.getReadGuard().recordRead({
-					filePath: entry.filePath,
-					requestedOffset: offset,
-					requestedLimit: limit,
-					effectiveOffset: offset,
-					effectiveLimit: limit,
-					expandedByLsp: false,
-					turnIndex: deps.getTurnIndex(),
-					writeIndex: deps.peekWriteIndex(),
-					// Stamp the timestamp here, matching exactly how the internal
-					// read path works (runtime-tool-call.ts always uses Date.now()).
-					timestamp: Date.now(),
-					// Provenance: identifies this record as bridge-sourced in
-					// read-guard.log.
-					source: `bridge:${entry.consumer ?? "unknown"}`,
-					...(contentBinding !== undefined && { contentBinding }),
-				});
-			},
-		}),
-	);
+			deps.getReadGuard().recordRead({
+				filePath: entry.filePath,
+				requestedOffset: offset,
+				requestedLimit: limit,
+				effectiveOffset: offset,
+				effectiveLimit: limit,
+				expandedByLsp: false,
+				turnIndex: deps.getTurnIndex(),
+				writeIndex: deps.peekWriteIndex(),
+				// Stamp the timestamp here, matching exactly how the internal
+				// read path works (runtime-tool-call.ts always uses Date.now()).
+				timestamp: Date.now(),
+				// Provenance: identifies this record as bridge-sourced in
+				// read-guard.log.
+				source: `bridge:${entry.consumer ?? "unknown"}`,
+				...(contentBinding !== undefined && { contentBinding }),
+			});
+		},
+	}));
 }

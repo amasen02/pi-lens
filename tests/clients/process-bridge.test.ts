@@ -32,9 +32,7 @@ interface Probe extends ProcessBridge {
 describe("registerProcessBridge", () => {
 	it("mounts build()'s result at globalThis[key]", () => {
 		const key = Symbol("pi-lens-test:process-bridge-mount");
-		const build = vi.fn(
-			(): Probe => ({ version: 1, ping: () => "pong" }),
-		);
+		const build = vi.fn((): Probe => ({ version: 1, ping: () => "pong" }));
 
 		registerProcessBridge(key, build);
 

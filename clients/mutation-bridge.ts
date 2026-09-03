@@ -324,15 +324,12 @@ export function recordMutationThroughSeam(
  * module's header, #2437).
  */
 export function registerMutationBridge(deps: MutationBridgeDeps): void {
-	registerProcessBridge(
-		MUTATION_BRIDGE_KEY,
-		(): MutationBridge => ({
-			version: 1 as const,
-			recordMutation(entry: MutationBridgeEntry): boolean {
-				return recordMutationThroughSeam(entry, deps);
-			},
-		}),
-	);
+	registerProcessBridge(MUTATION_BRIDGE_KEY, (): MutationBridge => ({
+		version: 1 as const,
+		recordMutation(entry: MutationBridgeEntry): boolean {
+			return recordMutationThroughSeam(entry, deps);
+		},
+	}));
 }
 
 /**
