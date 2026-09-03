@@ -80,10 +80,15 @@ describe("lsp launch", () => {
 		}));
 		vi.doMock("../../../clients/file-utils.js", () => ({
 			getGlobalPiLensDir: () => tempDir,
-			// #2506: sessionstart.log now resolves through the LOG dir, so the
-			// double must move it too — the assertion below reads
-			// `<tempDir>/sessionstart.log`, which is only where launch.ts writes
-			// if this resolver points at tempDir as well.
+		}));
+		// #2506: sessionstart.log resolves through the LOG dir, so the double
+		// must move that too — the assertion below reads
+		// `<tempDir>/sessionstart.log`, which is only where launch.ts writes if
+		// this resolver points at tempDir as well. #2516 round 2 moved the log
+		// resolver off `file-utils.ts` onto the cycle-free `probe-home-state.ts`
+		// leaf, so this doubles THAT module; doubling file-utils.js alone leaves
+		// launch.ts writing to the real (vitest-pinned) log root.
+		vi.doMock("../../../clients/probe-home-state.js", () => ({
 			getGlobalPiLensLogDir: () => tempDir,
 		}));
 
@@ -103,8 +108,22 @@ describe("lsp launch", () => {
 		} finally {
 			vi.doUnmock("../../../clients/env-utils.js");
 			vi.doUnmock("../../../clients/file-utils.js");
+			vi.doUnmock("../../../clients/probe-home-state.js");
 			removeTempDirSync(tempDir);
 		}
+	});
+
+	it("leaves probe-home-state.js un-truncated for later cases in this file", async () => {
+		// Regression for the previous test's `vi.doMock("../../../clients/
+		// probe-home-state.js", ...)` double, which stubbed only
+		// `getGlobalPiLensLogDir`. `vi.resetModules()` in `afterEach` clears the
+		// real-module cache but NOT the doMock registry, so a missing
+		// `vi.doUnmock` for that module leaves every later dynamic import of it
+		// (direct, or transitive through degradation-ledger.js) seeing the
+		// truncated fake instead of the real module.
+		const probeHomeState = await import("../../../clients/probe-home-state.js");
+		expect(typeof probeHomeState.getProbeHomeRedirectEvent).toBe("function");
+		expect(typeof probeHomeState.getProbeHomeResolution).toBe("function");
 	});
 
 	it.runIf(process.platform === "win32")(

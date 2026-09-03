@@ -23,12 +23,13 @@ import {
 	getProcessSingletonResets,
 	PROCESS_SINGLETON_RESET_KIND,
 } from "./process-singletons.js";
-// #2506: same inversion, same reason — `file-utils.ts` cannot import this
-// module (directly OR dynamically) without closing a no-client-cycles cycle
-// through the existing extension-log.ts/latency-logger.ts/safe-spawn.js path,
-// so `getGlobalPiLensLogDir()`'s probe-home-redirect event is written to this
-// zero-import leaf and read back here instead. See
-// `probe-home-state.ts`'s doc comment for the full account.
+// #2506: same inversion, same reason — the log-dir resolver cannot import this
+// module (directly OR dynamically). THIS module is on a no-client-cycles cycle
+// via extension-log.ts; the resolver's whole correctness argument is that it
+// sits off every cycle, so an edge in that direction would put it back on one.
+// `getGlobalPiLensLogDir()`'s probe-home-redirect event is therefore written
+// into `probe-home-state.ts` and read back here instead. See that module's doc
+// comment for the full account.
 import { getProbeHomeRedirectEvent } from "./probe-home-state.js";
 
 // Re-exported so existing importers keep one name for the ledger's bound.
@@ -138,6 +139,20 @@ export type DegradationKind =
 	 * never reach. Subject is the raw (unnormalized) `filePath` received.
 	 */
 	| "review-graph-non-absolute-entity-path"
+	/**
+	 * #2489 round 2: `dispatchForFile`'s (`clients/dispatch/dispatcher.ts`)
+	 * delta-baseline key is `session.baseline.<ctx.filePath>`. Every production
+	 * caller reaches `ctx.filePath` through `createDispatchContext`, which
+	 * guarantees it is always absolute (the #2016 invariant) — the same
+	 * guarantee `review-graph-non-absolute-entity-path` enforces for the
+	 * sibling entity-snapshot seam. A relative `ctx.filePath` here can only
+	 * happen through a caller regression (a hand-built `DispatchContext`
+	 * bypassing the constructor), so this fires at most once per subject (the
+	 * offending path) and the baseline read/write is skipped for that
+	 * dispatch rather than keyed under a value the constructor would never
+	 * produce. Subject is the raw `ctx.filePath` received.
+	 */
+	| "dispatch-non-absolute-baseline-path"
 	/**
 	 * The project-snapshot persist seam detected durable meta/body evidence
 	 * failing the #2008 integrity gate — the meta's recorded gz size no longer
@@ -725,11 +740,14 @@ export type DegradationKind =
 	 */
 	| "config-notice-suppressed"
 	/**
-	 * `getGlobalPiLensLogDir()` (`clients/file-utils.ts`, #2506) redirected the
-	 * LOG/ledger root away from the real `~/.pi-lens` because `PI_LENS_HOME`
-	 * was unset outside test mode and the process's `cwd` looked like a
-	 * probe context (inside a specific `.claude/worktrees/<worktree>/` or under
-	 * `os.tmpdir()`), or `PILENS_PROBE=1` forced the redirect. Without this kind
+	 * `getGlobalPiLensLogDir()` (`clients/probe-home-state.ts`, #2506) redirected
+	 * the LOG/ledger root away from the real `~/.pi-lens` because `PI_LENS_HOME`
+	 * was unset and the process's `cwd` looked like a probe context (inside a
+	 * specific `.claude/worktrees/<worktree>/` or under `os.tmpdir()`), or
+	 * `PILENS_PROBE=1` forced the redirect — this fires in test mode too, not
+	 * only outside it: `tests/support/vitest-setup.ts` pins `PI_LENS_HOME` for
+	 * the workers it covers, but globalSetup and children spawned without that
+	 * pin still redirect. Without this kind
 	 * a probe run outside vitest that forgot to pin `PI_LENS_HOME` would
 	 * silently write into the maintainer's real telemetry with no durable trace
 	 * — the exact gap that let two review probes leave 42 fixture rows in real
@@ -748,10 +766,11 @@ export type DegradationKind =
 	 * other kind above — the same `log-sink-write-failure`/
 	 * `process-singleton-reset` shape: it is folded into
 	 * `getDegradationSummary()` at READ time from `probe-home-state.ts`'s own
-	 * process-scoped event, because `file-utils.ts` cannot import this module
-	 * (directly OR dynamically) without closing a `no-client-cycles` violation
-	 * through the existing `extension-log.ts`/`latency-logger.ts`/
-	 * `safe-spawn.js` cycle. See `probe-home-state.ts`'s doc comment.
+	 * process-scoped event, because the resolver cannot import this module
+	 * (directly OR dynamically) without landing back on a `no-client-cycles`
+	 * cycle — this one is on the `extension-log.ts` cycle, and staying off
+	 * every cycle is the resolver's whole correctness argument. See
+	 * `probe-home-state.ts`'s doc comment.
 	 */
 	| "global-dir-probe-redirect"
 	/**
@@ -1048,7 +1067,7 @@ export function getDegradationSummary(): DegradationGroup[] {
 		});
 	}
 	// #2506, same read-time fold: `getGlobalPiLensLogDir()`'s probe-home redirect
-	// fires at most once per process (see `file-utils.ts`), so this is a
+	// fires at most once per process (see `probe-home-state.ts`), so this is a
 	// presence check, not a tally.
 	const probeHomeRedirect = getProbeHomeRedirectEvent();
 	if (probeHomeRedirect) {
@@ -1060,7 +1079,7 @@ export function getDegradationSummary(): DegradationGroup[] {
 				{
 					subject: truncateForLedger(probeHomeRedirect.probeHome),
 					reason: truncateForLedger(
-						`PI_LENS_HOME unset outside test mode with cwd in a worktree/tmp probe context (${probeHomeRedirect.cwd}); LOGS redirected away from the real home directory (tools, bin and instances.json are unaffected)`,
+						`PI_LENS_HOME unset with cwd in an agent worktree/tmp probe context (${probeHomeRedirect.cwd}), or PILENS_PROBE=1 forced it; LOGS redirected away from the real home directory (tools, bin and instances.json are unaffected)`,
 					),
 				},
 			],

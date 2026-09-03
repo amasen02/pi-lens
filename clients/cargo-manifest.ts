@@ -33,6 +33,13 @@
  * table-scoping and a sibling `readCargoWorkspaceExclude`, both now reused by
  * `clients/lsp/server.ts` instead of that file hand-composing the same two
  * primitives itself.
+ *
+ * #2480's fold missed a THIRD `[workspace]` presence check: `clients/lsp/
+ * server.ts`'s `RustWorkspaceRoot` walk-up carried its own
+ * `/^\s*\[workspace\]/m.test(...)`, four lines above the call it had already
+ * folded onto this file's readers. {@link hasCargoWorkspaceTable} closes that
+ * gap (#2498) — the one presence check every caller (that walk-up, and both
+ * of {@link resolveCargoPackageEdition}'s own checks below) now shares.
  */
 
 import { readFile } from "node:fs/promises";
@@ -97,9 +104,20 @@ function stripTomlLineComment(line: string): string {
  * `# "member",` line stayed live because nothing removed it before the
  * quoted-string scan ran over the whole bracketed span). A commented-out
  * entry must never survive into a captured table/array body.
+ *
+ * A leading UTF-8 BOM (`\uFEFF`) is stripped first — valid at the start of a
+ * Cargo.toml (rust-lang/cargo#2031) — because it sits OUTSIDE every reader's
+ * heading/key anchor below (`[ \t]*`, not `\s*`) and would otherwise hide a
+ * table or key on the file's very first line. #2498's `RustWorkspaceRoot`
+ * walk-up used to carry its own `/^\s*\[workspace\]/m` check, and ES's `\s`
+ * class DOES include `\uFEFF` — so that hand-rolled regex accepted a
+ * BOM-prefixed manifest by accident; folding it onto this shared reader
+ * without this strip would have silently regressed that shape (review round
+ * 2, F4).
  */
 function normalizeToml(content: string): string {
 	return content
+		.replace(/^\uFEFF/, "")
 		.replace(/\r\n/g, "\n")
 		.split("\n")
 		.map(stripTomlLineComment)
@@ -182,6 +200,26 @@ export function parseTomlScalarString(
 	);
 	if (!match) return undefined;
 	return match[1] ?? match[2];
+}
+
+/**
+ * True when `content` declares a `[workspace]` table — table-scoped and
+ * comment/indentation/CRLF-tolerant like every other reader here, because it
+ * IS `extractTomlTableSection` underneath. Presence is `!== undefined`, not a
+ * truthiness check on the returned string: an empty `[workspace]` table (a
+ * heading with no keys) returns `""`, which reads as falsy but is a valid
+ * "table present" answer (`extractTomlTableSection`'s own doc comment covers
+ * this — review round 3, F1).
+ *
+ * Exists so a caller that only needs the yes/no answer does not hand-roll a
+ * `\[workspace\]` regex to get it — that regex, four lines above
+ * `cargoWorkspaceDeclaresMember` in `clients/lsp/server.ts`, was behaviorally
+ * identical to this call under every probed shape (comments, indentation,
+ * CRLF, trailing content) but sat outside the one Cargo.toml reader #2473
+ * consolidated the rest of this file's callers onto (#2498).
+ */
+export function hasCargoWorkspaceTable(content: string): boolean {
+	return extractTomlTableSection(content, "workspace") !== undefined;
 }
 
 /**
@@ -389,7 +427,7 @@ export async function resolveCargoPackageEdition(
 	// `extractTomlTableSection` returns for "table absent" — a `!== ""` check
 	// would misread this common non-virtual-workspace-root shape as "no
 	// [workspace] here" and wrongly climb past it.
-	if (extractTomlTableSection(packageContent, "workspace") !== undefined) {
+	if (hasCargoWorkspaceTable(packageContent)) {
 		return validatedEdition(
 			readWorkspacePackageEdition(packageContent),
 			filePath,
@@ -409,7 +447,7 @@ export async function resolveCargoPackageEdition(
 		// `!== ""` — see the same-shaped check above (review round 3, F1).
 		if (
 			ancestorContent !== undefined &&
-			extractTomlTableSection(ancestorContent, "workspace") !== undefined
+			hasCargoWorkspaceTable(ancestorContent)
 		) {
 			return validatedEdition(
 				readWorkspacePackageEdition(ancestorContent),
