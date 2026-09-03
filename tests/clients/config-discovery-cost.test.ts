@@ -28,6 +28,7 @@
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { FRESHNESS_CADENCE_MS } from "../../clients/freshness-cadence.js";
 
 const counter = vi.hoisted(() => ({ stats: 0, counting: false }));
 
@@ -78,6 +79,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+	vi.useRealTimers();
 	if (previousConfigPath === undefined) delete process.env.PI_LENS_CONFIG_PATH;
 	else process.env.PI_LENS_CONFIG_PATH = previousConfigPath;
 	if (previousHome === undefined) delete process.env.PI_LENS_HOME;
@@ -172,5 +174,126 @@ describe("#2426 F-C: a warm project-config load is O(1) in filesystem stats", ()
 			after,
 			`warm=${warm} after legacy edit=${after} (a re-walk is expected here)`,
 		).toBeGreaterThan(warm);
+	});
+});
+
+describe("#2483: a warm load with NO config found anywhere is bearing-scoped too", () => {
+	it("spends the same, small stat budget on every one of 500 warm loads", async () => {
+		const home = tmpRoot("pi-lens-cost4-home-");
+		process.env.PI_LENS_HOME = tmpRoot("pi-lens-cost4-global-");
+		process.env.PI_LENS_CONFIG_PATH = path.join(home, "absent", "config.json");
+		// Several ancestor levels between the project and the ceiling, so a
+		// pre-fix full-chain freshness key has room to show its cost.
+		const projectDir = path.join(home, "a", "b", "c", "proj");
+		fs.mkdirSync(projectDir, { recursive: true });
+		// No .pi-lens.json / pi-lens.json anywhere in the chain.
+
+		const { loadPiLensProjectConfig } = await loader();
+		loadPiLensProjectConfig(projectDir); // cold: populate the discovery cache
+
+		const perLoad: number[] = [];
+		for (let index = 0; index < 500; index += 1) {
+			perLoad.push(statsFor(() => loadPiLensProjectConfig(projectDir)));
+		}
+		const distinct = [...new Set(perLoad)];
+		// Constant per load, and independent of chain depth: only startDir's own
+		// mtime is re-statted (no legacy documents exist to add their own stamp).
+		expect(
+			distinct,
+			`stats per warm load (500 loads): ${JSON.stringify(distinct)}`,
+		).toEqual([1]);
+	});
+
+	it("does not re-walk when an ancestor ABOVE startDir churns", async () => {
+		const home = tmpRoot("pi-lens-cost5-home-");
+		process.env.PI_LENS_HOME = tmpRoot("pi-lens-cost5-global-");
+		process.env.PI_LENS_CONFIG_PATH = path.join(home, "absent", "config.json");
+		const ancestor = path.join(home, "workspace");
+		const projectDir = path.join(ancestor, "pkg");
+		fs.mkdirSync(projectDir, { recursive: true });
+
+		const { loadPiLensProjectConfig } = await loader();
+		loadPiLensProjectConfig(projectDir);
+		const warm = statsFor(() => loadPiLensProjectConfig(projectDir));
+
+		// Unrelated churn in an ancestor of the (config-less) project — the exact
+		// shape from the issue: `~/Desktop` or `~/projects` moving should not
+		// force a re-walk of a project that has no config at all.
+		fs.writeFileSync(path.join(ancestor, "unrelated.txt"), "churn");
+		const churnStamp = new Date(Date.now() + 10_000);
+		fs.utimesSync(ancestor, churnStamp, churnStamp);
+
+		const after = statsFor(() => loadPiLensProjectConfig(projectDir));
+		expect(after, `warm=${warm} after ancestor churn=${after}`).toBe(warm);
+	});
+
+	it("notices a config file newly created directly in startDir", async () => {
+		const home = tmpRoot("pi-lens-cost6-home-");
+		process.env.PI_LENS_HOME = tmpRoot("pi-lens-cost6-global-");
+		process.env.PI_LENS_CONFIG_PATH = path.join(home, "absent", "config.json");
+		const projectDir = path.join(home, "proj");
+		fs.mkdirSync(projectDir, { recursive: true });
+
+		const { loadPiLensProjectConfig } = await loader();
+		expect(loadPiLensProjectConfig(projectDir).maxProjectFiles).toBeUndefined();
+		statsFor(() => loadPiLensProjectConfig(projectDir)); // warm, cache settled
+
+		// A config file created directly in startDir bumps startDir's OWN mtime —
+		// the one directory this entry's per-call freshness check tracks — so it
+		// is found on the very next load, no cadence wait needed. A file created
+		// further up the chain relies on the cadence-bound force-expiry instead
+		// (see the round-2 describe block below).
+		write(path.join(projectDir, ".pi-lens.json"), { maxProjectFiles: 42 });
+		const createStamp = new Date(Date.now() + 10_000);
+		fs.utimesSync(projectDir, createStamp, createStamp);
+
+		const config = loadPiLensProjectConfig(projectDir);
+		expect(config.maxProjectFiles).toBe(42);
+	});
+});
+
+describe("#2483 round 2: a no-config entry re-checks the full ancestor chain at most once per cadence window", () => {
+	it("does not notice a config created two levels above startDir within the cadence window, but does once it elapses", async () => {
+		const home = tmpRoot("pi-lens-cost7-home-");
+		process.env.PI_LENS_HOME = tmpRoot("pi-lens-cost7-global-");
+		process.env.PI_LENS_CONFIG_PATH = path.join(home, "absent", "config.json");
+		// The reviewer's probe shape: a repo-root config created above a nested
+		// worktree's startDir (clients/file-utils.ts:783-784's nested-worktree
+		// case) — two levels up, well outside what `bearingDirMtimes`'s no-`info`
+		// branch tracks (`startDir` alone).
+		const repoRoot = path.join(home, "repo");
+		const projectDir = path.join(repoRoot, "worktrees", "wt1");
+		fs.mkdirSync(projectDir, { recursive: true });
+
+		// Fake timers installed BEFORE the cold load, so `checkedAtMs` (captured
+		// via `Date.now()` inside the loader) is pinned to `start` exactly —
+		// real wall-clock time spent on the cold walk's own I/O does not eat
+		// into the 1ms-precision margin the two assertions below rely on.
+		vi.useFakeTimers();
+		const start = Date.now();
+
+		const { loadPiLensProjectConfig } = await loader();
+		expect(loadPiLensProjectConfig(projectDir).maxProjectFiles).toBeUndefined();
+
+		// Created two levels above startDir — moves nothing `dirMtimes` (scoped
+		// to `startDir` alone in the no-config case) tracks.
+		write(path.join(repoRoot, ".pi-lens.json"), { maxProjectFiles: 99 });
+
+		// Still inside the cadence window: the entry force-expires at most once
+		// per window, so this load must NOT re-walk yet.
+		vi.setSystemTime(start + FRESHNESS_CADENCE_MS - 1);
+		expect(
+			loadPiLensProjectConfig(projectDir).maxProjectFiles,
+			"picked up the ancestor config before the cadence window elapsed",
+		).toBeUndefined();
+
+		// Past the cadence window: the next load force-expires the entry,
+		// re-walks the full ancestor chain, and finds the config that was
+		// created above startDir.
+		vi.setSystemTime(start + FRESHNESS_CADENCE_MS + 1);
+		expect(
+			loadPiLensProjectConfig(projectDir).maxProjectFiles,
+			"did not pick up the ancestor config after the cadence window elapsed",
+		).toBe(99);
 	});
 });
