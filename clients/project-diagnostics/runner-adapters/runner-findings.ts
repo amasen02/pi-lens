@@ -35,6 +35,16 @@ export interface TestRunnerFindingsCache {
 	publishedAgainst?: AdvisoryProvenance;
 	provenance?: AdvisoryProvenance;
 	superseded?: boolean;
+	/**
+	 * #2522: true when every entry in `content` is a RUNNER error (timeout,
+	 * missing provider/binary, a rejected promise — `TestResult.error` with
+	 * `failed === 0`), never a genuine failing test. Read by
+	 * `peekTestFindings`/`consumeTestFindings` (`runtime-context.ts`) to
+	 * deliver these as advisory rather than "fix before continuing" — the
+	 * agent introduced nothing here to fix. Absent on older cache writes,
+	 * which fall back to the pre-#2522 blocking framing.
+	 */
+	runnerErrorOnly?: boolean;
 }
 
 function failureMessage(failure: TestFailure): string {

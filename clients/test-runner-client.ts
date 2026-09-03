@@ -26,7 +26,11 @@ import {
 	augmentPythonEnvironment,
 	detectPythonEnvironment,
 } from "./python-environment.js";
-import { normalizeEphemeralMapKey, normalizeMapKey } from "./path-utils.js";
+import {
+	normalizeEphemeralMapKey,
+	normalizeMapKey,
+	toPosix,
+} from "./path-utils.js";
 import { isMeasuredDuration, toMeasuredDurationMs } from "./run-duration.js";
 import { safeSpawn, safeSpawnAsync } from "./safe-spawn.js";
 import { stripAnsi } from "./sanitize.js";
@@ -139,6 +143,47 @@ const MAX_NODE_MODULES_WALK_UP = 5;
 // test type rather than mirroring source layout) — capped depth, never an
 // unbounded walk of the whole tests tree.
 const MAX_PYTEST_RECURSE_DEPTH = 3;
+
+/**
+ * #2522: built-in exclusion list for the turn-end auto-fired test selection.
+ *
+ * `getTestRunTarget`'s three strategies (failed-first / related / self) will
+ * happily resolve to ANY test file on disk, including integration/e2e suites
+ * that spawn external processes. A plegma dogfooding turn resolved
+ * `tests/integration/opencode-delegate.test.ts` this way — it spawns
+ * `opencode` and needs a configured provider, so on a box without one it took
+ * 17s to fail and was reported to the agent as "3/3 failed, fix before
+ * proceeding" on an unrelated model-switch turn (#2522, refs #2504/#2509).
+ *
+ * One hard-coded list, no per-project config knob (maintainer decision
+ * 2026-09-03) — this is a safety bound on what turn_end may auto-fire, not a
+ * project preference. Documented in AGENTS.md and docs/. Matched against the
+ * resolved test file's project-relative, POSIX-folded path so it applies
+ * uniformly to whichever strategy produced the target.
+ */
+export const TURN_END_EXCLUDED_TEST_GLOBS: readonly string[] = [
+	"**/integration/**",
+	"**/e2e/**",
+	"**/*.integration.*",
+	"**/*.e2e.*",
+];
+
+/**
+ * Whether a resolved test target falls under the built-in turn-end
+ * exclusion list (#2522). `testFilePath` may be absolute or relative, and
+ * may use either path-separator form — folded through `toPosix` after being
+ * made cwd-relative so `\`- and `/`-separated inputs match identically
+ * (AGENTS.md cross-form-path screen).
+ */
+export function isExcludedTestTarget(
+	testFilePath: string,
+	cwd: string,
+): boolean {
+	const rel = toPosix(path.relative(cwd, path.resolve(cwd, testFilePath)));
+	return TURN_END_EXCLUDED_TEST_GLOBS.some((glob) =>
+		minimatch(rel, glob, { dot: true }),
+	);
+}
 
 // --- Runner Detection ---
 

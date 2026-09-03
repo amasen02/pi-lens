@@ -12,6 +12,7 @@ import {
 	getLatencyLogPath,
 } from "../../clients/latency-logger.js";
 import {
+	isExcludedTestTarget,
 	RUNNERS,
 	TestRunnerClient,
 	type TestResult,
@@ -2851,6 +2852,123 @@ describe("test-runner-client", () => {
 		expect(result.failed).toBe(1);
 		expect(result.failures[0].name).toBe("test creates a user");
 		expect(result.failures[0].location).toBe("Demo.Accounts.UserTest");
+	});
+});
+
+/**
+ * #2522: turn-end selection must never auto-fire an integration/e2e test —
+ * those spawn external processes (a plegma dogfooding turn resolved
+ * `tests/integration/opencode-delegate.test.ts`, which spawns `opencode` and
+ * needs a configured provider — 17s to fail on a box without one, reported
+ * as "3/3 failed, fix before proceeding" on an unrelated model-switch turn).
+ *
+ * One hard-coded built-in list, no per-project config knob. Verified through
+ * the REAL `getTestRunTarget` (a real `TestRunnerClient` against real files
+ * on disk, same as the rest of this file), not a hand-fed path shaped to hit
+ * the exclusion — the self/related strategies must actually resolve to the
+ * excluded file first, exactly like the reported turn.
+ */
+describe("#2522 — turn-end selection excludes integration/e2e test targets", () => {
+	const exclusionCleanups: Array<() => void> = [];
+	afterEach(() => {
+		for (const c of exclusionCleanups.splice(0)) c();
+	});
+
+	describe("isExcludedTestTarget", () => {
+		// A real absolute cwd, resolved through the host's OWN `path` module —
+		// never a hardcoded drive-letter/UNC literal (AGENTS.md: a Windows-shaped
+		// literal fed as an INPUT is fine, but this also keeps every case below
+		// correctly parseable on Linux CI, where `path` is the posix module).
+		const cwd = path.resolve("pi-lens-2522-fixture-root");
+
+		it("excludes tests/integration/**", () => {
+			expect(
+				isExcludedTestTarget(
+					path.join(cwd, "tests", "integration", "foo.test.ts"),
+					cwd,
+				),
+			).toBe(true);
+		});
+
+		it("excludes tests/e2e/**", () => {
+			expect(
+				isExcludedTestTarget(
+					path.join(cwd, "tests", "e2e", "foo.test.ts"),
+					cwd,
+				),
+			).toBe(true);
+		});
+
+		it("excludes a *.integration.* basename outside an integration/ dir", () => {
+			expect(
+				isExcludedTestTarget(
+					path.join(cwd, "src", "foo.integration.test.ts"),
+					cwd,
+				),
+			).toBe(true);
+		});
+
+		it("excludes a *.e2e.* basename outside an e2e/ dir", () => {
+			expect(
+				isExcludedTestTarget(path.join(cwd, "src", "foo.e2e.test.ts"), cwd),
+			).toBe(true);
+		});
+
+		it("does not exclude an ordinary unit test", () => {
+			expect(
+				isExcludedTestTarget(
+					path.join(cwd, "tests", "clients", "foo.test.ts"),
+					cwd,
+				),
+			).toBe(false);
+		});
+
+		it("matches identically for the host-native path and its forward-slash form (cross-form)", () => {
+			// On Windows this exercises the REAL production shape — `path.resolve`
+			// returns backslash-separated paths there — against a forward-slash
+			// variant of the exact same path (which win32's own `path.resolve`
+			// also parses correctly, since it accepts either separator). On
+			// POSIX both forms are already identical, so this is a no-op there
+			// and stays meaningful specifically on the OS this bug shipped on.
+			const native = path.join(cwd, "tests", "integration", "foo.test.ts");
+			const forwardSlashForm = native.split(path.sep).join("/");
+			expect(isExcludedTestTarget(native, cwd)).toBe(true);
+			expect(isExcludedTestTarget(forwardSlashForm, cwd)).toBe(true);
+		});
+	});
+
+	it("a real self-strategy match under tests/integration/ is reported as excluded by the real getTestRunTarget resolution", () => {
+		const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-2522-");
+		exclusionCleanups.push(cleanup);
+
+		fs.mkdirSync(path.join(tmpDir, "tests", "integration"), {
+			recursive: true,
+		});
+		const integrationTest = path.join(
+			tmpDir,
+			"tests",
+			"integration",
+			"opencode-delegate.test.ts",
+		);
+		fs.writeFileSync(
+			integrationTest,
+			"import { it } from 'vitest'; it('spawns opencode', () => {});\n",
+		);
+		fs.writeFileSync(
+			path.join(tmpDir, "vitest.config.ts"),
+			"export default {}\n",
+		);
+
+		const client = new TestRunnerClient(false);
+		// The real "self" strategy: editing the integration test file itself.
+		const target = client.getTestRunTarget(integrationTest, tmpDir);
+		expect(target?.strategy).toBe("self");
+		expect(target?.testFile).toBe(path.resolve(integrationTest));
+		// getTestRunTarget itself does not filter — the built-in exclusion is
+		// enforced at the turn-end SELECTION site (runtime-turn.ts), which
+		// checks every resolved target through this same real function before
+		// it is ever added to the fire list.
+		expect(isExcludedTestTarget(target!.testFile, tmpDir)).toBe(true);
 	});
 });
 

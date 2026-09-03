@@ -88,7 +88,11 @@ import { isSubagentSession } from "./subagent-mode.js";
 import type { RuntimeCoordinator } from "./runtime-coordinator.js";
 import type { TurnStateOwner } from "./cache-manager.js";
 import { formatRunDurationMs } from "./run-duration.js";
-import type { TestResult, TestRunnerClient } from "./test-runner-client.js";
+import {
+	isExcludedTestTarget,
+	type TestResult,
+	type TestRunnerClient,
+} from "./test-runner-client.js";
 import {
 	MAX_ADVISORY_AFFECTED_FILES,
 	gateFindingsByPathFreshness,
@@ -162,10 +166,20 @@ const LATE_AUX_COVERAGE_GAP_DETAIL_CAP_PER_TURN = 20;
  *  - the WALL BUDGET caps how long the batch may keep spawning, and is raced
  *    against the ambient abort signal so a cancelled turn stops dispatching
  *    immediately rather than at the next natural boundary.
+ *
+ * #2522: the batch budget shipped at 90 s in #2509 — well over the turn
+ * itself, so a slow/hung batch could still hold up the agent for most of a
+ * turn before the bound even engaged. Reconciled down to 20 s (one constant,
+ * not a second budget alongside it): well under the turn, and still an order
+ * of magnitude below the PER-TARGET 60 s cap in `test-runner-client.ts`, so
+ * the batch bound is the one that actually fires first for a stuck target.
+ * Whatever hasn't settled by then is deferred to the next turn through the
+ * same `runTestTargetsBounded` skip/degradation path #2509 already built —
+ * see the `stopReason === "budget"` handling below.
  */
 export const TEST_RUNNER_BATCH_CONCURRENCY = 4;
 export const TEST_RUNNER_MAX_TARGETS = 12;
-export const TEST_RUNNER_BATCH_BUDGET_MS = 90_000;
+export const TEST_RUNNER_BATCH_BUDGET_MS = 20_000;
 
 export interface BoundedTestBatchOutcome<R> {
 	/** One entry per target that was actually dispatched AND settled. */
@@ -2047,6 +2061,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 
 		let overCapTargets = 0;
 		let missingTargetFiles = 0;
+		let excludedTargets = 0;
 		for (const { display, abs, isNeighbor } of candidates) {
 			const target = testRunnerClient.getTestRunTarget(
 				abs,
@@ -2055,6 +2070,18 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			);
 			if (target && !seen.has(target.testFile)) {
 				seen.add(target.testFile);
+				// #2522: built-in exclusion for turn-end SELECTION — a resolved
+				// target under an integration/e2e directory or naming convention
+				// is never auto-fired, whichever strategy (failed-first/related/
+				// self) produced it. No per-project config knob (maintainer
+				// decision); see `TURN_END_EXCLUDED_TEST_GLOBS`.
+				if (isExcludedTestTarget(target.testFile, cwd)) {
+					excludedTargets++;
+					dbg(
+						`turn_end: ${display} → test target excluded (integration/e2e), skipping spawn (${path.relative(cwd, target.testFile)})`,
+					);
+					continue;
+				}
 				// #2504: a conventional target that no longer exists on disk still
 				// cost a full runner spawn, which came back "Test file not found"
 				// and was then dropped as an expected skip further down. 9 of the
@@ -2080,6 +2107,11 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 					`turn_end: ${display} → no test file found${isNeighbor ? " (cascade-neighbor)" : ""}`,
 				);
 			}
+		}
+		if (excludedTargets > 0) {
+			dbg(
+				`turn_end: excluded ${excludedTargets} test target(s) under the built-in integration/e2e exclusion list`,
+			);
 		}
 		if (missingTargetFiles > 0) {
 			dbg(
@@ -2183,6 +2215,13 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 					const failures: string[] = [];
 					const resultValues: TestResult[] = [];
 					let rejectedCount = 0;
+					// #2522: whether ANY reported item is a genuine failing test
+					// (`failed > 0`) as opposed to the runner itself never
+					// completing (timeout, missing provider/binary, a rejected
+					// promise). Drives the delivery framing below — a batch made
+					// up ENTIRELY of runner errors is not something the agent
+					// introduced, so it must not read as "fix before continuing".
+					let hasRealFailure = false;
 					for (const r of results) {
 						if (r.status === "rejected") {
 							rejectedCount++;
@@ -2212,6 +2251,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 						}
 						resultValues.push(r.value);
 						const { file, runner, passed, failed, duration, error } = r.value;
+						if (failed > 0) hasRealFailure = true;
 						const shortFile = path.basename(file);
 						// #1479: `(0ms)` used to be printed for a run nobody
 						// timed — a payload with no suite timestamps, an
@@ -2286,6 +2326,13 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 						const content = stale
 							? `[from a prior turn — the edit that triggered this run had already been superseded by the time results came back]\n\n${failures.join("\n\n")}`
 							: failures.join("\n\n");
+						// #2522: nothing in this batch is a genuine failing test —
+						// every entry is a runner error (timeout, missing
+						// provider/binary, a rejected promise). `peekTestFindings`
+						// reads this to deliver advisory framing instead of
+						// "fix before continuing", since the agent introduced
+						// nothing here to fix.
+						const runnerErrorOnly = !hasRealFailure;
 						cacheManager.writeCache(
 							"test-runner-findings",
 							{
@@ -2297,6 +2344,7 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 								publishedAgainst,
 								provenance: publishedAgainst,
 								superseded,
+								runnerErrorOnly,
 							},
 							cwd,
 						);

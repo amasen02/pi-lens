@@ -176,11 +176,25 @@ export function peekTestFindings(
 			{
 				role: "user",
 				content: current
-					? `${AUTOMATION_FRAMING}Test failures detected last turn — fix before continuing:\n\n${findings.data.content}`
+					? `${AUTOMATION_FRAMING}${testFindingsCurrentPrefix(findings.data.runnerErrorOnly)}\n\n${findings.data.content}`
 					: `${AUTOMATION_FRAMING}${historicalTestContent(findings.data.content, findings.data.provenance)}`,
 			},
 		],
 	};
+}
+
+/**
+ * #2522: a batch made entirely of RUNNER errors (timeout, missing
+ * provider/binary — see `TestRunnerFindingsCache.runnerErrorOnly`) is not a
+ * failure the agent introduced, so it must not read as a blocker the way a
+ * genuine failing test does.
+ */
+function testFindingsCurrentPrefix(
+	runnerErrorOnly: boolean | undefined,
+): string {
+	return runnerErrorOnly
+		? "Test runner could not complete last turn (advisory — not a failure introduced this turn):"
+		: "Test failures detected last turn — fix before continuing:";
 }
 
 export function consumeTestFindings(

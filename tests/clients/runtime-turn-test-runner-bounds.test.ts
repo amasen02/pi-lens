@@ -13,8 +13,10 @@ import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { CacheManager } from "../../clients/cache-manager.js";
 import { resetDegradationLedger } from "../../clients/degradation-ledger.js";
+import { peekTestFindings } from "../../clients/runtime-context.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import {
+	TEST_RUNNER_BATCH_BUDGET_MS,
 	TEST_RUNNER_BATCH_CONCURRENCY,
 	TEST_RUNNER_MAX_TARGETS,
 	handleTurnEnd,
@@ -239,6 +241,255 @@ describe("#2504 AC2 — turn_end wires the bounds into the real fan-out", () => 
 	});
 });
 
+/**
+ * #2522: the real turn-end candidate loop (`runtime-turn.ts`) must never
+ * fire a resolved target under the built-in integration/e2e exclusion list,
+ * regardless of which strategy (failed-first/related/self) resolved it —
+ * reproduced through the real `handleTurnEnd` selection loop, not a
+ * hand-fed input shaped to hit the guard.
+ */
+describe("#2522 AC1 — turn_end selection excludes integration/e2e targets", () => {
+	it("never spawns a target resolved under tests/integration/, and dbg names the excluded target", async () => {
+		const runtime = new RuntimeCoordinator();
+		const cacheManager = new CacheManager(false);
+
+		fs.mkdirSync(path.join(env.tmpDir, "src"), { recursive: true });
+		fs.mkdirSync(path.join(env.tmpDir, "tests", "integration"), {
+			recursive: true,
+		});
+		const source = path.join(env.tmpDir, "src", "delegate.ts");
+		fs.writeFileSync(source, "export const delegate = 1;\n");
+		const integrationTest = path.join(
+			env.tmpDir,
+			"tests",
+			"integration",
+			"opencode-delegate.test.ts",
+		);
+		fs.writeFileSync(integrationTest, "export {};\n");
+		cacheManager.addModifiedRange(
+			source,
+			{ start: 1, end: 1 },
+			false,
+			env.tmpDir,
+			runtime.telemetrySessionId,
+		);
+
+		const ran: string[] = [];
+		const dbgLines: string[] = [];
+		const testRunnerClient = {
+			// Mirrors the reported turn: whichever strategy resolved it, the
+			// candidate's OWN test file lands under tests/integration/.
+			getTestRunTarget: () => ({
+				testFile: integrationTest,
+				runner: "vitest",
+				config: undefined,
+				strategy: "related",
+			}),
+			runTestFileAsync: async (testFile: string) => {
+				ran.push(testFile);
+				return {
+					file: testFile,
+					runner: "vitest",
+					passed: 1,
+					failed: 0,
+					duration: 1,
+				};
+			},
+			formatResult: () => "",
+		};
+
+		await handleTurnEnd({
+			ctxCwd: env.tmpDir,
+			getFlag: () => false,
+			dbg: (msg: string) => dbgLines.push(msg),
+			runtime,
+			cacheManager,
+			knipClient: {
+				ensureAvailable: async () => false,
+				analyze: async () => EMPTY_KNIP_RESULT,
+			},
+			deadCodeClients: [],
+			depChecker: { ensureAvailable: async () => false },
+			testRunnerClient,
+			resetLSPService: () => {},
+			resetFormatService: () => {},
+			// biome-ignore lint/suspicious/noExplicitAny: minimal turn_end deps
+		} as any);
+
+		// The fan-out is fire-and-forget; give it a beat, then assert nothing
+		// was ever dispatched (there's only one candidate, and it's excluded).
+		await delay(200);
+
+		expect(ran).toHaveLength(0);
+		expect(
+			dbgLines.some((l) => l.includes("excluded") && l.includes("integration")),
+		).toBe(true);
+	});
+});
+
+/**
+ * #2522 AC3: through the REAL `handleTurnEnd` delivery path (not a
+ * hand-written cache record), a batch made entirely of RUNNER errors must be
+ * persisted and delivered as advisory; a batch containing a genuine failing
+ * test must keep the "fix before continuing" framing, unchanged.
+ */
+describe("#2522 AC3 — delivery framing distinguishes runner errors from real failures", () => {
+	it("persists runnerErrorOnly:true and delivers advisory framing for an all-runner-error batch", async () => {
+		const runtime = new RuntimeCoordinator();
+		const cacheManager = new CacheManager(false);
+
+		fs.mkdirSync(path.join(env.tmpDir, "src"), { recursive: true });
+		const source = path.join(env.tmpDir, "src", "widget.ts");
+		const testFile = path.join(env.tmpDir, "src", "widget.test.ts");
+		fs.writeFileSync(source, "export const widget = 1;\n");
+		fs.writeFileSync(testFile, "export {};\n");
+		cacheManager.addModifiedRange(
+			source,
+			{ start: 1, end: 1 },
+			false,
+			env.tmpDir,
+			runtime.telemetrySessionId,
+		);
+
+		let settled = false;
+		const testRunnerClient = {
+			getTestRunTarget: () => ({
+				testFile,
+				runner: "vitest",
+				config: undefined,
+				strategy: "self",
+			}),
+			runTestFileAsync: async () => {
+				settled = true;
+				// A runner error: the suite never started (missing provider/
+				// binary), so `failed === 0` by construction — mirrors
+				// `test-runner-client.ts`'s own `emptyResult` shape.
+				return {
+					file: testFile,
+					sourceFile: source,
+					runner: "vitest",
+					passed: 0,
+					failed: 0,
+					error: "spawn opencode ENOENT",
+				};
+			},
+			formatResult: (r: { error?: string }) =>
+				`[Tests] ⚠ Could not run tests: ${r.error}`,
+		};
+
+		await handleTurnEnd({
+			ctxCwd: env.tmpDir,
+			getFlag: () => false,
+			dbg: () => {},
+			runtime,
+			cacheManager,
+			knipClient: {
+				ensureAvailable: async () => false,
+				analyze: async () => EMPTY_KNIP_RESULT,
+			},
+			deadCodeClients: [],
+			depChecker: { ensureAvailable: async () => false },
+			testRunnerClient,
+			resetLSPService: () => {},
+			resetFormatService: () => {},
+			// biome-ignore lint/suspicious/noExplicitAny: minimal turn_end deps
+		} as any);
+
+		const deadline = Date.now() + 5000;
+		while (Date.now() < deadline && !settled) await delay(20);
+		// Give the fire-and-forget `.then()` a beat to land the cache write.
+		await delay(100);
+
+		const persisted = cacheManager.readCache<{
+			content: string;
+			runnerErrorOnly?: boolean;
+		}>("test-runner-findings", env.tmpDir)?.data;
+		expect(persisted?.content).toContain("Could not run tests");
+		expect(persisted?.runnerErrorOnly).toBe(true);
+
+		const message =
+			peekTestFindings(cacheManager, env.tmpDir, runtime)?.messages[0]
+				?.content ?? "";
+		expect(message).toContain("advisory");
+		expect(message).not.toContain("fix before continuing");
+	});
+
+	it("persists runnerErrorOnly:false and keeps the blocking framing for a genuine failure", async () => {
+		const runtime = new RuntimeCoordinator();
+		const cacheManager = new CacheManager(false);
+
+		fs.mkdirSync(path.join(env.tmpDir, "src"), { recursive: true });
+		const source = path.join(env.tmpDir, "src", "widget.ts");
+		const testFile = path.join(env.tmpDir, "src", "widget.test.ts");
+		fs.writeFileSync(source, "export const widget = 1;\n");
+		fs.writeFileSync(testFile, "export {};\n");
+		cacheManager.addModifiedRange(
+			source,
+			{ start: 1, end: 1 },
+			false,
+			env.tmpDir,
+			runtime.telemetrySessionId,
+		);
+
+		let settled = false;
+		const testRunnerClient = {
+			getTestRunTarget: () => ({
+				testFile,
+				runner: "vitest",
+				config: undefined,
+				strategy: "self",
+			}),
+			runTestFileAsync: async () => {
+				settled = true;
+				return {
+					file: testFile,
+					sourceFile: source,
+					runner: "vitest",
+					passed: 0,
+					failed: 1,
+					failures: [{ name: "widget works", message: "expected 1 to be 2" }],
+				};
+			},
+			formatResult: () => "[Tests] ✗ 1/1 failed",
+		};
+
+		await handleTurnEnd({
+			ctxCwd: env.tmpDir,
+			getFlag: () => false,
+			dbg: () => {},
+			runtime,
+			cacheManager,
+			knipClient: {
+				ensureAvailable: async () => false,
+				analyze: async () => EMPTY_KNIP_RESULT,
+			},
+			deadCodeClients: [],
+			depChecker: { ensureAvailable: async () => false },
+			testRunnerClient,
+			resetLSPService: () => {},
+			resetFormatService: () => {},
+			// biome-ignore lint/suspicious/noExplicitAny: minimal turn_end deps
+		} as any);
+
+		const deadline = Date.now() + 5000;
+		while (Date.now() < deadline && !settled) await delay(20);
+		await delay(100);
+
+		const persisted = cacheManager.readCache<{
+			content: string;
+			runnerErrorOnly?: boolean;
+		}>("test-runner-findings", env.tmpDir)?.data;
+		expect(persisted?.runnerErrorOnly).toBe(false);
+
+		const message =
+			peekTestFindings(cacheManager, env.tmpDir, runtime)?.messages[0]
+				?.content ?? "";
+		expect(message).toContain(
+			"Test failures detected last turn — fix before continuing",
+		);
+	});
+});
+
 describe("#2504 AC2 — cap constants", () => {
 	it("caps concurrency at 4", () => {
 		expect(TEST_RUNNER_BATCH_CONCURRENCY).toBe(4);
@@ -247,5 +498,18 @@ describe("#2504 AC2 — cap constants", () => {
 	it("caps the per-turn target count", () => {
 		expect(TEST_RUNNER_MAX_TARGETS).toBeGreaterThan(0);
 		expect(TEST_RUNNER_MAX_TARGETS).toBeLessThan(SOURCE_COUNT);
+	});
+});
+
+/**
+ * #2522 AC2: the batch-wide wall budget must sit well under the turn, and
+ * distinct from (well below) the per-target 60s spawn timeout
+ * (`test-runner-client.ts`'s `runTestFileAsync`) — reconciled to ONE
+ * constant rather than adding a second budget alongside #2509's 90s.
+ */
+describe("#2522 AC2 — batch wall budget reconciled below the turn", () => {
+	it("is well under a turn and well under the 60s per-target timeout", () => {
+		expect(TEST_RUNNER_BATCH_BUDGET_MS).toBeLessThanOrEqual(20_000);
+		expect(TEST_RUNNER_BATCH_BUDGET_MS).toBeLessThan(60_000);
 	});
 });
