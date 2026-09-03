@@ -60,6 +60,7 @@ import { findLocalSgconfig, resolveBaselineSgconfig } from "../sgconfig.js";
 import { findLocalTyposConfig } from "../typos-config.js";
 import { resolvePackagePath } from "../package-root.js";
 import {
+	hasCargoWorkspaceTable,
 	readCargoWorkspaceExclude,
 	readCargoWorkspaceMembers,
 	readTextFileOrUndefined,
@@ -2600,7 +2601,7 @@ function RustWorkspaceRoot(): RootFunction {
 			const parentCargoContent = await readTextFileOrUndefined(parentCargoPath);
 			if (
 				parentCargoContent !== undefined &&
-				/^\s*\[workspace\]/m.test(parentCargoContent)
+				hasCargoWorkspaceTable(parentCargoContent)
 			) {
 				// Test membership against the ORIGINAL crate dir (`root`), never the
 				// walk cursor (`current`, which may already have climbed through
