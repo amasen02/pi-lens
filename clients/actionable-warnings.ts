@@ -1401,6 +1401,8 @@ export function mergeActionableWarningsReports(args: {
 	 * caller has no runtime to ask.
 	 */
 	getFileSeq?: (filePath: string) => number;
+	/** #2504 review round 6 (F1/b): traces the scope-guard drop -- informational, not a degradation. */
+	dbg?: (msg: string) => void;
 }): {
 	report: ActionableWarningsReport;
 	mergedFiles: number;
@@ -1410,18 +1412,19 @@ export function mergeActionableWarningsReports(args: {
 	const deferredPublish = origin === "deferred";
 
 	// The newer half wins identity and fileSeq; the older half is folded in.
+	// #2504 review round 6 (F1): a same-sessionId check used to gate this --
+	// removed. pi's telemetry sessionId is STABLE across a quit->resume
+	// (setSessionLifecycle pins it, runtime-coordinator.ts:677-682), but
+	// resetForSession clears the live _fileSeq map for the new process, so a
+	// resumed process's getFileSeq answers 0 for a file a PRE-restart
+	// deferral had recorded at a nonzero seq. The sessionId gate could not
+	// see that: same id, stale data. The equality check below (baselineSeq
+	// !== entry.fileSeq) is what actually distinguishes "this session,
+	// unmoved" (live seq matches the recorded seq exactly) from "stale
+	// carry" (any mismatch, including a reset-to-0 baseline) -- the
+	// sessionId gate added nothing past it.
 	const newerHalf = deferredPublish ? (persisted?.files ?? []) : incoming.files;
-	const olderHalf = deferredPublish
-		? incoming.files
-		: // A persisted report from ANOTHER session can never hold an entry this
-			// session's deferral produced: resetLSPService aborts the deferred
-			// loop at session_start and session_shutdown alike, and an aborted
-			// loop publishes nothing. Without this the live getFileSeq -- which
-			// answers 0 for a file the new session has not touched -- would read
-			// a days-old entry as unmoved and resurrect it.
-			persisted?.sessionId === incoming.sessionId
-			? (persisted?.files ?? [])
-			: [];
+	const olderHalf = deferredPublish ? incoming.files : (persisted?.files ?? []);
 	const newerReport = deferredPublish ? persisted : incoming;
 	const olderReport = deferredPublish ? incoming : persisted;
 
@@ -1436,15 +1439,38 @@ export function mergeActionableWarningsReports(args: {
 		// The scope guard. An in-band publish exists to add THIS turn's
 		// findings; the only thing it owes the persisted report is the deferred
 		// work that would otherwise be erased between the read and the write.
-		if (!deferredPublish && entry.origin !== "deferred") continue;
+		// #2504 review round 6 (b): the marker spend (below) means an entry
+		// carried once and then dropped here on the NEXT in-band publish is
+		// expected, not a fault -- traced to dbg (informational) rather than
+		// the degradation ledger (which is for loss the agent didn't cause).
+		if (!deferredPublish && entry.origin !== "deferred") {
+			args.dbg?.(
+				`actionable_warnings: in-band publish dropped ${entry.displayPath || entry.filePath} -- its carry-forward window (from an earlier deferred publish) already closed`,
+			);
+			continue;
+		}
 		const key = normalizeMapKey(entry.filePath);
 		const incumbent = byPath.get(key);
+		const liveBaseline = args.getFileSeq !== undefined;
 		const baselineSeq = args.getFileSeq?.(entry.filePath) ?? incumbent?.fileSeq;
-		if (
-			typeof baselineSeq === "number" &&
-			typeof entry.fileSeq === "number" &&
-			baselineSeq > entry.fileSeq
-		) {
+		// #2504 review round 6 (F1): the in-band carry-forward path, when a
+		// LIVE baseline is available, requires EXACT equality rather than
+		// "baseline advanced past it". An unmoved file's live fileSeq always
+		// equals its persisted entry's recorded fileSeq; any mismatch --
+		// higher (edited since) OR lower (a resumed process whose fileSeq map
+		// was cleared, #2504 r6 F1) -- means the entry no longer describes
+		// what is on disk now. The deferred-publish path keeps the coarser
+		// ">" check: a live process's own fileSeq only ever advances, so
+		// "advanced past it" and "mismatched" agree there, and the deferred
+		// loop's entries can legitimately equal a JUST-bumped incumbent seq
+		// it upserts into.
+		const stale =
+			!deferredPublish && liveBaseline
+				? typeof entry.fileSeq === "number" && baselineSeq !== entry.fileSeq
+				: typeof baselineSeq === "number" &&
+					typeof entry.fileSeq === "number" &&
+					baselineSeq > entry.fileSeq;
+		if (stale) {
 			droppedFiles.push(entry.displayPath || entry.filePath);
 			continue;
 		}
@@ -1556,6 +1582,7 @@ export function publishActionableWarningsReport(
 		incoming: report,
 		origin,
 		getFileSeq: opts.getFileSeq,
+		dbg: opts.dbg,
 	});
 	writeActionableWarningsReport(cacheManager, cwd, merged.report);
 	// The history records what THIS publish OBSERVED, not what it carried: a

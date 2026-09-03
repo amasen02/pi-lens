@@ -2642,14 +2642,24 @@ export async function handleTurnEnd(deps: TurnEndDeps): Promise<void> {
 			// forward only entries a DEFERRAL produced, and only while their
 			// file has not moved, so a `turn_delta` report does not accumulate
 			// every prior turn's findings.
-			publishActionableWarningsReport(cacheManager, cwd, report, {
-				origin: "in-band",
-				getFileSeq: getFileSeq
-					? (filePath: string) => getFileSeq.call(runtime, filePath)
-					: undefined,
-				dbg,
-			});
-			const advisory = formatActionableWarningsAdvisory(report);
+			const publishResult = publishActionableWarningsReport(
+				cacheManager,
+				cwd,
+				report,
+				{
+					origin: "in-band",
+					getFileSeq: getFileSeq
+						? (filePath: string) => getFileSeq.call(runtime, filePath)
+						: undefined,
+					dbg,
+				},
+			);
+			// #2504 review round 6 (a): the advisory must read the MERGED report,
+			// not the pre-merge `report` this turn assembled -- a rescued deferred
+			// entry lives only on `publishResult.report`, and formatting the
+			// pre-merge report silently dropped it from the turn_end advisory
+			// even though it was correctly persisted to cache.
+			const advisory = formatActionableWarningsAdvisory(publishResult.report);
 			// @delivery-surface: runtime-turn:actionable-warnings-advisory
 			if (advisory) advisoryParts.push(advisory);
 			logActionableWarningsEvent({

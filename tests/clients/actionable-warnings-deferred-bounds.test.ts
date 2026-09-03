@@ -1358,3 +1358,267 @@ describe("#2504 r5 F2 — each entry is stamped when its own pull returned", () 
 		);
 	});
 });
+
+/**
+ * #2504 review round 6 (F1) — a quit-\>resume kept pi's telemetry sessionId
+ * STABLE (`setSessionLifecycle`, `runtime-coordinator.ts:677-682`), which
+ * used to be enough to pass the merge's same-sessionId carry-forward gate.
+ * But `resetForSession` clears the live `_fileSeq` map for the new process
+ * (`runtime-coordinator.ts:397`), so a file the resumed process has not
+ * touched answers `getFileSeq` 0 -- and the gate's `baselineSeq >
+ * entry.fileSeq` comparison read `0 > 7` as false, carrying a pre-restart
+ * deferred entry into the resumed process's very first in-band publish. That
+ * stale entry then poisoned `checkActionableWarningsReportFresh`
+ * (`file_seq_mismatch`, first mismatch wins), so `agent_end` silently skipped
+ * the whole autofix pass over a report that otherwise had nothing wrong with
+ * it.
+ *
+ * Fixed by requiring EXACT equality against a live baseline on the in-band
+ * carry-forward path (rather than "baseline advanced past it"), which makes
+ * the sessionId gate redundant: an unmoved file's live seq matches its
+ * recorded entry seq exactly, in-session or across a resume; any mismatch
+ * (including the reset-to-0 case) drops it.
+ */
+describe("#2504 r6 F1 — a resumed process's reset fileSeq no longer resurrects a stale deferred entry", () => {
+	function warning(
+		filePath: string,
+		id: string,
+	): ActionableWarningsReport["files"][number]["warnings"][number] {
+		return {
+			id,
+			filePath,
+			displayPath: path.basename(filePath),
+			line: 1,
+			severity: "warning",
+			tool: "typescript",
+			message: `finding ${id}`,
+			actions: [
+				{
+					title: "Fix it",
+					kind: "quickfix",
+					hasEdit: true,
+					hasCommand: false,
+					autoFixEligible: true,
+				},
+			],
+			suppressed: false,
+			origin: "lsp",
+		};
+	}
+
+	function baseReport(
+		over: Partial<ActionableWarningsReport>,
+	): ActionableWarningsReport {
+		return {
+			generatedAt: new Date(2_000_000).toISOString(),
+			scope: "turn_delta",
+			sessionId: "lens-test",
+			turnIndex: 7,
+			projectSeqStart: 0,
+			projectSeqEnd: 1,
+			deltaOnly: true,
+			includeLspCodeActions: true,
+			files: [],
+			summary: {
+				warnings: 0,
+				unsuppressed: 0,
+				byTier: { warning: 0, info: 0, hint: 0 },
+				suppressed: 0,
+				files: 0,
+				actions: 0,
+				autoFixEligible: 0,
+			},
+			...over,
+		} as ActionableWarningsReport;
+	}
+
+	it("drops STALE-A instead of carrying it into process B's turn-1 report", async () => {
+		const { publishActionableWarningsReport, checkActionableWarningsReportFresh } =
+			await loadWarnings();
+		const cacheManager = new CacheManager(false);
+		const [stale] = makeSources(1);
+		const sharedSessionId = "lens-stable-resume-id";
+
+		// Process A, pre-restart: a deferred publish left an UNSPENT entry
+		// (origin: "deferred") recorded at fileSeq 7.
+		cacheManager.writeCache(
+			"actionable-warnings",
+			baseReport({
+				sessionId: sharedSessionId,
+				turnIndex: 3,
+				projectSeqEnd: 10,
+				files: [
+					{
+						...{
+							filePath: stale,
+							displayPath: path.basename(stale),
+							fileSeq: 7,
+							generatedAt: new Date(2_000_000).toISOString(),
+							warnings: [warning(stale, "STALE-A")],
+						},
+						origin: "deferred" as const,
+					},
+				],
+			}),
+			env.tmpDir,
+		);
+
+		// Process B: a genuinely fresh RuntimeCoordinator, the shape a resumed
+		// process actually gets (resetForSession already ran, then
+		// setSessionLifecycle pinned pi's stable id) -- its `_fileSeq` map is
+		// empty, so `getFileSeq` for the untouched `stale` file answers 0.
+		const runtimeB = new RuntimeCoordinator();
+		runtimeB.setSessionLifecycle({ sessionId: sharedSessionId });
+		expect(runtimeB.telemetrySessionId).toBe(sharedSessionId);
+		expect(runtimeB.getFileSeq(stale)).toBe(0);
+
+		const result = publishActionableWarningsReport(
+			cacheManager,
+			env.tmpDir,
+			baseReport({
+				sessionId: sharedSessionId,
+				turnIndex: 1,
+				projectSeqEnd: 1,
+				files: [],
+			}),
+			{
+				origin: "in-band",
+				getFileSeq: (filePath: string) => runtimeB.getFileSeq(filePath),
+			},
+		);
+
+		expect(result.droppedFiles).toContain(path.basename(stale));
+		expect(
+			(result.report.files ?? []).some((f) => f.filePath === stale),
+		).toBe(false);
+
+		const persisted = cacheManager.readCache<ActionableWarningsReport>(
+			"actionable-warnings",
+			env.tmpDir,
+		)?.data;
+		expect(
+			(persisted?.files ?? []).some((f) => f.filePath === stale),
+		).toBe(false);
+
+		// And with the entry gone at merge time, the freshness gate never trips
+		// on it -- `agent_end`'s autofix pass is not skipped over a report that
+		// otherwise has nothing stale in it.
+		const freshness = checkActionableWarningsReportFresh({
+			report: persisted as ActionableWarningsReport,
+			currentProjectSeq: 1,
+			getFileSeq: (filePath: string) => runtimeB.getFileSeq(filePath),
+		});
+		expect(freshness.fresh).toBe(true);
+	});
+});
+
+/**
+ * #2504 review round 6 (F2) — the marker spend (`merged.origin = undefined`)
+ * is what stops a carried entry from accumulating forever. A mutation that
+ * deletes that line left 277/279 of the existing suite green, because no
+ * existing case carries the SAME entry across three publishes: round 5's
+ * "does NOT accumulate" case never defers anything, so nothing is ever
+ * eligible to carry in the first place.
+ */
+describe("#2504 r6 F2 — the marker spend actually stops accumulation on the third turn", () => {
+	function warning(
+		filePath: string,
+		id: string,
+	): ActionableWarningsReport["files"][number]["warnings"][number] {
+		return {
+			id,
+			filePath,
+			displayPath: path.basename(filePath),
+			line: 1,
+			severity: "warning",
+			tool: "typescript",
+			message: `finding ${id}`,
+			actions: [],
+			suppressed: false,
+			origin: "lsp",
+		};
+	}
+
+	function baseReport(
+		over: Partial<ActionableWarningsReport>,
+	): ActionableWarningsReport {
+		return {
+			generatedAt: new Date(2_000_000).toISOString(),
+			scope: "turn_delta",
+			sessionId: "lens-test",
+			turnIndex: 0,
+			projectSeqStart: 0,
+			projectSeqEnd: 1,
+			deltaOnly: true,
+			includeLspCodeActions: true,
+			files: [],
+			summary: {
+				warnings: 0,
+				unsuppressed: 0,
+				byTier: { warning: 0, info: 0, hint: 0 },
+				suppressed: 0,
+				files: 0,
+				actions: 0,
+				autoFixEligible: 0,
+			},
+			...over,
+		} as ActionableWarningsReport;
+	}
+
+	it("f0 survives turn N+1 (carried once) and is gone by turn N+2 (marker spent)", async () => {
+		const { writeDeferredActionableWarningsReport, publishActionableWarningsReport } =
+			await loadWarnings();
+		const cacheManager = new CacheManager(false);
+		const [f0] = makeSources(1);
+		const liveFileSeq = () => 1;
+
+		// Turn N: a deferred publish delivers f0's finding, recorded at seq 1.
+		writeDeferredActionableWarningsReport({
+			cacheManager,
+			cwd: env.tmpDir,
+			report: baseReport({
+				turnIndex: 1,
+				files: [
+					{
+						filePath: f0,
+						displayPath: path.basename(f0),
+						fileSeq: 1,
+						generatedAt: new Date(2_000_000).toISOString(),
+						warnings: [warning(f0, "n0")],
+					},
+				],
+			}),
+			getFileSeq: liveFileSeq,
+		});
+
+		// Turn N+1: in-band publish, no new findings, f0 unmoved -- carries it
+		// forward (the ONE-turn delivery window) and spends the marker.
+		publishActionableWarningsReport(
+			cacheManager,
+			env.tmpDir,
+			baseReport({ turnIndex: 2, files: [] }),
+			{ origin: "in-band", getFileSeq: liveFileSeq },
+		);
+		const afterN1 = cacheManager.readCache<ActionableWarningsReport>(
+			"actionable-warnings",
+			env.tmpDir,
+		)?.data;
+		expect((afterN1?.files ?? []).map((f) => f.filePath)).toEqual([f0]);
+
+		// Turn N+2: another in-band publish, still nothing new, f0 STILL
+		// unmoved. Pre-fix (marker spend deleted) f0's carried entry never lost
+		// its "deferred" marker in turn N+1, so it would still pass the scope
+		// guard here and accumulate forever.
+		publishActionableWarningsReport(
+			cacheManager,
+			env.tmpDir,
+			baseReport({ turnIndex: 3, files: [] }),
+			{ origin: "in-band", getFileSeq: liveFileSeq },
+		);
+		const afterN2 = cacheManager.readCache<ActionableWarningsReport>(
+			"actionable-warnings",
+			env.tmpDir,
+		)?.data;
+		expect((afterN2?.files ?? []).map((f) => f.filePath)).toEqual([]);
+	});
+});
