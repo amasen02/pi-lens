@@ -8,6 +8,7 @@ export declare const EXIT_TRANSPORT: number;
 export declare const POLL_INTERVAL_SECONDS: number;
 export declare const HARD_CAP_SECONDS: number;
 export declare const DEFAULT_GH_TIMEOUT_MS: number;
+export declare const MIN_GH_TIMEOUT_MS: number;
 
 export declare function isPrNumber(arg: unknown): boolean;
 
@@ -23,6 +24,8 @@ export interface Verdict {
 	exitCode: number;
 	rows: VerdictRow[];
 	reason: string;
+	mergeState: string;
+	truncated: boolean;
 }
 
 export declare function computeVerdict(
@@ -61,11 +64,15 @@ export type GhExec = (
 	options?: { timeoutMs?: number },
 ) => string;
 
-export declare function resolveRepository(ghExec?: GhExec): string;
+export declare function resolveRepository(
+	ghExec?: GhExec,
+	timeoutMs?: number,
+): string;
 
 export declare function resolveHeadSha(
 	target: string,
 	ghExec?: GhExec,
+	timeoutMs?: number,
 ): { sha: string; mergeable: string | null };
 
 export declare function fetchCheckRunsPayload(

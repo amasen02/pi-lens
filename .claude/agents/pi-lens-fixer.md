@@ -125,8 +125,11 @@ instructions say so.
    `gh api repos/<owner>/<repo>/commits/<sha>/check-runs?per_page=100` read
    filtered to `Unit tests` and `Lint & type-check`, exits `0`/`1`/`2`/`3` for
    success/failure/DIRTY/pending) — never the tail of `gh pr checks`, whose
-   last lines hid a failed Unit tests behind a passing Lint (#2527 r2). A
-   DIRTY PR silently skips both (exit 2).
+   last lines hid a failed Unit tests behind a passing Lint (#2527 r2). DIRTY
+   (exit 2) fires whenever the PR head is merge-conflicted
+   (`mergeable=CONFLICTING`): the checks may be silently skipped (absent) or
+   may show a stale green from before the head went conflicting — either way,
+   it is not a pass (#2539 round 3, F1).
 9. Expect an adversarial review round. When findings come back, fix on the
    same branch, re-prove red-first for each new test, and update the PR body
    with an honest review-round section. Never argue with a probe — reproduce
@@ -190,7 +193,8 @@ finding with its red-run evidence.
   `node scripts/ci-verdict.mjs <pr-number|sha>` (#2539) — the sibling of
   `scripts/check-pr-body.mjs`, one REST read, no hand-written `gh api`
   filter to get wrong. Report its table and exit code as the state — success,
-  failure, DIRTY (absent), or pending. Never poll in a loop (stall watchdogs
+  failure, DIRTY (`mergeable=CONFLICTING`, whether or not checks are present),
+  or pending. Never poll in a loop (stall watchdogs
   kill the turn) and never use `--wait` yourself — that flag is for the
   orchestrator only, never a bare `gh pr checks --watch` either. Never report
   "started" as green, and never quote a previous head's job ids. If no

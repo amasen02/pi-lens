@@ -12,6 +12,7 @@ import {
 	formatVerdictTable,
 	HARD_CAP_SECONDS,
 	isPrNumber,
+	MIN_GH_TIMEOUT_MS,
 	parseArgs,
 	pollVerdict,
 	POLL_INTERVAL_SECONDS,
@@ -151,6 +152,81 @@ describe("computeVerdict — absent-check verdict is mergeable-aware (#2539 roun
 	});
 });
 
+// #2539 round 3, F1: round 2's DIRTY gate was `anyAbsent && mergeable ===
+// "CONFLICTING"`, so the DOMINANT DIRTY shape -- a head that went green and
+// only turned conflicted AFTERWARD, same head SHA, old green check-runs
+// still attached -- read as a pass. A live probe on #2552 confirmed exit 0
+// ("both required checks concluded success") on a present-and-green PR that
+// `gh pr view` reported as CONFLICTING. DIRTY must fire from `mergeable`
+// alone, independent of whether the required checks are present.
+describe("computeVerdict — DIRTY fires on CONFLICTING regardless of check presence (#2539 round 3, F1)", () => {
+	it("exits 2 (DIRTY) when both required checks are present and green but the PR is CONFLICTING", () => {
+		const verdict = computeVerdict(BOTH_SUCCESS, undefined, "CONFLICTING");
+		expect(verdict.exitCode).toBe(EXIT_DIRTY);
+		expect(verdict.rows.every((row) => row.present)).toBe(true);
+		expect(verdict.rows.every((row) => row.conclusion === "success")).toBe(
+			true,
+		);
+	});
+
+	it("the verdict record always carries mergeState, even off the DIRTY path", () => {
+		expect(
+			computeVerdict(BOTH_SUCCESS, undefined, "CONFLICTING").mergeState,
+		).toBe("CONFLICTING");
+		expect(
+			computeVerdict(BOTH_SUCCESS, undefined, "MERGEABLE").mergeState,
+		).toBe("MERGEABLE");
+		// Bare-SHA target: no PR context, mergeable is null -- reported as
+		// "n/a", and DIRTY documented as PR-only: null can never equal the
+		// literal string "CONFLICTING".
+		expect(computeVerdict(BOTH_SUCCESS, undefined, null).mergeState).toBe(
+			"n/a",
+		);
+		expect(computeVerdict(BOTH_SUCCESS, undefined, null).exitCode).toBe(
+			EXIT_SUCCESS,
+		);
+	});
+
+	it("run() prints the merge state line unconditionally, including on a clean pass", async () => {
+		const ghExec = (args: string[]) => {
+			if (args[0] === "repo") return "acme/repo";
+			if (args[0] === "pr")
+				return JSON.stringify({ headRefOid: "c0ffee", mergeable: "MERGEABLE" });
+			return JSON.stringify(BOTH_SUCCESS);
+		};
+		const stdoutLines: string[] = [];
+		const exitCode = await run({
+			argv: ["2539"],
+			ghExec,
+			stdout: (line: string) => stdoutLines.push(line),
+			stderr: () => {},
+		});
+		expect(exitCode).toBe(EXIT_SUCCESS);
+		expect(stdoutLines).toContain("Merge state: MERGEABLE");
+	});
+
+	it("run() exits 2 end to end for a present-and-green PR that is CONFLICTING (#2552 live-probe shape)", async () => {
+		const ghExec = (args: string[]) => {
+			if (args[0] === "repo") return "acme/repo";
+			if (args[0] === "pr")
+				return JSON.stringify({
+					headRefOid: "c0ffee",
+					mergeable: "CONFLICTING",
+				});
+			return JSON.stringify(BOTH_SUCCESS);
+		};
+		const stdoutLines: string[] = [];
+		const exitCode = await run({
+			argv: ["2539"],
+			ghExec,
+			stdout: (line: string) => stdoutLines.push(line),
+			stderr: () => {},
+		});
+		expect(exitCode).toBe(EXIT_DIRTY);
+		expect(stdoutLines).toContain("Merge state: CONFLICTING");
+	});
+});
+
 // #2539 round 2, F7: `per_page=100` is not paginated, but `total_count` in
 // the same response says whether the fetched page was actually complete.
 describe("computeVerdict — truncated check-runs response (#2539 round 2, F7)", () => {
@@ -246,7 +322,7 @@ describe("computeVerdict — rerun de-duplication (latest-started wins)", () => 
 	// all, must not read as success -- both are covered again here (beyond
 	// merge-train-warden.test.ts's own coverage of the shared resolver)
 	// because ci-verdict.mjs is what actually calls it with REST-shaped runs.
-	it("does not let a superseded success with the higher id win an unorderable tie", () => {
+	it("does not let a superseded success with the higher id win an unorderable tie (in_progress first)", () => {
 		const payload = {
 			check_runs: [
 				checkRun({
@@ -262,6 +338,40 @@ describe("computeVerdict — rerun de-duplication (latest-started wins)", () => 
 					conclusion: "success",
 					started_at: "",
 					id: 99,
+				}),
+				checkRun({ name: "Lint & type-check", id: 3 }),
+			],
+		};
+		const verdict = computeVerdict(payload);
+		expect(verdict.exitCode).toBe(EXIT_PENDING);
+		const unitTests = verdict.rows.find((row) => row.name === "Unit tests");
+		expect(unitTests?.status).toBe("in_progress");
+	});
+
+	// #2539 round 3: the case above happens to also put the correct winner
+	// (in_progress) FIRST in array order, so it cannot distinguish the real
+	// fail-closed policy (non-success wins an unorderable tie, per
+	// preferCheckRun in scripts/lib/ci-checks.mjs) from a regression to
+	// "array position first wins" -- both would return in_progress there.
+	// Swapping the order (success first, in_progress LAST) forces them apart:
+	// a first-wins bug would return success here; the real fail-closed policy
+	// still returns in_progress regardless of position.
+	it("does not let a superseded success with the higher id win an unorderable tie (in_progress last)", () => {
+		const payload = {
+			check_runs: [
+				checkRun({
+					name: "Unit tests",
+					status: "completed",
+					conclusion: "success",
+					started_at: "",
+					id: 99,
+				}),
+				checkRun({
+					name: "Unit tests",
+					status: "in_progress",
+					conclusion: null,
+					started_at: "",
+					id: 1,
 				}),
 				checkRun({ name: "Lint & type-check", id: 3 }),
 			],
@@ -481,22 +591,50 @@ describe("pollVerdict", () => {
 });
 
 describe("resolveGhTimeoutMs — the derived per-call gh timeout (#2539 round 2, F4)", () => {
-	it("falls back to the flat default with no wait budget", () => {
+	it("falls back to the flat default with no wait budget (undefined/null, not a number)", () => {
 		expect(resolveGhTimeoutMs(undefined)).toBe(DEFAULT_GH_TIMEOUT_MS);
 		expect(resolveGhTimeoutMs(null as unknown as number)).toBe(
 			DEFAULT_GH_TIMEOUT_MS,
 		);
-		expect(resolveGhTimeoutMs(0)).toBe(DEFAULT_GH_TIMEOUT_MS);
 	});
 
-	it("uses the remaining budget when it is smaller than the default", () => {
+	it("uses the remaining budget when it is between the floor and the default", () => {
 		expect(resolveGhTimeoutMs(5_000)).toBe(5_000);
+		expect(resolveGhTimeoutMs(30_000)).toBe(30_000);
 	});
 
 	it("clamps to the default when the remaining budget is larger", () => {
 		expect(resolveGhTimeoutMs(HARD_CAP_SECONDS * 1000)).toBe(
 			DEFAULT_GH_TIMEOUT_MS,
 		);
+	});
+});
+
+// #2539 round 3, F2: `resolveGhTimeoutMs` clamped straight to the literal
+// remaining budget with no floor. A probe on `--wait 31` derived a 50ms
+// timeout for the last poll and killed a healthy ~950ms `gh` call (exit 70
+// over a genuinely green head). Separately, a budget already at its deadline
+// (remainingMs === 0) fell through the `remainingMs > 0` guard to the FULL
+// 60s default -- the opposite failure, on the very call meant to end the
+// wait. `MIN_GH_TIMEOUT_MS` floors both.
+describe("resolveGhTimeoutMs — floored at MIN_GH_TIMEOUT_MS (#2539 round 3, F2)", () => {
+	it("floors a tiny positive remainder up to MIN_GH_TIMEOUT_MS instead of killing a healthy call", () => {
+		// `--wait 31` on the last poll: 31s cap, 30.95s already spent sleeping
+		// at the fixed 30s interval, ~50ms left -- the exact live-probe shape.
+		expect(resolveGhTimeoutMs(50)).toBe(MIN_GH_TIMEOUT_MS);
+		expect(resolveGhTimeoutMs(1)).toBe(MIN_GH_TIMEOUT_MS);
+	});
+
+	it("floors an exhausted budget (remainingMs === 0) instead of granting the full 60s default", () => {
+		// The deadline is already reached -- this is the LAST call before
+		// giving up, and it must not itself get a fresh 60s timeout that could
+		// blow the `--wait` budget it was derived from.
+		expect(resolveGhTimeoutMs(0)).toBe(MIN_GH_TIMEOUT_MS);
+	});
+
+	it("MIN_GH_TIMEOUT_MS is well under DEFAULT_GH_TIMEOUT_MS and the hard cap", () => {
+		expect(MIN_GH_TIMEOUT_MS).toBeGreaterThan(0);
+		expect(MIN_GH_TIMEOUT_MS).toBeLessThan(DEFAULT_GH_TIMEOUT_MS);
 	});
 });
 
@@ -542,6 +680,30 @@ describe("resolveRepository", () => {
 		};
 		expect(resolveRepository(ghExec)).toBe("acme/repo");
 	});
+
+	// #2539 round 3, F2: this call used to fire with NO options at all, so it
+	// fell back to the `gh()` wrapper's own default (a flat 60s) with no
+	// relationship whatsoever to `--wait` -- the same gap F4 closed for the
+	// check-runs read, just missed here.
+	it("passes the timeoutMs through to ghExec's own options", () => {
+		const calls: unknown[] = [];
+		const ghExec = (_args: string[], options: unknown) => {
+			calls.push(options);
+			return "acme/repo";
+		};
+		resolveRepository(ghExec, 12_345);
+		expect(calls[0]).toEqual({ timeoutMs: 12_345 });
+	});
+
+	it("defaults to DEFAULT_GH_TIMEOUT_MS when no timeout is given", () => {
+		const calls: unknown[] = [];
+		const ghExec = (_args: string[], options: unknown) => {
+			calls.push(options);
+			return "acme/repo";
+		};
+		resolveRepository(ghExec);
+		expect(calls[0]).toEqual({ timeoutMs: DEFAULT_GH_TIMEOUT_MS });
+	});
 });
 
 describe("resolveHeadSha — mergeable resolution (#2539 round 2, F1)", () => {
@@ -569,6 +731,75 @@ describe("resolveHeadSha — mergeable resolution (#2539 round 2, F1)", () => {
 			sha: "abc1234",
 			mergeable: null,
 		});
+	});
+
+	// #2539 round 3, F2: same gap as resolveRepository above.
+	it("passes the timeoutMs through to ghExec's own options for a PR-number target", () => {
+		const calls: unknown[] = [];
+		const ghExec = (_args: string[], options: unknown) => {
+			calls.push(options);
+			return JSON.stringify({ headRefOid: "c0ffee", mergeable: "MERGEABLE" });
+		};
+		resolveHeadSha("2539", ghExec, 12_345);
+		expect(calls[0]).toEqual({ timeoutMs: 12_345 });
+	});
+
+	it("defaults to DEFAULT_GH_TIMEOUT_MS when no timeout is given", () => {
+		const calls: unknown[] = [];
+		const ghExec = (_args: string[], options: unknown) => {
+			calls.push(options);
+			return JSON.stringify({ headRefOid: "c0ffee", mergeable: "MERGEABLE" });
+		};
+		resolveHeadSha("2539", ghExec);
+		expect(calls[0]).toEqual({ timeoutMs: DEFAULT_GH_TIMEOUT_MS });
+	});
+});
+
+// #2539 round 3, F2: `run()` must derive resolveRepository/resolveHeadSha's
+// timeout from the FULL clamped `--wait` budget (nothing spent yet when
+// they fire), not the flat default -- otherwise a small `--wait` still lets
+// an unbounded 60s hang on either of these two calls blow the whole budget
+// before polling even starts.
+describe("run — resolveRepository/resolveHeadSha get a --wait-derived timeout (#2539 round 3, F2)", () => {
+	it("derives the initial timeout from the full --wait cap, floored at MIN_GH_TIMEOUT_MS", async () => {
+		const seenTimeouts: unknown[] = [];
+		const ghExec = (args: string[], options?: { timeoutMs?: number }) => {
+			seenTimeouts.push(options?.timeoutMs);
+			if (args[0] === "repo") return "acme/repo";
+			if (args[0] === "pr")
+				return JSON.stringify({ headRefOid: "c0ffee", mergeable: "MERGEABLE" });
+			return JSON.stringify(BOTH_SUCCESS);
+		};
+		await run({
+			argv: ["2539", "--wait", "1"],
+			ghExec,
+			stdout: () => {},
+			stderr: () => {},
+		});
+		// --wait 1 (1s = 1000ms) is under MIN_GH_TIMEOUT_MS, so both the
+		// repository and PR-view calls must floor to MIN_GH_TIMEOUT_MS, not
+		// clamp down to 1000ms and not fall back to the 60s default.
+		expect(seenTimeouts[0]).toBe(MIN_GH_TIMEOUT_MS);
+		expect(seenTimeouts[1]).toBe(MIN_GH_TIMEOUT_MS);
+	});
+
+	it("falls back to the flat default with no --wait", async () => {
+		const seenTimeouts: unknown[] = [];
+		const ghExec = (args: string[], options?: { timeoutMs?: number }) => {
+			seenTimeouts.push(options?.timeoutMs);
+			if (args[0] === "repo") return "acme/repo";
+			if (args[0] === "pr")
+				return JSON.stringify({ headRefOid: "c0ffee", mergeable: "MERGEABLE" });
+			return JSON.stringify(BOTH_SUCCESS);
+		};
+		await run({
+			argv: ["2539"],
+			ghExec,
+			stdout: () => {},
+			stderr: () => {},
+		});
+		expect(seenTimeouts[0]).toBe(DEFAULT_GH_TIMEOUT_MS);
+		expect(seenTimeouts[1]).toBe(DEFAULT_GH_TIMEOUT_MS);
 	});
 });
 
