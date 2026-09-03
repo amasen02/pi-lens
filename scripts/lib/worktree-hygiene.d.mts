@@ -35,6 +35,7 @@ export interface WorktreeCandidate {
 	head?: string | null;
 	branch?: string | null;
 	dirty: boolean;
+	dirtyUnreadable?: boolean;
 	pushed: boolean;
 	mtimeMs: number;
 	locked?: boolean;
@@ -202,8 +203,34 @@ export function formatScanRecord(input: {
 		| "self-missing"
 		| "chain-incomplete";
 	budgetMs: number;
+	/** What was left of the SWEEP budget when the degradation was recorded. */
 	remainingMs?: number;
+	/** The bound the listing was actually given, `min(ceiling, remaining)`. */
+	ceilingMs?: number;
 	rows?: number;
+	nowIso?: string;
+}): string;
+
+export const RUN_SKIP_REASONS: {
+	readonly NO_AGENT_ID: "no-agent-id";
+	readonly AGENT_WORKTREE_MISSING: "agent-worktree-missing";
+	readonly WORKTREE_LIST_FAILED: "worktree-list-failed";
+	readonly INVALID_ARGUMENTS: "invalid-arguments";
+};
+
+export function formatRunRecord(input: {
+	hook?: string | null;
+	outcome: "fired" | "skipped";
+	reason?: string | null;
+	worktree?: string | null;
+	/** Why the run's single scoped tree is still on disk; null if removed. */
+	keptReason?: string | null;
+	removed?: number;
+	orphans?: number;
+	rows?: number;
+	dryRun?: boolean;
+	budgetMs?: number;
+	durationMs?: number;
 	nowIso?: string;
 }): string;
 
