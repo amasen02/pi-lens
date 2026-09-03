@@ -58,6 +58,7 @@ import {
 } from "./mutating-tool.js";
 import { noteMutationHandled } from "./observed-mutation.js";
 import type { ProjectChangeSource } from "./project-changes.js";
+import { getProcessBridge, registerProcessBridge } from "./process-bridge.js";
 
 /** Stable Symbol key — identical across module reloads in the same process. */
 export const MUTATION_BRIDGE_KEY: unique symbol = Symbol.for(
@@ -318,42 +319,33 @@ export function recordMutationThroughSeam(
 
 /**
  * Mount the bridge singleton. Call once from inside the extension factory,
- * protected by the caller's module-level flag. Subsequent calls are no-ops.
+ * protected by the caller's module-level flag. Subsequent calls are no-ops
+ * (first-wins, `clients/process-bridge.ts` owns the mount body — see that
+ * module's header, #2437).
  */
 export function registerMutationBridge(deps: MutationBridgeDeps): void {
-	// `in` check so the frozen non-configurable property does not throw on a
-	// redundant defineProperty attempt.
-	if (MUTATION_BRIDGE_KEY in (globalThis as object)) return;
-
-	const bridge: MutationBridge = Object.freeze({
-		version: 1 as const,
-		recordMutation(entry: MutationBridgeEntry): boolean {
-			return recordMutationThroughSeam(entry, deps);
-		},
-	});
-
-	// Non-writable and non-configurable so no later code silently replaces the
-	// bridge — first-wins is the contract, same as the read bridge.
-	Object.defineProperty(globalThis, MUTATION_BRIDGE_KEY, {
-		value: bridge,
-		writable: false,
-		configurable: false,
-		enumerable: false,
-	});
+	registerProcessBridge(
+		MUTATION_BRIDGE_KEY,
+		(): MutationBridge => ({
+			version: 1 as const,
+			recordMutation(entry: MutationBridgeEntry): boolean {
+				return recordMutationThroughSeam(entry, deps);
+			},
+		}),
+	);
 }
 
 /**
- * The mounted bridge, or `undefined` when pi-lens has not registered one.
+ * The mounted bridge, or `undefined` when pi-lens has not registered one (or
+ * a differently-versioned bridge is mounted, or the mounted value is missing
+ * `recordMutation`).
  *
  * In-repo producers use this instead of reaching for `globalThis` themselves,
  * so there is one spelling of the key and one version check.
  */
 export function getMutationBridge(): MutationBridge | undefined {
-	const bridge = (globalThis as Record<symbol, unknown>)[MUTATION_BRIDGE_KEY];
-	if (!bridge || typeof bridge !== "object") return undefined;
-	const candidate = bridge as Partial<MutationBridge>;
-	if (candidate.version !== 1) return undefined;
-	return typeof candidate.recordMutation === "function"
-		? (candidate as MutationBridge)
+	const candidate = getProcessBridge<MutationBridge>(MUTATION_BRIDGE_KEY, 1);
+	return typeof candidate?.recordMutation === "function"
+		? candidate
 		: undefined;
 }
