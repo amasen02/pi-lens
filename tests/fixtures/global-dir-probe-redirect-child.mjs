@@ -28,10 +28,8 @@
 //                   module scope). Asserting on the resolver alone would not
 //                   prove the installer still finds its tools; this does.
 import { recordDegradationOnce } from "../../clients/degradation-ledger.js";
-import {
-	getGlobalPiLensDir,
-	getGlobalPiLensLogDir,
-} from "../../clients/file-utils.js";
+import { getGlobalPiLensDir } from "../../clients/file-utils.js";
+import { getGlobalPiLensLogDir } from "../../clients/probe-home-state.js";
 import { getManagedToolsDir } from "../../clients/installer/index.js";
 import { flushLatencyLog } from "../../clients/latency-logger.js";
 import * as os from "node:os";

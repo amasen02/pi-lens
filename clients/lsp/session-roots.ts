@@ -32,6 +32,7 @@
  * This is also the seam #2053 needs: an explicit `analysisRoot` registers here.
  */
 
+import { BoundedSet } from "../bounded-cache.js";
 import { isSameOrWithin } from "./server.js";
 import path from "node:path";
 
@@ -39,19 +40,15 @@ import path from "node:path";
  * Insertion-ordered, so eviction drops the OLDEST root. Matches
  * `LSP_CONFIG_CWD_CAP` in `index.ts`, the cap on the set of cwds that
  * `ensureLSPConfigInitialized` will initialize at all — a root this process
- * cannot re-initialize must not still be considered served.
+ * cannot re-initialize must not still be considered served. `BoundedSet`
+ * (#2460) owns the eviction; this module no longer hand-rolls it.
  */
-const sessionRoots = new Set<string>();
 const SESSION_ROOT_CAP = 128;
+const sessionRoots = new BoundedSet<string>(SESSION_ROOT_CAP);
 
 /** Record a session cwd as served. Idempotent; re-registering refreshes nothing. */
 export function registerSessionRoot(cwd: string): void {
 	sessionRoots.add(path.resolve(cwd));
-	while (sessionRoots.size > SESSION_ROOT_CAP) {
-		const oldest = sessionRoots.values().next().value;
-		if (oldest === undefined) break;
-		sessionRoots.delete(oldest);
-	}
 }
 
 /** Return whether this exact root is still served after cap eviction. */
