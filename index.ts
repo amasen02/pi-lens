@@ -311,7 +311,11 @@ let loadedDispatchIntegration: DispatchIntegration | undefined;
  */
 const sessionBootstrapAccess: SessionBootstrapAccess = {
 	peek: () => peekBootstrapClients(),
-	request: (reason) => requestBootstrapClients({ reason }),
+	// `session_start` is not a guess: this adapter IS the session-start seam —
+	// `SessionBootstrapAccess` is constructed here and reached only from
+	// `handleSessionStart`'s three demands (#2557 review F7).
+	request: (reason) =>
+		requestBootstrapClients({ reason, hook: "session_start" }),
 };
 
 function warmDispatchAtSessionStart(): void {

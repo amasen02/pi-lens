@@ -48,22 +48,49 @@
  * says that none applies and why. That is a fact a reviewer can check against
  * the source; a reachability heuristic's silence is not.
  *
- * ## But the walked file set is itself partial — this scan under-includes too
+ * ## The walked file set, and the widening slice 2 added
  *
  * Round 1's header claimed "over-inclusion is the safe direction for a guard"
- * without saying that the FILE SET is a partial walk of its own (#2530 review
- * F6). It is: hook work reached through a helper MODULE leaves this scan's
- * view entirely, and those modules carry more unbounded awaits than the
- * four scanned groups suggest. Measured with this file's own detector:
- * `clients/pipeline.ts` 46, `clients/bootstrap.ts` 24,
- * `clients/actionable-warnings.ts` 12, `clients/dispatch/dispatcher.ts` 7,
- * `clients/quiet-window.ts` 6, `clients/format-service.ts` 5 — 100 unbounded
- * awaits reachable from hooks that this sweep does NOT flag and the table
- * below does NOT record. The ratchet is real for the files it covers and
- * silent outside them, which is stated here rather than left for a reader to
- * discover. #2523 slice 2's structural answer is threading the hook signal
- * into the deps types, which follows the work across module boundaries in a
- * way a file-group scan cannot.
+ * without saying that the FILE SET was a partial walk of its own (#2530 review
+ * F6): hook work reached through a helper MODULE left the scan's view
+ * entirely. Slice 2's first attempt at closing that listed SIX module names by
+ * hand — which is defect shape 34, a guard that enumerates spellings. The
+ * reviewer planted 18 unbounded awaits in `clients/observed-mutation.ts` and
+ * 148 in `clients/lsp/index.ts` — modules that same PR labelled hook-reached —
+ * and the sweep stayed green (#2557 review F4).
+ *
+ * The set is now DERIVED from the import graph: {@link hookHelperModules}
+ * resolves every relative specifier in the four hook-handler groups and
+ * returns what they reach in ONE hop. That is **202** modules today, holding
+ * **1255** unbounded awaits, against the six hand-picked modules' 100 — and
+ * the hand-picked list included `clients/dispatch/dispatcher.ts`, which is not
+ * even a one-hop import (it is reached through `clients/dispatch/
+ * integration.ts`), so it was both under- and mis-inclusive.
+ *
+ * {@link HELPER_UNBOUNDED} pins every one of those modules that holds at least
+ * one, exactly, through the kit's own `auditSymbolCounts`. Zero-count modules
+ * are not listed and do not need to be: one gaining an await appears in the
+ * measured map and fails as an unaccounted entry. The granularity is
+ * per-MODULE rather than per-occurrence deliberately — 1255 `EXEMPT_SITES`
+ * entries whose `reason` would all read "slice 3 owns bounding this" is the
+ * hand-maintained mirror AGENTS.md's single-source rule exists to prevent —
+ * and the trade is stated in {@link SWEEP_HEURISTIC_LIMITS}: a count cannot
+ * tell "bounded one, added one" from "changed nothing". The table shrinks to
+ * nothing as #2523 threads the hook signal into the deps types, which is the
+ * structural answer a file list only approximates.
+ *
+ * ## A third family: every `bounded()` call, and where its signal comes from
+ *
+ * `bounded()`'s `signal` is a REQUIRED property typed `AbortSignal |
+ * undefined` — the key must be written, so a deadline-only call cannot
+ * compile, but a seam holding an optional signal may pass it straight through
+ * and then run on ONE live bound whenever the caller genuinely had none.
+ * {@link BOUNDED_CALL_SITES} registers every shipped call with the provenance
+ * of its signal, so that set cannot grow without someone writing down why. It
+ * replaces round 1's `NEVER_ABORTED` sentinel, which enumerated the same fact
+ * by making callers name a constant — a SECOND concept for behaviour
+ * `bounded()` already had, on an issue whose premise is that one primitive
+ * replaces the private copies (#2557 review F2).
  *
  * ## The table is a BASELINE, deliberately
  *
@@ -81,6 +108,8 @@
  * suffix buys and what it costs.
  */
 
+import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -92,13 +121,21 @@ import {
 import {
 	awaitOccurrenceKey,
 	DEFINITION_FILE,
+	findBoundedCallLines,
 	findHandRolledRaceLines,
 	findUnboundedAwaitLines,
+	hookHelperModules,
 	hookPathFiles,
+	localImportTargets,
 	scanFiles,
 	shippedSourceFiles,
 } from "../support/hook-await-scan.js";
-import { auditRegistry, stripSource } from "../support/sweep-kit.js";
+import {
+	auditRegistry,
+	auditSymbolCounts,
+	relativePosix,
+	stripSource,
+} from "../support/sweep-kit.js";
 
 const REPO_ROOT = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -151,15 +188,40 @@ export const SWEEP_HEURISTIC_LIMITS = [
 		"candidate; whether a site is actually on a hook path is recorded in the " +
 		"exemption table's `site` field, which a reviewer checks against the " +
 		"source. Over-inclusion WITHIN those files is the safe direction.",
-	"The FILE SET is itself a partial walk, so this sweep also UNDER-includes " +
-		"and is silent about it. Hook work that moves into a helper module " +
-		"leaves the scan's view: measured with this file's own detector, " +
-		"clients/pipeline.ts has 46 unbounded awaits, clients/bootstrap.ts 24, " +
-		"clients/actionable-warnings.ts 12, clients/dispatch/dispatcher.ts 7, " +
-		"clients/quiet-window.ts 6 and clients/format-service.ts 5 — 100 " +
-		"reachable from hooks, none of them flagged or recorded below. #2523 " +
-		"slice 2's deps-type threading is the structural answer; this is the " +
-		"slice-2 worklist those counts belong to.",
+	"The helper walk is ONE import hop from the four hook-handler groups, not " +
+		"the transitive closure. index.ts alone reaches most of clients/ " +
+		"transitively, so the closure is 'the codebase' — a whole-repo " +
+		"unbounded-await ratchet, a much larger promise than #2523's and one " +
+		"whose numbers no reviewer could check. One hop is the set a hook " +
+		"handler calls DIRECTLY, which is where the work a hook awaits lives. A " +
+		"module reached only at two hops (clients/dispatch/dispatcher.ts, via " +
+		"clients/dispatch/integration.ts) is therefore NOT counted here.",
+	"The helper family is keyed per-MODULE COUNT, not per occurrence. A count " +
+		"cannot tell 'bounded one, added one' from 'changed nothing' — only the " +
+		"four hook-handler groups get per-line keys. The trade buys a table of " +
+		"~75 numbers instead of ~1255 exemption entries whose reason would all " +
+		"read 'slice 3 owns bounding this', which is the hand-maintained mirror " +
+		"the single-source rule exists to prevent. #2523's deps-type threading " +
+		"removes the need for the coarser half.",
+	"A whole `import type …` / `export type …` DECLARATION is excluded from " +
+		"the helper walk (#2557 review friction) — a type edge is not a call. " +
+		'A MIXED clause (`import { type A, b } from "…"`) is NOT excluded: the ' +
+		"declaration itself does not start with `type`, and `b` is a real value " +
+		"import, so the module genuinely is called into. The detector does not " +
+		"walk INSIDE a multi-line clause for a per-specifier `type` modifier — " +
+		"only the declaration's own leading keyword decides it, which is the " +
+		"same 'over-inclusion within a file is the safe direction' trade the " +
+		"line-granular limit above states: a mixed clause with every named " +
+		'specifier `type`-prefixed (`import { type A, type B } from "…"`, no ' +
+		"plain specifier at all) still counts as reached, because nothing here " +
+		"parses the specifier list.",
+	"The `bounded()` call registry does NOT decide whether a call's `signal` " +
+		"argument can be `undefined`. That is a type question, and a regex for " +
+		"`??`/`||`/`undefined` would call `signal: options.signal` — the " +
+		"bootstrap seam, whose parameter is optional and which is the single " +
+		"most important site — clean, the false-negative direction a guard must " +
+		"never take. EVERY call is registered instead, and its entry states " +
+		"where its signal comes from.",
 	"`bounded()` is recognised SYNTACTICALLY, by call shape. A helper that " +
 		"wraps `bounded()` one level down reads as unbounded here and needs an " +
 		"exemption naming the wrapper — mechanically visible, unlike a walk that " +
@@ -178,11 +240,12 @@ export const SWEEP_HEURISTIC_LIMITS = [
 		"when `signal` appears in it: a signal-only race is the mirror image " +
 		"of the deadline-only defect this guard exists for, and a new race is " +
 		"forbidden by the hand-rolled-race family anyway.",
-	"Awaits in `clients/` modules OTHER than `runtime-*.ts` are out of scope of " +
-		"the hook-await family, so a hook whose work moves into a new helper " +
-		"module leaves that scan's view. #2523 slice 2 threads the hook signal " +
-		"into the deps types, which is the structural answer; this sweep covers " +
-		"the hook FILES.",
+	"A module reached only through ANOTHER helper is still outside both scans, " +
+		"so a hook whose work moves two hops out leaves the guard's view until " +
+		"someone widens the walk. #2523's deps-type threading is the structural " +
+		"answer — it follows the work across module boundaries in a way an " +
+		"import-graph radius cannot — and until it lands the one-hop set is the " +
+		"screen.",
 	"The hand-rolled-race scan matches `Promise.race(` AND `Promise.any(` " +
 		"(#2530 round 3 F3: `Promise.any([work, delay])` is the same " +
 		"first-settlement-wins shape as `race` with a timer arm, and round 1 " +
@@ -1954,16 +2017,6 @@ const EXEMPT_SITES: Readonly<Record<string, SweepExemption>> = {
 			"request; no pi hook budget applies.",
 		owner: "#2523 slice 2",
 	},
-	"race:clients/bootstrap.ts#awaitWithinBounds:888067f6~9dc2335c": {
-		family: "hand-rolled-race",
-		site: "off-hook",
-		reason:
-			"Hand-rolled timeout race in the analyzer-bootstrap loader " +
-			"(`awaitWithinBounds`). Reached from every hook that needs " +
-			"analyzer clients, so folding it into `bounded()` is high-value " +
-			"slice-2 work; slice 1 only forbids NEW ones.",
-		owner: "#2523 slice 2",
-	},
 	"race:clients/dispatch/dispatcher.ts#runRunner:5dbd3dcf~c580947c": {
 		family: "hand-rolled-race",
 		site: "off-hook",
@@ -2009,23 +2062,6 @@ const EXEMPT_SITES: Readonly<Record<string, SweepExemption>> = {
 			"family #2523's inventory names). Slice 2's fold worklist.",
 		owner: "#2523 slice 2",
 	},
-	"race:clients/observed-mutation.ts#withBounds:888067f6~411d7c3a": {
-		family: "hand-rolled-race",
-		site: "off-hook",
-		reason:
-			"`withBounds`: the observed-mutation capture budget " +
-			"(OBSERVED_CAPTURE_BUDGET_MS) as a hand-rolled race. Slice 2's " +
-			"fold worklist.",
-		owner: "#2523 slice 2",
-	},
-	"race:clients/pipeline.ts#resyncLspFile:5f7e02c1~e0e223f7": {
-		family: "hand-rolled-race",
-		site: "off-hook",
-		reason:
-			"`resyncLspFile`'s touch-versus-bail race with a hand-rolled " +
-			"timer arm. Slice 2's fold worklist.",
-		owner: "#2523 slice 2",
-	},
 	"race:clients/quiet-window.ts#buildHeartbeatResourcePatchBounded:888067f6~f7fcd4ba":
 		{
 			family: "hand-rolled-race",
@@ -2065,6 +2101,181 @@ const EXEMPT_SITES: Readonly<Record<string, SweepExemption>> = {
 	},
 };
 
+/**
+ * The one reason every {@link HELPER_UNBOUNDED} entry carries, written once.
+ *
+ * It is genuinely ONE fact for all 75 modules — none of them can be bounded
+ * from here, because bounding a helper's await needs the hook's signal to have
+ * been threaded into the deps type that reaches it, which is #2523 AC4 and has
+ * not landed. Repeating that sentence 75 times with a module name substituted
+ * in would be the hand-maintained mirror the single-source rule exists to
+ * prevent, not 75 reasons.
+ */
+const HELPER_EXEMPTION_REASON =
+	"Unbounded awaits in a module a registered hook handler imports directly. " +
+	"None can be bounded without the hook's own signal reaching them, which is " +
+	"#2523 AC4's deps-type threading (TurnEndDeps / AgentEndDeps / " +
+	"SessionStartDeps gain a required `signal`, both hosts pass ctx.signal) and " +
+	"is not in this PR. This pin is the measured slice-3 worklist: the number " +
+	"may only change with a stated reason, so an await added here fails loudly " +
+	"and one bounded here is recorded rather than absorbed.";
+
+/**
+ * Every one-hop helper module holding at least one unbounded await, and how
+ * many (#2557 review F4).
+ *
+ * The SET is derived by {@link hookHelperModules} from the import graph, never
+ * spelled — see this file's header for what the hand-written six-name list
+ * missed. Modules measuring ZERO are deliberately absent: one that gains an
+ * await appears in the measured map and fails as an unaccounted entry, so
+ * listing 127 zeroes would add churn without adding a guard.
+ *
+ * Pinned through `auditSymbolCounts`, the kit's own file-count mechanism
+ * (#1817), rather than a bespoke comparison — same machinery the session-state
+ * sweep pins ~72 files with.
+ *
+ * Round-3 deltas (2026-09-03), all measured, none hand-picked:
+ *
+ * - `clients/actionable-warnings.ts` 12 → 14. Review F-A's fix adds an outer
+ *   `await withDeadline(inner, …)` deadline-only cap around the existing
+ *   `await bounded(…)` call in `boundedLspCall`, so the loop's own shrinking
+ *   residual budget stops reaching the ledger as a false
+ *   `hook-await-exceeded`. `isBoundedAwait` only recognizes the literal
+ *   `bounded(` call head (by design — see its own doc comment on why
+ *   `withDeadline` was deliberately dropped from that list in round 1), so
+ *   the new deadline-only await is honestly unbounded by this heuristic even
+ *   though it composes correctly with the still-present `bounded()` call.
+ * - `clients/formatters.ts` 118 → 115, from `origin/master`'s #2514
+ *   (`05df8268`..`4cd8bdb6`, folding formatters' tool-bin walkers onto one
+ *   ceilinged walker), merged into this branch — not a change this PR made.
+ * - Eight modules REMOVED entirely (their one-hop edge was ONLY an `import
+ *   type`, per the friction fix above): `clients/biome-client.ts` (9),
+ *   `clients/complexity-client.ts` (1), `clients/dependency-checker.ts` (21),
+ *   `clients/jscpd-client.ts` (4), `clients/knip-client.ts` (6),
+ *   `clients/lsp/client.ts` (75), `clients/opengrep-client.ts` (2),
+ *   `clients/ruff-client.ts` (6) — 8 modules, 124 awaits, measured with
+ *   `scripts/.probe-measure-helpers.mjs` (not committed) against this
+ *   branch's `hookHelperModules`. Every one of these is a linter/analyzer
+ *   CLIENT class only reached from a hook handler for its exported TYPE
+ *   (`clients/runtime-turn.ts`'s `import type { DependencyChecker,
+ *   MadgeBatchStats } from "./dependency-checker.js"`, confirmed by hand for
+ *   this entry); the actual VALUE-level construction is `bootstrap.ts`'s
+ *   dynamic `await import(...)` inside `requestBootstrapClients`, which is
+ *   TWO hops from a hook handler (hook handler → `bootstrap.ts` →
+ *   the client) and correctly outside the one-hop walk. 202 modules / 1255
+ *   awaits (the PR's round-1 baseline) is now 190 modules / 1130 awaits.
+ */
+const HELPER_UNBOUNDED: Readonly<Record<string, number>> = {
+	"clients/actionable-warnings.ts": 14,
+	"clients/ast-grep-client.ts": 15,
+	"clients/blocker-freshness.ts": 13,
+	"clients/bootstrap.ts": 23,
+	"clients/cooperative-budget.ts": 3,
+	"clients/dead-code-client.ts": 4,
+	"clients/dispatch/integration.ts": 20,
+	"clients/dispatch/pending-runner-findings.ts": 2,
+	"clients/dispatch/runners/psscriptanalyzer.ts": 7,
+	"clients/dispatch/runners/utils/lazy-installer.ts": 2,
+	"clients/dispatch/runners/utils/runner-helpers.ts": 32,
+	"clients/file-time.ts": 1,
+	"clients/file-utils.ts": 1,
+	"clients/format-service.ts": 5,
+	"clients/formatters.ts": 115,
+	"clients/gitleaks-client.ts": 4,
+	"clients/govulncheck-client.ts": 6,
+	"clients/installer/index.ts": 192,
+	"clients/installer/managed-tool-refresh.ts": 29,
+	"clients/instance-reaper.ts": 26,
+	"clients/instance-registry.ts": 23,
+	"clients/language-profile.ts": 3,
+	"clients/lens-engine.ts": 1,
+	"clients/lens-map.ts": 2,
+	"clients/lsp-budget.ts": 1,
+	"clients/lsp-document-symbols.ts": 2,
+	"clients/lsp/cascade-tier.ts": 2,
+	"clients/lsp/config.ts": 3,
+	"clients/lsp/index.ts": 151,
+	"clients/lsp/server.ts": 111,
+	"clients/map-with-concurrency.ts": 2,
+	"clients/observed-mutation.ts": 18,
+	"clients/opaque-mutation-scan.ts": 10,
+	"clients/package-manager.ts": 8,
+	"clients/partial-edit-apply.ts": 2,
+	"clients/performance-report.ts": 8,
+	"clients/pipeline.ts": 45,
+	"clients/project-changes.ts": 2,
+	"clients/project-snapshot.ts": 2,
+	"clients/quiet-window.ts": 6,
+	"clients/read-expansion.ts": 2,
+	"clients/recent-touches.ts": 8,
+	"clients/review-graph/builder.ts": 41,
+	"clients/safe-spawn.ts": 9,
+	"clients/session-state-store.ts": 4,
+	"clients/shared-checkout-guard.ts": 7,
+	"clients/source-filter.ts": 2,
+	"clients/startup-scan.ts": 3,
+	"clients/test-runner-client.ts": 4,
+	"clients/tree-sitter-shared.ts": 1,
+	"clients/trivy-client.ts": 2,
+	"clients/warm-attach.ts": 9,
+	"clients/widget-state.ts": 3,
+	"clients/word-index.ts": 24,
+	"clients/zizmor-config.ts": 2,
+	"tools/ast-dump.ts": 2,
+	"tools/ast-grep-outline.ts": 2,
+	"tools/ast-grep-replace.ts": 3,
+	"tools/ast-grep-search.ts": 5,
+	"tools/effective-config.ts": 1,
+	"tools/lens-diagnostic-mark.ts": 2,
+	"tools/lens-diagnostics.ts": 10,
+	"tools/lsp-diagnostics.ts": 30,
+	"tools/lsp-navigation.ts": 33,
+	"tools/module-report.ts": 3,
+	"tools/project-report.ts": 1,
+	"tools/symbol-search.ts": 1,
+};
+
+/**
+ * Every shipped `bounded()` CALL, and where its `signal` comes from (#2557
+ * review F2).
+ *
+ * `bounded()` takes a REQUIRED `signal` whose type admits `undefined`: the key
+ * must be written, so a deadline-only call cannot compile, but a seam holding
+ * an optional signal passes it straight through and then runs on ONE live
+ * bound whenever the caller genuinely had none. That is weaker than #2523's
+ * contract, so it is not forbidden — it is written down, here, per call site.
+ *
+ * Keyed on the call's `signal` line (`findBoundedCallLines`), so changing WHICH
+ * signal a call passes re-keys it and forces the claim below to be re-stated
+ * rather than silently inherited.
+ */
+const BOUNDED_CALL_SITES: Readonly<Record<string, string>> = {
+	"call:clients/actionable-warnings.ts#boundedLspCall:2b57f8b9~9137fb1a":
+		"`LspEnrichmentDeps.signal`. ALWAYS live on the deferred loop (built " +
+		"from the turn signal combined with the deferral controller's). Optional " +
+		"for the in-band loop, which passes `args.signal` — present on every " +
+		"turn_end path and absent only in a unit harness. Deadline half is live " +
+		"either way, and is itself the per-trip minimum of the loop's remaining " +
+		"budget and the per-pull timeout.",
+	"call:clients/bootstrap.ts#requestBootstrapClients:076f54d7~878c680d":
+		"`options.signal`, GENUINELY absent for the three session-start demands: " +
+		"`SessionBootstrapAccess.request` takes no signal on purpose (#1394 — a " +
+		"session_start can land mid-turn, and binding the outgoing turn's signal " +
+		"cancelled every startup scan with no retry). Two live bounds even then, " +
+		"because this call supplies the seam's own `bootstrapShutdownController` " +
+		"as `shutdownSignal`. The tool_call demand passes the ambient signal.",
+	"call:clients/observed-mutation.ts#withBounds:6ec6083f~67028b50":
+		"`withBounds(work, ms, signal, site)`'s third parameter, threaded from " +
+		"`ArmObservationArgs.signal` / `SettledSweepArgs.signal`. Optional in the " +
+		"type; filled by every production hook path (tool_call arm, " +
+		"tool_result_edit settle, agent_settled sweeps). The fallback is " +
+		"fail-safe, not the normal case, and the wall budget is live regardless.",
+	"call:clients/pipeline.ts#resyncLspFile:194d22cb~34c8c753":
+		"The AMBIENT turn abort signal, set for the whole tool_result path and " +
+		"absent only in a bare unit harness. PI_LENS_LSP_SYNC_BUDGET_MS is the " +
+		"bound that is always live.",
+};
+
 /** `auditRegistry` takes flat strings; the structure is folded in here. */
 function exemptionReasons(): Record<string, string> {
 	const out: Record<string, string> = {};
@@ -2097,6 +2308,26 @@ const races = scanFiles(
 	"race:",
 	(rel) => rel === DEFINITION_FILE,
 );
+const boundedCalls = scanFiles(
+	REPO_ROOT,
+	shippedSourceFiles(REPO_ROOT),
+	findBoundedCallLines,
+	"call:",
+	(rel) => rel === DEFINITION_FILE,
+);
+
+/** rel -> unbounded-await count for every one-hop helper that has any. */
+function measureHelperModules(): Record<string, number> {
+	const out: Record<string, number> = {};
+	for (const absolute of hookHelperModules(REPO_ROOT)) {
+		const rel = relativePosix(REPO_ROOT, absolute);
+		const count = findUnboundedAwaitLines(
+			stripSource(fs.readFileSync(absolute, "utf8")),
+		).length;
+		if (count > 0) out[rel] = count;
+	}
+	return out;
+}
 
 describe("#2523 AC1 every hook-path await is bounded, and no new hand-rolled race", () => {
 	it("scans both file groups and finds both families (a dead scan is not a clean one)", () => {
@@ -2306,6 +2537,186 @@ describe("#2523 AC1 every hook-path await is bounded, and no new hand-rolled rac
 		);
 		expect(hookOwned.length).toBeGreaterThanOrEqual(
 			Math.max(1, Math.floor(entries.length / 4)),
+		);
+	});
+
+	it("derives the helper set from the import graph, not from a list of names", () => {
+		// #2557 review F4. The round-1 shape was six hand-written module names,
+		// which is defect shape 34: it could not see `clients/observed-mutation.ts`
+		// or `clients/lsp/index.ts` — modules this PR itself labels hook-reached.
+		const helpers = hookHelperModules(REPO_ROOT).map((absolute) =>
+			relativePosix(REPO_ROOT, absolute),
+		);
+		// A dead walk is not a clean one: the resolver returning [] (a stray
+		// `strings: "blank"` erases every specifier, which it did on the first
+		// cut) would make every count below vacuously correct.
+		expect(helpers.length).toBeGreaterThanOrEqual(100);
+		// The three modules the hand-written list missed, each reached in one hop
+		// and each carrying real unbounded awaits.
+		expect(helpers).toContain("clients/observed-mutation.ts");
+		expect(helpers).toContain("clients/lsp/index.ts");
+		expect(helpers).toContain("clients/formatters.ts");
+		// ...and one it WRONGLY included: `clients/dispatch/dispatcher.ts` is
+		// two hops out, through `clients/dispatch/integration.ts`.
+		expect(helpers).not.toContain("clients/dispatch/dispatcher.ts");
+		expect(
+			localImportTargets(
+				path.join(REPO_ROOT, "clients/dispatch/integration.ts"),
+			).map((absolute) => relativePosix(REPO_ROOT, absolute)),
+		).toContain("clients/dispatch/dispatcher.ts");
+		// ...and one the TYPE-ONLY exclusion above wrongly included before this
+		// PR: `clients/lsp/client.ts` is reached from a hook handler only for
+		// its exported TYPES (`LSPDiagnostic`/`LSPCodeAction` in signatures);
+		// the actual value-level LSP client is `clients/lsp/index.ts`'s
+		// `getLSPService()`.
+		expect(helpers).not.toContain("clients/lsp/client.ts");
+		// A hook handler is not its own helper.
+		for (const handler of hookPathFiles(REPO_ROOT)) {
+			expect(helpers).not.toContain(relativePosix(REPO_ROOT, handler));
+		}
+	});
+
+	// #2557 review friction: 9 modules / 128 awaits (`clients/lsp/client.ts`
+	// alone contributing 75) reached the one-hop set ONLY through an
+	// `import type` clause, never a value import — a hook handler that
+	// imports a TYPE from a helper never actually calls into it, so counting
+	// it as a hook-reached module is a false positive the reviewer measured
+	// tripping 22% of recently merged PRs. A type edge is not a call.
+	it("does not count a module reached only through import type / export type", () => {
+		const dir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-hook-await-type-only-"),
+		);
+		try {
+			fs.writeFileSync(
+				path.join(dir, "type-only-target.ts"),
+				"export interface A {}\n",
+			);
+			fs.writeFileSync(
+				path.join(dir, "value-target.ts"),
+				"export const B = 1;\n",
+			);
+			fs.writeFileSync(
+				path.join(dir, "mixed-target.ts"),
+				"export interface C {}\nexport const D = 1;\n",
+			);
+			fs.writeFileSync(
+				path.join(dir, "importer.ts"),
+				[
+					'import type { A } from "./type-only-target.js";',
+					'import { B } from "./value-target.js";',
+					// A mixed clause: an inline `type` specifier alongside a real
+					// value one. The whole DECLARATION does not start with `type`,
+					// so this stays a real edge (the module IS called into).
+					'import { type C, D } from "./mixed-target.js";',
+					'export type { A as AReExport } from "./type-only-target.js";',
+					"",
+					"export function use(): void {",
+					"  void B;",
+					"  void D;",
+					"}",
+					"",
+				].join("\n"),
+			);
+			const targets = localImportTargets(path.join(dir, "importer.ts")).map(
+				(absolute) => path.basename(absolute),
+			);
+			expect(targets).not.toContain("type-only-target.ts");
+			expect(targets).toContain("value-target.ts");
+			expect(targets).toContain("mixed-target.ts");
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("pins every one-hop helper module's unbounded-await count", () => {
+		const measured = measureHelperModules();
+		// Vacuity floor: an empty measurement would make the audit below pass on
+		// nothing at all.
+		expect(Object.keys(measured).length).toBeGreaterThanOrEqual(50);
+		expect(
+			Object.values(measured).reduce((total, n) => total + n, 0),
+		).toBeGreaterThan(0);
+		const audit = auditSymbolCounts({
+			sweepName: "hook helper unbounded-await pin (#2523 slice 3 worklist)",
+			counts: measured,
+			pinned: HELPER_UNBOUNDED,
+			remediation:
+				"A module a registered hook handler imports DIRECTLY gained or lost " +
+				"an unbounded await. Wrap it in bounded() (clients/deadline-utils.ts) " +
+				"and lower the pinned number, or raise the number here and say why it " +
+				"had to grow. A module that appears with no pin at all is new to the " +
+				"one-hop set — add it. " +
+				HELPER_EXEMPTION_REASON,
+		});
+		expect(audit.problems, audit.problems.join("\n\n")).toEqual([]);
+		expect(HELPER_EXEMPTION_REASON.length).toBeGreaterThan(120);
+	});
+
+	it("registers every shipped bounded() call with the provenance of its signal", () => {
+		// #2557 review F2. `bounded()` reads a missing signal as one that never
+		// aborts, so a seam with an optional signal runs on ONE live bound
+		// whenever its caller had none. Round 1 made that greppable with a
+		// `NEVER_ABORTED` sentinel — a second concept for behaviour bounded()
+		// already had. Registering the CALLS instead covers the same seams
+		// without one, and covers sites that would never have named a sentinel.
+		const audit = auditRegistry({
+			sweepName: "bounded() call-site registry (#2523)",
+			flagged: boundedCalls.occurrences,
+			registered: [],
+			exemptions: BOUNDED_CALL_SITES,
+			scannedCount: boundedCalls.scanned,
+			minScanned: 200,
+			minFlagged: 1,
+			remediation:
+				"A new bounded() call site. Add an entry here keyed by the printed " +
+				"occurrence key, saying WHERE its `signal` comes from and whether " +
+				"that source can be undefined — if it can, this call runs on the " +
+				"wall clock alone whenever it is, which is weaker than #2523's " +
+				"contract and has to be a written decision rather than a default.",
+		});
+		expect(audit.problems, audit.problems.join("\n\n")).toEqual([]);
+		for (const [key, reason] of Object.entries(BOUNDED_CALL_SITES)) {
+			expect(reason.length, `${key}: provenance too thin`).toBeGreaterThan(80);
+		}
+	});
+
+	it("MUTATION: the bounded() call detector sees calls and nothing that merely looks like one", () => {
+		expect(
+			findBoundedCallLines(
+				[
+					"const settled = await bounded(work(), {",
+					"\tms: 5,",
+					"\tsignal: deps.signal,",
+					'\thook: "turn_end",',
+					'\tlabel: "l",',
+					"});",
+				].join("\n"),
+			),
+		).toEqual([3]);
+		// Shorthand `signal` keys on the same line the value comes from.
+		expect(
+			findBoundedCallLines(
+				[
+					'await bounded(w(), { ms, signal, hook: "turn_end", label: "l" });',
+				].join("\n"),
+			),
+		).toEqual([1]);
+		// No `signal` property at all (a JS caller): keyed at the call head, so
+		// it is still registered rather than invisible.
+		expect(findBoundedCallLines("await bounded(w(), { ms: 5 });")).toEqual([1]);
+		// The neighbours that must NOT match.
+		expect(findBoundedCallLines("await boundedLspCall(call, deps);")).toEqual(
+			[],
+		);
+		expect(findBoundedCallLines("const n = boundedNumber(v, 5);")).toEqual([]);
+		expect(findBoundedCallLines("await deps.bounded(work(), opts);")).toEqual(
+			[],
+		);
+		expect(findBoundedCallLines("const c = new BoundedFifoMap(10);")).toEqual(
+			[],
+		);
+		expect(findBoundedCallLines(stripSource("// bounded(w(), o);"))).toEqual(
+			[],
 		);
 	});
 

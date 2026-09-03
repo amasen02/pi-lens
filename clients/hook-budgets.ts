@@ -91,6 +91,30 @@ export const HOOK_WALL_BUDGET_MS: Readonly<Record<HookBudgetKey, number>> =
 		session_before_fork: 0,
 	});
 
+/**
+ * Hook families that may appear on the degradation ledger's HOOK axis.
+ *
+ * A superset of {@link HookBudgetKey}, because two real execution contexts
+ * carry no wall budget in the maintainer's contract yet still have to be
+ * NAMEABLE when a bound fires under them:
+ *
+ * - `tool_call` — the pre-dispatch hook (`clients/runtime-tool-call.ts`). The
+ *   contract gives it no ceiling of its own; work there is bounded per-await.
+ * - `off_hook` — deliberately deferred work (`clients/deferred-lsp-work.ts`,
+ *   the cascade deferred settle, the actionable-warnings deferred pull). It is
+ *   the ANSWER to a blown hook budget, so charging its exceedances to the hook
+ *   that deferred it inverts the reading: `turn_end` would look over budget
+ *   precisely because it correctly moved work off itself (#2557 review F3).
+ *
+ * `bounded()` takes this type rather than a bare `string` so a call site
+ * cannot put something that is not a hook on the hook axis. #2557 review F7:
+ * `clients/bootstrap.ts` passed its `options.reason` (`"session-start-scans"`,
+ * `"tool-call-complexity-baseline"`) as `hook`, which made
+ * `hook-await-exceeded` subjects unjoinable with every other hook-keyed record
+ * and unreadable against this budget table. That is now a type error.
+ */
+export type LedgerHookKey = HookBudgetKey | "tool_call" | "off_hook";
+
 /** Every declared hook family, for sweeps that must enumerate them. */
 export const HOOK_BUDGET_KEYS = Object.keys(
 	HOOK_WALL_BUDGET_MS,

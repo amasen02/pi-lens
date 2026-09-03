@@ -310,6 +310,8 @@ const lspSpawnHeavyInclude = [
 const wallClockBudgetInclude = [
 	// #2528: the bounded batch helper tests race a real wall-clock budget against settle latency (flake-shape admission).
 	"tests/clients/runtime-turn-test-runner-bounds.test.ts",
+	// #2557 review round 3: a real 30s deadline margin is the subject of an abort-vs-deadline precedence assertion (flake-shape admission).
+	"tests/clients/hook-await-fold-bounds.test.ts",
 	"tests/clients/startup-overhead.test.ts",
 	"tests/clients/runtime-session-scan-cache.test.ts",
 	"tests/clients/cascade-turn-merge.test.ts",

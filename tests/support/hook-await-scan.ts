@@ -17,6 +17,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { jsTsCandidatePaths } from "../../clients/review-graph/import-resolvers.js";
 import { lineContentHash } from "../../clients/read-guard.js";
 import {
 	listSourceFiles,
@@ -152,6 +153,65 @@ export function findHandRolledRaceLines(stripped: string): number[] {
 }
 
 /**
+ * A CALL to {@link DEFINITION_FILE}'s `bounded()`, as opposed to any of the
+ * `bounded*` identifiers around it. The lookbehind refuses a property access
+ * (`deps.bounded(`) and an identifier tail (`unbounded(`); requiring `(` after
+ * an optional type-argument list refuses `boundedLspCall(`, `boundedNumber(`
+ * and `BoundedFifoMap`.
+ */
+const BOUNDED_CALL_HEAD = /(?<![.\w$])bounded\s*(?:<[^<>()]*>\s*)?\(/g;
+
+/**
+ * The `signal` property inside a `bounded()` options object, in either
+ * spelling: `signal: expr` or the shorthand `signal` (followed by `,` or the
+ * object's closing brace).
+ */
+const SIGNAL_PROPERTY = /(?:^|[,{(\s])signal\s*(?::|,|\})/;
+
+/**
+ * Every shipped `bounded()` CALL line in one already-stripped source, 1-based
+ * — reported at the `signal:` property when the call spells one, and at the
+ * call head otherwise.
+ *
+ * ## What this family is for (#2557 review F2)
+ *
+ * `bounded()`'s `signal` is a REQUIRED property typed `AbortSignal |
+ * undefined`: the key must be written (so a deadline-only call cannot
+ * compile), but several real seams hold an optional signal and pass it
+ * straight through, which leaves them on ONE live bound whenever the caller
+ * genuinely had none. That is weaker than #2523's contract, so it is not
+ * forbidden — it is ENUMERATED, and the enumeration is what this detector
+ * feeds.
+ *
+ * Round 1 of this PR enumerated the same fact by counting a `NEVER_ABORTED`
+ * sentinel constant instead. The sentinel duplicated behaviour `bounded()`
+ * already had (it treats a missing signal as one that never aborts), so it was
+ * a second concept on an issue whose entire premise is that one primitive
+ * replaces the private copies — the reviewer's net-count finding. Deleting it
+ * loses nothing here: the registry keys on the CALL, not on a spelling a
+ * caller has to remember to use, so it also covers the sites that never named
+ * the sentinel.
+ *
+ * Deliberately NOT a heuristic over the argument's TEXT. "Is this expression
+ * possibly `undefined`" is a type question; a regex for `??` / `||` /
+ * `undefined` would call `signal: options.signal` — the bootstrap seam, whose
+ * parameter is optional and which is the single most important site here —
+ * clean, which is the false-negative direction a guard must never take. Every
+ * call is registered instead, and its entry states where its signal comes
+ * from.
+ */
+export function findBoundedCallLines(stripped: string): number[] {
+	const hits = new Set<number>();
+	for (const match of stripped.matchAll(BOUNDED_CALL_HEAD)) {
+		const head = lineOf(stripped, match.index);
+		const args = callArguments(stripped, match.index + match[0].length - 1);
+		const offset = args.split("\n").findIndex((l) => SIGNAL_PROPERTY.test(l));
+		hits.add(offset < 0 ? head : head + offset);
+	}
+	return [...hits].sort((a, b) => a - b);
+}
+
+/**
  * Nearest non-blank RAW line in `direction` from `index`, or `""` at the edge
  * of the file.
  */
@@ -210,6 +270,134 @@ export function hookPathFiles(repoRoot: string): string[] {
 		if (fs.existsSync(absolute)) files.push(absolute);
 	}
 	return files.sort();
+}
+
+/**
+ * A relative module specifier in an `import` / `export ... from` /
+ * `await import()` / `require()`. Only RELATIVE ones: a bare specifier is an
+ * npm package or a builtin and has no file in this repo.
+ */
+const LOCAL_SPECIFIER =
+	/(?:\bfrom\s*|\bimport\s*\(\s*|\brequire\s*\(\s*)["'](\.\.?\/[^"']*)["']/g;
+
+/**
+ * A whole `import type { … } from "…"` / `export type { … } from "…"`
+ * DECLARATION — one where the `type` keyword sits immediately after `import`/
+ * `export`, not a per-specifier `{ type Foo, bar }` inline modifier inside an
+ * otherwise-real import (#2557 review friction). A hook handler that imports
+ * only a TYPE from a helper never calls into it at runtime, so counting that
+ * edge as "reached" is a false positive: the reviewer measured 9 modules /
+ * 128 unbounded-await entries (`clients/lsp/client.ts` alone contributing 75)
+ * that existed in the helper set ONLY through an edge like this, and that 22%
+ * of recently merged PRs would have tripped the pin on one. `[^;]*?`
+ * non-greedy up to the clause's own `from "…"` — it stops at the first match,
+ * so it cannot swallow a later, unrelated `import` on the next line.
+ */
+const TYPE_ONLY_IMPORT_CLAUSE =
+	/\b(?:import|export)\s+type\b[^;]*?\bfrom\s*["'](\.\.?\/[^"']*)["']/g;
+
+/**
+ * Resolve one relative specifier written the way this repo writes them —
+ * `nodenext`, so `./x.js` names the SOURCE `./x.ts` — to an absolute `.ts`
+ * path, or `undefined` when nothing exists there.
+ *
+ * Candidate generation is `clients/review-graph/import-resolvers.ts`'s
+ * `jsTsCandidatePaths` (#2557 review F-C): this file used to hand-roll the
+ * SAME `./x.js` → sibling `.ts`/`.tsx`/`index.ts` mapping that the review
+ * graph's warm jsts builder and cold `module_report` path already share
+ * (#694's single-source-of-truth rule for exactly this resolution). The
+ * existence check and return shape (a raw `path.resolve()`-based, OS-native
+ * path — not `resolveImportToFiles`'s realpath-canonicalized one, which
+ * `hookHelperModules`'s `target.startsWith(repoRoot)` check below is not
+ * written to survive) stay local, so this module's callers see no behaviour
+ * change.
+ */
+function resolveLocalSpecifier(
+	fromFile: string,
+	specifier: string,
+): string | undefined {
+	for (const candidate of jsTsCandidatePaths(fromFile, specifier)) {
+		if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+			return candidate;
+		}
+	}
+	return undefined;
+}
+
+/** Every repo-local `.ts` module `absolute` imports, resolved and deduplicated. */
+export function localImportTargets(absolute: string): string[] {
+	// `strings: "keep"` — the thing being searched for IS a string literal, so
+	// the default blanking policy (which every other scan in this file wants,
+	// because an identifier inside a string is not a call) would erase every
+	// specifier and return an empty set. It did, on the first cut here.
+	const stripped = stripSource(fs.readFileSync(absolute, "utf8"), {
+		strings: "keep",
+	});
+	// Every `import type …` / `export type …` declaration's span — a type
+	// edge is not a call, so a `from "…"` match landing inside one of these
+	// spans is skipped below (#2557 review friction).
+	const typeOnlySpans = [...stripped.matchAll(TYPE_ONLY_IMPORT_CLAUSE)].map(
+		(match) => [match.index, match.index + match[0].length] as const,
+	);
+	const targets = new Set<string>();
+	for (const match of stripped.matchAll(LOCAL_SPECIFIER)) {
+		if (
+			typeOnlySpans.some(
+				([start, end]) => match.index >= start && match.index < end,
+			)
+		) {
+			continue;
+		}
+		const resolved = resolveLocalSpecifier(absolute, match[1] ?? "");
+		if (resolved !== undefined && !resolved.endsWith(".d.ts")) {
+			targets.add(resolved);
+		}
+	}
+	return [...targets].sort();
+}
+
+/**
+ * The HELPER modules a registered hook handler reaches in ONE import hop.
+ *
+ * DERIVED, never spelled (#2557 review F4). Round 1 of this PR listed six
+ * module names by hand — `clients/pipeline.ts`, `clients/bootstrap.ts`,
+ * `clients/actionable-warnings.ts`, `clients/dispatch/dispatcher.ts`,
+ * `clients/quiet-window.ts`, `clients/format-service.ts` — which is defect
+ * shape 34 exactly: a guard that enumerates SPELLINGS is blind to everything
+ * it did not think of. The reviewer's probe planted 18 unbounded awaits in
+ * `clients/observed-mutation.ts` and 148 in `clients/lsp/index.ts` — two
+ * modules this very PR labels hook-reached — and the sweep stayed green.
+ *
+ * One hop, not the transitive closure, and that is a deliberate limit rather
+ * than an oversight: `index.ts` alone reaches most of `clients/` transitively,
+ * so the closure is "the codebase" and would make this a whole-repo
+ * unbounded-await ratchet — a different, much larger promise than #2523's, and
+ * one whose numbers no reviewer could check. One hop is the set a hook handler
+ * calls DIRECTLY, which is where the work a hook actually awaits lives. The
+ * limit is stated in `SWEEP_HEURISTIC_LIMITS`.
+ *
+ * A whole `import type …` / `export type …` DECLARATION is excluded (#2557
+ * review friction) — a type edge is not a call, so a hook handler that
+ * imports only a TYPE from a helper never actually calls into it. Measured
+ * before this exclusion: 9 modules / 128 unbounded-await entries
+ * (`clients/lsp/client.ts` alone contributing 75) existed in this set ONLY
+ * through an edge like this, and 22% of recently merged PRs would have
+ * tripped the pin below on one. A MIXED clause (`import { type A, b } from
+ * "…"`) is not excluded — the declaration itself does not start with `type`,
+ * and `b` is a real value import, so the module genuinely is called into.
+ */
+export function hookHelperModules(repoRoot: string): string[] {
+	const handlers = hookPathFiles(repoRoot);
+	const handlerSet = new Set(handlers);
+	const helpers = new Set<string>();
+	for (const handler of handlers) {
+		for (const target of localImportTargets(handler)) {
+			if (handlerSet.has(target)) continue;
+			if (!target.startsWith(repoRoot)) continue;
+			helpers.add(target);
+		}
+	}
+	return [...helpers].sort();
 }
 
 /** Every shipped source file the hand-rolled-race scan covers. */

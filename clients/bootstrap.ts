@@ -36,7 +36,8 @@
  * abandon-the-wait, keep-the-work shape as `lsp-pull-late-answer`.
  */
 import { logExtension } from "./extension-log.js";
-import { combineAbortSignals } from "./deadline-utils.js";
+import { bounded } from "./deadline-utils.js";
+import type { LedgerHookKey } from "./hook-budgets.js";
 import { logLatency } from "./latency-logger.js";
 import { emitBounded } from "./bounded-telemetry.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
@@ -596,6 +597,17 @@ function noteBootstrapBuildFailure(err: unknown): void {
 export async function requestBootstrapClients(options: {
 	/** Who is asking. Becomes the ledger subject, so keep it stable and coarse. */
 	reason: string;
+	/**
+	 * Which HOOK the demand runs under (#2557 review F7).
+	 *
+	 * Separate from {@link reason} because they answer different questions and
+	 * a ledger row needs both: the hook says whose wall budget the wait is
+	 * spending, the reason says which demand spent it. Passing the reason as
+	 * the hook — what this seam did before — put `"session-start-scans"` on the
+	 * ledger's hook axis, where nothing could join it against
+	 * `HOOK_WALL_BUDGET_MS` or against any other hook-keyed record.
+	 */
+	hook: LedgerHookKey;
 	/** The caller's abort signal (turn abort / Escape). */
 	signal?: AbortSignal;
 	/** Override the default wall-clock ceiling. */
@@ -607,13 +619,32 @@ export async function requestBootstrapClients(options: {
 	// still satisfies AGENTS.md's both-bounds rule without binding a turn
 	// signal that would cancel it for the wrong reason.
 	const shutdownSignal = bootstrapShutdownController.signal;
+	const timeoutMs = options.timeoutMs ?? BOOTSTRAP_LOAD_TIMEOUT_MS;
 	try {
-		return await awaitWithinBounds(
-			loadBootstrapClients(),
-			options.timeoutMs ?? BOOTSTRAP_LOAD_TIMEOUT_MS,
-			options.signal,
+		// #2523 slice 2: this used to be `awaitWithinBounds`, a private copy of
+		// exactly what `bounded()` does — same three-way precedence, same
+		// remove-the-listener-in-`finally`, same abandon-the-wait-keep-the-work
+		// contract. `bounded()` is a true superset of it (it also records the
+		// abandonment), so the copy is gone rather than kept in sync by hand.
+		//
+		// `undefined` here can only mean a bound fired: `loadBootstrapClients`
+		// resolves `BootstrapClients` or rejects, never `undefined`.
+		const clients = await bounded(loadBootstrapClients(), {
+			ms: timeoutMs,
+			// Genuinely absent for the three session-start schedulers — see
+			// `SessionBootstrapAccess.request` for why binding a turn signal
+			// there is the wrong bound. `shutdownSignal` is the second live
+			// bound in that case, so both still hold.
+			signal: options.signal,
 			shutdownSignal,
-		);
+			// The hook on the hook axis, the demand on the label (#2557 F7).
+			// `<hook>:loadBootstrapClients:<reason>` joins against
+			// `HOOK_WALL_BUDGET_MS` and still says WHICH demand blew the budget.
+			hook: options.hook,
+			label: `loadBootstrapClients:${options.reason}`,
+		});
+		if (clients) return clients;
+		throw abandonedError(options.signal, shutdownSignal, timeoutMs);
 	} catch (err) {
 		const unavailableReason =
 			err instanceof BootstrapUnavailableError
@@ -650,52 +681,13 @@ export async function requestBootstrapClients(options: {
 }
 
 /**
- * Race `work` against ONE combined signal carrying both bounds.
+ * Which bound won, read off the caller's own signal rather than guessed.
  *
- * `combineAbortSignals` folds the wall-clock ceiling in as
- * `AbortSignal.timeout`, which is the use its own doc comment names — so
- * there is one signal, one listener, and none of the hand-rolled
- * `Promise.race` + `setTimeout` copies #366 consolidated. `work` keeps
- * running when a bound wins: the shared flight is what a later demand joins,
- * and this caller only stops waiting on it.
+ * Read AFTER `bounded()` has settled, exactly as the deleted `awaitWithinBounds`
+ * read it after its own race — and in the same precedence `bounded()` applies
+ * internally (caller, then teardown, then the clock), so the reason this
+ * reconstructs is the reason that fired.
  */
-async function awaitWithinBounds<T>(
-	work: Promise<T>,
-	timeoutMs: number,
-	signal: AbortSignal | undefined,
-	shutdownSignal: AbortSignal,
-): Promise<T> {
-	const bound = combineAbortSignals(
-		signal,
-		shutdownSignal,
-		timeoutMs > 0 ? AbortSignal.timeout(timeoutMs) : AbortSignal.abort(),
-	);
-	// Unreachable — a signal is always supplied above — but the declared type
-	// admits `undefined` and an unbounded await is the one outcome this
-	// function exists to prevent, so it fails closed rather than silently
-	// dropping both bounds.
-	if (!bound) throw abandonedError(signal, shutdownSignal, timeoutMs);
-	// The loser leg must not surface as an unhandled rejection when a bound
-	// wins the race; the flight's own callers still see the rejection.
-	void work.catch(() => {});
-	if (bound.aborted) throw abandonedError(signal, shutdownSignal, timeoutMs);
-	let onAbort: (() => void) | undefined;
-	try {
-		return await Promise.race([
-			work,
-			new Promise<never>((_resolve, reject) => {
-				onAbort = () => {
-					reject(abandonedError(signal, shutdownSignal, timeoutMs));
-				};
-				bound.addEventListener("abort", onAbort, { once: true });
-			}),
-		]);
-	} finally {
-		if (onAbort) bound.removeEventListener("abort", onAbort);
-	}
-}
-
-/** Which bound won, read off the caller's own signal rather than guessed. */
 function abandonedError(
 	signal: AbortSignal | undefined,
 	shutdownSignal: AbortSignal,

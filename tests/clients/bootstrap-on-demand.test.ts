@@ -198,6 +198,7 @@ describe("#2467 — a failed demand fails OPEN for that caller", () => {
 
 		const answer = await bootstrap.requestBootstrapClients({
 			reason: "session-start-scans",
+			hook: "session_start",
 		});
 		expect(answer).toBeNull();
 
@@ -230,7 +231,10 @@ describe("#2467 — a failed demand fails OPEN for that caller", () => {
 
 		for (let i = 0; i < 3; i++) {
 			expect(
-				await bootstrap.requestBootstrapClients({ reason: "tool-call" }),
+				await bootstrap.requestBootstrapClients({
+					reason: "tool-call",
+					hook: "tool_call",
+				}),
 			).toBeNull();
 		}
 		const group = ledger
@@ -248,6 +252,7 @@ describe("#2467 — both bounds on the wait, neither on the load", () => {
 
 		const answer = await bootstrap.requestBootstrapClients({
 			reason: "tool-call-complexity-baseline",
+			hook: "tool_call",
 			timeoutMs: 5,
 		});
 		expect(answer).toBeNull();
@@ -271,6 +276,7 @@ describe("#2467 — both bounds on the wait, neither on the load", () => {
 
 		const pending = bootstrap.requestBootstrapClients({
 			reason: "session-start-tool-probes",
+			hook: "session_start",
 			signal: controller.signal,
 			// Far past anything this test waits for: the ABORT must be what ends
 			// the wait, so a timeout that could also fire would make the case
@@ -305,7 +311,10 @@ describe("#2467 — the primary-shutdown gate", () => {
 		);
 		expect(bootstrap._analyzerBootstrapLoadAttempts()).toBe(0);
 		expect(
-			await bootstrap.requestBootstrapClients({ reason: "post-shutdown" }),
+			await bootstrap.requestBootstrapClients({
+				reason: "post-shutdown",
+				hook: "session_shutdown",
+			}),
 		).toBeNull();
 		const group = ledger
 			.getDegradationSummary()
@@ -346,6 +355,7 @@ describe("#2467 — the primary-shutdown gate", () => {
 
 		const pending = bootstrap.requestBootstrapClients({
 			reason: "session-start-scans",
+			hook: "session_start",
 			timeoutMs: 60_000,
 		});
 		await new Promise((resolve) => setImmediate(resolve));
@@ -371,6 +381,7 @@ describe("#2467 — the primary-shutdown gate", () => {
 		const opener = bootstrap.loadBootstrapClients();
 		const joiner = bootstrap.requestBootstrapClients({
 			reason: "tool-call-complexity-baseline",
+			hook: "tool_call",
 			timeoutMs: 60_000,
 		});
 
@@ -426,6 +437,7 @@ describe("#2467 — a load that cannot succeed latches after N strikes", () => {
 			expect(
 				await bootstrap.requestBootstrapClients({
 					reason: "tool-call-complexity-baseline",
+					hook: "tool_call",
 				}),
 			).toBeNull();
 		}
@@ -450,6 +462,7 @@ describe("#2467 — a load that cannot succeed latches after N strikes", () => {
 			expect(
 				await bootstrap.requestBootstrapClients({
 					reason: "session-start-scans",
+					hook: "session_start",
 				}),
 			).toBeNull();
 		}
@@ -462,6 +475,7 @@ describe("#2467 — a load that cannot succeed latches after N strikes", () => {
 		bootstrap.resetAnalyzerBootstrapSessionState();
 		const clients = await bootstrap.requestBootstrapClients({
 			reason: "session-start-scans",
+			hook: "session_start",
 		});
 		expect(clients?.biomeClient).toBeDefined();
 		expect(bootstrap._analyzerBootstrapLoadAttempts()).toBe(4);

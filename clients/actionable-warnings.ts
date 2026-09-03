@@ -12,7 +12,12 @@ import type { LSPCodeAction, LSPDiagnostic } from "./lsp/client.js";
 import { applyWorkspaceEdit } from "./lsp/edits.js";
 import { getLSPService } from "./lsp/index.js";
 import { isUnderDir, normalizeMapKey } from "./path-utils.js";
-import { combineAbortSignals, withDeadline } from "./deadline-utils.js";
+import {
+	bounded,
+	combineAbortSignals,
+	withDeadline,
+} from "./deadline-utils.js";
+import type { LedgerHookKey } from "./hook-budgets.js";
 import {
 	armDeferredLspWork,
 	awaitDeferredLspWork,
@@ -661,25 +666,33 @@ interface LspEnrichmentDeps {
 	 * loop does, one macrotask after these deps are built.
 	 */
 	deadlineAt?: number;
-	/** The loop's live abort signal. */
+	/**
+	 * The loop's live abort signal — the SECOND bound every round trip races.
+	 *
+	 * Optional only because the in-band caller may have none; `bounded()` reads
+	 * a missing signal as one that never aborts, so the deadline is still live.
+	 * There is no longer a separate pre-built abort leg to forget to supply.
+	 */
 	signal?: AbortSignal;
 	/**
-	 * One pre-built abort leg for the whole loop. Built once so racing every
-	 * round trip against the signal adds exactly ONE listener to it rather than
-	 * three per file.
+	 * WHICH loop these deps belong to, on the degradation ledger's two axes
+	 * (#2557 review F3).
+	 *
+	 * `boundedLspCall` used to hard-code `hook: "turn_end"` / `label:
+	 * "lspEnrichmentRoundTrip"`, and it is reached from BOTH the in-band loop
+	 * (genuinely awaited on `turn_end`) and the deferred loop (deliberately
+	 * moved off the hook, running a macrotask later with its own budget and its
+	 * own signal). One subject for two loops was wrong in both directions:
+	 * `recordDegradationOnce` is rising-edge, so whichever loop blew its budget
+	 * first SILENCED the other for the rest of the session, and any deferred
+	 * exceedance that did land was charged to `turn_end` — making the hook look
+	 * over budget precisely because it had correctly deferred the work.
+	 *
+	 * Carried on the deps object, like `deadlineAt` / `pullTimeoutMs` /
+	 * `signal`, because that object is already the one thing that differs
+	 * between the two loops.
 	 */
-	abortRace?: Promise<undefined>;
-}
-
-/** A promise that resolves (never rejects) the moment `signal` aborts. */
-function makeAbortRace(signal: AbortSignal): Promise<undefined> {
-	return new Promise<undefined>((resolve) => {
-		if (signal.aborted) {
-			resolve(undefined);
-			return;
-		}
-		signal.addEventListener("abort", () => resolve(undefined), { once: true });
-	});
+	site: { hook: LedgerHookKey; label: string };
 }
 
 /**
@@ -687,6 +700,46 @@ function makeAbortRace(signal: AbortSignal): Promise<undefined> {
  * requires of any async step in a sweep loop: a per-call timeout AND the abort
  * signal. Resolves `undefined` when either bound wins; the caller reads that
  * as "this file was not checked", never as "this file is clean".
+ *
+ * #2523 slice 2 folded this onto `bounded()`. It used to be `withDeadline`
+ * (deadline only) raced against a hand-built `abortRace` leg carried on the
+ * deps — the fifth private spelling of "deadline AND signal".
+ *
+ * What the fold did NOT fix, stated because the first draft of this PR claimed
+ * it did (#2557 review F5): the old shape did not silently degrade any wait.
+ * Both construction sites derived the leg from the signal in the same
+ * expression (`args.signal ? makeAbortRace(args.signal) : undefined`), so
+ * `abortRace` was absent exactly when `signal` was, and the behaviour before
+ * and after this fold is identical on that axis. What the fold actually buys
+ * is that the two fields which had to AGREE are now one — a pairing invariant
+ * that lived in prose is gone rather than enforced — plus the abandonment now
+ * reaching the ledger, and the leg's listener now being released per call
+ * instead of living as long as the loop's signal does.
+ *
+ * ## The loop's residual budget is a THIRD bound, and it must not reach the
+ * ledger (#2557 review F-A)
+ *
+ * Round 1 clamped `bounded()`'s own timer to
+ * `Math.min(pullTimeoutMs, remainingMs)`, so whenever the LOOP's own wall
+ * budget was already low, `bounded()` armed at the shrunken value and — on
+ * firing — recorded `hook-await-exceeded` naming THAT value as "the budget".
+ * A healthy pull that simply started late in a big batch was reported as
+ * exceeding a budget that exists in no configuration (measured: 400 ms
+ * pulls, 12 files, "exceeded 65ms budget after 77ms"), and because
+ * `recordDegradationOnce` is rising-edge, that benign row could silence a
+ * genuinely wedged server later in the same session.
+ *
+ * `bounded()`'s OWN timer is now always armed at the full `pullTimeoutMs`, so
+ * it only ever fires — and only ever records — when a call outlives its own
+ * configured per-trip budget (`metadata.budgetMs === pullTimeoutMs`, always).
+ * The loop's shrinking residual is enforced SEPARATELY, by racing `bounded()`
+ * against `withDeadline(…, { onTimeout: "undefined" })` keyed to the loop's
+ * own `deadlineAt` — a deadline-only wait with no ledger connection of its
+ * own, the same primitive `bounded()` itself is built to replace when a
+ * caller needs BOTH bounds. The still-running `bounded()` call is not
+ * cancelled (nothing here can cancel already-started work); if it later
+ * genuinely outlives `pullTimeoutMs`, it still records, correctly, on its own
+ * clock.
  */
 async function boundedLspCall<T>(
 	call: () => Promise<T>,
@@ -699,15 +752,37 @@ async function boundedLspCall<T>(
 	// awaited hook for minutes past a spent batch budget.
 	const remainingMs =
 		deps.deadlineAt !== undefined ? deps.deadlineAt - Date.now() : undefined;
+	// Returned BEFORE `bounded()` rather than handed to it as a zero budget: a
+	// trip that never started did not exceed anything, and recording it as an
+	// exceedance would attribute the loop's spent budget to whichever call
+	// happened to be next.
 	if (remainingMs !== undefined && remainingMs <= 0) return undefined;
-	const timed: Promise<T | undefined> = withDeadline(call(), {
-		ms:
-			remainingMs !== undefined
-				? Math.min(deps.pullTimeoutMs, remainingMs)
-				: deps.pullTimeoutMs,
-		onTimeout: "undefined",
-	});
-	return deps.abortRace ? Promise.race([timed, deps.abortRace]) : timed;
+	const inner = bounded(
+		call().then((value) => ({ value })),
+		{
+			// Always the FULL per-trip budget -- never clamped to the loop's own
+			// residual. The residual is enforced below, off the ledger.
+			ms: deps.pullTimeoutMs,
+			// Optional for the in-band caller; `bounded()` reads a missing signal
+			// as one that never aborts, so the deadline half stays live.
+			signal: deps.signal,
+			// From the deps, never a literal: the in-band and deferred loops must
+			// key separately (#2557 review F3).
+			hook: deps.site.hook,
+			label: deps.site.label,
+		},
+	);
+	const boxed =
+		deps.deadlineAt !== undefined
+			? await withDeadline(inner, {
+					deadlineAt: deps.deadlineAt,
+					onTimeout: "undefined",
+				})
+			: await inner;
+	// Boxed because an LSP pull legitimately resolves `undefined` (no
+	// diagnostics for this file), which must stay distinguishable from a bound
+	// firing even though both currently mean "not checked" to the caller.
+	return boxed?.value;
 }
 
 /** Positive finite bound, else the default. Guards NaN from env/config. */
@@ -863,7 +938,8 @@ export async function buildActionableWarningsReport(
 			// files get started.
 			deadlineAt: deadline,
 			signal: args.signal,
-			abortRace: args.signal ? makeAbortRace(args.signal) : undefined,
+			// This loop IS on the awaited hook, so its exceedances are turn_end's.
+			site: { hook: "turn_end", label: "lspEnrichmentRoundTrip" },
 		};
 
 		let unchecked = 0;
@@ -939,7 +1015,15 @@ export async function buildActionableWarningsReport(
 					lspService,
 					pullTimeoutMs,
 					signal: loopSignal,
-					abortRace: makeAbortRace(loopSignal),
+					// OFF the hook by construction: this loop is the answer to
+					// turn_end's budget, not a spender of it, and it runs on its
+					// own ACTIONABLE_WARNINGS_DEFERRED_BUDGET_MS deadline. Charging
+					// its exceedances to `turn_end` would make the hook look over
+					// budget for having correctly deferred the work (#2557 F3).
+					site: {
+						hook: "off_hook",
+						label: "deferredLspEnrichmentRoundTrip",
+					},
 				};
 				const deferredWork = (async () => {
 					// Yield a full macrotask first. Without this the loop would run
