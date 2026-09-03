@@ -1169,18 +1169,36 @@ whole-file-change false positive, re-entered through a re-spelled write (#2355).
 for both fact keys; do not reintroduce a second realpath probe on this runner
 hot path.
 
-Small process-lifetime memo tables use `clients/bounded-cache.ts`'s two
+Small process-lifetime memo tables use `clients/bounded-cache.ts`'s three
 primitives: `BoundedFifoMap` (`get` never reorders — a write-side
-`delete`+`set` is the only way to refresh recency) and `BoundedLruCache`
-(extends it, overriding `get` to re-insert so a read promotes). Both share
-one `set()`/`setMaxEntries()` eviction path that returns the evicted
-`[key, value]` pairs, oldest first, so a call site with an eviction side
-effect (freeing a WASM tree, disposing a compiled query) consumes the return
-value instead of hand-rolling `keys()/values()/entries().next().value` or a
-`for (... of map.keys()) { …; break }` walk — any of those three spellings,
-newly added under `clients/`, `tools/`, `mcp/`, or `index.ts`, fails CI via
+`delete`+`set` is the only way to refresh recency), `BoundedLruCache`
+(extends it, overriding `get` to re-insert so a read promotes), and
+`BoundedSet<T>` (#2460 — the membership-only sibling for a Set-shaped cap). A
+thin wrapper over `BoundedFifoMap<T, true>` (#2460 review T1) — not its own
+`Set`-backed reimplementation — so the ONE eviction block lives in
+`BoundedFifoMap` and the dummy `true` value never escapes the wrapper (no
+tax paid by call sites, only internally). All three share that one eviction
+path, exposed as `add()`/`set()`/`setMaxEntries()`, returning the evicted
+values (`BoundedSet`) or `[key, value]` pairs (the two Map-shaped classes),
+oldest first, so a call site with an eviction side effect (freeing a WASM
+tree, disposing a compiled query, naming a dropped identity in a bounded
+telemetry record) consumes the return value instead of hand-rolling
+`keys()/values()/entries().next().value`, a
+`for (... of map.keys()) { …; break }` walk, or a BARE
+`for (... of set) { …; break }` walk with no accessor call at all (#2460
+review S1 — invisible to the first two spellings, since iterating a `Set`
+directly already yields its values) — any of those four spellings, newly
+added under `clients/`, `tools/`, `mcp/`, or `index.ts`, fails CI via
 `tests/config/bounded-eviction-idiom-sweep.test.ts` unless registered there
-with a `path:line` exemption and a reason. Path-root caches still normalize
+with a `stableOccurrenceKey`-keyed exemption (content-derived, not
+`path:line` — #2475) and a reason. The bare spelling's own gate is narrower
+than "any break+delete pair nearby": it requires a `.size` **comparison**
+(`>`/`>=`) within its window, not just a `.size` mention — a log line
+reporting the current size or a `size === 0` early-return guard does not gate
+it in (#2460 round-3 review F2) — but does NOT require the deleted
+identifier to be the loop variable itself; any `break`+`.delete(` pair in the
+window trips it, same as the accessor-call for-of spelling (#2460 round-3
+review F1). Path-root caches still normalize
 keys at the seam. Widget-state's file map remains a plain map because active
 diagnostic records must not be evicted; it opportunistically removes only
 records idle beyond the active window at one lifecycle size boundary (never

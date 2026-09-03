@@ -101,7 +101,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { createHash } from "node:crypto";
 
-import { BoundedFifoMap } from "./bounded-cache.js";
+import { BoundedFifoMap, BoundedSet } from "./bounded-cache.js";
 import { emitBounded } from "./bounded-telemetry.js";
 import { freshnessFromMtime } from "./freshness.js";
 import { logLatency } from "./latency-logger.js";
@@ -310,7 +310,7 @@ interface ObservedNetState {
 	pending: BoundedFifoMap<string, PendingObservation>;
 	ledger: BoundedFifoMap<string, LedgerEntry>;
 	/** Path keys already recorded through the pipeline this run. */
-	handled: Set<string>;
+	handled: BoundedSet<string>;
 	turnIndex: number;
 	turnSpentMs: number;
 	/** Where the next settled sweep resumes its rotation over the tracked set. */
@@ -327,7 +327,7 @@ function state(): ObservedNetState {
 		() => ({
 			pending: new BoundedFifoMap(OBSERVED_PENDING_MAX),
 			ledger: new BoundedFifoMap(OBSERVED_LEDGER_MAX),
-			handled: new Set(),
+			handled: new BoundedSet(OBSERVED_HANDLED_MAX),
 			turnIndex: -1,
 			turnSpentMs: 0,
 			sweepCursor: 0,
@@ -379,14 +379,13 @@ export function noteMutationHandled(filePath: string): void {
 	try {
 		const handled = state().handled;
 		const key = normalizeMapKey(path.resolve(filePath));
-		if (!handled.has(key) && handled.size >= OBSERVED_HANDLED_MAX) {
-			// FIFO: a Set iterates in insertion order, so the first key is the
-			// oldest. `handled` is membership-only, so this stays a hand-rolled
-			// eviction over a `Set` rather than a `BoundedFifoMap` carrying a
-			// dummy value — see this occurrence's entry in
-			// `tests/config/bounded-eviction-idiom-sweep.test.ts`, and #2460, the
-			// `BoundedSet` follow-up that would clear all four Set-shaped sites.
-			//
+		// `BoundedSet#add` (#2460) owns the FIFO eviction and hands back what it
+		// dropped, oldest first — `handled` is membership-only, so there is never
+		// more than one entry here, but the array shape keeps this call site
+		// identical to every other `BoundedFifoMap`/`BoundedSet` eviction
+		// consumer rather than assuming the cardinality.
+		const evicted = handled.add(key);
+		for (const oldest of evicted) {
 			// The drop is NOT silent (#2449 review round 4, S2). Dropping a mark
 			// reinstates exactly the defect round 3 (S5) fixed: the ledger still
 			// holds the PRE-drain bytes for this file while the only record that
@@ -394,30 +393,25 @@ export function noteMutationHandled(filePath: string): void {
 			// next settled sweep replays our own formatter output as third-party
 			// drift. Naming the victim makes that a traceable record rather than a
 			// mystery re-format (catalog shape 10).
-			const oldest = handled.keys().next().value;
-			if (oldest !== undefined) {
-				handled.delete(oldest);
-				emitBounded(
-					"observed_handled_evicted",
-					// Identity is the DROPPED PATH, not a constant label: the ledger
-					// entry is keyed by subject and survives the per-turn cap on the
-					// detailed record, so it is what still names WHICH file lost its
-					// mark after a turn that overflowed the set many times.
-					oldest,
-					{
-						filePath: oldest,
-						durationMs: 0,
-						result: `cap:${OBSERVED_HANDLED_MAX}`,
-					},
-					{
-						ledgerKind: "observed-mutation-budget",
-						reason: `the handled set is full at ${OBSERVED_HANDLED_MAX}; the oldest pi-lens-authored file lost its mark, so its next drift is reported as third-party`,
-						capPerTurn: { limit: 2, turnIndex: state().turnIndex },
-					},
-				);
-			}
+			emitBounded(
+				"observed_handled_evicted",
+				// Identity is the DROPPED PATH, not a constant label: the ledger
+				// entry is keyed by subject and survives the per-turn cap on the
+				// detailed record, so it is what still names WHICH file lost its
+				// mark after a turn that overflowed the set many times.
+				oldest,
+				{
+					filePath: oldest,
+					durationMs: 0,
+					result: `cap:${OBSERVED_HANDLED_MAX}`,
+				},
+				{
+					ledgerKind: "observed-mutation-budget",
+					reason: `the handled set is full at ${OBSERVED_HANDLED_MAX}; the oldest pi-lens-authored file lost its mark, so its next drift is reported as third-party`,
+					capPerTurn: { limit: 2, turnIndex: state().turnIndex },
+				},
+			);
 		}
-		handled.add(key);
 	} catch {
 		// A path that cannot be resolved cannot collide with a ledger key either.
 	}
