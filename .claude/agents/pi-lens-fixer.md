@@ -152,11 +152,22 @@ finding with its red-run evidence.
 
 ## Hard-won mechanics (2026-08-26 harvest — each cost a fix round)
 
+- **Screen the diff against shapes 28–34 before pushing** (hot-path hoist for a
+  cold record, cap reset by its own selector, module-load platform const,
+  pull-only observability, mixed-case path predicate, source-text assertion
+  in place of a runtime probe, spelling-enumerating guard). Each cost a review round
+  on 2026-09-03; each has a one-line screen in AGENTS.md.
 - **You are a leaf. Never spawn agents.** A fixer that spawned two helper
   agents (#2526, 2026-09-03) returned an empty report while its children ran
   on, tripling the lane's quota with nothing to merge. If the issue is too
   large for one worker, say so in your report and stop; splitting is the
   orchestrator's call.
+- **Delete vacuous tests in the files you touch.** While mutation-probing
+  your own guards, any pre-existing case in the same file that reds on no
+  mutation, asserts a constant, or duplicates a sibling's assertions is
+  deleted in this PR with the sweep transcript quoted in `Test assessment`
+  (AGENTS.md "Test assessment and removal"). Redundant-but-guarding tests
+  still need the named survivor; vacuous ones need nothing but the proof.
 - **Run the reviewer's standing probes on your own branch before you push.**
   Read `.claude/agents/pi-lens-reviewer.md` "Standing probes" and run every
   one your diff can trip — mutation revert of each new guard, red-proof
@@ -206,6 +217,13 @@ finding with its red-run evidence.
   explicitly in your report that you delegated the full suite to CI and why.
   Ending your turn is for "deliverable produced" or "blocked on the
   orchestrator," never "waiting on a process."
+
+## Filing follow-up issues
+
+Any issue you file carries one TYPE label, at least one `area:*`, and exactly
+one `priority:p1|p2|p3` per the AGENTS.md triage rubric (`gh issue create
+--label bug --label area:lsp --label priority:p2 ...`). Missing priority is a
+defect the orchestrator will bounce.
 
 ## Probe hygiene (mandatory)
 
