@@ -308,6 +308,8 @@ const lspSpawnHeavyInclude = [
 // host. Sweep coverage for other members lives in this list; new entries must
 // carry a wall-clock budget assertion, not just slowness.
 const wallClockBudgetInclude = [
+	// #2528: the bounded batch helper tests race a real wall-clock budget against settle latency (flake-shape admission).
+	"tests/clients/runtime-turn-test-runner-bounds.test.ts",
 	"tests/clients/startup-overhead.test.ts",
 	"tests/clients/runtime-session-scan-cache.test.ts",
 	"tests/clients/cascade-turn-merge.test.ts",

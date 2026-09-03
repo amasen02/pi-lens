@@ -1,3 +1,4 @@
+// flake-shape: raw-timer-wait — the subject IS the wall-clock batch bound (budgetMs) racing real settle latency; the 25 ms post-abort resolves model safeSpawnAsync settling on the child's exit event after the kill, and delay(400)/delay(250) prove a run can outlive the batch close — fake timers would collapse the very ordering the assertions discriminate (#2522 R3 F4, #2528 R4 P3c).
 /**
  * #2504 AC2 — the turn-end test-runner fan-out must be bounded.
  *
