@@ -97,7 +97,13 @@ instructions say so.
    list as not applying). Quote the file count you ran in the PR body. The full suite is CI's
    job.
 6. If the issue asks for a class sweep, run it and report coverage honestly:
-   what you searched, what you found, what you deliberately left.
+   what you searched, what you found, what you deliberately left. The sweep
+   covers the WHOLE repo — `clients/`, `tools/`, `mcp/`, `scripts/`,
+   `scripts/lib/`, `tests/support/`, `index.ts` — and greps for both the
+   symbol NAME and the literal VALUE of anything you introduce. #2550
+   declared "no consolidation opportunity" while `scripts/lib/merge-train-warden.mjs`
+   exported a byte-identical `REQUIRED_CHECKS` with a stricter tie policy;
+   the sweep had only looked in `clients/`.
 7. Ship: changelog fragment in `.changelog/` — validate it with
    `node scripts/check-changelog-fragments.mjs` (the CI gate: YAML front
    matter with one `section:`, exactly ONE top-level entry per file);
