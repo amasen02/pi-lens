@@ -37,6 +37,10 @@ function batchPaths(prefix: string, count = BATCH): string[] {
 
 // A realistic per-file delta-baseline payload: two `Diagnostic`s, the shape
 // `dispatcher.ts` persists to `session.baseline.*` on every delta-mode dispatch.
+// #2489: previously TWO keys per file (absolute + a cwd-blind relative
+// fallback); the relative fallback was removed because on a `FactStore`
+// shared across project roots it collided across projects that dispatch
+// files sharing a relative path. One key per file now.
 function representativeBaseline(path: string): Diagnostic[] {
 	return [
 		{
@@ -71,13 +75,14 @@ describe("FactStore session-fact bound (#2282)", () => {
 		const FILES = 500; // "several hundred", matching the issue's own wording
 		const paths = batchPaths("measure", FILES);
 
-		// dispatcher.ts mints TWO session.baseline keys per file (absolute +
-		// relative), each holding the same Diagnostic[] snapshot (#2282 evidence).
+		// dispatcher.ts mints ONE session.baseline key per file (absolute path
+		// only, post-#2489 — a cwd-blind relative fallback key was removed
+		// because it collided across project roots sharing a `FactStore`).
 		const perFileBytes = paths.reduce((sum, p) => {
 			const payload = JSON.stringify(representativeBaseline(p));
-			return sum + 2 * Buffer.byteLength(payload, "utf8");
+			return sum + Buffer.byteLength(payload, "utf8");
 		}, 0);
-		const baselineKeyCount = FILES * 2;
+		const baselineKeyCount = FILES;
 
 		// Fixed-vocabulary keys stay small and constant regardless of batch size:
 		// one `<command>`/`<command>.transientAttempts`/`<command>.transientRetryAt`
@@ -86,16 +91,16 @@ describe("FactStore session-fact bound (#2282)", () => {
 		const FIXED_VOCAB_COMMANDS = 30;
 		const fixedVocabKeyCount = FIXED_VOCAB_COMMANDS * 3 + 1;
 
-		// Stated numbers (acceptance criterion 1): a 500-file batch retains 1000
-		// baseline entries totaling ~430 KB (439,560 bytes measured here) that
+		// Stated numbers (acceptance criterion 1): a 500-file batch retains 500
+		// baseline entries totaling ~215 KB (219,780 bytes measured here) that
 		// never shrink for the rest of the process, against a fixed-vocabulary
 		// footprint of ~91 entries that cannot grow past the tool count. The
 		// baseline family — not the fixed vocabulary — is what scales with batch
 		// size, so it is the one bounded.
-		expect(baselineKeyCount).toBe(1000);
-		expect(perFileBytes).toBe(439_560);
+		expect(baselineKeyCount).toBe(500);
+		expect(perFileBytes).toBe(219_780);
 		expect(fixedVocabKeyCount).toBeLessThan(100);
-		expect(baselineKeyCount).toBeGreaterThan(fixedVocabKeyCount * 10);
+		expect(baselineKeyCount).toBeGreaterThan(fixedVocabKeyCount * 5);
 	});
 
 	// Acceptance criteria 2 & 4: the production dispatch path (dispatcher.ts)
@@ -142,8 +147,11 @@ describe("FactStore session-fact bound (#2282)", () => {
 		expect(firstResult.baselineWarningCount).toBe(0);
 
 		// A several-hundred(+)-file batch touches every OTHER file exactly once —
-		// the shape a large merge/checkout dispatch produces.
-		for (const p of batchPaths("filler")) {
+		// the shape a large merge/checkout dispatch produces. #2489 dropped the
+		// second (relative-fallback) baseline key dispatcher.ts used to mint per
+		// file, so the batch must now exceed MAX_SESSION_RECORDS on its own (one
+		// key per filler file, not two) to force the eviction this test proves.
+		for (const p of batchPaths("filler", MAX_SESSION_RECORDS + 200)) {
 			await dispatchForFile(
 				createDispatchContext(p, cwd, pi, facts),
 				groups,
