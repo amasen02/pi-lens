@@ -39,6 +39,7 @@ function mockService(
 		supportsLSP: () => true,
 		touchFile: vi.fn(touchFile),
 		isSpawnInFlight: vi.fn(isSpawnInFlight),
+		getAuxiliaryClientsForFile: vi.fn().mockResolvedValue([]),
 	} as any);
 }
 
@@ -234,14 +235,15 @@ describe("resyncLspFile — bounded pre-dispatch LSP sync", () => {
 	});
 
 	it("kicks off auxiliary server acquisition concurrently and unawaited (#2540)", async () => {
-		const getAuxSpy = vi.fn().mockResolvedValue([]);
+		const neverResolvingAux = new Promise<never>(() => {});
+		const getAuxSpy = vi.fn().mockImplementation(() => neverResolvingAux);
 		vi.mocked(getLSPService).mockReturnValue({
 			supportsLSP: () => true,
 			touchFile: vi.fn().mockResolvedValue("done"),
 			getAuxiliaryClientsForFile: getAuxSpy,
 		} as any);
 
-		await resyncLspFile(
+		const resyncPromise = resyncLspFile(
 			"/proj/a.ts",
 			"content",
 			true,
@@ -250,6 +252,8 @@ describe("resyncLspFile — bounded pre-dispatch LSP sync", () => {
 			dbg,
 		);
 
+		// resyncLspFile resolves immediately without waiting on auxiliary warmup
+		await expect(resyncPromise).resolves.toBeUndefined();
 		expect(getAuxSpy).toHaveBeenCalledTimes(1);
 	});
 });
