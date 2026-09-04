@@ -1086,7 +1086,7 @@ export async function resyncLspFile(
 			const auxServerIds = enabledAuxiliaryLspServerIds(getFlag);
 			if (auxServerIds.length > 0) {
 				void lspService
-					.getAuxiliaryClientsForFile?.(
+					.getAuxiliaryClientsForFile(
 						filePath,
 						new Set(auxServerIds),
 						undefined,
@@ -1094,7 +1094,7 @@ export async function resyncLspFile(
 						abort,
 						"tool_result_edit",
 					)
-					?.catch(() => {});
+					.catch(() => {});
 			}
 
 			const startedAt = Date.now();

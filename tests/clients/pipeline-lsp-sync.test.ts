@@ -218,6 +218,7 @@ describe("resyncLspFile — bounded pre-dispatch LSP sync", () => {
 		vi.mocked(getLSPService).mockReturnValue({
 			supportsLSP: () => true,
 			touchFile: vi.fn(() => new Promise(() => {})),
+			getAuxiliaryClientsForFile: vi.fn().mockResolvedValue([]),
 			// isSpawnInFlight intentionally omitted — partial double / older shape.
 		} as any);
 
