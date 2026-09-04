@@ -232,4 +232,24 @@ describe("resyncLspFile — bounded pre-dispatch LSP sync", () => {
 		expect(abandoned).toBeDefined();
 		expect(abandoned?.metadata?.reason).toBe("timeout");
 	});
+
+	it("kicks off auxiliary server acquisition concurrently and unawaited (#2540)", async () => {
+		const getAuxSpy = vi.fn().mockResolvedValue([]);
+		vi.mocked(getLSPService).mockReturnValue({
+			supportsLSP: () => true,
+			touchFile: vi.fn().mockResolvedValue("done"),
+			getAuxiliaryClientsForFile: getAuxSpy,
+		} as any);
+
+		await resyncLspFile(
+			"/proj/a.ts",
+			"content",
+			true,
+			false,
+			() => undefined,
+			dbg,
+		);
+
+		expect(getAuxSpy).toHaveBeenCalledTimes(1);
+	});
 });

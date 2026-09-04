@@ -34,6 +34,7 @@ import {
 import { shouldPreferPullOnlyDiagnostics } from "../lsp-budget.js";
 import { sampleProcessTreeCpuPercent } from "../resource-sampler.js";
 import { bounded, withDeadline, withTimeout } from "../deadline-utils.js";
+import type { LedgerHookKey } from "../hook-budgets.js";
 import { getAmbientAbortSignal } from "../safe-spawn.js";
 import { abortDeferredLspWork } from "../deferred-lsp-work.js";
 import {
@@ -679,6 +680,8 @@ export interface LSPTouchFileOptions {
 	excludeServerIds?: ReadonlySet<string>;
 	/** Budget for waiting on the LSP client to spawn / become ready. */
 	maxClientWaitMs?: number;
+	/** Hook identity for bounded abandonment attribution (defaults to tool_result_edit). */
+	hook?: LedgerHookKey;
 	/**
 	 * Budget for waiting on `textDocument/publishDiagnostics` after the notify
 	 * lands. The dispatch-lsp-runner sets this to a tighter value so a slow
@@ -3259,6 +3262,7 @@ export class LSPService {
 		) => void,
 		maxWaitMs?: number,
 		signal?: AbortSignal,
+		hook?: LedgerHookKey,
 	): Promise<SpawnedServer[]> {
 		if (this.checkDestroyed() || enabledIds.size === 0) return [];
 		const servers = getServersForFileWithConfig(filePath).filter(
@@ -3267,6 +3271,7 @@ export class LSPService {
 		if (servers.length === 0) return [];
 		const rootMemo = new Map<string, Promise<string | undefined>>();
 		const effectiveSignal = signal ?? getAmbientAbortSignal();
+		const effectiveHook = hook ?? "tool_result_edit";
 		const spawned = await Promise.all(
 			servers.map(async (server) => {
 				const acquisition = this.ensureClientForServer(
@@ -3283,7 +3288,7 @@ export class LSPService {
 				return bounded(acquisition, {
 					ms: maxWaitMs,
 					signal: effectiveSignal,
-					hook: "tool_result_edit",
+					hook: effectiveHook,
 					label: `auxiliary-spawn:${server.id}`,
 				});
 			}),
@@ -4496,6 +4501,8 @@ export class LSPService {
 					new Set(options.auxiliaryServerIds ?? []),
 					noteColdAuxiliary,
 					options.maxClientWaitMs,
+					undefined,
+					options.hook,
 				),
 			]);
 			const auxDurationMs = Date.now() - auxStartedAt;

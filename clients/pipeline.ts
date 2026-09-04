@@ -73,6 +73,11 @@ import { RUNTIME_CONFIG } from "./runtime-config.js";
 import type { WordIndex } from "./word-index.js";
 import { getAmbientAbortSignal, safeSpawnAsync } from "./safe-spawn.js";
 import { bounded } from "./deadline-utils.js";
+import {
+	armDeferredLspWork,
+	registerDeferredLspWork,
+} from "./deferred-lsp-work.js";
+import { enabledAuxiliaryLspServerIds } from "./dispatch/auxiliary-lsp.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
 import { dropFindingsForMissingPaths } from "./advisory-provenance.js";
 import {
@@ -1077,6 +1082,32 @@ export async function resyncLspFile(
 			const budgetMs = lspSyncBudgetMs();
 			const abort = getAmbientAbortSignal();
 			if (abort?.aborted) return;
+
+			// #2540: Kick off auxiliary server acquisition concurrently and unawaited
+			// so auxiliary warmup overlaps with the primary language server during resync.
+			// Routed through deferred-lsp-work so it is abandoned on turn abort and never gates the hook.
+			const auxServerIds = enabledAuxiliaryLspServerIds(getFlag);
+			if (
+				auxServerIds.length > 0 &&
+				typeof lspService.getAuxiliaryClientsForFile === "function"
+			) {
+				const deferredSignal = armDeferredLspWork();
+				if (deferredSignal) {
+					const auxWork = lspService
+						.getAuxiliaryClientsForFile(
+							filePath,
+							new Set(auxServerIds),
+							undefined,
+							LSP_SPAWN_BUDGET_MS,
+							deferredSignal,
+							"tool_result_edit",
+						)
+						.then(() => {})
+						.catch(() => {});
+					registerDeferredLspWork(deferredSignal, auxWork);
+				}
+			}
+
 			const startedAt = Date.now();
 			const touch = lspService
 				.touchFile(filePath, fileContent, {

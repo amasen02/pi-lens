@@ -2,4 +2,4 @@
 section: Fixed
 ---
 
-- **LSP auxiliary server spawn concurrent and off-hook bounded (closes #2540)** — on cold first edit, eligible auxiliary servers spawn concurrently via Promise.all bounded by bounded() using the ambient turn signal, rather than running serially. Pre-dispatch sync retains primary-only scope while auxiliary readiness is pushed to the latency log under the auxiliary_readiness phase.
+- **Overlap auxiliary LSP warmup with primary server during resync (closes #2540)** — on cold first edit, auxiliary LSP server acquisition is kicked off concurrently and unawaited via deferred LSP work at resync time, overlapping auxiliary warmup with the primary language server. Bounded per server by `bounded()` using the ambient turn signal and caller hook attribution, dropping cold two-server edit latency from the sum of both spawns to the slowest single spawn. Auxiliary readiness duration is pushed to the latency log under the `auxiliary_readiness` phase.
